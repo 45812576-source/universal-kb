@@ -17,4 +17,5 @@ def health():
     return {"status": "ok"}
 
 
-# Routers registered after models are defined (imported in Task 3+)
+from app.routers import auth  # noqa: E402
+app.include_router(auth.router)
