@@ -31,7 +31,8 @@ async def startup_event():
 from app.routers import auth, admin, skills, knowledge, conversations  # noqa: E402
 from app.routers import business_tables, data_tables, audit, skill_suggestions, contributions  # noqa: E402
 from app.routers import tools, files, intel, lark  # noqa: E402
-from app.routers import web_apps  # noqa: E402
+from app.routers import web_apps, workspaces  # noqa: E402
+from app.routers import skill_market  # noqa: E402
 app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(skills.router)
@@ -47,3 +48,5 @@ app.include_router(files.router)
 app.include_router(intel.router)
 app.include_router(lark.router)
 app.include_router(web_apps.router)
+app.include_router(workspaces.router)
+app.include_router(skill_market.router)
