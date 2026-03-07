@@ -64,10 +64,31 @@ class Skill(Base):
         onupdate=datetime.datetime.utcnow,
     )
 
+    data_queries = Column(JSON, default=list)  # quick access copy of SkillDataQuery entries
+    tools = Column(JSON, default=list)  # tool declarations
+
+    bound_tools = relationship(
+        "ToolRegistry",
+        secondary="skill_tools",
+        back_populates="skills",
+    )
     versions = relationship(
         "SkillVersion",
         back_populates="skill",
         order_by="SkillVersion.version.desc()",
+        cascade="all, delete-orphan",
+    )
+    suggestions = relationship(
+        "SkillSuggestion",
+        foreign_keys="SkillSuggestion.skill_id",
+        cascade="all, delete-orphan",
+        overlaps="skill",
+    )
+    attributions = relationship(
+        "SkillAttribution",
+        foreign_keys="SkillAttribution.skill_id",
+        cascade="all, delete-orphan",
+        overlaps="skill",
     )
 
 
@@ -86,3 +107,53 @@ class SkillVersion(Base):
 
     skill = relationship("Skill", back_populates="versions")
     model_config = relationship("ModelConfig")
+
+
+class SuggestionStatus(str, enum.Enum):
+    PENDING = "pending"
+    ADOPTED = "adopted"
+    PARTIAL = "partial"
+    REJECTED = "rejected"
+
+
+class SkillSuggestion(Base):
+    __tablename__ = "skill_suggestions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skill_id = Column(Integer, ForeignKey("skills.id"), nullable=False)
+    submitted_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    problem_desc = Column(Text, nullable=False)
+    expected_direction = Column(Text, nullable=False)
+    case_example = Column(Text, nullable=True)
+    status = Column(Enum(SuggestionStatus), default=SuggestionStatus.PENDING)
+    review_note = Column(Text, nullable=True)
+    reviewed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    skill = relationship("Skill", foreign_keys=[skill_id], overlaps="suggestions")
+    submitter = relationship("User", foreign_keys=[submitted_by])
+    reviewer = relationship("User", foreign_keys=[reviewed_by])
+
+
+class AttributionLevel(str, enum.Enum):
+    FULL = "full"
+    PARTIAL = "partial"
+    NONE = "none"
+
+
+class SkillAttribution(Base):
+    __tablename__ = "skill_attributions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skill_id = Column(Integer, ForeignKey("skills.id"), nullable=False)
+    version_from = Column(Integer, nullable=False)
+    version_to = Column(Integer, nullable=False)
+    suggestion_id = Column(Integer, ForeignKey("skill_suggestions.id"), nullable=False)
+    attribution_level = Column(Enum(AttributionLevel), nullable=False)
+    matched_change = Column(Text, nullable=True)
+    reason = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    skill = relationship("Skill", foreign_keys=[skill_id], overlaps="attributions")
+    suggestion = relationship("SkillSuggestion", foreign_keys=[suggestion_id])

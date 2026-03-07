@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 from sqlalchemy.orm import Session
 
 from app.models.conversation import Conversation, Message, MessageRole
 from app.models.knowledge import KnowledgeEntry, KnowledgeStatus
-from app.models.skill import Skill, SkillStatus
+from app.models.skill import Skill, SkillMode, SkillStatus
 from app.services.llm_gateway import llm_gateway
 
 logger = logging.getLogger(__name__)
@@ -98,7 +99,6 @@ class SkillEngine:
         if not hits:
             return ""
 
-        # Deduplicate by knowledge_id and fetch titles from DB
         parts = []
         seen_ids = set()
         for h in hits:
@@ -108,11 +108,74 @@ class SkillEngine:
 
         return "\n\n---\n\n".join(parts)
 
+    async def _handle_data_operation(
+        self,
+        db: Session,
+        skill: Skill,
+        user_message: str,
+        model_config: dict,
+        user_id: int | None,
+        intent_type: str,
+    ) -> str:
+        """Handle data query or mutation via Text-to-SQL."""
+        from app.services.data_engine import data_engine
+        from app.models.business import BusinessTable
+
+        # Collect allowed tables from skill's data_queries
+        data_queries = skill.data_queries or []
+        allowed_table_names = list({q.get("table_name") for q in data_queries if q.get("table_name")})
+
+        # Get table metadata
+        tables = data_engine.describe_tables(db)
+        # Filter to only tables declared in the skill
+        if allowed_table_names:
+            tables = [t for t in tables if t["table_name"] in allowed_table_names]
+
+        if not tables:
+            return "该 Skill 未关联任何业务数据表，无法执行数据操作。"
+
+        try:
+            sql_result = await data_engine.generate_sql(user_message, tables, model_config)
+        except Exception as e:
+            logger.error(f"SQL generation failed: {e}")
+            return f"SQL 生成失败：{e}"
+
+        sql = sql_result.get("sql", "")
+        operation = sql_result.get("operation", "read")
+        explanation = sql_result.get("explanation", "")
+
+        # Safety validation
+        ok, reason = data_engine.validate_sql(sql, operation, allowed_table_names)
+        if not ok:
+            return f"操作被拒绝：{reason}"
+
+        # Execute
+        exec_result = await data_engine.execute_sql(
+            db=db,
+            sql=sql,
+            operation=operation,
+            user_id=user_id,
+            table_name=allowed_table_names[0] if allowed_table_names else "",
+        )
+
+        if not exec_result["ok"]:
+            return f"执行失败：{exec_result.get('error', '未知错误')}"
+
+        if operation == "read":
+            rows = exec_result["rows"]
+            columns = exec_result["columns"]
+            table_str = data_engine.format_results(rows, columns)
+            return f"{explanation}\n\n{table_str}" if explanation else table_str
+        else:
+            affected = exec_result.get("affected_rows", 0)
+            return f"操作成功，影响 {affected} 行。\n\n{explanation}"
+
     async def execute(
         self,
         db: Session,
         conversation: Conversation,
         user_message: str,
+        user_id: int | None = None,
     ) -> str:
         # Get default model config for intent matching
         default_config = llm_gateway.get_config(db)
@@ -143,15 +206,50 @@ class SkillEngine:
         model_config_id = skill_version.model_config_id if skill_version else None
         model_config = llm_gateway.get_config(db, model_config_id)
 
-        # 4. Inject knowledge
+        # 4a. Structured mode: try rule engine first
+        if skill and skill.mode == SkillMode.STRUCTURED:
+            try:
+                from app.services.rule_engine import rule_engine
+                rule_result = await rule_engine.try_evaluate(
+                    db, skill, user_message, default_config
+                )
+                if rule_result is not None:
+                    return rule_result
+            except Exception as e:
+                logger.warning(f"Rule engine failed, falling through to LLM: {e}")
+
+        # 4b. If skill has data_queries, classify intent and possibly route to data operation
+        if skill and skill.data_queries:
+            try:
+                from app.services.data_engine import data_engine
+                intent = await data_engine.classify_intent(user_message, default_config)
+                intent_type = intent.get("type", "ai_generate")
+                if intent_type in ("data_query", "data_mutation"):
+                    return await self._handle_data_operation(
+                        db, skill, user_message, model_config, user_id, intent_type
+                    )
+            except Exception as e:
+                logger.warning(f"Intent classification failed, falling through to LLM: {e}")
+
+        # 5. Inject available tools for this skill
+        tool_prompt = ""
+        if skill:
+            try:
+                from app.services.tool_executor import tool_executor
+                bound_tools = tool_executor.get_tools_for_skill(db, skill.id)
+                if bound_tools:
+                    tool_prompt = tool_executor.build_tool_list_prompt(bound_tools)
+            except Exception as e:
+                logger.warning(f"Tool loading failed: {e}")
+
+        # 6. Inject knowledge
         knowledge_context = ""
         if not skill or (skill and skill.auto_inject):
             knowledge_context = self._inject_knowledge(user_message, skill)
 
-        # 5. Build system prompt
+        # 7. Build system prompt
         if skill_version:
             system_content = skill_version.system_prompt
-            # Extract and substitute variables
             if skill_version.variables:
                 history_text = "\n".join(
                     f"{m.role.value}: {m.content}" for m in messages
@@ -163,7 +261,6 @@ class SkillEngine:
                     )
                     for var, val in extracted.items():
                         if val:
-                            # variables are stored like "{industry}", match with braces
                             system_content = system_content.replace(
                                 "{" + var.strip("{}") + "}", str(val)
                             )
@@ -175,18 +272,83 @@ class SkillEngine:
         if knowledge_context:
             system_content += f"\n\n## 参考知识\n\n{knowledge_context}"
 
-        # 6. Build message list for LLM
+        if tool_prompt:
+            system_content += f"\n\n{tool_prompt}"
+
+        # 8. Build message list for LLM
         llm_messages = [{"role": "system", "content": system_content}]
         for m in messages:
             if m.role in (MessageRole.USER, MessageRole.ASSISTANT):
                 llm_messages.append({"role": m.role.value, "content": m.content})
         llm_messages.append({"role": "user", "content": user_message})
 
-        # 7. Call LLM
+        # 9. Call LLM (with Agent Loop for tool calls)
         response = await llm_gateway.chat(
             model_config=model_config,
             messages=llm_messages,
         )
+
+        # 10. Agent Loop: detect and execute tool calls
+        if skill and "```tool_call" in response:
+            response = await self._handle_tool_calls(
+                db, skill, response, llm_messages, model_config, user_id
+            )
+
+        return response
+
+    async def _handle_tool_calls(
+        self,
+        db: Session,
+        skill: Skill,
+        response: str,
+        llm_messages: list[dict],
+        model_config: dict,
+        user_id: int | None,
+        max_rounds: int = 3,
+    ) -> str:
+        """Execute tool calls found in LLM response and continue conversation."""
+        from app.services.tool_executor import tool_executor
+
+        for _ in range(max_rounds):
+            # Extract tool_call blocks
+            pattern = r"```tool_call\s*(.*?)\s*```"
+            matches = re.findall(pattern, response, re.DOTALL)
+            if not matches:
+                break
+
+            tool_results = []
+            for match in matches:
+                try:
+                    call = json.loads(match)
+                    tool_name = call.get("tool", "")
+                    params = call.get("params", {})
+                    result = await tool_executor.execute_tool(db, tool_name, params, user_id)
+                    tool_results.append(
+                        f"工具 `{tool_name}` 执行结果：\n```json\n{json.dumps(result, ensure_ascii=False, indent=2)}\n```"
+                    )
+                except Exception as e:
+                    tool_results.append(f"工具调用解析失败：{e}")
+
+            if not tool_results:
+                break
+
+            # Continue the conversation with tool results
+            tool_result_text = "\n\n".join(tool_results)
+            llm_messages.append({"role": "assistant", "content": response})
+            llm_messages.append({
+                "role": "user",
+                "content": f"[工具执行结果]\n\n{tool_result_text}\n\n请基于以上工具结果，给出最终回复。",
+            })
+
+            response = await llm_gateway.chat(
+                model_config=model_config,
+                messages=llm_messages,
+            )
+
+            # If no more tool calls, done
+            if "```tool_call" not in response:
+                break
+
         return response
 
 

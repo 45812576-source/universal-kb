@@ -1,4 +1,4 @@
-"""种子数据：组织架构 + 超管账号 + 默认模型配置"""
+"""种子数据：组织架构 + 超管账号 + 默认模型配置 + 内置工具"""
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.database import SessionLocal
 from app.models.user import Department, User, Role
 from app.models.skill import ModelConfig
+from app.models.tool import ToolRegistry, ToolType
 from passlib.hash import bcrypt
 
 
@@ -70,9 +71,92 @@ def seed():
     )
     db.add(default_model)
 
+    # 内置工具注册
+    _seed_tools(db)
+
     db.commit()
     db.close()
-    print("Seed complete: org structure, admin user, default model config.")
+    print("Seed complete: org structure, admin user, default model config, builtin tools.")
+
+
+def _seed_tools(db):
+    """Register builtin tools if not already present."""
+    builtin_tools = [
+        {
+            "name": "ppt_generator",
+            "display_name": "PPT生成器",
+            "description": "根据结构化内容生成PowerPoint演示文稿",
+            "tool_type": ToolType.BUILTIN,
+            "config": {"module": "app.tools.ppt_generator", "function": "execute"},
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "演示文稿标题"},
+                    "slides": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+                "required": ["title", "slides"],
+            },
+            "output_format": "file",
+        },
+        {
+            "name": "excel_generator",
+            "display_name": "Excel生成器",
+            "description": "根据表格数据生成Excel文件",
+            "tool_type": ToolType.BUILTIN,
+            "config": {"module": "app.tools.excel_generator", "function": "execute"},
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "文件名（不含扩展名）"},
+                    "sheets": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "headers": {"type": "array", "items": {"type": "string"}},
+                                "rows": {"type": "array"},
+                            },
+                        },
+                    },
+                },
+                "required": ["sheets"],
+            },
+            "output_format": "file",
+        },
+        {
+            "name": "web_builder",
+            "display_name": "Web小工具搭建",
+            "description": "根据需求描述生成可分享的单页Web应用",
+            "tool_type": ToolType.BUILTIN,
+            "config": {"module": "app.tools.web_builder", "function": "execute"},
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "description": "小工具功能描述"},
+                    "name": {"type": "string", "description": "小工具名称"},
+                },
+                "required": ["description"],
+            },
+            "output_format": "json",
+        },
+    ]
+
+    for tool_data in builtin_tools:
+        if db.query(ToolRegistry).filter(ToolRegistry.name == tool_data["name"]).first():
+            continue
+        tool = ToolRegistry(**tool_data)
+        db.add(tool)
+    db.flush()
 
 
 if __name__ == "__main__":

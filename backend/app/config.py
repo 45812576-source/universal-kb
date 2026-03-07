@@ -11,6 +11,12 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379"
     UPLOAD_DIR: str = "./uploads"
 
+    # Feishu (Lark) integration
+    LARK_APP_ID: str = ""
+    LARK_APP_SECRET: str = ""
+    LARK_VERIFICATION_TOKEN: str = ""
+    LARK_ENCRYPT_KEY: str = ""
+
     class Config:
         env_file = ".env"
 

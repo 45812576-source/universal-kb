@@ -38,6 +38,7 @@ class User(Base):
     role = Column(Enum(Role), default=Role.EMPLOYEE)
     department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
     is_active = Column(Boolean, default=True)
+    lark_user_id = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     department = relationship("Department", back_populates="users")
