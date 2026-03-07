@@ -178,6 +178,11 @@ def add_version(
         created_by=user.id,
         change_note=req.change_note,
     )
+    # Mark as customized if this is an imported/forked skill being modified
+    if skill.source_type in ("imported", "forked"):
+        import datetime as _dt
+        skill.is_customized = True
+        skill.local_modified_at = _dt.datetime.utcnow()
     db.add(v)
     db.commit()
     return {"version": v.version, "id": v.id}
