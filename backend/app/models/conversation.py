@@ -21,6 +21,7 @@ class Conversation(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     title = Column(Text, default="新对话")
     skill_id = Column(Integer, ForeignKey("skills.id"), nullable=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(
@@ -42,6 +43,7 @@ class Message(Base):
     role = Column(Enum(MessageRole), nullable=False)
     content = Column(Text, nullable=False)
     metadata_ = Column("metadata", JSON, default=dict)
+    draft_id = Column(Integer, ForeignKey("drafts.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     conversation = relationship("Conversation", back_populates="messages")

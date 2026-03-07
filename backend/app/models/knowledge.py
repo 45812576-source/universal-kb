@@ -40,6 +40,10 @@ class KnowledgeEntry(Base):
     # Milvus chunk IDs
     milvus_ids = Column(JSON, default=list)
 
+    source_draft_id = Column(Integer, ForeignKey("drafts.id"), nullable=True)
+    raw_input_id    = Column(Integer, ForeignKey("raw_inputs.id"), nullable=True)
+    capture_mode    = Column(String(50), default="manual_form")
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(
         DateTime,

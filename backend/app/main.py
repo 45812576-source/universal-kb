@@ -5,7 +5,7 @@ app = FastAPI(title="Universal KB API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -37,6 +37,9 @@ async def startup_event():
         import logging
         logging.getLogger(__name__).warning(f"Upstream checker scheduler failed: {e}")
 
+
+# Register new models with Base.metadata
+from app.models import raw_input, draft, opportunity, feedback_item  # noqa: F401
 
 from app.routers import auth, admin, skills, knowledge, conversations  # noqa: E402
 from app.routers import business_tables, data_tables, audit, skill_suggestions, contributions  # noqa: E402
