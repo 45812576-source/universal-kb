@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    DATABASE_URL: str = "mysql+pymysql://root:kb_root_pass@localhost:3306/universal_kb"
+    DATABASE_URL: str = "mysql+pymysql://root@localhost:3306/universal_kb"
     JWT_SECRET: str = "change-me-in-production"
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = 480
