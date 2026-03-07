@@ -17,8 +17,9 @@ def health():
     return {"status": "ok"}
 
 
-from app.routers import auth, admin, skills, knowledge  # noqa: E402
+from app.routers import auth, admin, skills, knowledge, conversations  # noqa: E402
 app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(skills.router)
 app.include_router(knowledge.router)
+app.include_router(conversations.router)
