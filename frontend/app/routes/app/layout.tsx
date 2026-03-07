@@ -262,6 +262,20 @@ const ICONS = {
     ],
     colors: { C: "#00A3C4", W: "#CCF2FF" },
   },
+  // MCP Token: cyan key
+  mcpToken: {
+    pattern: [
+      "..CCCCC",
+      ".CWWWWC",
+      "CC....C",
+      "C.....C",
+      "CC....C",
+      ".CWWWWC",
+      "..CCCCC",
+      ".......",
+    ],
+    colors: { C: "#00A3C4", W: "#CCF2FF" },
+  },
   // 工作台管理: purple layers admin
   workspaceAdmin: {
     pattern: [
@@ -442,6 +456,10 @@ export default function AppLayout() {
                 <NavItem to="/admin/skill-market">
                   <PixelIcon {...ICONS.skillMarket} />
                   外部市场
+                </NavItem>
+                <NavItem to="/admin/mcp-tokens">
+                  <PixelIcon {...ICONS.mcpToken} />
+                  MCP Token
                 </NavItem>
                 <NavItem to="/admin/intel">
                   <PixelIcon {...ICONS.intelAdmin} />

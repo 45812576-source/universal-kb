@@ -12,6 +12,8 @@ export default [
 
   // Authenticated app
   layout("routes/app/layout.tsx", [
+    index("routes/app/home.tsx"),
+
     // Chat
     route("chat", "routes/app/chat/layout.tsx", [
       index("routes/app/chat/index.tsx"),
@@ -55,6 +57,7 @@ export default [
       route("admin/workspaces", "routes/app/admin/workspaces/index.tsx"),
       route("admin/workspaces/:id", "routes/app/admin/workspaces/detail.tsx"),
       route("admin/skill-market", "routes/app/admin/skill-market/index.tsx"),
+      route("admin/mcp-tokens", "routes/app/admin/mcp-tokens/index.tsx"),
     ]),
   ]),
 ] satisfies RouteConfig;
