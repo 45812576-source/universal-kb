@@ -27,6 +27,16 @@ async def startup_event():
         import logging
         logging.getLogger(__name__).warning(f"Intel scheduler startup failed: {e}")
 
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from app.services.upstream_checker import check_all_imported_skills
+        upstream_scheduler = BackgroundScheduler()
+        upstream_scheduler.add_job(check_all_imported_skills, "cron", hour=3, minute=0)
+        upstream_scheduler.start()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Upstream checker scheduler failed: {e}")
+
 
 from app.routers import auth, admin, skills, knowledge, conversations  # noqa: E402
 from app.routers import business_tables, data_tables, audit, skill_suggestions, contributions  # noqa: E402

@@ -42,7 +42,6 @@ def _skill_summary(s: Skill) -> dict:
         "knowledge_tags": s.knowledge_tags or [],
         "auto_inject": s.auto_inject,
         "current_version": latest.version if latest else 0,
-        "system_prompt_preview": (latest.system_prompt[:120] + "...") if latest and len(latest.system_prompt) > 120 else (latest.system_prompt if latest else ""),
         "department_id": s.department_id,
         "created_at": s.created_at.isoformat(),
     }
@@ -55,7 +54,10 @@ def list_skills(
     user: User = Depends(get_current_user),
 ):
     q = db.query(Skill)
-    if status:
+    # employee can only see published skills
+    if user.role == Role.EMPLOYEE:
+        q = q.filter(Skill.status == SkillStatus.PUBLISHED)
+    elif status:
         q = q.filter(Skill.status == status)
     return [_skill_summary(s) for s in q.order_by(Skill.updated_at.desc()).all()]
 
@@ -105,21 +107,32 @@ def get_skill(
     skill = db.get(Skill, skill_id)
     if not skill:
         raise HTTPException(404, "Skill not found")
+
+    # employee: no versions at all
+    if user.role == Role.EMPLOYEE:
+        return _skill_summary(skill)
+
+    # dept_admin: show prompt only for own department's skills
+    is_own_dept = (user.role == Role.DEPT_ADMIN and skill.department_id == user.department_id)
+    is_super = user.role == Role.SUPER_ADMIN
+
+    def _version_dict(v) -> dict:
+        base = {
+            "id": v.id,
+            "version": v.version,
+            "variables": v.variables or [],
+            "model_config_id": v.model_config_id,
+            "change_note": v.change_note,
+            "created_by": v.created_by,
+            "created_at": v.created_at.isoformat(),
+        }
+        if is_super or is_own_dept:
+            base["system_prompt"] = v.system_prompt
+        return base
+
     return {
         **_skill_summary(skill),
-        "versions": [
-            {
-                "id": v.id,
-                "version": v.version,
-                "system_prompt": v.system_prompt,
-                "variables": v.variables or [],
-                "model_config_id": v.model_config_id,
-                "change_note": v.change_note,
-                "created_by": v.created_by,
-                "created_at": v.created_at.isoformat(),
-            }
-            for v in skill.versions
-        ],
+        "versions": [_version_dict(v) for v in skill.versions],
     }
 
 
@@ -320,3 +333,112 @@ def delete_skill(
     db.delete(skill)
     db.commit()
     return {"ok": True}
+
+
+@router.get("/{skill_id}/upstream-diff")
+def get_upstream_diff(
+    skill_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """Return upstream vs local diff for an imported skill."""
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill not found")
+    if not skill.upstream_content:
+        return {"has_upstream": False}
+
+    latest = skill.versions[0] if skill.versions else None
+    local_prompt = latest.system_prompt if latest else ""
+
+    from app.models.mcp import SkillUpstreamCheck
+    latest_check = (
+        db.query(SkillUpstreamCheck)
+        .filter(SkillUpstreamCheck.skill_id == skill_id)
+        .order_by(SkillUpstreamCheck.checked_at.desc())
+        .first()
+    )
+
+    return {
+        "has_upstream": True,
+        "source_type": skill.source_type,
+        "upstream_version": skill.upstream_version,
+        "upstream_synced_at": skill.upstream_synced_at.isoformat() if skill.upstream_synced_at else None,
+        "is_customized": skill.is_customized,
+        "upstream_content": skill.upstream_content,
+        "local_content": local_prompt,
+        "has_new_upstream": latest_check.has_diff if latest_check else False,
+        "new_upstream_version": latest_check.upstream_version if latest_check else None,
+        "diff_summary": latest_check.diff_summary if latest_check else None,
+        "check_action": latest_check.action if latest_check else None,
+    }
+
+
+class UpstreamSyncRequest(BaseModel):
+    action: str  # overwrite / ignore
+
+
+@router.post("/{skill_id}/upstream-sync")
+def upstream_sync(
+    skill_id: int,
+    req: UpstreamSyncRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """Handle sync decision: overwrite local with upstream, or ignore upstream update."""
+    from app.models.mcp import SkillUpstreamCheck, McpSource
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill not found")
+
+    latest_check = (
+        db.query(SkillUpstreamCheck)
+        .filter(SkillUpstreamCheck.skill_id == skill_id, SkillUpstreamCheck.has_diff == True)
+        .order_by(SkillUpstreamCheck.checked_at.desc())
+        .first()
+    )
+
+    if req.action == "ignore":
+        if latest_check:
+            latest_check.action = "ignored"
+        db.commit()
+        return {"ok": True, "action": "ignored"}
+
+    if req.action == "overwrite":
+        source = db.query(McpSource).filter(McpSource.is_active == True).first()
+        if not source or not skill.upstream_id:
+            raise HTTPException(400, "Cannot fetch upstream: no active source")
+
+        from app.services.mcp_client import fetch_remote_skill, McpClientError
+        try:
+            remote = fetch_remote_skill(source, skill.upstream_id)
+        except McpClientError as e:
+            raise HTTPException(502, str(e))
+
+        new_prompt = remote.get("system_prompt", "")
+        new_version = remote.get("upstream_version", "")
+
+        max_ver = max((v.version for v in skill.versions), default=0)
+        import datetime as dt
+        v = SkillVersion(
+            skill_id=skill_id,
+            version=max_ver + 1,
+            system_prompt=new_prompt,
+            variables=[],
+            created_by=user.id,
+            change_note=f"同步上游 v{new_version}",
+        )
+        db.add(v)
+
+        skill.upstream_content = new_prompt
+        skill.upstream_version = new_version
+        skill.upstream_synced_at = dt.datetime.utcnow()
+        skill.is_customized = False
+
+        if latest_check:
+            latest_check.action = "synced"
+
+        db.commit()
+        return {"ok": True, "action": "overwrite", "new_version": v.version}
+
+    raise HTTPException(400, f"Unknown action: {req.action}")
