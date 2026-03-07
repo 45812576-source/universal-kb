@@ -6,3 +6,4 @@ from app.models.business import BusinessTable, AuditLog, SkillDataQuery, DataOwn
 from app.models.tool import ToolRegistry, SkillTool, ToolType  # noqa: F401
 from app.models.web_app import WebApp  # noqa: F401
 from app.models.intel import IntelSource, IntelEntry, IntelSourceType, IntelEntryStatus  # noqa: F401
+from app.models import mcp  # noqa: F401

@@ -91,6 +91,17 @@ class Skill(Base):
         overlaps="skill",
     )
 
+    # Upstream tracking fields
+    source_type = Column(String(20), default="local")  # local / imported / forked
+    upstream_url = Column(String(500), nullable=True)
+    upstream_id = Column(String(200), nullable=True)
+    upstream_version = Column(String(50), nullable=True)
+    upstream_content = Column(Text, nullable=True)  # 永远保存上游原版 system_prompt
+    upstream_synced_at = Column(DateTime, nullable=True)
+    is_customized = Column(Boolean, default=False)
+    parent_skill_id = Column(Integer, ForeignKey("skills.id"), nullable=True)
+    local_modified_at = Column(DateTime, nullable=True)
+
 
 class SkillVersion(Base):
     __tablename__ = "skill_versions"
