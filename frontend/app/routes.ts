@@ -41,6 +41,9 @@ export default [
     // My workspaces (all users)
     route("workspaces/my", "routes/app/workspaces/my.tsx"),
 
+    // Confirmations (pending questions)
+    route("confirmations", "routes/app/confirmations/index.tsx"),
+
     // Admin
     layout("routes/app/admin/layout.tsx", [
       route("admin/skills", "routes/app/admin/skills/index.tsx"),

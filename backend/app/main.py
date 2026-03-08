@@ -47,6 +47,7 @@ from app.routers import tools, files, intel, lark  # noqa: E402
 from app.routers import web_apps, workspaces  # noqa: E402
 from app.routers import skill_market  # noqa: E402
 from app.routers import mcp_server, mcp_tokens  # noqa: E402
+from app.routers import drafts  # noqa: E402
 app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(skills.router)
@@ -66,3 +67,4 @@ app.include_router(workspaces.router)
 app.include_router(skill_market.router)
 app.include_router(mcp_server.router)
 app.include_router(mcp_tokens.router)
+app.include_router(drafts.router)

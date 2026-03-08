@@ -52,6 +52,20 @@ const ICONS = {
     ],
     colors: { B: "#00A3C4", W: "#CCF2FF" },
   },
+  // 待确认: yellow bell
+  confirmations: {
+    pattern: [
+      ".......",
+      "..YYY..",
+      ".YYYYY.",
+      ".YYYYY.",
+      ".YYYYY.",
+      ".YYYYY.",
+      "..YYY..",
+      "..YYY..",
+    ],
+    colors: { Y: "#D69E2E" },
+  },
   // 我的工作台: purple layers
   workspace: {
     pattern: [
@@ -389,9 +403,9 @@ export default function AppLayout() {
               <PixelIcon {...ICONS.chat} />
               对话
             </NavItem>
-            <NavItem to="/workspaces/my">
-              <PixelIcon {...ICONS.workspace} />
-              我的工作台
+            <NavItem to="/confirmations">
+              <PixelIcon {...ICONS.confirmations} />
+              待确认
             </NavItem>
 
             <NavSection label="知识贡献" />

@@ -1,4 +1,6 @@
 """Tool registry CRUD API."""
+from __future__ import annotations
+
 import datetime
 from typing import Optional
 
@@ -39,26 +41,34 @@ class ToolTestRequest(BaseModel):
     params: dict = {}
 
 
-def _tool_dict(t: ToolRegistry) -> dict:
-    return {
+def _tool_dict(t: ToolRegistry, user: User | None = None) -> dict:
+    is_super = user is not None and user.role == Role.SUPER_ADMIN
+    is_admin = user is not None and user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
+    d: dict = {
         "id": t.id,
         "name": t.name,
         "display_name": t.display_name,
         "description": t.description,
-        "tool_type": t.tool_type.value,
-        "config": t.config,
-        "input_schema": t.input_schema,
-        "output_format": t.output_format,
         "is_active": t.is_active,
-        "created_by": t.created_by,
-        "created_at": t.created_at.isoformat() if t.created_at else None,
     }
+    if is_admin:
+        d["tool_type"] = t.tool_type.value
+        d["input_schema"] = t.input_schema
+        d["output_format"] = t.output_format
+        d["created_by"] = t.created_by
+        d["created_at"] = t.created_at.isoformat() if t.created_at else None
+    if is_super:
+        d["config"] = t.config
+    return d
 
 
 @router.get("")
 def list_tools(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    tools = db.query(ToolRegistry).order_by(ToolRegistry.created_at.desc()).all()
-    return [_tool_dict(t) for t in tools]
+    q = db.query(ToolRegistry)
+    if user.role == Role.EMPLOYEE:
+        q = q.filter(ToolRegistry.is_active == True)
+    tools = q.order_by(ToolRegistry.created_at.desc()).all()
+    return [_tool_dict(t, user) for t in tools]
 
 
 @router.post("")
@@ -82,7 +92,7 @@ def create_tool(
     db.add(tool)
     db.commit()
     db.refresh(tool)
-    return _tool_dict(tool)
+    return _tool_dict(tool, user)
 
 
 @router.get("/{tool_id}")
@@ -90,7 +100,7 @@ def get_tool(tool_id: int, db: Session = Depends(get_db), user: User = Depends(g
     tool = db.get(ToolRegistry, tool_id)
     if not tool:
         raise HTTPException(status_code=404, detail="Tool not found")
-    return _tool_dict(tool)
+    return _tool_dict(tool, user)
 
 
 @router.put("/{tool_id}")
@@ -109,7 +119,7 @@ def update_tool(
     tool.updated_at = datetime.datetime.utcnow()
     db.commit()
     db.refresh(tool)
-    return _tool_dict(tool)
+    return _tool_dict(tool, user)
 
 
 @router.delete("/{tool_id}")
@@ -149,7 +159,7 @@ def get_skill_tools(
     user: User = Depends(get_current_user),
 ):
     tools = tool_executor.get_tools_for_skill(db, skill_id)
-    return [_tool_dict(t) for t in tools]
+    return [_tool_dict(t, user) for t in tools]
 
 
 @router.post("/skill/{skill_id}/tools/{tool_id}")

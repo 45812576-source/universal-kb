@@ -24,61 +24,75 @@ export default function ContributionsPage() {
   }
 
   return (
-    <div className="p-6 max-w-5xl">
-      <h1 className="text-xl font-bold text-gray-900 mb-2">贡献统计</h1>
-      <p className="text-sm text-gray-500 mb-6">基于 Skill 改进意见的采纳情况，统计各员工对知识体系的贡献度。</p>
-
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-        <table className="w-full text-sm">
-          <thead className="bg-gray-50 border-b border-gray-200">
-            <tr>
-              <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500">排名</th>
-              <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500">姓名</th>
-              <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500">部门</th>
-              <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500">提交意见数</th>
-              <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500">采纳率</th>
-              <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500">影响力分</th>
-              <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500">影响Skill数</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-100">
-            {(stats || []).map((row: any, i: number) => (
-              <tr key={row.user_id} className="hover:bg-gray-50">
-                <td className="px-4 py-3 text-sm font-bold text-gray-400">
-                  {i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `#${i + 1}`}
-                </td>
-                <td className="px-4 py-3 font-medium text-gray-800">{row.display_name}</td>
-                <td className="px-4 py-3 text-gray-500 text-xs">
-                  {row.department_id ? deptMap[row.department_id] ?? "-" : "-"}
-                </td>
-                <td className="px-4 py-3 text-right text-gray-700">{row.total_suggestions}</td>
-                <td className="px-4 py-3 text-right">
-                  <span className={`text-xs font-medium ${
-                    row.adoption_rate >= 0.5 ? "text-green-600" :
-                    row.adoption_rate >= 0.2 ? "text-yellow-600" : "text-gray-400"
-                  }`}>
-                    {row.total_suggestions > 0 ? `${Math.round(row.adoption_rate * 100)}%` : "-"}
-                  </span>
-                </td>
-                <td className="px-4 py-3 text-right font-bold text-blue-600">
-                  {row.influence_score}
-                </td>
-                <td className="px-4 py-3 text-right text-gray-500">{row.impacted_skills}</td>
-              </tr>
-            ))}
-            {(!stats || stats.length === 0) && (
-              <tr>
-                <td colSpan={7} className="px-4 py-8 text-center text-gray-400">
-                  暂无贡献数据。员工提交意见并被采纳后，数据将出现在这里。
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+    <div className="min-h-full bg-[#F0F4F8]">
+      <div className="border-b-2 border-[#1A202C] bg-[#EBF4F7] px-6 py-4 flex items-center gap-4">
+        <div className="w-1.5 h-5 bg-[#00D1FF]" />
+        <div>
+          <h1 className="text-xs font-bold uppercase tracking-widest text-[#1A202C]">贡献统计</h1>
+          <p className="text-[9px] text-gray-500 uppercase font-bold mt-0.5">基于 Skill 改进意见采纳情况</p>
+        </div>
       </div>
 
-      <div className="mt-4 text-xs text-gray-400">
-        影响力分计算规则：完全采纳 ×3 分，部分采纳 ×1 分
+      <div className="p-6 max-w-5xl">
+        <div className="pixel-border bg-white overflow-hidden">
+          <div className="bg-[#2D3748] text-white px-4 py-2.5 flex items-center justify-between border-b-2 border-[#1A202C]">
+            <span className="text-[10px] font-bold uppercase tracking-widest">Contribution_Leaderboard</span>
+            <div className="flex space-x-1.5">
+              <div className="w-2 h-2 bg-red-400" />
+              <div className="w-2 h-2 bg-yellow-400" />
+              <div className="w-2 h-2 bg-green-400" />
+            </div>
+          </div>
+          <table className="w-full text-left">
+            <thead className="bg-[#F0F4F8] border-b-2 border-[#1A202C]">
+              <tr>
+                <th className="px-4 py-3 text-[9px] font-bold uppercase tracking-widest text-gray-500">排名</th>
+                <th className="px-4 py-3 text-[9px] font-bold uppercase tracking-widest text-gray-500">姓名</th>
+                <th className="px-4 py-3 text-[9px] font-bold uppercase tracking-widest text-gray-500">部门</th>
+                <th className="px-4 py-3 text-[9px] font-bold uppercase tracking-widest text-gray-500 text-right">提交意见数</th>
+                <th className="px-4 py-3 text-[9px] font-bold uppercase tracking-widest text-gray-500 text-right">采纳率</th>
+                <th className="px-4 py-3 text-[9px] font-bold uppercase tracking-widest text-gray-500 text-right">影响力分</th>
+                <th className="px-4 py-3 text-[9px] font-bold uppercase tracking-widest text-gray-500 text-right">影响Skill数</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {(stats || []).map((row: any, i: number) => (
+                <tr key={row.user_id} className="hover:bg-[#F0F4F8]">
+                  <td className="px-4 py-3 text-xs font-bold text-[#1A202C]">
+                    {i === 0 ? "[#1]" : i === 1 ? "[#2]" : i === 2 ? "[#3]" : `#${i + 1}`}
+                  </td>
+                  <td className="px-4 py-3 text-xs font-bold text-[#1A202C]">{row.display_name}</td>
+                  <td className="px-4 py-3 text-[10px] font-bold uppercase text-gray-500">
+                    {row.department_id ? deptMap[row.department_id] ?? "-" : "-"}
+                  </td>
+                  <td className="px-4 py-3 text-right text-xs font-bold text-gray-700">{row.total_suggestions}</td>
+                  <td className="px-4 py-3 text-right">
+                    <span className={`text-xs font-bold uppercase ${
+                      row.adoption_rate >= 0.5 ? "text-green-600" :
+                      row.adoption_rate >= 0.2 ? "text-yellow-600" : "text-gray-400"
+                    }`}>
+                      {row.total_suggestions > 0 ? `${Math.round(row.adoption_rate * 100)}%` : "-"}
+                    </span>
+                  </td>
+                  <td className="px-4 py-3 text-right text-xs font-bold text-[#00A3C4]">
+                    {row.influence_score}
+                  </td>
+                  <td className="px-4 py-3 text-right text-[10px] font-bold text-gray-500">{row.impacted_skills}</td>
+                </tr>
+              ))}
+              {(!stats || stats.length === 0) && (
+                <tr>
+                  <td colSpan={7} className="px-4 py-8 text-center text-xs font-bold uppercase text-gray-400">
+                    暂无贡献数据
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="mt-4 text-[9px] font-bold uppercase text-gray-400">
+          影响力分计算规则：完全采纳 ×3 分，部分采纳 ×1 分
+        </div>
       </div>
     </div>
   );

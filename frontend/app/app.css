@@ -1,15 +1,24 @@
 @import "tailwindcss";
 
 @theme {
-  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif,
-    "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+  --font-sans: "Roboto Mono", ui-monospace, monospace;
 }
 
-html,
-body {
-  @apply bg-white dark:bg-gray-950;
-
-  @media (prefers-color-scheme: dark) {
-    color-scheme: dark;
-  }
+html, body {
+  font-family: 'Roboto Mono', monospace;
+  background-color: #F0F4F8;
+  color: #1A202C;
 }
+
+.pixel-border {
+  border: 2px solid #1A202C;
+  box-shadow: 2px 2px 0px 0px #1A202C;
+}
+
+.pixel-border-sm {
+  border: 1px solid #1A202C;
+}
+
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: #F0F4F8; }
+::-webkit-scrollbar-thumb { background: #1A202C; }

@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -15,16 +17,21 @@ class SendMessage(BaseModel):
     content: str
 
 
+class ConversationCreate(BaseModel):
+    workspace_id: Optional[int] = None
+
+
 @router.post("")
 def create_conversation(
+    req: ConversationCreate = ConversationCreate(),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    conv = Conversation(user_id=user.id)
+    conv = Conversation(user_id=user.id, workspace_id=req.workspace_id)
     db.add(conv)
     db.commit()
     db.refresh(conv)
-    return {"id": conv.id, "title": conv.title}
+    return {"id": conv.id, "title": conv.title, "workspace_id": conv.workspace_id}
 
 
 @router.get("")
@@ -39,15 +46,19 @@ def list_conversations(
         .limit(50)
         .all()
     )
-    return [
-        {
+    def _conv_dict(c: Conversation) -> dict:
+        from app.models.workspace import Workspace
+        ws = db.get(Workspace, c.workspace_id) if c.workspace_id else None
+        return {
             "id": c.id,
             "title": c.title,
             "skill_id": c.skill_id,
+            "workspace_id": c.workspace_id,
+            "workspace": {"name": ws.name, "icon": ws.icon, "color": ws.color} if ws else None,
             "updated_at": c.updated_at.isoformat(),
         }
-        for c in convs
-    ]
+
+    return [_conv_dict(c) for c in convs]
 
 
 @router.get("/{conv_id}/messages")
@@ -92,7 +103,10 @@ async def send_message(
     db.flush()
 
     # Execute skill engine
-    response = await skill_engine.execute(db, conv, req.content)
+    try:
+        response = await skill_engine.execute(db, conv, req.content, user_id=user.id)
+    except ValueError as e:
+        raise HTTPException(503, str(e))
 
     # Persist assistant response
     assistant_msg = Message(

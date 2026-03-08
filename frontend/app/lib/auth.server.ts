@@ -32,7 +32,7 @@ export async function createUserSession(token: string, user: User) {
   const session = await sessionStorage.getSession();
   session.set("token", token);
   session.set("user", user);
-  return redirect("/chat", {
+  return redirect("/", {
     headers: { "Set-Cookie": await sessionStorage.commitSession(session) },
   });
 }

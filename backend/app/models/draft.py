@@ -1,6 +1,6 @@
 import datetime
 import enum
-from sqlalchemy import Column, DateTime, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy import Column, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.dialects.mysql import JSON
 from app.database import Base
 from app.models.raw_input import DetectedObjectType
@@ -32,6 +32,7 @@ class Draft(Base):
     user_corrections     = Column(JSON, default=list)
     suggested_actions    = Column(JSON, default=list)
     status               = Column(Enum(DraftStatus), default=DraftStatus.WAITING_CONFIRMATION)
+    formal_object_type   = Column(String(100), nullable=True)
     formal_object_id     = Column(Integer, nullable=True)
     created_at           = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at           = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
@@ -48,5 +49,7 @@ class LearningSample(Base):
     model_output_json    = Column(JSON, default=dict)
     user_correction_json = Column(JSON, default=dict)
     final_answer_json    = Column(JSON, default=dict)
+    confidence           = Column(Numeric(5, 4), nullable=True)
     created_by_id        = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reviewed_by_id       = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at           = Column(DateTime, default=datetime.datetime.utcnow)

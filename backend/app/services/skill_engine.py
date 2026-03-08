@@ -39,13 +39,20 @@ _DEFAULT_SYSTEM = (
 class SkillEngine:
 
     async def _match_skill(
-        self, db: Session, user_message: str, model_config: dict
+        self, db: Session, user_message: str, model_config: dict,
+        candidate_skills: list[Skill] | None = None,
     ) -> Skill | None:
-        skills = (
-            db.query(Skill).filter(Skill.status == SkillStatus.PUBLISHED).all()
-        )
+        if candidate_skills is None:
+            skills = (
+                db.query(Skill).filter(Skill.status == SkillStatus.PUBLISHED).all()
+            )
+        else:
+            skills = candidate_skills
+
         if not skills:
             return None
+        if len(skills) == 1:
+            return skills[0]
 
         skill_list = "\n".join(
             f"- {s.name}: {s.description or '无描述'}" for s in skills
@@ -62,6 +69,10 @@ class SkillEngine:
         name = result.strip().strip('"').strip("'")
         if name.lower() == "none":
             return None
+        # search within candidates first, then globally
+        for s in skills:
+            if s.name == name:
+                return s
         return db.query(Skill).filter(Skill.name == name).first()
 
     async def _extract_variables(
@@ -180,10 +191,33 @@ class SkillEngine:
         # Get default model config for intent matching
         default_config = llm_gateway.get_config(db)
 
+        # Load workspace if present
+        workspace = None
+        workspace_skills: list[Skill] = []
+        if conversation.workspace_id:
+            try:
+                from app.models.workspace import Workspace
+                workspace = db.get(Workspace, conversation.workspace_id)
+                if workspace:
+                    workspace_skills = [
+                        db.get(Skill, wsk.skill_id)
+                        for wsk in workspace.workspace_skills
+                        if db.get(Skill, wsk.skill_id) is not None
+                    ]
+            except Exception as e:
+                logger.warning(f"Workspace load failed: {e}")
+
         # 1. Match Skill on first message (or if not yet matched)
         if not conversation.skill_id:
             try:
-                skill = await self._match_skill(db, user_message, default_config)
+                if workspace and workspace_skills:
+                    # Single skill → use directly; multiple → match within candidates
+                    skill = await self._match_skill(
+                        db, user_message, default_config,
+                        candidate_skills=workspace_skills,
+                    )
+                else:
+                    skill = await self._match_skill(db, user_message, default_config)
                 if skill:
                     conversation.skill_id = skill.id
                     db.flush()
@@ -231,16 +265,26 @@ class SkillEngine:
             except Exception as e:
                 logger.warning(f"Intent classification failed, falling through to LLM: {e}")
 
-        # 5. Inject available tools for this skill
+        # 5. Inject available tools (workspace tools take priority over skill tools)
         tool_prompt = ""
-        if skill:
-            try:
-                from app.services.tool_executor import tool_executor
+        try:
+            from app.services.tool_executor import tool_executor
+            if workspace and workspace.workspace_tools:
+                from app.models.workspace import WorkspaceTool
+                from app.models.tool import ToolRegistry
+                ws_tools = [
+                    db.get(ToolRegistry, wt.tool_id)
+                    for wt in workspace.workspace_tools
+                    if db.get(ToolRegistry, wt.tool_id) is not None
+                ]
+                if ws_tools:
+                    tool_prompt = tool_executor.build_tool_list_prompt(ws_tools)
+            elif skill:
                 bound_tools = tool_executor.get_tools_for_skill(db, skill.id)
                 if bound_tools:
                     tool_prompt = tool_executor.build_tool_list_prompt(bound_tools)
-            except Exception as e:
-                logger.warning(f"Tool loading failed: {e}")
+        except Exception as e:
+            logger.warning(f"Tool loading failed: {e}")
 
         # 6. Inject knowledge
         knowledge_context = ""
@@ -268,6 +312,9 @@ class SkillEngine:
                     logger.warning(f"Variable extraction failed: {e}")
         else:
             system_content = _DEFAULT_SYSTEM
+
+        if workspace and workspace.system_context:
+            system_content += f"\n\n## 工作台附加指令\n\n{workspace.system_context}"
 
         if knowledge_context:
             system_content += f"\n\n## 参考知识\n\n{knowledge_context}"

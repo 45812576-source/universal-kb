@@ -27,7 +27,12 @@ export async function apiFetch(
 
   if (!resp.ok) {
     const body = await resp.text();
-    throw new ApiError(resp.status, body);
+    let message = body;
+    try {
+      const parsed = JSON.parse(body);
+      message = parsed.detail || parsed.message || body;
+    } catch {}
+    throw new ApiError(resp.status, message);
   }
 
   const text = await resp.text();

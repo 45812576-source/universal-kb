@@ -18,6 +18,9 @@ class LLMGateway:
         api_key = model_config.get("api_key") or os.getenv(
             model_config.get("api_key_env", ""), ""
         )
+        if not api_key:
+            env_var = model_config.get("api_key_env", "API_KEY")
+            raise ValueError(f"LLM API key not configured. Please set the '{env_var}' environment variable.")
         temp = temperature if temperature is not None else float(model_config.get("temperature", 0.7))
         tokens = max_tokens or model_config.get("max_tokens", 4096)
 

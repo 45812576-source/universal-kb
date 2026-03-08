@@ -106,22 +106,27 @@ export default function DataTable({
     }
   }
 
-  function renderCell(col: string, value: unknown, isEditing: boolean, data: Record<string, unknown>, onChange: (col: string, val: unknown) => void) {
+  function renderCell(
+    col: string,
+    value: unknown,
+    isEditing: boolean,
+    data: Record<string, unknown>,
+    onChange: (col: string, val: unknown) => void
+  ) {
     if (!isEditing) {
-      return <span className="text-sm text-gray-800">{String(value ?? "")}</span>;
+      return <span className="text-[10px] font-bold text-[#1A202C]">{String(value ?? "")}</span>;
     }
 
     const colDef = colDefMap[col];
     const rules = validationRules[col];
     const inputType = colDef ? getInputType(colDef.type) : "text";
 
-    // Enum → select
     if (rules?.enum) {
       return (
         <select
           value={String(data[col] ?? "")}
           onChange={(e) => onChange(col, e.target.value)}
-          className="w-full rounded border border-blue-300 px-2 py-1 text-sm"
+          className="w-full border-2 border-[#00D1FF] bg-white px-2 py-1 text-xs font-bold focus:outline-none"
         >
           <option value="">-- 选择 --</option>
           {rules.enum.map((opt) => (
@@ -136,7 +141,7 @@ export default function DataTable({
         type={inputType}
         value={String(data[col] ?? "")}
         onChange={(e) => onChange(col, e.target.value)}
-        className="w-full rounded border border-blue-300 px-2 py-1 text-sm"
+        className="w-full border-2 border-[#00D1FF] bg-white px-2 py-1 text-xs font-bold focus:outline-none"
       />
     );
   }
@@ -144,7 +149,7 @@ export default function DataTable({
   return (
     <div className="space-y-3">
       {error && (
-        <div className="rounded-lg bg-red-50 border border-red-200 px-4 py-2 text-sm text-red-700">
+        <div className="border-2 border-red-400 bg-red-50 px-4 py-2 text-xs font-bold text-red-700">
           {error}
         </div>
       )}
@@ -153,151 +158,163 @@ export default function DataTable({
       {onRowCreate && !showNewRow && (
         <button
           onClick={() => setShowNewRow(true)}
-          className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 transition-colors"
+          className="bg-[#1A202C] text-white px-4 py-2 text-[10px] font-bold uppercase tracking-widest hover:bg-black pixel-border transition-colors"
         >
           + 新增行
         </button>
       )}
 
-      <div className="overflow-x-auto rounded-xl border border-gray-200">
-        <table className="w-full text-sm">
-          <thead className="bg-gray-50 border-b border-gray-200">
-            <tr>
-              {columns.map((col) => (
-                <th key={col} className="px-4 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide whitespace-nowrap">
-                  {colDefMap[col]?.comment || col}
-                </th>
-              ))}
-              {(onRowSave || onRowDelete) && (
-                <th className="px-4 py-2.5 text-right text-xs font-semibold text-gray-500 uppercase tracking-wide">
-                  操作
-                </th>
-              )}
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-100">
-            {/* New row form */}
-            {showNewRow && (
-              <tr className="bg-blue-50">
+      <div className="pixel-border bg-white overflow-hidden">
+        <div className="bg-[#2D3748] text-white px-4 py-2.5 border-b-2 border-[#1A202C] flex items-center justify-between">
+          <span className="text-[10px] font-bold uppercase tracking-widest">Data_Table</span>
+          <div className="flex space-x-1.5">
+            <div className="w-2 h-2 bg-red-400" />
+            <div className="w-2 h-2 bg-yellow-400" />
+            <div className="w-2 h-2 bg-green-400" />
+          </div>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left">
+            <thead className="bg-[#F0F4F8] border-b-2 border-[#1A202C]">
+              <tr>
                 {columns.map((col) => (
-                  <td key={col} className="px-4 py-2">
-                    {col === "id" || col === "created_at" || col === "updated_at" ? (
-                      <span className="text-xs text-gray-400">自动</span>
-                    ) : (
-                      renderCell(col, newRowData[col], true, newRowData, (c, v) =>
-                        setNewRowData((prev) => ({ ...prev, [c]: v }))
-                      )
-                    )}
-                  </td>
+                  <th key={col} className="px-4 py-3 text-[9px] font-bold uppercase tracking-widest text-gray-500 whitespace-nowrap">
+                    {colDefMap[col]?.comment || col}
+                  </th>
                 ))}
                 {(onRowSave || onRowDelete) && (
-                  <td className="px-4 py-2 text-right whitespace-nowrap">
-                    <button
-                      onClick={saveNewRow}
-                      disabled={saving}
-                      className="text-xs text-blue-600 hover:text-blue-800 mr-2 disabled:opacity-50"
-                    >
-                      保存
-                    </button>
-                    <button
-                      onClick={() => { setShowNewRow(false); setNewRowData({}); }}
-                      className="text-xs text-gray-400 hover:text-gray-600"
-                    >
-                      取消
-                    </button>
-                  </td>
+                  <th className="px-4 py-3 text-[9px] font-bold uppercase tracking-widest text-gray-500 text-right">
+                    操作
+                  </th>
                 )}
               </tr>
-            )}
-
-            {rows.map((row) => {
-              const rowId = row.id as number;
-              const isEditing = editingId === rowId;
-              return (
-                <tr key={rowId} className={isEditing ? "bg-blue-50" : "hover:bg-gray-50"}>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {/* New row form */}
+              {showNewRow && (
+                <tr className="bg-[#CCF2FF]">
                   {columns.map((col) => (
-                    <td key={col} className="px-4 py-2.5">
-                      {isEditing && editableColumns.includes(col)
-                        ? renderCell(col, row[col], true, editData, (c, v) =>
-                            setEditData((prev) => ({ ...prev, [c]: v }))
-                          )
-                        : renderCell(col, row[col], false, row, () => {})}
+                    <td key={col} className="px-4 py-2">
+                      {col === "id" || col === "created_at" || col === "updated_at" ? (
+                        <span className="text-[9px] font-bold text-gray-400 uppercase">自动</span>
+                      ) : (
+                        renderCell(col, newRowData[col], true, newRowData, (c, v) =>
+                          setNewRowData((prev) => ({ ...prev, [c]: v }))
+                        )
+                      )}
                     </td>
                   ))}
                   {(onRowSave || onRowDelete) && (
-                    <td className="px-4 py-2.5 text-right whitespace-nowrap">
-                      {isEditing ? (
-                        <>
-                          <button
-                            onClick={() => saveEdit(rowId)}
-                            disabled={saving}
-                            className="text-xs text-blue-600 hover:text-blue-800 mr-2 disabled:opacity-50"
-                          >
-                            保存
-                          </button>
-                          <button
-                            onClick={cancelEdit}
-                            className="text-xs text-gray-400 hover:text-gray-600"
-                          >
-                            取消
-                          </button>
-                        </>
-                      ) : (
-                        <>
-                          {onRowSave && (
-                            <button
-                              onClick={() => startEdit(row)}
-                              className="text-xs text-gray-500 hover:text-blue-600 mr-2"
-                            >
-                              编辑
-                            </button>
-                          )}
-                          {onRowDelete && (
-                            <button
-                              onClick={() => deleteRow(rowId)}
-                              className="text-xs text-gray-400 hover:text-red-500"
-                            >
-                              删除
-                            </button>
-                          )}
-                        </>
-                      )}
+                    <td className="px-4 py-2 text-right whitespace-nowrap">
+                      <button
+                        onClick={saveNewRow}
+                        disabled={saving}
+                        className="text-[10px] font-bold uppercase text-[#00A3C4] hover:underline mr-3 disabled:opacity-50"
+                      >
+                        保存
+                      </button>
+                      <button
+                        onClick={() => { setShowNewRow(false); setNewRowData({}); }}
+                        className="text-[10px] font-bold uppercase text-gray-400 hover:text-gray-600"
+                      >
+                        取消
+                      </button>
                     </td>
                   )}
                 </tr>
-              );
-            })}
+              )}
 
-            {rows.length === 0 && (
-              <tr>
-                <td colSpan={columns.length + 1} className="px-4 py-8 text-center text-sm text-gray-400">
-                  暂无数据
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+              {rows.map((row) => {
+                const rowId = row.id as number;
+                const isEditing = editingId === rowId;
+                return (
+                  <tr key={rowId} className={isEditing ? "bg-[#EBF4F7]" : "hover:bg-[#F0F4F8]"}>
+                    {columns.map((col) => (
+                      <td key={col} className="px-4 py-2.5">
+                        {isEditing && editableColumns.includes(col)
+                          ? renderCell(col, row[col], true, editData, (c, v) =>
+                              setEditData((prev) => ({ ...prev, [c]: v }))
+                            )
+                          : renderCell(col, row[col], false, row, () => {})}
+                      </td>
+                    ))}
+                    {(onRowSave || onRowDelete) && (
+                      <td className="px-4 py-2.5 text-right whitespace-nowrap">
+                        {isEditing ? (
+                          <>
+                            <button
+                              onClick={() => saveEdit(rowId)}
+                              disabled={saving}
+                              className="text-[10px] font-bold uppercase text-[#00A3C4] hover:underline mr-3 disabled:opacity-50"
+                            >
+                              保存
+                            </button>
+                            <button
+                              onClick={cancelEdit}
+                              className="text-[10px] font-bold uppercase text-gray-400 hover:text-gray-600"
+                            >
+                              取消
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            {onRowSave && (
+                              <button
+                                onClick={() => startEdit(row)}
+                                className="text-[10px] font-bold uppercase text-gray-500 hover:text-[#1A202C] mr-3"
+                              >
+                                编辑
+                              </button>
+                            )}
+                            {onRowDelete && (
+                              <button
+                                onClick={() => deleteRow(rowId)}
+                                className="text-[10px] font-bold uppercase text-red-500 hover:underline"
+                              >
+                                删除
+                              </button>
+                            )}
+                          </>
+                        )}
+                      </td>
+                    )}
+                  </tr>
+                );
+              })}
+
+              {rows.length === 0 && (
+                <tr>
+                  <td colSpan={columns.length + 1} className="px-4 py-12 text-center text-xs font-bold uppercase text-gray-400">
+                    暂无数据
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
       </div>
 
       {/* Pagination */}
       {totalPages > 1 && (
-        <div className="flex items-center justify-between text-sm text-gray-500">
-          <span>共 {total} 条</span>
-          <div className="flex gap-1">
+        <div className="flex items-center justify-between">
+          <span className="text-[10px] font-bold uppercase text-gray-500">共 {total} 条</span>
+          <div className="flex items-center gap-3">
             <button
               onClick={() => onPageChange(page - 1)}
               disabled={page <= 1}
-              className="rounded px-3 py-1 border border-gray-200 hover:bg-gray-50 disabled:opacity-40"
+              className="border-2 border-[#1A202C] bg-white px-3 py-1.5 text-[10px] font-bold uppercase text-gray-600 hover:bg-[#EBF4F7] disabled:opacity-40"
             >
-              上一页
+              &lt; 上一页
             </button>
-            <span className="px-3 py-1">第 {page} / {totalPages} 页</span>
+            <span className="text-[10px] font-bold uppercase text-gray-500">
+              第 {page} / {totalPages} 页
+            </span>
             <button
               onClick={() => onPageChange(page + 1)}
               disabled={page >= totalPages}
-              className="rounded px-3 py-1 border border-gray-200 hover:bg-gray-50 disabled:opacity-40"
+              className="border-2 border-[#1A202C] bg-white px-3 py-1.5 text-[10px] font-bold uppercase text-gray-600 hover:bg-[#EBF4F7] disabled:opacity-40"
             >
-              下一页
+              下一页 &gt;
             </button>
           </div>
         </div>

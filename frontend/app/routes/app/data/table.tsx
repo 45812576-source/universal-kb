@@ -48,7 +48,6 @@ export default function TableView() {
 
   async function handlePageChange(newPage: number) {
     setPage(newPage);
-    // Force reload with new page via URL
     window.history.pushState({}, "", `?page=${newPage}`);
     revalidator.revalidate();
   }
@@ -80,36 +79,40 @@ export default function TableView() {
   }
 
   return (
-    <div className="p-6 max-w-full">
-      {/* Header */}
-      <div className="flex items-center gap-3 mb-6">
-        <Link to="/data" className="text-gray-400 hover:text-gray-600 text-sm">
-          ← 业务数据
-        </Link>
-        <span className="text-gray-300">/</span>
-        <div>
-          <h1 className="text-xl font-bold text-gray-900">{schema.display_name}</h1>
-          <p className="text-xs text-gray-400 font-mono">{tableName}</p>
+    <div className="min-h-full bg-[#F0F4F8]">
+      <div className="border-b-2 border-[#1A202C] bg-[#EBF4F7] px-6 py-4 flex items-center gap-4">
+        <div className="w-1.5 h-5 bg-[#00D1FF]" />
+        <div className="flex items-center gap-2">
+          <Link to="/data" className="text-[10px] font-bold uppercase tracking-widest text-gray-400 hover:text-[#1A202C]">
+            业务数据
+          </Link>
+          <span className="text-gray-300 font-bold">/</span>
+          <div>
+            <span className="text-xs font-bold uppercase tracking-widest text-[#1A202C]">{schema.display_name}</span>
+            <span className="ml-2 text-[9px] font-mono font-bold text-gray-400">{tableName}</span>
+          </div>
         </div>
       </div>
 
-      {schema.description && (
-        <p className="text-sm text-gray-500 mb-4">{schema.description}</p>
-      )}
+      <div className="p-6">
+        {schema.description && (
+          <p className="text-[10px] font-bold text-gray-500 mb-4 uppercase">{schema.description}</p>
+        )}
 
-      <DataTable
-        columns={rowsData.columns}
-        columnDefs={schema.columns}
-        rows={rowsData.rows}
-        total={rowsData.total}
-        page={page}
-        pageSize={20}
-        onPageChange={handlePageChange}
-        onRowSave={handleRowSave}
-        onRowCreate={handleRowCreate}
-        onRowDelete={handleRowDelete}
-        validationRules={schema.validation_rules}
-      />
+        <DataTable
+          columns={rowsData.columns}
+          columnDefs={schema.columns}
+          rows={rowsData.rows}
+          total={rowsData.total}
+          page={page}
+          pageSize={20}
+          onPageChange={handlePageChange}
+          onRowSave={handleRowSave}
+          onRowCreate={handleRowCreate}
+          onRowDelete={handleRowDelete}
+          validationRules={schema.validation_rules}
+        />
+      </div>
     </div>
   );
 }

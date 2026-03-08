@@ -43,6 +43,10 @@ class KnowledgeEntry(Base):
     source_draft_id = Column(Integer, ForeignKey("drafts.id"), nullable=True)
     raw_input_id    = Column(Integer, ForeignKey("raw_inputs.id"), nullable=True)
     capture_mode    = Column(String(50), default="manual_form")
+    visibility_scope = Column(String(50), nullable=True)
+    linked_skill_codes = Column(JSON, default=list)
+    applicable_departments = Column(JSON, default=list)
+    applicable_roles = Column(JSON, default=list)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(

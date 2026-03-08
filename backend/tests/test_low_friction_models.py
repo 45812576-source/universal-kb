@@ -2,7 +2,7 @@
 from app.models.raw_input import RawInput, InputExtraction, RawInputSourceType, RawInputStatus, DetectedObjectType
 from app.models.draft import Draft, DraftStatus, LearningSample
 from app.models.opportunity import Opportunity
-from app.models.feedback_item import FeedbackItem
+from app.models.feedback_item import FeedbackItem, FeedbackType
 from tests.conftest import _make_user, _make_dept
 
 
@@ -98,7 +98,7 @@ def test_feedback_item_create(db):
     fb = FeedbackItem(
         title="数据报错问题",
         customer_name="YY客户",
-        feedback_type="bug",
+        feedback_type=FeedbackType.BUG,
         created_by_id=user.id,
     )
     db.add(fb)
