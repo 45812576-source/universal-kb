@@ -4,11 +4,13 @@ import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from typing import Optional
 
 from app.database import get_db
 from app.dependencies import get_current_user, require_role
 from app.models.skill import Skill, SkillSuggestion, SuggestionStatus
 from app.models.user import User, Role
+from app.models.conversation import Message, Conversation
 
 router = APIRouter(tags=["skill-suggestions"])
 
@@ -27,6 +29,8 @@ def _suggestion_detail(s: SkillSuggestion) -> dict:
         "reviewed_by": s.reviewed_by,
         "reviewed_at": s.reviewed_at.isoformat() if s.reviewed_at else None,
         "created_at": s.created_at.isoformat() if s.created_at else None,
+        "reaction_type": s.reaction_type,
+        "source_message_id": s.source_message_id,
     }
 
 
@@ -34,6 +38,11 @@ class SuggestionCreate(BaseModel):
     problem_desc: str
     expected_direction: str
     case_example: str = None
+
+
+class MessageReact(BaseModel):
+    reaction_type: str  # "like" or "comment"
+    comment: Optional[str] = None  # text when reaction_type == "comment"
 
 
 class SuggestionReview(BaseModel):
@@ -119,6 +128,91 @@ def my_suggestions(
     suggestions = (
         db.query(SkillSuggestion)
         .filter(SkillSuggestion.submitted_by == user.id)
+        .order_by(SkillSuggestion.created_at.desc())
+        .all()
+    )
+    return [_suggestion_detail(s) for s in suggestions]
+
+
+# POST /api/messages/{msg_id}/react — react to an assistant message (like or comment)
+@router.post("/api/messages/{msg_id}/react")
+def react_to_message(
+    msg_id: int,
+    req: MessageReact,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    msg = db.get(Message, msg_id)
+    if not msg:
+        raise HTTPException(404, "Message not found")
+    if msg.role.value != "assistant":
+        raise HTTPException(400, "Can only react to assistant messages")
+
+    # Find the skill_id from the conversation
+    conv = db.get(Conversation, msg.conversation_id)
+    skill_id = conv.skill_id if conv else None
+    if not skill_id:
+        # Try metadata
+        meta = msg.metadata_ or {}
+        skill_id = meta.get("skill_id")
+    if not skill_id:
+        raise HTTPException(400, "No skill associated with this message")
+
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill not found")
+
+    if req.reaction_type == "like":
+        s = SkillSuggestion(
+            skill_id=skill_id,
+            submitted_by=user.id,
+            problem_desc="[点赞]",
+            expected_direction="用户对该回复点赞，表示满意",
+            reaction_type="like",
+            source_message_id=msg_id,
+            status=SuggestionStatus.PENDING,
+        )
+    elif req.reaction_type == "comment":
+        if not req.comment:
+            raise HTTPException(400, "comment field required for reaction_type=comment")
+        s = SkillSuggestion(
+            skill_id=skill_id,
+            submitted_by=user.id,
+            problem_desc=req.comment,
+            expected_direction="来自对话消息的用户评论",
+            reaction_type="comment",
+            source_message_id=msg_id,
+            status=SuggestionStatus.PENDING,
+        )
+    else:
+        raise HTTPException(400, "reaction_type must be 'like' or 'comment'")
+
+    db.add(s)
+    db.commit()
+    db.refresh(s)
+    return {"ok": True, "id": s.id, "reaction_type": req.reaction_type}
+
+
+# GET /api/skills/{skill_id}/comments — list comments (suggestions) for a skill (owner view)
+@router.get("/api/skills/{skill_id}/comments")
+def list_comments(
+    skill_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill not found")
+
+    # Only skill owner or admins can see comments
+    is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
+    is_owner = skill.created_by == user.id
+    if not is_admin and not is_owner:
+        raise HTTPException(403, "Not authorized")
+
+    suggestions = (
+        db.query(SkillSuggestion)
+        .filter(SkillSuggestion.skill_id == skill_id)
         .order_by(SkillSuggestion.created_at.desc())
         .all()
     )

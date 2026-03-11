@@ -67,7 +67,7 @@ async def _sync_source_jobs(scheduler):
     """Sync APScheduler jobs from intel_sources table."""
     from apscheduler.triggers.cron import CronTrigger
     from app.database import SessionLocal
-    from app.models.intel import IntelSource
+    from app.models.intel import IntelSource, IntelSourceType
     from app.services.intel_collector import intel_collector
 
     db = SessionLocal()
@@ -78,6 +78,7 @@ async def _sync_source_jobs(scheduler):
         for source in sources:
             job_id = f"intel_source_{source.id}"
             if source.schedule and job_id not in existing_job_ids:
+                # 支持所有类型：rss, crawler, deep_crawl
                 async def _run(src_id=source.id):
                     dbs = SessionLocal()
                     try:
@@ -95,7 +96,7 @@ async def _sync_source_jobs(scheduler):
                         id=job_id,
                         replace_existing=True,
                     )
-                    logger.info(f"Registered intel job for source '{source.name}' ({source.schedule})")
+                    logger.info(f"Registered intel job for source '{source.name}' ({source.schedule}), type={source.source_type.value}")
                 except Exception as e:
                     logger.warning(f"Invalid cron schedule for source '{source.name}': {e}")
     finally:

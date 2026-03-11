@@ -86,7 +86,7 @@ class SchemaGenerator:
     ) -> dict:
         """Direction A: natural language → DDL + Skill definition (preview)."""
         system = _FROM_DESC_SYSTEM.format(description=description)
-        result = await llm_gateway.chat(
+        result, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[
                 {"role": "system", "content": system},
@@ -120,7 +120,7 @@ class SchemaGenerator:
             table_name=table_name,
             columns=columns_str,
         )
-        result = await llm_gateway.chat(
+        result, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[
                 {"role": "system", "content": system},

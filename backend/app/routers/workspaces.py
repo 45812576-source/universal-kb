@@ -10,6 +10,7 @@ from app.dependencies import get_current_user, require_role
 from app.models.skill import Skill, SkillStatus
 from app.models.tool import ToolRegistry
 from app.models.user import Role, User
+from app.models.skill import ModelConfig
 from app.models.workspace import (
     Workspace,
     WorkspaceDataTable,
@@ -27,11 +28,22 @@ MAX_EMPLOYEE_DRAFT = 3
 
 def _ws_dict(ws: Workspace, user: User, include_system_context: bool = False) -> dict:
     skills = [
-        {"id": wsk.skill_id}
+        {
+            "id": wsk.skill_id,
+            "name": wsk.skill.name if wsk.skill else None,
+            "description": wsk.skill.description if wsk.skill else None,
+            "scope": wsk.skill.scope if wsk.skill else None,
+        }
         for wsk in ws.workspace_skills
     ]
     tools = [
-        {"id": wt.tool_id}
+        {
+            "id": wt.tool_id,
+            "name": wt.tool.name if wt.tool else None,
+            "display_name": wt.tool.display_name if wt.tool else None,
+            "description": wt.tool.description if wt.tool else None,
+            "tool_type": wt.tool.tool_type.value if wt.tool else None,
+        }
         for wt in ws.workspace_tools
     ]
     data_tables = [wdt.table_name for wdt in ws.workspace_data_tables]
@@ -52,6 +64,7 @@ def _ws_dict(ws: Workspace, user: User, include_system_context: bool = False) ->
         "skills": skills,
         "tools": tools,
         "data_tables": data_tables,
+        "model_config_id": ws.model_config_id,
         "created_at": ws.created_at.isoformat() if ws.created_at else None,
         "updated_at": ws.updated_at.isoformat() if ws.updated_at else None,
     }
@@ -88,6 +101,7 @@ class WorkspaceCreate(BaseModel):
     visibility: str = "all"
     welcome_message: str = "你好，有什么可以帮你的？"
     system_context: Optional[str] = None
+    model_config_id: Optional[int] = None
     department_id: Optional[int] = None
     sort_order: int = 0
 
@@ -101,6 +115,7 @@ class WorkspaceUpdate(BaseModel):
     visibility: Optional[str] = None
     welcome_message: Optional[str] = None
     system_context: Optional[str] = None
+    model_config_id: Optional[int] = None
     department_id: Optional[int] = None
     sort_order: Optional[int] = None
 
@@ -181,6 +196,10 @@ def create_workspace(
     # Only super_admin can set system_context
     system_context = req.system_context if user.role == Role.SUPER_ADMIN else None
 
+    # Validate model_config_id if provided
+    if req.model_config_id and not db.get(ModelConfig, req.model_config_id):
+        raise HTTPException(400, "指定的模型配置不存在")
+
     ws = Workspace(
         name=req.name,
         description=req.description,
@@ -190,6 +209,7 @@ def create_workspace(
         visibility=req.visibility,
         welcome_message=req.welcome_message,
         system_context=system_context,
+        model_config_id=req.model_config_id,
         department_id=req.department_id or user.department_id,
         sort_order=req.sort_order,
         status=status,
@@ -238,9 +258,11 @@ def update_workspace(
             raise HTTPException(403, "只能编辑自己的草稿工作台")
 
     for field, value in req.model_dump(exclude_none=True).items():
-        # Only super_admin can edit system_context
-        if field == "system_context" and not is_super:
+        # Only super_admin can edit system_context and model_config_id
+        if field in ("system_context", "model_config_id") and not is_super:
             continue
+        if field == "model_config_id" and value and not db.get(ModelConfig, value):
+            raise HTTPException(400, "指定的模型配置不存在")
         setattr(ws, field, value)
 
     db.commit()
@@ -438,3 +460,49 @@ def unbind_tool(
         db.delete(row)
         db.commit()
     return {"ok": True}
+
+
+# ─── Batch binding ────────────────────────────────────────────────────────────
+
+class BatchBindRequest(BaseModel):
+    ids: list[int]
+
+
+@router.put("/{ws_id}/skills")
+def batch_set_skills(
+    ws_id: int,
+    req: BatchBindRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """Replace all skill bindings for a workspace (admin only)."""
+    ws = db.get(Workspace, ws_id)
+    if not ws:
+        raise HTTPException(404, "Workspace not found")
+    db.query(WorkspaceSkill).filter(WorkspaceSkill.workspace_id == ws_id).delete()
+    for skill_id in req.ids:
+        if db.get(Skill, skill_id):
+            db.add(WorkspaceSkill(workspace_id=ws_id, skill_id=skill_id))
+    db.commit()
+    db.refresh(ws)
+    return _ws_dict(ws, user, include_system_context=True)
+
+
+@router.put("/{ws_id}/tools")
+def batch_set_tools(
+    ws_id: int,
+    req: BatchBindRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """Replace all tool bindings for a workspace (admin only)."""
+    ws = db.get(Workspace, ws_id)
+    if not ws:
+        raise HTTPException(404, "Workspace not found")
+    db.query(WorkspaceTool).filter(WorkspaceTool.workspace_id == ws_id).delete()
+    for tool_id in req.ids:
+        if db.get(ToolRegistry, tool_id):
+            db.add(WorkspaceTool(workspace_id=ws_id, tool_id=tool_id))
+    db.commit()
+    db.refresh(ws)
+    return _ws_dict(ws, user, include_system_context=True)

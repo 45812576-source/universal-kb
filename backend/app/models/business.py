@@ -22,7 +22,8 @@ class DataOwnership(Base):
     owner_field = Column(String(100), nullable=False)  # e.g. "sales_rep_id"
     department_field = Column(String(100), nullable=True)  # e.g. "department_id"
     visibility_level = Column(
-        Enum(VisibilityLevel), default=VisibilityLevel.DETAIL
+        Enum(VisibilityLevel, values_callable=lambda obj: [e.value for e in obj]),
+        default=VisibilityLevel.DETAIL,
     )
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 

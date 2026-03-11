@@ -133,7 +133,7 @@ class DataEngine:
             table_context=table_context,
             validation_rules=validation_rules,
         )
-        result = await llm_gateway.chat(
+        result, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[
                 {"role": "system", "content": system},
@@ -282,7 +282,7 @@ class DataEngine:
         model_config: dict,
     ) -> dict:
         """Classify whether user wants data query, mutation, or AI generation."""
-        result = await llm_gateway.chat(
+        result, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[
                 {"role": "system", "content": _INTENT_CLASSIFY_SYSTEM},

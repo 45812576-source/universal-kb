@@ -153,7 +153,7 @@ async def process_raw_input(raw_input_id: int, db: Session) -> Draft:
     # Step 2: LLM detect & extract
     try:
         model_config = llm_gateway.get_config(db)
-        result_str = await llm_gateway.chat(
+        result_str, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[{
                 "role": "user",
@@ -189,6 +189,15 @@ async def process_raw_input(raw_input_id: int, db: Session) -> Draft:
     db.add(extraction)
     db.flush()
 
+    # Step 3.5: 若为 knowledge 类型，自动分类（不阻塞，失败静默）
+    taxonomy_cls = None
+    if object_type.value == "knowledge":
+        try:
+            from app.services.knowledge_classifier import classify
+            taxonomy_cls = await classify(normalized[:3000], db)
+        except Exception as e:
+            logger.warning(f"Auto-classification failed for raw_input {raw_input_id}: {e}")
+
     # Step 4: build draft
     fields = parsed.get("fields", {})
     title = (
@@ -201,6 +210,10 @@ async def process_raw_input(raw_input_id: int, db: Session) -> Draft:
         "platform": fields.get("platform_tags", []),
         "topic": fields.get("topic_tags", []),
     }
+
+    # 将分类结果嵌入 fields_json，供 convert_draft 时使用
+    if taxonomy_cls:
+        fields["_taxonomy_classification"] = taxonomy_cls.to_dict()
 
     draft = Draft(
         object_type=object_type,

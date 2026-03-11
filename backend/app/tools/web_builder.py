@@ -49,7 +49,7 @@ async def execute(params: dict) -> dict:
     db = SessionLocal()
     try:
         model_config = llm_gateway.get_config(db)
-        html_content = await llm_gateway.chat(
+        html_content, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[
                 {"role": "user", "content": _BUILD_PROMPT.format(description=description)},

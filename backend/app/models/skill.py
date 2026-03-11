@@ -91,6 +91,12 @@ class Skill(Base):
         overlaps="skill",
     )
 
+    # Scope: personal / department / company
+    scope = Column(String(20), default="personal")
+
+    # 是否在 Skill 执行后自动触发"沉淀为知识"
+    auto_save_output = Column(Boolean, default=False)
+
     # Upstream tracking fields
     source_type = Column(String(20), default="local")  # local / imported / forked
     upstream_url = Column(String(500), nullable=True)
@@ -111,6 +117,8 @@ class SkillVersion(Base):
     version = Column(Integer, nullable=False, default=1)
     system_prompt = Column(Text, nullable=False)
     variables = Column(JSON, default=list)  # ["{industry}", "{platform}"]
+    required_inputs = Column(JSON, default=list)  # [{"key": "product", "label": "产品名称", "desc": "你的具体产品是什么", "example": "XX猫粮"}]
+    output_schema = Column(JSON, default=None)  # JSON Schema defining structured output
     model_config_id = Column(Integer, ForeignKey("model_configs.id"), nullable=True)
     change_note = Column(Text)
     created_by = Column(Integer, ForeignKey("users.id"))
@@ -142,6 +150,10 @@ class SkillSuggestion(Base):
     reviewed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
+    # Comment/reaction source fields
+    source_message_id = Column(Integer, ForeignKey("messages.id"), nullable=True)
+    reaction_type = Column(String(20), nullable=True)  # "like" / "comment"
+
     skill = relationship("Skill", foreign_keys=[skill_id], overlaps="suggestions")
     submitter = relationship("User", foreign_keys=[submitted_by])
     reviewer = relationship("User", foreign_keys=[reviewed_by])
@@ -151,6 +163,18 @@ class AttributionLevel(str, enum.Enum):
     FULL = "full"
     PARTIAL = "partial"
     NONE = "none"
+
+
+class UserSavedSkill(Base):
+    """用户保存的公司级 Skill（从市场收藏）。"""
+    __tablename__ = "user_saved_skills"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    skill_id = Column(Integer, ForeignKey("skills.id"), nullable=False)
+    saved_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    skill = relationship("Skill", foreign_keys=[skill_id])
 
 
 class SkillAttribution(Base):

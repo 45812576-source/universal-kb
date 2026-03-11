@@ -5,6 +5,8 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user, require_role
+from app.models.conversation import Message, MessageRole
+from app.models.knowledge import KnowledgeEntry
 from app.models.skill import SkillAttribution, SkillSuggestion, SuggestionStatus, AttributionLevel
 from app.models.user import Department, Role, User
 
@@ -114,6 +116,107 @@ def contribution_stats(
 
     # Sort by influence score desc
     result.sort(key=lambda x: (-x["influence_score"], -x["total_suggestions"]))
+    return result
+
+
+@router.get("/kb-stats")
+def kb_contribution_stats(
+    department_id: int = Query(None),
+    db: Session = Depends(get_db),
+    _user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """Per-user knowledge base contribution stats: entry count, token usage, model distribution."""
+    user_q = db.query(User)
+    if department_id:
+        user_q = user_q.filter(User.department_id == department_id)
+    users = user_q.all()
+    user_ids = [u.id for u in users]
+
+    if not user_ids:
+        return []
+
+    # Knowledge entry counts per user (all statuses)
+    entry_rows = (
+        db.query(KnowledgeEntry.created_by, func.count(KnowledgeEntry.id).label("total"))
+        .filter(KnowledgeEntry.created_by.in_(user_ids))
+        .group_by(KnowledgeEntry.created_by)
+        .all()
+    )
+    entry_map = {r.created_by: r.total for r in entry_rows}
+
+    # Approved entry counts
+    approved_rows = (
+        db.query(KnowledgeEntry.created_by, func.count(KnowledgeEntry.id).label("approved"))
+        .filter(
+            KnowledgeEntry.created_by.in_(user_ids),
+            KnowledgeEntry.status == "approved",
+        )
+        .group_by(KnowledgeEntry.created_by)
+        .all()
+    )
+    approved_map = {r.created_by: r.approved for r in approved_rows}
+
+    # Token usage from assistant messages (metadata JSON fields)
+    # Aggregate input_tokens, output_tokens per user via conversation → message
+    from app.models.conversation import Conversation
+    from sqlalchemy.dialects.mysql import JSON as MySQLJSON
+    import json as _json
+
+    # Fetch all assistant messages for users' conversations
+    conv_rows = (
+        db.query(Conversation.id, Conversation.user_id)
+        .filter(Conversation.user_id.in_(user_ids))
+        .all()
+    )
+    conv_to_user = {r.id: r.user_id for r in conv_rows}
+    conv_ids = list(conv_to_user.keys())
+
+    token_map: dict[int, dict] = {}  # user_id → {input, output, models}
+    if conv_ids:
+        msg_rows = (
+            db.query(Message)
+            .filter(
+                Message.conversation_id.in_(conv_ids),
+                Message.role == MessageRole.ASSISTANT,
+            )
+            .all()
+        )
+        for msg in msg_rows:
+            uid = conv_to_user.get(msg.conversation_id)
+            if uid is None:
+                continue
+            meta = msg.metadata_ or {}
+            inp = meta.get("input_tokens") or 0
+            out = meta.get("output_tokens") or 0
+            model = meta.get("model_id") or ""
+            if uid not in token_map:
+                token_map[uid] = {"input": 0, "output": 0, "models": {}}
+            token_map[uid]["input"] += inp
+            token_map[uid]["output"] += out
+            if model:
+                token_map[uid]["models"][model] = token_map[uid]["models"].get(model, 0) + 1
+
+    result = []
+    for u in users:
+        total_entries = entry_map.get(u.id, 0)
+        approved = approved_map.get(u.id, 0)
+        tok = token_map.get(u.id, {"input": 0, "output": 0, "models": {}})
+        # top model by usage count
+        models_dict = tok["models"]
+        top_model = max(models_dict, key=lambda k: models_dict[k]) if models_dict else None
+        result.append({
+            "user_id": u.id,
+            "display_name": u.display_name,
+            "department_id": u.department_id,
+            "total_entries": total_entries,
+            "approved_entries": approved,
+            "input_tokens": tok["input"],
+            "output_tokens": tok["output"],
+            "models": models_dict,
+            "top_model": top_model,
+        })
+
+    result.sort(key=lambda x: (-x["total_entries"], -x["input_tokens"]))
     return result
 
 

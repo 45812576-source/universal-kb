@@ -1,15 +1,17 @@
+import { useState, useEffect } from "react";
 import { Form, NavLink, Outlet, useLoaderData } from "react-router";
 import type { Route } from "./+types/layout";
 import { requireUser } from "~/lib/auth.server";
+import { apiFetch } from "~/lib/api";
 import type { User } from "~/lib/types";
 
 export async function loader({ request }: Route.LoaderArgs) {
-  const { user } = await requireUser(request);
-  return { user };
+  const { user, token } = await requireUser(request);
+  const taskStats = await apiFetch("/api/tasks/stats", { token }).catch(() => ({ total_pending: 0 }));
+  return { user, taskPending: (taskStats as any).total_pending ?? 0 };
 }
 
 // Pixel icon: renders a colored grid from a pattern string
-// pattern: "." = empty, any letter = color key
 function PixelIcon({ pattern, colors, size = 14 }: {
   pattern: string[];
   colors: Record<string, string>;
@@ -20,7 +22,7 @@ function PixelIcon({ pattern, colors, size = 14 }: {
   const px = Math.floor(size / cols);
   return (
     <div
-      className="flex-shrink-0 mr-2"
+      className="flex-shrink-0"
       style={{ width: size, height: size, display: "grid", gridTemplateColumns: `repeat(${cols}, ${px}px)`, gridTemplateRows: `repeat(${rows.length}, ${px}px)`, gap: 0 }}
     >
       {rows.map((row, r) =>
@@ -36,491 +38,300 @@ function PixelIcon({ pattern, colors, size = 14 }: {
   );
 }
 
-// Individual pixel icons
 const ICONS = {
-  // 对话: cyan speech bubble
   chat: {
-    pattern: [
-      ".BBBBB.",
-      "BWWWWWB",
-      "BWWWWWB",
-      "BWWWWWB",
-      "BWBBWWB",
-      ".BBBBB.",
-      "..BBB..",
-      "...B...",
-    ],
+    pattern: [".BBBBB.","BWWWWWB","BWWWWWB","BWWWWWB","BWBBWWB",".BBBBB.","..BBB...","...B..."],
     colors: { B: "#00A3C4", W: "#CCF2FF" },
   },
-  // 待确认: yellow bell
   confirmations: {
-    pattern: [
-      ".......",
-      "..YYY..",
-      ".YYYYY.",
-      ".YYYYY.",
-      ".YYYYY.",
-      ".YYYYY.",
-      "..YYY..",
-      "..YYY..",
-    ],
+    pattern: [".......","..YYY..",".YYYYY.",".YYYYY.",".YYYYY.",".YYYYY.","..YYY..","..YYY.."],
     colors: { Y: "#D69E2E" },
   },
-  // 我的工作台: purple layers
-  workspace: {
-    pattern: [
-      ".PPPPP.",
-      "PPPPPPP",
-      ".PPPPP.",
-      "..PPP..",
-      ".PPPPP.",
-      "PPPPPPP",
-      ".PPPPP.",
-      "..PPP..",
-    ],
-    colors: { P: "#9F7AEA" },
-  },
-  // 录入知识: green plus
-  knowledgeNew: {
-    pattern: [
-      "..GGG..",
-      "..GGG..",
-      "GGGGGGG",
-      "GGGGGGG",
-      "GGGGGGG",
-      "..GGG..",
-      "..GGG..",
-      "..GGG..",
-    ],
-    colors: { G: "#38A169" },
-  },
-  // 我的知识: yellow document
   knowledgeMy: {
-    pattern: [
-      ".YYYYY.",
-      ".YYYYYN",
-      ".YYYYNN",
-      ".YYYYYY",
-      ".YYYYYY",
-      ".YYYYYY",
-      ".YYYYYY",
-      ".YYYYYY",
-    ],
+    pattern: [".YYYYY.",".YYYYYN",".YYYYNN",".YYYYYY",".YYYYYY",".YYYYYY",".YYYYYY",".YYYYYY"],
     colors: { Y: "#D69E2E", N: "#F6E05E" },
   },
-  // 数据表: blue grid
-  data: {
-    pattern: [
-      "BBBBBBB",
-      "BWBWBWB",
-      "BBBBBBB",
-      "BWBWBWB",
-      "BBBBBBB",
-      "BWBWBWB",
-      "BBBBBBB",
-      "BWBWBWB",
-    ],
-    colors: { B: "#3182CE", W: "#BEE3F8" },
-  },
-  // 提交意见: orange chat
-  suggestionNew: {
-    pattern: [
-      "OOOOOOO",
-      "OWWWWWO",
-      "OWWWWWO",
-      "OWWWWWO",
-      "OOOOOOO",
-      "..OO...",
-      "...OO..",
-      "....OO.",
-    ],
-    colors: { O: "#DD6B20", W: "#FEEBC8" },
-  },
-  // 我的意见: orange clipboard
-  suggestionMy: {
-    pattern: [
-      "..OOO..",
-      ".OOOOO.",
-      "OOOOOOO",
-      "OWWWWWO",
-      "OWWWWWO",
-      "OWWWWWO",
-      "OWWWWWO",
-      "OOOOOOO",
-    ],
-    colors: { O: "#C05621", W: "#FEEBC8" },
-  },
-  // 小工具: pink 2x2 grid
-  webApps: {
-    pattern: [
-      "PPP.PPP",
-      "PPP.PPP",
-      "PPP.PPP",
-      ".......",
-      "PPP.PPP",
-      "PPP.PPP",
-      "PPP.PPP",
-      ".......",
-    ],
-    colors: { P: "#D53F8C" },
-  },
-  // 情报中心: teal eye
-  intel: {
-    pattern: [
-      ".......",
-      ".TTTTT.",
-      "TTWWWTT",
-      "TWWBBWT",
-      "TTWWWTT",
-      ".TTTTT.",
-      ".......",
-      ".......",
-    ],
-    colors: { T: "#319795", W: "#B2F5EA", B: "#1A202C" },
-  },
-  // 知识审核: green checkmark
-  review: {
-    pattern: [
-      ".......",
-      "......G",
-      ".....GG",
-      "....GG.",
-      "G..GG..",
-      "GGGG...",
-      ".GGG...",
-      "..G....",
-    ],
-    colors: { G: "#38A169" },
-  },
-  // Skill管理: cyan code brackets
   skills: {
-    pattern: [
-      "CC.....",
-      ".CC....",
-      "..CC...",
-      "...CC..",
-      "...CC..",
-      "..CC...",
-      ".CC....",
-      "CC.....",
-    ],
+    pattern: ["CC.....","..CC...","....CC.","......C","......C","....CC.","..CC...",".CC...."],
     colors: { C: "#00A3C4" },
   },
-  // 模型配置: purple monitor
-  models: {
-    pattern: [
-      "PPPPPPP",
-      "PWWWWWP",
-      "PWWWWWP",
-      "PWWWWWP",
-      "PPPPPPP",
-      "..PPP..",
-      ".PPPPP.",
-      ".......",
-    ],
-    colors: { P: "#805AD5", W: "#E9D8FD" },
+  data: {
+    pattern: ["BBBBBBB","BWBWBWB","BBBBBBB","BWBWBWB","BBBBBBB","BWBWBWB","BBBBBBB","BWBWBWB"],
+    colors: { B: "#3182CE", W: "#BEE3F8" },
   },
-  // 业务表管理: blue database
-  bizTable: {
-    pattern: [
-      ".BBBBB.",
-      "BBBBBBB",
-      "BWWWWWB",
-      ".BBBBB.",
-      "BWWWWWB",
-      "BWWWWWB",
-      ".BBBBB.",
-      ".......",
-    ],
-    colors: { B: "#2B6CB0", W: "#BEE3F8" },
-  },
-  // 工具管理: gray gear
-  tools: {
-    pattern: [
-      "..GGG..",
-      ".GGGGG.",
-      "GWWWWWG",
-      "GWWWWWG",
-      "GWWWWWG",
-      ".GGGGG.",
-      "..GGG..",
-      ".......",
-    ],
-    colors: { G: "#718096", W: "#E2E8F0" },
-  },
-  // 情报管理: teal newspaper
-  intelAdmin: {
-    pattern: [
-      "TTTTTTT",
-      "TWWWWWT",
-      "TTTTTTT",
-      "TWWWWWT",
-      "TTTTTTT",
-      "TWWWWWT",
-      "TTTTTTT",
-      ".......",
-    ],
+  intelSource: {
+    pattern: [".TTTTT.","TTWWWTT","TW...WT","TW.T.WT","TW...WT","TTWWWTT",".TTTTT.",".......",],
     colors: { T: "#319795", W: "#B2F5EA" },
   },
-  // 外部市场: cyan store
+  webApps: {
+    pattern: ["PPP.PPP","PPP.PPP","PPP.PPP",".......","PPP.PPP","PPP.PPP","PPP.PPP","......."],
+    colors: { P: "#D53F8C" },
+  },
+  intel: {
+    pattern: [".......","..TTT..","TTWWWTT","TWWBBWT","TTWWWTT","..TTT..",".......","......."],
+    colors: { T: "#319795", W: "#B2F5EA", B: "#1A202C" },
+  },
+  review: {
+    pattern: [".......","......G",".....GG","....GG.","G..GG..","GGGG...",".GGG...","..G...."],
+    colors: { G: "#38A169" },
+  },
+  skillsAdmin: {
+    pattern: ["CC.....","..CC...","....CC.","......C","......C","....CC.","..CC...",".CC...."],
+    colors: { C: "#00A3C4" },
+  },
+  models: {
+    pattern: ["PPPPPPP","PWWWWWP","PWWWWWP","PWWWWWP","PPPPPPP","..PPP..",".PPPPP.","......."],
+    colors: { P: "#805AD5", W: "#E9D8FD" },
+  },
+  bizTable: {
+    pattern: [".BBBBB.","BBBBBBB","BWWWWWB",".BBBBB.","BWWWWWB","BWWWWWB",".BBBBB.","......."],
+    colors: { B: "#2B6CB0", W: "#BEE3F8" },
+  },
+  tools: {
+    pattern: ["..GGG..",".GGGGG.","GWWWWWG","GWWWWWG","GWWWWWG",".GGGGG.","..GGG...","......."],
+    colors: { G: "#718096", W: "#E2E8F0" },
+  },
   skillMarket: {
-    pattern: [
-      "CCCCCCC",
-      "CWWWWWC",
-      "CCCCCCC",
-      "CWWCWWC",
-      "CWWCWWC",
-      "CCCCCCC",
-      "CWWWWWC",
-      "CCCCCCC",
-    ],
+    pattern: ["CCCCCCC","CWWWWWC","CCCCCCC","CWWCWWC","CWWCWWC","CCCCCCC","CWWWWWC","CCCCCCC"],
     colors: { C: "#00A3C4", W: "#CCF2FF" },
   },
-  // MCP Token: cyan key
   mcpToken: {
-    pattern: [
-      "..CCCCC",
-      ".CWWWWC",
-      "CC....C",
-      "C.....C",
-      "CC....C",
-      ".CWWWWC",
-      "..CCCCC",
-      ".......",
-    ],
+    pattern: ["..CCCCC",".CWWWWC","CC....C","C.....C","CC....C",".CWWWWC","..CCCCC","......."],
     colors: { C: "#00A3C4", W: "#CCF2FF" },
   },
-  // 工作台管理: purple layers admin
+  intelAdmin: {
+    pattern: ["TTTTTTT","TWWWWWT","TTTTTTT","TWWWWWT","TTTTTTT","TWWWWWT","TTTTTTT","......."],
+    colors: { T: "#319795", W: "#B2F5EA" },
+  },
   workspaceAdmin: {
-    pattern: [
-      "PPPPPPP",
-      "PWWWWWP",
-      "PPPPPPP",
-      "PWWWWWP",
-      "PPPPPPP",
-      ".......",
-      ".......",
-      ".......",
-    ],
+    pattern: ["PPPPPPP","PWWWWWP","PPPPPPP","PWWWWWP","PPPPPPP",".......",".......",".......",],
     colors: { P: "#553C9A", W: "#E9D8FD" },
   },
-  // 操作审计: red list
   audit: {
-    pattern: [
-      "RRRRRRR",
-      "RWWWWWR",
-      "RWWWWWR",
-      "RRRRRRR",
-      "RWWWWWR",
-      "RWWWWWR",
-      "RRRRRRR",
-      ".......",
-    ],
+    pattern: ["RRRRRRR","RWWWWWR","RWWWWWR","RRRRRRR","RWWWWWR","RWWWWWR","RRRRRRR","......."],
     colors: { R: "#C53030", W: "#FED7D7" },
   },
-  // 贡献排行: gold bars
   contrib: {
-    pattern: [
-      "......G",
-      "....GGG",
-      "....GGG",
-      "..GGGGG",
-      "..GGGGG",
-      "GGGGGGG",
-      "GGGGGGG",
-      "GGGGGGG",
-    ],
+    pattern: ["......G","....GGG","....GGG","..GGGGG","..GGGGG","GGGGGGG","GGGGGGG","GGGGGGG"],
     colors: { G: "#B7791F" },
   },
-  // 用户管理: cyan person
   users: {
-    pattern: [
-      "..CCC..",
-      "..CCC..",
-      ".CCCCC.",
-      "CCCCCCC",
-      "CWWWWWC",
-      "CWWWWWC",
-      "CCCCCCC",
-      ".......",
-    ],
+    pattern: ["..CCC..","..CCC..",".CCCCC.","CCCCCCC","CWWWWWC","CWWWWWC","CCCCCCC","......."],
     colors: { C: "#00A3C4", W: "#CCF2FF" },
+  },
+  tasks: {
+    pattern: ["GGGGGGG","G.....G","GWWWWWG","G.WWW.G","G..W..G","G.....G","GGGGGGG","......."],
+    colors: { G: "#38A169", W: "#C6F6D5" },
+  },
+  // collapse toggle arrows
+  chevronDown: {
+    pattern: [".......",".......",".CCCCC.","..CCC..","...C...",".......",".......","......."],
+    colors: { C: "#00A3C4" },
+  },
+  chevronRight: {
+    pattern: [".C.....","..CC...","...CCC.","....CC.","...CCC.","..CC...","..C....",".......",],
+    colors: { C: "#00A3C4" },
   },
 };
 
-function NavItem({ to, children }: { to: string; children: React.ReactNode }) {
+function NavItem({ to, label, icon, collapsed }: {
+  to: string;
+  label: string;
+  icon: { pattern: string[]; colors: Record<string, string> };
+  collapsed: boolean;
+}) {
   return (
     <NavLink
       to={to}
+      title={collapsed ? label : undefined}
       className={({ isActive }) =>
-        `flex items-center px-3 py-2 text-xs font-bold uppercase tracking-wide transition-colors ${
+        `flex items-center gap-2 px-2 py-2 text-xs font-bold uppercase tracking-wide transition-colors ${
+          collapsed ? "justify-center" : ""
+        } ${
           isActive
             ? "bg-[#CCF2FF] border-2 border-[#1A202C] text-[#1A202C]"
             : "text-[#1A202C] opacity-60 hover:opacity-100 hover:bg-white/50"
         }`
       }
     >
-      {children}
+      <PixelIcon {...icon} size={14} />
+      {!collapsed && <span>{label}</span>}
     </NavLink>
   );
 }
 
-function NavSection({ label }: { label: string }) {
+function NavGroup({ label, children, storageKey, collapsed: sidebarCollapsed }: {
+  label: string;
+  children: React.ReactNode;
+  storageKey: string;
+  collapsed: boolean;
+}) {
+  const [open, setOpen] = useState(() => {
+    if (typeof window === "undefined") return true;
+    const saved = localStorage.getItem(storageKey);
+    return saved === null ? true : saved === "true";
+  });
+
+  function toggle() {
+    const next = !open;
+    setOpen(next);
+    localStorage.setItem(storageKey, String(next));
+  }
+
+  if (sidebarCollapsed) {
+    // In collapsed mode just show the group divider (a thin cyan line)
+    return (
+      <div className="my-2">
+        <div className="mx-2 border-t border-[#00A3C4]/40" />
+        {children}
+      </div>
+    );
+  }
+
   return (
-    <p className="px-3 pt-4 pb-1 text-[9px] font-bold text-[#00A3C4] uppercase tracking-widest">
-      — {label}
-    </p>
+    <div className="mt-1">
+      <button
+        onClick={toggle}
+        className="w-full flex items-center justify-between px-3 pt-4 pb-1 text-[9px] font-bold text-[#00A3C4] uppercase tracking-widest hover:text-[#007A96] transition-colors"
+      >
+        <span>— {label}</span>
+        <PixelIcon {...(open ? ICONS.chevronDown : ICONS.chevronRight)} size={8} />
+      </button>
+      {open && <div className="space-y-0.5">{children}</div>}
+    </div>
   );
 }
 
 export default function AppLayout() {
-  const { user } = useLoaderData<typeof loader>() as { user: User };
+  const { user, taskPending } = useLoaderData<typeof loader>() as { user: User; taskPending: number };
   const isAdmin = user.role === "super_admin" || user.role === "dept_admin";
   const isSuperAdmin = user.role === "super_admin";
+
+  const [collapsed, setCollapsed] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return localStorage.getItem("sidebar_collapsed") === "true";
+  });
+
+  function toggleSidebar() {
+    const next = !collapsed;
+    setCollapsed(next);
+    localStorage.setItem("sidebar_collapsed", String(next));
+  }
 
   return (
     <div className="flex h-screen bg-[#F0F4F8] overflow-hidden">
       {/* Sidebar */}
-      <aside className="w-56 flex-shrink-0 border-r-2 border-[#1A202C] bg-[#EBF4F7] flex flex-col justify-between">
-        <div className="overflow-y-auto">
+      <aside
+        className={`flex-shrink-0 border-r-2 border-[#1A202C] bg-[#EBF4F7] flex flex-col justify-between transition-all duration-200 ${
+          collapsed ? "w-14" : "w-56"
+        }`}
+      >
+        <div className="overflow-y-auto flex-1">
           {/* Branding */}
-          <div className="p-5 flex items-center space-x-3 border-b-2 border-[#1A202C]">
-            <div className="w-9 h-9 bg-[#00D1FF] pixel-border flex items-center justify-center flex-shrink-0">
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <div className={`border-b-2 border-[#1A202C] flex items-center ${collapsed ? "justify-center p-2" : "p-4 space-x-3"}`}>
+            <div className="w-8 h-8 bg-[#00D1FF] pixel-border flex items-center justify-center flex-shrink-0">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" />
               </svg>
             </div>
-            <div>
-              <h1 className="text-xs font-bold uppercase tracking-tight leading-none">Universal</h1>
-              <p className="text-[10px] text-[#00A3C4] font-bold uppercase mt-0.5">Knowledge Base</p>
-            </div>
+            {!collapsed && (
+              <div>
+                <h1 className="text-xs font-bold uppercase tracking-tight leading-none">Universal</h1>
+                <p className="text-[10px] text-[#00A3C4] font-bold uppercase mt-0.5">Knowledge Base</p>
+              </div>
+            )}
           </div>
 
           {/* Nav */}
-          <nav className="p-3 space-y-0.5">
-            <NavSection label="工作台" />
-            <NavItem to="/chat">
-              <PixelIcon {...ICONS.chat} />
-              对话
-            </NavItem>
-            <NavItem to="/confirmations">
-              <PixelIcon {...ICONS.confirmations} />
-              待确认
-            </NavItem>
+          <nav className={`${collapsed ? "px-1 py-2" : "px-2 py-2"} space-y-0`}>
 
-            <NavSection label="知识贡献" />
-            <NavItem to="/knowledge/new">
-              <PixelIcon {...ICONS.knowledgeNew} />
-              录入知识
-            </NavItem>
-            <NavItem to="/knowledge/my">
-              <PixelIcon {...ICONS.knowledgeMy} />
-              我的知识
-            </NavItem>
-
-            <NavSection label="业务数据" />
-            <NavItem to="/data">
-              <PixelIcon {...ICONS.data} />
-              数据表
-            </NavItem>
-
-            <NavSection label="Skill 反馈" />
-            <NavItem to="/suggestions/new">
-              <PixelIcon {...ICONS.suggestionNew} />
-              提交意见
-            </NavItem>
-            <NavItem to="/suggestions/my">
-              <PixelIcon {...ICONS.suggestionMy} />
-              我的意见
-            </NavItem>
-
-            <NavSection label="工具" />
-            <NavItem to="/web-apps">
-              <PixelIcon {...ICONS.webApps} />
-              小工具
-            </NavItem>
-            <NavItem to="/intel">
-              <PixelIcon {...ICONS.intel} />
-              情报中心
-            </NavItem>
-
-            {isAdmin && (
-              <>
-                <NavSection label="管理" />
-                <NavItem to="/admin/knowledge">
-                  <PixelIcon {...ICONS.review} />
-                  知识审核
-                </NavItem>
-                <NavItem to="/admin/skills">
-                  <PixelIcon {...ICONS.skills} />
-                  Skill管理
-                </NavItem>
-                <NavItem to="/admin/models">
-                  <PixelIcon {...ICONS.models} />
-                  模型配置
-                </NavItem>
-                <NavItem to="/admin/business-tables">
-                  <PixelIcon {...ICONS.bizTable} />
-                  业务表管理
-                </NavItem>
-                <NavItem to="/admin/tools">
-                  <PixelIcon {...ICONS.tools} />
-                  工具管理
-                </NavItem>
-                <NavItem to="/admin/skill-market">
-                  <PixelIcon {...ICONS.skillMarket} />
-                  外部市场
-                </NavItem>
-                <NavItem to="/admin/mcp-tokens">
-                  <PixelIcon {...ICONS.mcpToken} />
-                  MCP Token
-                </NavItem>
-                <NavItem to="/admin/intel">
-                  <PixelIcon {...ICONS.intelAdmin} />
-                  情报管理
-                </NavItem>
-                <NavItem to="/admin/workspaces">
-                  <PixelIcon {...ICONS.workspaceAdmin} />
-                  工作台管理
-                </NavItem>
-                <NavItem to="/admin/audit">
-                  <PixelIcon {...ICONS.audit} />
-                  操作审计
-                </NavItem>
-                <NavItem to="/admin/contributions">
-                  <PixelIcon {...ICONS.contrib} />
-                  贡献排行
-                </NavItem>
-                {isSuperAdmin && (
-                  <NavItem to="/admin/users">
-                    <PixelIcon {...ICONS.users} />
-                    用户管理
-                  </NavItem>
+            {/* 工作台 */}
+            <NavGroup label="工作台" storageKey="nav_group_workspace" collapsed={collapsed}>
+              <NavItem to="/chat" label="对话" icon={ICONS.chat} collapsed={collapsed} />
+              <NavItem to="/confirmations" label="待确认" icon={ICONS.confirmations} collapsed={collapsed} />
+              <div className="relative">
+                <NavItem to="/tasks" label="待办" icon={ICONS.tasks} collapsed={collapsed} />
+                {taskPending > 0 && (
+                  <span
+                    className="absolute top-1 right-2 min-w-[16px] h-4 bg-red-500 text-white text-[8px] font-bold flex items-center justify-center px-1 pointer-events-none"
+                    style={{ borderRadius: 0 }}
+                  >
+                    {taskPending > 99 ? "99+" : taskPending}
+                  </span>
                 )}
-              </>
+              </div>
+            </NavGroup>
+
+            {/* 知识管理 */}
+            <NavGroup label="知识管理" storageKey="nav_group_knowledge" collapsed={collapsed}>
+              <NavItem to="/knowledge/my" label="我的知识" icon={ICONS.knowledgeMy} collapsed={collapsed} />
+              <NavItem to="/skills" label="Skill" icon={ICONS.skills} collapsed={collapsed} />
+              <NavItem to="/data" label="数据表" icon={ICONS.data} collapsed={collapsed} />
+              <NavItem to="/intel/sources" label="数据源" icon={ICONS.intelSource} collapsed={collapsed} />
+            </NavGroup>
+
+            {/* 工具 */}
+            <NavGroup label="工具" storageKey="nav_group_tools" collapsed={collapsed}>
+              <NavItem to="/web-apps" label="小工具" icon={ICONS.webApps} collapsed={collapsed} />
+              <NavItem to="/intel" label="情报中心" icon={ICONS.intel} collapsed={collapsed} />
+            </NavGroup>
+
+            {/* 管理 */}
+            {isAdmin && (
+              <NavGroup label="管理" storageKey="nav_group_admin" collapsed={collapsed}>
+                <NavItem to="/admin/knowledge" label="知识审核" icon={ICONS.review} collapsed={collapsed} />
+                <NavItem to="/admin/skills" label="Skill管理" icon={ICONS.skillsAdmin} collapsed={collapsed} />
+                <NavItem to="/admin/models" label="模型配置" icon={ICONS.models} collapsed={collapsed} />
+                <NavItem to="/admin/business-tables" label="业务表管理" icon={ICONS.bizTable} collapsed={collapsed} />
+                <NavItem to="/admin/tools" label="工具管理" icon={ICONS.tools} collapsed={collapsed} />
+                <NavItem to="/admin/skill-market" label="外部市场" icon={ICONS.skillMarket} collapsed={collapsed} />
+                <NavItem to="/admin/mcp-tokens" label="MCP Token" icon={ICONS.mcpToken} collapsed={collapsed} />
+                <NavItem to="/admin/intel" label="情报管理" icon={ICONS.intelAdmin} collapsed={collapsed} />
+                <NavItem to="/admin/workspaces" label="工作台管理" icon={ICONS.workspaceAdmin} collapsed={collapsed} />
+                <NavItem to="/admin/audit" label="操作审计" icon={ICONS.audit} collapsed={collapsed} />
+                <NavItem to="/admin/contributions" label="贡献排行" icon={ICONS.contrib} collapsed={collapsed} />
+                {isSuperAdmin && (
+                  <NavItem to="/admin/users" label="用户管理" icon={ICONS.users} collapsed={collapsed} />
+                )}
+              </NavGroup>
             )}
           </nav>
         </div>
 
-        {/* User footer */}
-        <div className="p-4 border-t-2 border-[#1A202C] bg-white/40 flex-shrink-0">
-          <div className="flex items-center space-x-3 mb-3">
-            <div className="w-8 h-8 bg-[#00CC99] pixel-border flex-shrink-0" />
-            <div>
-              <div className="text-[10px] font-bold uppercase truncate max-w-[100px]">{user.display_name}</div>
-              <div className="text-[9px] text-[#00A3C4] font-bold uppercase">
-                {user.role === "super_admin" ? "超级管理员" : user.role === "dept_admin" ? "部门管理员" : "员工"}
+        {/* User footer + collapse toggle */}
+        <div className="border-t-2 border-[#1A202C] bg-white/40 flex-shrink-0">
+          {!collapsed && (
+            <div className="p-3 flex items-center space-x-2">
+              <div className="w-7 h-7 bg-[#00CC99] pixel-border flex-shrink-0" />
+              <div className="min-w-0">
+                <div className="text-[10px] font-bold uppercase truncate">{user.display_name}</div>
+                <div className="text-[9px] text-[#00A3C4] font-bold uppercase">
+                  {user.role === "super_admin" ? "超管" : user.role === "dept_admin" ? "部门管理员" : "员工"}
+                </div>
               </div>
             </div>
-          </div>
-          <Form method="post" action="/logout">
+          )}
+
+          <div className={`${collapsed ? "p-1" : "px-3 pb-3"} flex flex-col gap-1`}>
+            {!collapsed && (
+              <Form method="post" action="/logout">
+                <button
+                  type="submit"
+                  className="w-full text-left px-2 py-1.5 text-[10px] font-bold uppercase tracking-wide text-gray-500 hover:bg-white/60 border border-transparent hover:border-gray-400 transition-colors"
+                >
+                  [退出登录]
+                </button>
+              </Form>
+            )}
+            {/* Collapse toggle button */}
             <button
-              type="submit"
-              className="w-full text-left px-3 py-1.5 text-[10px] font-bold uppercase tracking-wide text-gray-500 hover:bg-white/60 border border-transparent hover:border-gray-400 transition-colors"
+              onClick={toggleSidebar}
+              title={collapsed ? "展开侧边栏" : "收起侧边栏"}
+              className={`${collapsed ? "mx-auto" : "ml-auto"} flex items-center justify-center w-8 h-8 border-2 border-[#1A202C] bg-white hover:bg-[#CCF2FF] transition-colors`}
             >
-              [退出登录]
+              <span className="text-[10px] font-bold text-[#1A202C]">{collapsed ? "»" : "«"}</span>
             </button>
-          </Form>
+          </div>
         </div>
       </aside>
 

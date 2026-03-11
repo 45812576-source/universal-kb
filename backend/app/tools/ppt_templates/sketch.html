@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>天机智投 · 内部培训课件模板（手绘风）</title>
+<style>
+:root {
+  --starry-blue: #040B59;
+  --mystic-purple: #7153EE;
+  --tech-cyan: #48CCE7;
+  --premium-black: #000000;
+  --warm-yellow: #FFC043;
+  --purple-10: #f0ecfd;
+  --purple-20: #ddd4fb;
+  --blue-10: #e6e7f0;
+  --cyan-10: #e4f7fb;
+  --yellow-10: #fff8e6;
+  --paper-bg: #faf8f5;
+  --sketch-line: rgba(4,11,89,0.55);
+}
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=Ma+Shan+Zheng&display=swap');
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family: 'Noto Sans SC', sans-serif;
+  background: #e8e4df;
+  color: var(--starry-blue);
+}
+.slide-label {
+  text-align:center; font-size:13px; color:#888;
+  margin: 30px auto 6px; font-family: Helvetica, sans-serif;
+}
+/* ===== 幻灯片通用 ===== */
+.slide {
+  width: 960px; height: 540px; margin: 8px auto;
+  position: relative; overflow: hidden;
+  box-shadow: 0 6px 24px rgba(4,11,89,0.12);
+  border: 2px solid transparent;
+}
+.paper {
+  background: var(--paper-bg);
+  background-image:
+    repeating-linear-gradient(0deg, transparent, transparent 27px, rgba(4,11,89,0.03) 27px, rgba(4,11,89,0.03) 28px);
+}
+/* 手绘边框 */
+.sketch-border {
+  border: 2.5px solid var(--sketch-line);
+  border-radius: 255px 15px 225px 15px / 15px 225px 15px 255px;
+}
+.sketch-box {
+  border: 2px solid var(--sketch-line);
+  border-radius: 255px 15px 225px 15px / 15px 225px 15px 255px;
+  padding: 16px 20px;
+}
+.sketch-box-accent {
+  border: 2px solid var(--mystic-purple);
+  border-radius: 255px 15px 225px 15px / 15px 225px 15px 255px;
+  padding: 16px 20px;
+  background: var(--purple-10);
+}
+.sketch-box-cyan {
+  border: 2px solid var(--tech-cyan);
+  border-radius: 255px 15px 225px 15px / 15px 225px 15px 255px;
+  padding: 16px 20px;
+  background: var(--cyan-10);
+}
+.sketch-box-yellow {
+  border: 2px solid var(--warm-yellow);
+  border-radius: 255px 15px 225px 15px / 15px 225px 15px 255px;
+  padding: 16px 20px;
+  background: var(--yellow-10);
+}
+/* 手绘下划线 */
+.sketch-underline {
+  text-decoration: none;
+  background-image: linear-gradient(120deg, var(--warm-yellow) 0%, var(--warm-yellow) 100%);
+  background-repeat: no-repeat;
+  background-size: 100% 6px;
+  background-position: 0 88%;
+}
+/* 手绘圆圈标记 */
+.sketch-circle {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 44px; height: 44px;
+  border: 2.5px solid var(--mystic-purple);
+  border-radius: 255px 15px 225px 15px / 15px 225px 15px 255px;
+  font-weight: 700; font-size: 18px; color: var(--mystic-purple);
+  flex-shrink: 0;
+}
+/* 水彩色块 */
+.watercolor-blob {
+  position: absolute; border-radius: 50%; opacity: 0.12; filter: blur(30px);
+}
+/* 品牌标识区 */
+.brand-footer {
+  position: absolute; bottom: 14px; right: 24px;
+  font-size: 11px; color: rgba(4,11,89,0.35);
+  font-family: Helvetica, sans-serif; letter-spacing: 0.5px;
+}
+.brand-footer-left {
+  position: absolute; bottom: 14px; left: 24px;
+  font-size: 11px; color: rgba(4,11,89,0.35);
+}
+/* 手写风标题 */
+.handwrite {
+  font-family: 'Ma Shan Zheng', cursive;
+}
+/* SVG 手绘装饰 */
+.deco-star { position: absolute; }
+.deco-star svg { width: 100%; height: 100%; }
+/* 页码 */
+.page-num {
+  position: absolute; bottom: 14px; left: 50%;
+  transform: translateX(-50%);
+  font-size: 12px; color: rgba(4,11,89,0.3);
+  font-family: Helvetica, sans-serif;
+}
+</style>
+</head>
+<body>
+
+<!-- ========== SLIDE 1: 封面 ========== -->
+<div class="slide-label">Slide 1 · 封面 Cover</div>
+<div class="slide paper" style="display:flex; align-items:center; justify-content:center; flex-direction:column;">
+  <div class="watercolor-blob" style="width:320px;height:320px;background:var(--mystic-purple);top:-60px;right:-80px;"></div>
+  <div class="watercolor-blob" style="width:260px;height:260px;background:var(--tech-cyan);bottom:-40px;left:-60px;"></div>
+  <div class="watercolor-blob" style="width:180px;height:180px;background:var(--warm-yellow);bottom:60px;right:120px;"></div>
+  <!-- 手绘星座装饰 -->
+  <svg style="position:absolute;top:30px;left:40px;opacity:0.15;" width="120" height="100" viewBox="0 0 120 100">
+    <circle cx="20" cy="30" r="3" fill="#7153EE"/><circle cx="60" cy="10" r="4" fill="#FFC043"/>
+    <circle cx="100" cy="40" r="3" fill="#7153EE"/><circle cx="80" cy="80" r="3" fill="#48CCE7"/>
+    <circle cx="40" cy="70" r="2.5" fill="#7153EE"/>
+    <line x1="20" y1="30" x2="60" y2="10" stroke="#7153EE" stroke-width="1" stroke-dasharray="4,3"/>
+    <line x1="60" y1="10" x2="100" y2="40" stroke="#7153EE" stroke-width="1" stroke-dasharray="4,3"/>
+    <line x1="100" y1="40" x2="80" y2="80" stroke="#48CCE7" stroke-width="1" stroke-dasharray="4,3"/>
+    <line x1="80" y1="80" x2="40" y2="70" stroke="#48CCE7" stroke-width="1" stroke-dasharray="4,3"/>
+    <line x1="40" y1="70" x2="20" y2="30" stroke="#7153EE" stroke-width="1" stroke-dasharray="4,3"/>
+  </svg>
+  <div style="text-align:center;position:relative;z-index:2;">
+    <div style="font-size:13px;color:var(--mystic-purple);letter-spacing:6px;margin-bottom:12px;font-family:Helvetica,sans-serif;">TIANJIZHITOU · INTERNAL TRAINING</div>
+    <h1 class="handwrite" style="font-size:48px;color:var(--starry-blue);margin-bottom:8px;">培训主题名称</h1>
+    <div style="width:120px;height:3px;background:var(--warm-yellow);margin:12px auto;border-radius:2px;"></div>
+    <p style="font-size:16px;color:var(--mystic-purple);font-weight:300;">副标题 / 培训日期 / 讲师姓名</p>
+  </div>
+  <div style="position:absolute;bottom:40px;text-align:center;">
+    <svg width="80" height="24" viewBox="0 0 80 24" style="opacity:0.5;">
+      <text x="0" y="18" font-family="Helvetica" font-size="11" fill="#040B59" letter-spacing="1">天机智投</text>
+    </svg>
+  </div>
+  <div class="brand-footer">POTENTIAL KNOWS NO BOUNDS</div>
+</div>
+
+<!-- ========== SLIDE 2: 目录 ========== -->
+<div class="slide-label">Slide 2 · 目录 Agenda</div>
+<div class="slide paper" style="padding:48px 60px;">
+  <div class="watercolor-blob" style="width:200px;height:200px;background:var(--tech-cyan);top:-40px;right:-40px;"></div>
+  <h2 class="handwrite" style="font-size:32px;margin-bottom:6px;">今日议程</h2>
+  <div style="width:80px;height:3px;background:var(--warm-yellow);margin-bottom:32px;border-radius:2px;"></div>
+  <div style="display:flex;flex-direction:column;gap:20px;position:relative;z-index:2;">
+    <div style="display:flex;align-items:center;gap:16px;">
+      <span class="sketch-circle">01</span>
+      <div class="sketch-box" style="flex:1;"><strong>章节一标题</strong><br><span style="font-size:13px;color:#666;">简要描述本章节内容</span></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:16px;">
+      <span class="sketch-circle">02</span>
+      <div class="sketch-box" style="flex:1;"><strong>章节二标题</strong><br><span style="font-size:13px;color:#666;">简要描述本章节内容</span></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:16px;">
+      <span class="sketch-circle">03</span>
+      <div class="sketch-box" style="flex:1;"><strong>章节三标题</strong><br><span style="font-size:13px;color:#666;">简要描述本章节内容</span></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:16px;">
+      <span class="sketch-circle">04</span>
+      <div class="sketch-box" style="flex:1;"><strong>章节四标题</strong><br><span style="font-size:13px;color:#666;">简要描述本章节内容</span></div>
+    </div>
+  </div>
+  <div class="page-num">02</div>
+  <div class="brand-footer">天机智投 · 内部培训</div>
+</div>
+
+<!-- ========== SLIDE 3: 章节分隔 ========== -->
+<div class="slide-label">Slide 3 · 章节分隔 Section Divider</div>
+<div class="slide paper" style="display:flex;align-items:center;justify-content:center;">
+  <div class="watercolor-blob" style="width:400px;height:400px;background:var(--mystic-purple);top:50%;left:50%;transform:translate(-50%,-50%);"></div>
+  <div style="text-align:center;position:relative;z-index:2;">
+    <div style="font-size:72px;font-weight:700;color:var(--mystic-purple);opacity:0.15;font-family:Helvetica;line-height:1;">01</div>
+    <h2 class="handwrite" style="font-size:36px;margin-top:-10px;">章节标题</h2>
+    <div style="width:60px;height:3px;background:var(--warm-yellow);margin:12px auto;border-radius:2px;"></div>
+    <p style="font-size:14px;color:#666;font-weight:300;">本章节的简要说明文字</p>
+  </div>
+  <div class="page-num">03</div>
+  <div class="brand-footer">天机智投 · 内部培训</div>
+</div>
+
+<!-- ========== SLIDE 4: 图文内容 ========== -->
+<div class="slide-label">Slide 4 · 图文内容 Content + Illustration</div>
+<div class="slide paper" style="display:flex;padding:48px 50px;">
+  <div style="flex:1;padding-right:30px;">
+    <h3 class="handwrite" style="font-size:26px;margin-bottom:16px;"><span class="sketch-underline">内容标题</span></h3>
+    <p style="font-size:14px;line-height:1.9;color:#333;margin-bottom:16px;">
+      这里是正文内容区域。使用思源黑体 Regular 字重，行距 1.9 倍，确保阅读舒适度。
+      可以在此处详细阐述培训要点。
+    </p>
+    <div class="sketch-box-accent" style="font-size:13px;line-height:1.7;">
+      <strong style="color:var(--mystic-purple);">💡 要点提示</strong><br>
+      重要知识点或需要特别注意的内容放在这个手绘风格的提示框中。
+    </div>
+  </div>
+  <div style="width:340px;height:380px;display:flex;align-items:center;justify-content:center;">
+    <div class="sketch-box" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:var(--blue-10);">
+      <div style="text-align:center;color:#999;">
+        <svg width="64" height="64" viewBox="0 0 64 64" fill="none" stroke="#7153EE" stroke-width="1.5" stroke-dasharray="4,3">
+          <rect x="4" y="4" width="56" height="56" rx="8"/>
+          <circle cx="24" cy="24" r="6"/><path d="M8 52 L24 36 L36 44 L56 20"/>
+        </svg>
+        <p style="margin-top:8px;font-size:12px;">插画 / 示意图区域</p>
+      </div>
+    </div>
+  </div>
+  <div class="page-num">04</div>
+  <div class="brand-footer">天机智投 · 内部培训</div>
+</div>
+
+<!-- ========== SLIDE 5: 要点列表 ========== -->
+<div class="slide-label">Slide 5 · 要点列表 Key Points</div>
+<div class="slide paper" style="padding:48px 60px;">
+  <div class="watercolor-blob" style="width:160px;height:160px;background:var(--warm-yellow);top:-20px;right:40px;"></div>
+  <h3 class="handwrite" style="font-size:28px;margin-bottom:24px;"><span class="sketch-underline">核心要点</span></h3>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px 24px;position:relative;z-index:2;">
+    <div class="sketch-box-accent" style="display:flex;gap:12px;align-items:flex-start;">
+      <span style="font-size:24px;color:var(--mystic-purple);font-weight:700;font-family:Helvetica;">①</span>
+      <div><strong>要点一标题</strong><p style="font-size:13px;color:#555;margin-top:4px;">要点描述文字，简明扼要地说明关键信息。</p></div>
+    </div>
+    <div class="sketch-box-cyan" style="display:flex;gap:12px;align-items:flex-start;">
+      <span style="font-size:24px;color:var(--tech-cyan);font-weight:700;font-family:Helvetica;">②</span>
+      <div><strong>要点二标题</strong><p style="font-size:13px;color:#555;margin-top:4px;">要点描述文字，简明扼要地说明关键信息。</p></div>
+    </div>
+    <div class="sketch-box-yellow" style="display:flex;gap:12px;align-items:flex-start;">
+      <span style="font-size:24px;color:var(--warm-yellow);font-weight:700;font-family:Helvetica;">③</span>
+      <div><strong>要点三标题</strong><p style="font-size:13px;color:#555;margin-top:4px;">要点描述文字，简明扼要地说明关键信息。</p></div>
+    </div>
+    <div class="sketch-box" style="display:flex;gap:12px;align-items:flex-start;">
+      <span style="font-size:24px;color:var(--starry-blue);font-weight:700;font-family:Helvetica;">④</span>
+      <div><strong>要点四标题</strong><p style="font-size:13px;color:#555;margin-top:4px;">要点描述文字，简明扼要地说明关键信息。</p></div>
+    </div>
+  </div>
+  <div class="page-num">05</div>
+  <div class="brand-footer">天机智投 · 内部培训</div>
+</div>
+
+<!-- ========== SLIDE 6: 双栏对比 ========== -->
+<div class="slide-label">Slide 6 · 双栏对比 Two Columns</div>
+<div class="slide paper" style="padding:48px 50px;">
+  <h3 class="handwrite" style="font-size:28px;margin-bottom:24px;text-align:center;"><span class="sketch-underline">对比分析</span></h3>
+  <div style="display:flex;gap:24px;position:relative;z-index:2;">
+    <div style="flex:1;">
+      <div class="sketch-box-accent" style="height:340px;">
+        <div style="text-align:center;margin-bottom:12px;">
+          <svg width="48" height="48" viewBox="0 0 48 48" fill="none" stroke="#7153EE" stroke-width="1.5" stroke-dasharray="3,2">
+            <circle cx="24" cy="24" r="20"/><path d="M16 24 L22 30 L32 18"/>
+          </svg>
+        </div>
+        <h4 style="text-align:center;color:var(--mystic-purple);margin-bottom:10px;">方案 A / 优势</h4>
+        <ul style="font-size:13px;line-height:2;color:#444;padding-left:18px;">
+          <li>对比项目一的描述说明</li><li>对比项目二的描述说明</li>
+          <li>对比项目三的描述说明</li><li>对比项目四的描述说明</li>
+        </ul>
+      </div>
+    </div>
+    <div style="flex:1;">
+      <div class="sketch-box-cyan" style="height:340px;">
+        <div style="text-align:center;margin-bottom:12px;">
+          <svg width="48" height="48" viewBox="0 0 48 48" fill="none" stroke="#48CCE7" stroke-width="1.5" stroke-dasharray="3,2">
+            <circle cx="24" cy="24" r="20"/><path d="M16 16 L32 32 M32 16 L16 32"/>
+          </svg>
+        </div>
+        <h4 style="text-align:center;color:var(--tech-cyan);margin-bottom:10px;">方案 B / 劣势</h4>
+        <ul style="font-size:13px;line-height:2;color:#444;padding-left:18px;">
+          <li>对比项目一的描述说明</li><li>对比项目二的描述说明</li>
+          <li>对比项目三的描述说明</li><li>对比项目四的描述说明</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="page-num">06</div>
+  <div class="brand-footer">天机智投 · 内部培训</div>
+</div>
+
+<!-- ========== SLIDE 7: 核心概念/金句 ========== -->
+<div class="slide-label">Slide 7 · 核心概念 Key Concept</div>
+<div class="slide paper" style="display:flex;align-items:center;justify-content:center;">
+  <div class="watercolor-blob" style="width:500px;height:500px;background:var(--mystic-purple);top:50%;left:50%;transform:translate(-50%,-50%);opacity:0.08;"></div>
+  <div class="watercolor-blob" style="width:200px;height:200px;background:var(--warm-yellow);bottom:20px;left:40px;"></div>
+  <div style="text-align:center;max-width:680px;position:relative;z-index:2;">
+    <div style="font-size:48px;color:var(--mystic-purple);opacity:0.3;font-family:Georgia,serif;line-height:1;">"</div>
+    <h2 class="handwrite" style="font-size:34px;line-height:1.5;margin:-10px 0 16px;">在这里放置一句<br>核心概念或金句</h2>
+    <div style="width:60px;height:3px;background:var(--warm-yellow);margin:0 auto 12px;border-radius:2px;"></div>
+    <p style="font-size:14px;color:#666;font-weight:300;">—— 来源说明或补充解释</p>
+  </div>
+  <div class="page-num">07</div>
+  <div class="brand-footer">天机智投 · 内部培训</div>
+</div>
+
+<!-- ========== SLIDE 8: 流程步骤 ========== -->
+<div class="slide-label">Slide 8 · 流程步骤 Process</div>
+<div class="slide paper" style="padding:48px 40px;">
+  <h3 class="handwrite" style="font-size:28px;margin-bottom:28px;text-align:center;"><span class="sketch-underline">操作流程</span></h3>
+  <div style="display:flex;align-items:flex-start;gap:6px;position:relative;z-index:2;">
+    <div style="flex:1;text-align:center;">
+      <div class="sketch-circle" style="width:50px;height:50px;font-size:20px;margin:0 auto 10px;">1</div>
+      <div class="sketch-box-accent" style="min-height:150px;padding:12px;">
+        <strong style="font-size:13px;">步骤一</strong>
+        <p style="font-size:11px;color:#555;margin-top:4px;">描述该步骤的操作内容。</p>
+      </div>
+    </div>
+    <div style="margin-top:22px;color:var(--mystic-purple);opacity:0.4;">→</div>
+    <div style="flex:1;text-align:center;">
+      <div class="sketch-circle" style="width:50px;height:50px;font-size:20px;margin:0 auto 10px;border-color:var(--tech-cyan);color:var(--tech-cyan);">2</div>
+      <div class="sketch-box-cyan" style="min-height:150px;padding:12px;">
+        <strong style="font-size:13px;">步骤二</strong>
+        <p style="font-size:11px;color:#555;margin-top:4px;">描述该步骤的操作内容。</p>
+      </div>
+    </div>
+    <div style="margin-top:22px;color:var(--tech-cyan);opacity:0.4;">→</div>
+    <div style="flex:1;text-align:center;">
+      <div class="sketch-circle" style="width:50px;height:50px;font-size:20px;margin:0 auto 10px;border-color:var(--warm-yellow);color:var(--warm-yellow);">3</div>
+      <div class="sketch-box-yellow" style="min-height:150px;padding:12px;">
+        <strong style="font-size:13px;">步骤三</strong>
+        <p style="font-size:11px;color:#555;margin-top:4px;">描述该步骤的操作内容。</p>
+      </div>
+    </div>
+    <div style="margin-top:22px;color:var(--warm-yellow);opacity:0.4;">→</div>
+    <div style="flex:1;text-align:center;">
+      <div class="sketch-circle" style="width:50px;height:50px;font-size:20px;margin:0 auto 10px;">4</div>
+      <div class="sketch-box" style="min-height:150px;padding:12px;">
+        <strong style="font-size:13px;">步骤四</strong>
+        <p style="font-size:11px;color:#555;margin-top:4px;">描述该步骤的操作内容。</p>
+      </div>
+    </div>
+  </div>
+  <div class="page-num">08</div>
+  <div class="brand-footer">天机智投 · 内部培训</div>
+</div>
+
+<!-- ========== SLIDE 9: 练习互动 ========== -->
+<div class="slide-label">Slide 9 · 练习互动 Exercise</div>
+<div class="slide paper" style="display:flex;align-items:center;justify-content:center;">
+  <div class="watercolor-blob" style="width:300px;height:300px;background:var(--warm-yellow);top:-60px;left:-60px;opacity:0.15;"></div>
+  <div class="watercolor-blob" style="width:250px;height:250px;background:var(--tech-cyan);bottom:-40px;right:-40px;"></div>
+  <div style="text-align:center;position:relative;z-index:2;max-width:560px;">
+    <div style="font-size:48px;margin-bottom:12px;">✏️</div>
+    <h2 class="handwrite" style="font-size:32px;margin-bottom:12px;">动手练习时间</h2>
+    <div style="width:60px;height:3px;background:var(--warm-yellow);margin:0 auto 20px;border-radius:2px;"></div>
+    <div class="sketch-box-yellow" style="text-align:left;font-size:14px;line-height:2;">
+      <strong>练习任务：</strong><br>
+      1. 第一个练习步骤的描述<br>
+      2. 第二个练习步骤的描述<br>
+      3. 第三个练习步骤的描述
+    </div>
+    <p style="font-size:13px;color:#888;margin-top:16px;">⏱ 练习时间：XX 分钟</p>
+  </div>
+  <div class="page-num">09</div>
+  <div class="brand-footer">天机智投 · 内部培训</div>
+</div>
+
+<!-- ========== SLIDE 10: 总结 ========== -->
+<div class="slide-label">Slide 10 · 总结回顾 Summary</div>
+<div class="slide paper" style="padding:48px 60px;">
+  <h3 class="handwrite" style="font-size:28px;margin-bottom:24px;text-align:center;"><span class="sketch-underline">今日总结</span></h3>
+  <div style="display:flex;gap:20px;position:relative;z-index:2;">
+    <div class="sketch-box-accent" style="flex:1;text-align:center;padding:24px 16px;">
+      <div style="font-size:28px;margin-bottom:8px;">📌</div>
+      <strong>要点一</strong>
+      <p style="font-size:12px;color:#555;margin-top:6px;">总结第一个核心知识点。</p>
+    </div>
+    <div class="sketch-box-cyan" style="flex:1;text-align:center;padding:24px 16px;">
+      <div style="font-size:28px;margin-bottom:8px;">📌</div>
+      <strong>要点二</strong>
+      <p style="font-size:12px;color:#555;margin-top:6px;">总结第二个核心知识点。</p>
+    </div>
+    <div class="sketch-box-yellow" style="flex:1;text-align:center;padding:24px 16px;">
+      <div style="font-size:28px;margin-bottom:8px;">📌</div>
+      <strong>要点三</strong>
+      <p style="font-size:12px;color:#555;margin-top:6px;">总结第三个核心知识点。</p>
+    </div>
+  </div>
+  <div class="sketch-box" style="margin-top:20px;text-align:center;font-size:14px;color:var(--mystic-purple);">
+    <strong>下次预告：</strong> 下一期培训主题名称
+  </div>
+  <div class="page-num">10</div>
+  <div class="brand-footer">天机智投 · 内部培训</div>
+</div>
+
+<!-- ========== SLIDE 11: Q&A ========== -->
+<div class="slide-label">Slide 11 · 问答 Q&A</div>
+<div class="slide paper" style="display:flex;align-items:center;justify-content:center;">
+  <div class="watercolor-blob" style="width:400px;height:400px;background:var(--mystic-purple);top:50%;left:50%;transform:translate(-50%,-50%);opacity:0.06;"></div>
+  <div class="watercolor-blob" style="width:180px;height:180px;background:var(--tech-cyan);top:30px;right:60px;"></div>
+  <div class="watercolor-blob" style="width:150px;height:150px;background:var(--warm-yellow);bottom:40px;left:80px;"></div>
+  <div style="text-align:center;position:relative;z-index:2;">
+    <svg width="80" height="80" viewBox="0 0 80 80" fill="none" style="margin-bottom:16px;">
+      <circle cx="40" cy="40" r="36" stroke="#7153EE" stroke-width="2" stroke-dasharray="6,4"/>
+      <text x="40" y="52" text-anchor="middle" font-family="'Ma Shan Zheng',cursive" font-size="36" fill="#7153EE">?</text>
+    </svg>
+    <h2 class="handwrite" style="font-size:40px;margin-bottom:8px;">Questions?</h2>
+    <p style="font-size:15px;color:#666;font-weight:300;">欢迎提出你的问题和想法</p>
+  </div>
+  <div class="brand-footer">天机智投 · 内部培训</div>
+  <div class="brand-footer-left">POTENTIAL KNOWS NO BOUNDS</div>
+</div>
+
+<div style="height:60px;"></div>
+</html>

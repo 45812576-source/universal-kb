@@ -107,7 +107,7 @@ async def mcp_endpoint(
             db.add(conv)
             db.flush()
 
-            response = await skill_engine.execute(db, conv, user_message, user_id=token.user_id)
+            response, _ = await skill_engine.execute(db, conv, user_message, user_id=token.user_id)
             db.rollback()
 
             return {

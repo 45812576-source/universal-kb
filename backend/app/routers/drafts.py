@@ -207,6 +207,13 @@ def convert_draft(
     formal_id = None
 
     if draft.object_type == DetectedObjectType.KNOWLEDGE:
+        # 判断确认程度决定 capture_mode
+        pending_qs = draft.pending_questions or []
+        if draft.status == DraftStatus.CONFIRMED or not pending_qs:
+            capture_mode = "chat_delegate_confirmed"
+        else:
+            capture_mode = "chat_delegate_partial"
+
         entry = KnowledgeEntry(
             title=draft.title or fields.get("title", "未命名"),
             content=fields.get("content_summary", draft.summary or ""),
@@ -219,18 +226,28 @@ def convert_draft(
             source_type="ai_draft",
             source_draft_id=draft.id,
             raw_input_id=draft.source_raw_input_id,
-            capture_mode="chat_delegate",
+            capture_mode=capture_mode,
         )
+
+        # 从 draft.fields_json 读取已有分类结果（由 input_processor 写入）
+        cls_data = (draft.fields_json or {}).get("_taxonomy_classification")
+        if cls_data:
+            entry.taxonomy_code = cls_data.get("taxonomy_code")
+            entry.taxonomy_board = cls_data.get("taxonomy_board")
+            entry.taxonomy_path = cls_data.get("taxonomy_path")
+            entry.storage_layer = cls_data.get("storage_layer")
+            entry.target_kb_ids = cls_data.get("target_kb_ids")
+            entry.serving_skill_codes = cls_data.get("serving_skill_codes")
+            entry.ai_classification_note = cls_data.get("reasoning")
+            entry.classification_confidence = cls_data.get("confidence")
+
         db.add(entry)
         db.flush()
         formal_id = entry.id
 
-        # 尝试写入向量库（失败不阻塞）
-        try:
-            from app.services.knowledge_service import approve_knowledge
-            # 知识条目仍需审核流程，不直接 approve
-        except Exception:
-            pass
+        # 通过策略引擎决定是否自动通过
+        from app.services.knowledge_service import submit_knowledge
+        submit_knowledge(db, entry)
 
     elif draft.object_type == DetectedObjectType.OPPORTUNITY:
         opp = Opportunity(

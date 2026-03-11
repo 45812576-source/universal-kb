@@ -1,0 +1,46 @@
+# --- 依赖与包管理器 (Token 杀手，必删) ---
+node_modules/
+bower_components/
+vendor/
+.pnp*
+.yarn/
+
+# --- 各种 Lock 文件 (几十万行文本就在这里，强制忽略) ---
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+Cargo.lock
+Gemfile.lock
+composer.lock
+go.sum
+mix.lock
+poetry.lock
+
+# --- 构建产物与缓存 ---
+dist/
+build/
+out/
+target/
+.next/
+.nuxt/
+.cache/
+*.pyc
+__pycache__/
+.terraform/
+bin/
+obj/
+
+# --- 日志与临时文件 ---
+*.log
+logs/
+tmp/
+temp/
+.DS_Store
+Thumbs.db
+
+# --- 隐藏的 IDE 配置 ---
+.vscode/
+.idea/
+.project
+.settings/
+.classpath

@@ -152,6 +152,24 @@ async def test_tool(
 
 # --- Skill <-> Tool binding ---
 
+@router.get("/tool-bindings/{tool_id}")
+def get_tool_skill_bindings(
+    tool_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Return all skills bound to a given tool."""
+    from app.models.skill import Skill
+    rows = (
+        db.query(Skill)
+        .join(SkillTool, SkillTool.skill_id == Skill.id)
+        .filter(SkillTool.tool_id == tool_id)
+        .all()
+    )
+    return [{"id": s.id, "name": s.name} for s in rows]
+
+
+
 @router.get("/skill/{skill_id}/tools")
 def get_skill_tools(
     skill_id: int,

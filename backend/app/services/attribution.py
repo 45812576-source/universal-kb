@@ -102,7 +102,7 @@ class AttributionService:
         )
 
         try:
-            result = await llm_gateway.chat(
+            result, _ = await llm_gateway.chat(
                 model_config=model_config,
                 messages=[
                     {"role": "system", "content": system},

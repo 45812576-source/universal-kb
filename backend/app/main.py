@@ -5,7 +5,7 @@ app = FastAPI(title="Universal KB API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://localhost:5023"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,6 +48,9 @@ from app.routers import web_apps, workspaces  # noqa: E402
 from app.routers import skill_market  # noqa: E402
 from app.routers import mcp_server, mcp_tokens  # noqa: E402
 from app.routers import drafts  # noqa: E402
+from app.routers import tasks  # noqa: E402
+from app.routers import projects  # noqa: E402
+from app.routers import asr  # noqa: E402
 app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(skills.router)
@@ -68,3 +71,6 @@ app.include_router(skill_market.router)
 app.include_router(mcp_server.router)
 app.include_router(mcp_tokens.router)
 app.include_router(drafts.router)
+app.include_router(tasks.router)
+app.include_router(projects.router)
+app.include_router(asr.router)

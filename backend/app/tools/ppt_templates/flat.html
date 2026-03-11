@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>天机智投 · 竞标比稿模板（平面简洁风）</title>
+<style>
+:root {
+  --starry-blue: #040B59;
+  --mystic-purple: #7153EE;
+  --tech-cyan: #48CCE7;
+  --premium-black: #000000;
+  --warm-yellow: #FFC043;
+  --purple-10: #f0ecfd;
+  --purple-20: #ddd4fb;
+  --blue-10: #ecedf5;
+  --cyan-10: #e4f7fb;
+  --yellow-10: #fff8e6;
+  --gray-50: #f7f8fa;
+  --gray-100: #eef0f4;
+  --gray-200: #d8dce6;
+  --gray-400: #9aa0b4;
+  --gray-600: #5a6178;
+  --text-primary: #1a1d2e;
+  --text-secondary: #5a6178;
+}
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&display=swap');
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:'Noto Sans SC',sans-serif; background:#e2e4ea; color:var(--text-primary); }
+.slide-label {
+  text-align:center; font-size:13px; color:#888;
+  margin:30px auto 6px; font-family:Helvetica,sans-serif;
+}
+/* ===== 幻灯片通用 ===== */
+.slide {
+  width:960px; height:540px; margin:8px auto;
+  position:relative; overflow:hidden;
+  box-shadow:0 4px 20px rgba(4,11,89,0.1);
+  background:#fff;
+}
+/* 品牌侧边条 */
+.brand-bar-left {
+  position:absolute; top:0; left:0; width:4px; height:100%;
+  background:linear-gradient(180deg, var(--starry-blue) 0%, var(--mystic-purple) 100%);
+}
+/* 页脚 */
+.slide-footer {
+  position:absolute; bottom:0; left:0; right:0; height:32px;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:0 28px; font-size:10px; color:var(--gray-400);
+  font-family:Helvetica,sans-serif; border-top:1px solid var(--gray-100);
+}
+/* 标签 */
+.tag {
+  display:inline-block; padding:3px 10px; border-radius:3px;
+  font-size:11px; font-weight:500;
+}
+.tag-purple { background:var(--purple-10); color:var(--mystic-purple); }
+.tag-cyan { background:var(--cyan-10); color:#2ba5bd; }
+.tag-yellow { background:var(--yellow-10); color:#b8860b; }
+/* 扁平卡片 */
+.flat-card {
+  background:var(--gray-50); border:1px solid var(--gray-100);
+  border-radius:6px; padding:20px;
+}
+.flat-card-accent {
+  background:var(--purple-10); border:1px solid var(--purple-20);
+  border-radius:6px; padding:20px;
+}
+/* 数据指标 */
+.metric-card {
+  text-align:center; padding:20px 12px;
+  background:var(--gray-50); border-radius:6px;
+}
+.metric-card .num {
+  font-size:32px; font-weight:700; font-family:Helvetica,sans-serif;
+  color:var(--mystic-purple); line-height:1.1;
+}
+.metric-card .label {
+  font-size:12px; color:var(--gray-600); margin-top:6px;
+}
+.metric-card .trend {
+  font-size:11px; margin-top:4px; font-family:Helvetica;
+}
+.trend-up { color:#22c55e; }
+.trend-down { color:#ef4444; }
+/* 进度条 */
+.bar-track { height:8px; background:var(--gray-100); border-radius:4px; overflow:hidden; }
+.bar-fill { height:100%; border-radius:4px; }
+/* 表格 */
+.data-table { width:100%; border-collapse:collapse; font-size:12px; }
+.data-table th {
+  background:var(--starry-blue); color:#fff; padding:8px 12px;
+  text-align:left; font-weight:500;
+}
+.data-table td { padding:8px 12px; border-bottom:1px solid var(--gray-100); }
+.data-table tr:nth-child(even) td { background:var(--gray-50); }
+/* 辅助图形装饰 */
+.deco-constellation {
+  position:absolute; opacity:0.06;
+}
+</style>
+</head>
+<body>
+
+<!-- ========== SLIDE 1: 封面 ========== -->
+<div class="slide-label">Slide 1 · 封面 Cover</div>
+<div class="slide" style="background:var(--starry-blue);display:flex;align-items:center;">
+  <!-- 星座辅助图形 -->
+  <svg class="deco-constellation" style="right:40px;top:30px;opacity:0.1;" width="200" height="160" viewBox="0 0 200 160">
+    <circle cx="30" cy="50" r="3" fill="#fff"/><circle cx="90" cy="20" r="4" fill="#FFC043"/>
+    <circle cx="160" cy="60" r="3" fill="#fff"/><circle cx="130" cy="120" r="3" fill="#48CCE7"/>
+    <circle cx="60" cy="110" r="2.5" fill="#fff"/>
+    <line x1="30" y1="50" x2="90" y2="20" stroke="#fff" stroke-width="0.8"/>
+    <line x1="90" y1="20" x2="160" y2="60" stroke="#fff" stroke-width="0.8"/>
+    <line x1="160" y1="60" x2="130" y2="120" stroke="#48CCE7" stroke-width="0.8"/>
+    <line x1="130" y1="120" x2="60" y2="110" stroke="#48CCE7" stroke-width="0.8"/>
+    <line x1="60" y1="110" x2="30" y2="50" stroke="#fff" stroke-width="0.8"/>
+  </svg>
+  <div style="padding:0 80px;position:relative;z-index:2;">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:24px;">
+      <div style="width:28px;height:3px;background:var(--warm-yellow);"></div>
+      <span style="font-size:12px;color:var(--warm-yellow);letter-spacing:3px;font-family:Helvetica;">BRAND PROPOSAL</span>
+    </div>
+    <h1 style="font-size:38px;color:#fff;font-weight:700;line-height:1.3;margin-bottom:12px;">
+      [客户品牌名称]<br>代运营服务竞标方案
+    </h1>
+    <p style="font-size:14px;color:rgba(255,255,255,0.6);font-weight:300;margin-bottom:32px;">
+      天机智投数据科技有限公司 · 2025年X月
+    </p>
+    <div style="display:flex;gap:8px;">
+      <span class="tag" style="background:rgba(113,83,238,0.3);color:#ddd;">全域引流</span>
+      <span class="tag" style="background:rgba(72,204,231,0.3);color:#ddd;">效果广告</span>
+      <span class="tag" style="background:rgba(255,192,67,0.3);color:#ddd;">数据驱动</span>
+    </div>
+  </div>
+  <div style="position:absolute;bottom:20px;right:28px;font-size:10px;color:rgba(255,255,255,0.3);font-family:Helvetica;letter-spacing:1px;">POTENTIAL KNOWS NO BOUNDS</div>
+</div>
+
+<!-- ========== SLIDE 2: 目录 ========== -->
+<div class="slide-label">Slide 2 · 目录 Contents</div>
+<div class="slide" style="display:flex;">
+  <div class="brand-bar-left"></div>
+  <div style="width:280px;background:var(--starry-blue);padding:48px 32px;display:flex;flex-direction:column;justify-content:center;">
+    <div style="font-size:11px;color:var(--warm-yellow);letter-spacing:3px;font-family:Helvetica;margin-bottom:8px;">CONTENTS</div>
+    <h2 style="font-size:28px;color:#fff;font-weight:700;">方案目录</h2>
+  </div>
+  <div style="flex:1;padding:48px 40px;display:flex;flex-direction:column;justify-content:center;gap:16px;">
+    <div style="display:flex;align-items:center;gap:16px;padding:12px 16px;border-left:3px solid var(--mystic-purple);">
+      <span style="font-size:24px;font-weight:700;color:var(--mystic-purple);font-family:Helvetica;width:32px;">01</span>
+      <div><strong>公司介绍</strong><br><span style="font-size:12px;color:var(--gray-600);">关于天机智投</span></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:16px;padding:12px 16px;border-left:3px solid var(--tech-cyan);">
+      <span style="font-size:24px;font-weight:700;color:var(--tech-cyan);font-family:Helvetica;width:32px;">02</span>
+      <div><strong>市场分析</strong><br><span style="font-size:12px;color:var(--gray-600);">行业洞察与竞品分析</span></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:16px;padding:12px 16px;border-left:3px solid var(--warm-yellow);">
+      <span style="font-size:24px;font-weight:700;color:var(--warm-yellow);font-family:Helvetica;width:32px;">03</span>
+      <div><strong>投放策略</strong><br><span style="font-size:12px;color:var(--gray-600);">全域引流方案设计</span></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:16px;padding:12px 16px;border-left:3px solid var(--mystic-purple);">
+      <span style="font-size:24px;font-weight:700;color:var(--mystic-purple);font-family:Helvetica;width:32px;">04</span>
+      <div><strong>成功案例</strong><br><span style="font-size:12px;color:var(--gray-600);">同类客户投放实绩</span></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:16px;padding:12px 16px;border-left:3px solid var(--tech-cyan);">
+      <span style="font-size:24px;font-weight:700;color:var(--tech-cyan);font-family:Helvetica;width:32px;">05</span>
+      <div><strong>报价与合作</strong><br><span style="font-size:12px;color:var(--gray-600);">服务方案与费用</span></div>
+    </div>
+  </div>
+  <div class="slide-footer"><span>天机智投 · 竞标方案</span><span>02</span></div>
+</div>
+
+<!-- ========== SLIDE 3: 公司介绍 ========== -->
+<div class="slide-label">Slide 3 · 公司介绍 About Us</div>
+<div class="slide" style="padding:44px 48px 40px;">
+  <div class="brand-bar-left"></div>
+  <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:24px;">
+    <span class="tag tag-purple">01</span>
+    <h2 style="font-size:24px;font-weight:700;">关于天机智投</h2>
+  </div>
+  <div style="display:flex;gap:24px;">
+    <div style="flex:1;">
+      <p style="font-size:13px;line-height:1.9;color:var(--text-secondary);margin-bottom:20px;">
+        天机智投成立于2022年，是一家以全域引流电商技术SaaS系统及运营服务为入口，围绕核心客户群体需求提供小程序商城搭建、素材洞察、媒介代理开户、品牌/效果广告代运营、供应链等增值服务的综合营销服务商。
+      </p>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+        <div class="metric-card">
+          <div class="num">800+</div>
+          <div class="label">累计服务客户</div>
+        </div>
+        <div class="metric-card">
+          <div class="num">¥5亿+</div>
+          <div class="label">年度管理预算</div>
+        </div>
+        <div class="metric-card">
+          <div class="num">15+</div>
+          <div class="label">行业类目覆盖</div>
+        </div>
+        <div class="metric-card">
+          <div class="num">Top 3</div>
+          <div class="label">阿里云台代理排名</div>
+        </div>
+      </div>
+    </div>
+    <div style="width:320px;">
+      <div class="flat-card" style="height:100%;display:flex;flex-direction:column;gap:12px;">
+        <div style="font-size:13px;font-weight:500;color:var(--mystic-purple);margin-bottom:4px;">核心优势</div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:12px;">
+          <div style="width:6px;height:6px;background:var(--mystic-purple);border-radius:50%;flex-shrink:0;"></div>
+          阿里大健康云台官方代理资质
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:12px;">
+          <div style="width:6px;height:6px;background:var(--tech-cyan);border-radius:50%;flex-shrink:0;"></div>
+          全域引流电商技术SaaS系统
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:12px;">
+          <div style="width:6px;height:6px;background:var(--warm-yellow);border-radius:50%;flex-shrink:0;"></div>
+          大健康、美妆护肤行业深耕
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:12px;">
+          <div style="width:6px;height:6px;background:var(--mystic-purple);border-radius:50%;flex-shrink:0;"></div>
+          素材洞察 + 数据驱动优化
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:12px;">
+          <div style="width:6px;height:6px;background:var(--tech-cyan);border-radius:50%;flex-shrink:0;"></div>
+          品效合一全链路服务能力
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-footer"><span>天机智投 · 竞标方案</span><span>03</span></div>
+</div>
+
+<!-- ========== SLIDE 4: 市场分析 ========== -->
+<div class="slide-label">Slide 4 · 市场分析 Market Analysis</div>
+<div class="slide" style="padding:44px 48px 40px;">
+  <div class="brand-bar-left"></div>
+  <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:20px;">
+    <span class="tag tag-cyan">02</span>
+    <h2 style="font-size:24px;font-weight:700;">行业市场洞察</h2>
+  </div>
+  <div style="display:flex;gap:20px;">
+    <div style="flex:1;">
+      <div class="flat-card" style="margin-bottom:16px;">
+        <div style="font-size:13px;font-weight:500;margin-bottom:12px;">行业规模与增长趋势</div>
+        <div style="display:flex;gap:16px;margin-bottom:16px;">
+          <div class="metric-card" style="flex:1;">
+            <div class="num">¥XX亿</div>
+            <div class="label">2024年市场规模</div>
+            <div class="trend trend-up">↑ YoY +XX%</div>
+          </div>
+          <div class="metric-card" style="flex:1;">
+            <div class="num">¥XX亿</div>
+            <div class="label">2025年预估规模</div>
+            <div class="trend trend-up">↑ YoY +XX%</div>
+          </div>
+        </div>
+        <!-- 简易柱状图 -->
+        <div style="display:flex;align-items:flex-end;gap:12px;height:80px;padding:0 8px;">
+          <div style="flex:1;text-align:center;">
+            <div style="background:var(--gray-200);height:40px;border-radius:3px 3px 0 0;"></div>
+            <div style="font-size:10px;color:var(--gray-400);margin-top:4px;">2022</div>
+          </div>
+          <div style="flex:1;text-align:center;">
+            <div style="background:var(--purple-20);height:52px;border-radius:3px 3px 0 0;"></div>
+            <div style="font-size:10px;color:var(--gray-400);margin-top:4px;">2023</div>
+          </div>
+          <div style="flex:1;text-align:center;">
+            <div style="background:var(--mystic-purple);height:64px;border-radius:3px 3px 0 0;"></div>
+            <div style="font-size:10px;color:var(--gray-400);margin-top:4px;">2024</div>
+          </div>
+          <div style="flex:1;text-align:center;">
+            <div style="background:var(--tech-cyan);height:76px;border-radius:3px 3px 0 0;"></div>
+            <div style="font-size:10px;color:var(--gray-400);margin-top:4px;">2025E</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div style="width:340px;">
+      <div class="flat-card-accent" style="margin-bottom:12px;">
+        <div style="font-size:13px;font-weight:500;color:var(--mystic-purple);margin-bottom:8px;">核心洞察</div>
+        <ul style="font-size:12px;line-height:2;color:var(--text-secondary);padding-left:16px;">
+          <li>[行业趋势洞察1：如消费者行为变化]</li>
+          <li>[行业趋势洞察2：如渠道格局变化]</li>
+          <li>[行业趋势洞察3：如内容形式演变]</li>
+        </ul>
+      </div>
+      <div class="flat-card">
+        <div style="font-size:13px;font-weight:500;margin-bottom:8px;">目标人群画像</div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;">
+          <span class="tag tag-purple">[年龄段]</span>
+          <span class="tag tag-cyan">[性别偏好]</span>
+          <span class="tag tag-yellow">[消费力]</span>
+          <span class="tag tag-purple">[触媒习惯]</span>
+          <span class="tag tag-cyan">[兴趣标签]</span>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-footer"><span>天机智投 · 竞标方案</span><span>04</span></div>
+</div>
+
+<!-- ========== SLIDE 5: 竞品分析 ========== -->
+<div class="slide-label">Slide 5 · 竞品分析 Competitive Landscape</div>
+<div class="slide" style="padding:44px 48px 40px;">
+  <div class="brand-bar-left"></div>
+  <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:20px;">
+    <span class="tag tag-cyan">02</span>
+    <h2 style="font-size:24px;font-weight:700;">竞品投放策略分析</h2>
+  </div>
+  <table class="data-table" style="margin-bottom:16px;">
+    <thead>
+      <tr>
+        <th style="width:14%;">竞品品牌</th>
+        <th style="width:18%;">主投渠道</th>
+        <th style="width:18%;">内容策略</th>
+        <th style="width:14%;">月均投放</th>
+        <th style="width:18%;">核心卖点</th>
+        <th style="width:18%;">薄弱点</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td style="font-weight:500;">[竞品A]</td>
+        <td>抖音、小红书</td>
+        <td>达人种草为主</td>
+        <td>¥XXX万</td>
+        <td>[核心卖点]</td>
+        <td style="color:var(--mystic-purple);font-weight:500;">[机会点]</td>
+      </tr>
+      <tr>
+        <td style="font-weight:500;">[竞品B]</td>
+        <td>小红书、微信</td>
+        <td>品牌广告+种草</td>
+        <td>¥XXX万</td>
+        <td>[核心卖点]</td>
+        <td style="color:var(--mystic-purple);font-weight:500;">[机会点]</td>
+      </tr>
+      <tr>
+        <td style="font-weight:500;">[竞品C]</td>
+        <td>抖音信息流</td>
+        <td>效果广告为主</td>
+        <td>¥XXX万</td>
+        <td>[核心卖点]</td>
+        <td style="color:var(--mystic-purple);font-weight:500;">[机会点]</td>
+      </tr>
+    </tbody>
+  </table>
+  <div style="display:flex;gap:16px;">
+    <div class="flat-card-accent" style="flex:1;">
+      <div style="font-size:13px;font-weight:500;color:var(--mystic-purple);margin-bottom:6px;">我们的差异化机会</div>
+      <p style="font-size:12px;line-height:1.8;color:var(--text-secondary);">
+        [基于竞品分析得出的差异化策略方向，如：竞品集中在XX渠道，我们建议主攻XX渠道，预计成本降低XX%]
+      </p>
+    </div>
+    <div class="flat-card" style="flex:1;">
+      <div style="font-size:13px;font-weight:500;margin-bottom:6px;">数据来源</div>
+      <p style="font-size:11px;line-height:1.8;color:var(--gray-400);">
+        蝉妈妈 / 新榜 / AppGrowing 等第三方平台<br>
+        数据周期：近3个月（20XX.XX - 20XX.XX）
+      </p>
+    </div>
+  </div>
+  <div class="slide-footer"><span>天机智投 · 竞标方案</span><span>05</span></div>
+</div>
+
+<!-- ========== SLIDE 6: 投放策略 ========== -->
+<div class="slide-label">Slide 6 · 投放策略 Strategy</div>
+<div class="slide" style="padding:44px 48px 40px;">
+  <div class="brand-bar-left"></div>
+  <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:20px;">
+    <span class="tag tag-yellow">03</span>
+    <h2 style="font-size:24px;font-weight:700;">全域引流投放策略</h2>
+  </div>
+  <div style="display:flex;gap:20px;">
+    <!-- 左侧：策略框架 -->
+    <div style="flex:1;">
+      <div style="display:flex;gap:12px;margin-bottom:16px;">
+        <div class="flat-card" style="flex:1;text-align:center;border-top:3px solid var(--mystic-purple);">
+          <div style="font-size:20px;margin-bottom:4px;">👥</div>
+          <div style="font-size:13px;font-weight:700;margin-bottom:4px;">人群策略</div>
+          <div style="font-size:11px;color:var(--text-secondary);line-height:1.6;">[核心人群定义]<br>[拓展人群方向]</div>
+        </div>
+        <div class="flat-card" style="flex:1;text-align:center;border-top:3px solid var(--tech-cyan);">
+          <div style="font-size:20px;margin-bottom:4px;">📱</div>
+          <div style="font-size:13px;font-weight:700;margin-bottom:4px;">渠道策略</div>
+          <div style="font-size:11px;color:var(--text-secondary);line-height:1.6;">[主投渠道]<br>[辅助渠道]</div>
+        </div>
+        <div class="flat-card" style="flex:1;text-align:center;border-top:3px solid var(--warm-yellow);">
+          <div style="font-size:20px;margin-bottom:4px;">🎬</div>
+          <div style="font-size:13px;font-weight:700;margin-bottom:4px;">内容策略</div>
+          <div style="font-size:11px;color:var(--text-secondary);line-height:1.6;">[内容形式]<br>[创意方向]</div>
+        </div>
+      </div>
+      <!-- 预算分配 -->
+      <div class="flat-card">
+        <div style="font-size:13px;font-weight:500;margin-bottom:12px;">预算分配建议</div>
+        <div style="margin-bottom:8px;">
+          <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px;">
+            <span>[渠道A]</span><span style="font-weight:700;color:var(--mystic-purple);">40%</span>
+          </div>
+          <div class="bar-track"><div class="bar-fill" style="width:40%;background:var(--mystic-purple);"></div></div>
+        </div>
+        <div style="margin-bottom:8px;">
+          <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px;">
+            <span>[渠道B]</span><span style="font-weight:700;color:var(--tech-cyan);">30%</span>
+          </div>
+          <div class="bar-track"><div class="bar-fill" style="width:30%;background:var(--tech-cyan);"></div></div>
+        </div>
+        <div>
+          <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px;">
+            <span>[渠道C]</span><span style="font-weight:700;color:var(--warm-yellow);">30%</span>
+          </div>
+          <div class="bar-track"><div class="bar-fill" style="width:30%;background:var(--warm-yellow);"></div></div>
+        </div>
+      </div>
+    </div>
+    <!-- 右侧：执行节奏 -->
+    <div style="width:300px;">
+      <div class="flat-card-accent" style="height:100%;">
+        <div style="font-size:13px;font-weight:500;color:var(--mystic-purple);margin-bottom:12px;">执行节奏规划</div>
+        <div style="position:relative;padding-left:20px;">
+          <div style="position:absolute;left:6px;top:8px;bottom:8px;width:2px;background:var(--purple-20);"></div>
+          <div style="margin-bottom:16px;position:relative;">
+            <div style="position:absolute;left:-17px;top:4px;width:8px;height:8px;border-radius:50%;background:var(--mystic-purple);"></div>
+            <div style="font-size:12px;font-weight:700;">第1个月 · 测试期</div>
+            <div style="font-size:11px;color:var(--text-secondary);line-height:1.6;">[测试策略说明]</div>
+          </div>
+          <div style="margin-bottom:16px;position:relative;">
+            <div style="position:absolute;left:-17px;top:4px;width:8px;height:8px;border-radius:50%;background:var(--tech-cyan);"></div>
+            <div style="font-size:12px;font-weight:700;">第2-3个月 · 放量期</div>
+            <div style="font-size:11px;color:var(--text-secondary);line-height:1.6;">[放量策略说明]</div>
+          </div>
+          <div style="position:relative;">
+            <div style="position:absolute;left:-17px;top:4px;width:8px;height:8px;border-radius:50%;background:var(--warm-yellow);"></div>
+            <div style="font-size:12px;font-weight:700;">第4-6个月 · 稳定期</div>
+            <div style="font-size:11px;color:var(--text-secondary);line-height:1.6;">[优化策略说明]</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-footer"><span>天机智投 · 竞标方案</span><span>06</span></div>
+</div>
+
+<!-- ========== SLIDE 7: 成功案例 ========== -->
+<div class="slide-label">Slide 7 · 成功案例 Case Study</div>
+<div class="slide" style="padding:44px 48px 40px;">
+  <div class="brand-bar-left"></div>
+  <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:20px;">
+    <span class="tag tag-purple">04</span>
+    <h2 style="font-size:24px;font-weight:700;">同类客户投放实绩</h2>
+  </div>
+  <div style="display:flex;gap:20px;">
+    <!-- 案例卡片1 -->
+    <div class="flat-card" style="flex:1;border-top:3px solid var(--mystic-purple);">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <span style="font-size:14px;font-weight:700;">[客户A品牌名]</span>
+        <span class="tag tag-purple">[行业]</span>
+      </div>
+      <div style="font-size:11px;color:var(--text-secondary);line-height:1.6;margin-bottom:16px;">
+        [一句话描述项目背景和挑战]
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;">
+        <div class="metric-card" style="padding:12px 8px;">
+          <div class="num" style="font-size:24px;">XX%</div>
+          <div class="label">ROI提升</div>
+        </div>
+        <div class="metric-card" style="padding:12px 8px;">
+          <div class="num" style="font-size:24px;">-XX%</div>
+          <div class="label">CPA降低</div>
+        </div>
+      </div>
+      <div style="font-size:11px;color:var(--mystic-purple);font-weight:500;">
+        核心策略：[一句话总结]
+      </div>
+    </div>
+    <!-- 案例卡片2 -->
+    <div class="flat-card" style="flex:1;border-top:3px solid var(--tech-cyan);">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <span style="font-size:14px;font-weight:700;">[客户B品牌名]</span>
+        <span class="tag tag-cyan">[行业]</span>
+      </div>
+      <div style="font-size:11px;color:var(--text-secondary);line-height:1.6;margin-bottom:16px;">
+        [一句话描述项目背景和挑战]
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;">
+        <div class="metric-card" style="padding:12px 8px;">
+          <div class="num" style="font-size:24px;">XX倍</div>
+          <div class="label">GMV增长</div>
+        </div>
+        <div class="metric-card" style="padding:12px 8px;">
+          <div class="num" style="font-size:24px;">XX万+</div>
+          <div class="label">新客获取</div>
+        </div>
+      </div>
+      <div style="font-size:11px;color:#2ba5bd;font-weight:500;">
+        核心策略：[一句话总结]
+      </div>
+    </div>
+    <!-- 案例卡片3 -->
+    <div class="flat-card" style="flex:1;border-top:3px solid var(--warm-yellow);">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <span style="font-size:14px;font-weight:700;">[客户C品牌名]</span>
+        <span class="tag tag-yellow">[行业]</span>
+      </div>
+      <div style="font-size:11px;color:var(--text-secondary);line-height:1.6;margin-bottom:16px;">
+        [一句话描述项目背景和挑战]
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;">
+        <div class="metric-card" style="padding:12px 8px;">
+          <div class="num" style="font-size:24px;">¥XX万</div>
+          <div class="label">月均消耗</div>
+        </div>
+        <div class="metric-card" style="padding:12px 8px;">
+          <div class="num" style="font-size:24px;">X.X</div>
+          <div class="label">平均ROI</div>
+        </div>
+      </div>
+      <div style="font-size:11px;color:#b8860b;font-weight:500;">
+        核心策略：[一句话总结]
+      </div>
+    </div>
+  </div>
+  <div class="slide-footer"><span>天机智投 · 竞标方案</span><span>07</span></div>
+</div>
+
+<!-- ========== SLIDE 8: 案例详情 ========== -->
+<div class="slide-label">Slide 8 · 案例详情 Case Detail</div>
+<div class="slide" style="padding:44px 48px 40px;">
+  <div class="brand-bar-left"></div>
+  <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:20px;">
+    <span class="tag tag-purple">04</span>
+    <h2 style="font-size:24px;font-weight:700;">[客户A品牌名] · 投放效果详情</h2>
+  </div>
+  <div style="display:flex;gap:20px;">
+    <div style="flex:1;">
+      <!-- 投放前后对比 -->
+      <div style="display:flex;gap:12px;margin-bottom:16px;">
+        <div class="flat-card" style="flex:1;text-align:center;">
+          <div style="font-size:11px;color:var(--gray-400);margin-bottom:8px;">投放前</div>
+          <div style="font-size:11px;margin-bottom:6px;">月均GMV</div>
+          <div style="font-size:22px;font-weight:700;color:var(--gray-400);font-family:Helvetica;">¥XX万</div>
+        </div>
+        <div style="display:flex;align-items:center;font-size:20px;color:var(--mystic-purple);">→</div>
+        <div class="flat-card-accent" style="flex:1;text-align:center;">
+          <div style="font-size:11px;color:var(--mystic-purple);margin-bottom:8px;">投放后</div>
+          <div style="font-size:11px;margin-bottom:6px;">月均GMV</div>
+          <div style="font-size:22px;font-weight:700;color:var(--mystic-purple);font-family:Helvetica;">¥XX万</div>
+        </div>
+      </div>
+      <!-- 关键指标趋势 -->
+      <div class="flat-card">
+        <div style="font-size:13px;font-weight:500;margin-bottom:12px;">关键指标月度趋势</div>
+        <table class="data-table">
+          <thead>
+            <tr><th>月份</th><th>消耗</th><th>GMV</th><th>ROI</th><th>CPA</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>第1月</td><td>¥XX万</td><td>¥XX万</td><td>X.X</td><td>¥XX</td></tr>
+            <tr><td>第2月</td><td>¥XX万</td><td>¥XX万</td><td>X.X</td><td>¥XX</td></tr>
+            <tr><td>第3月</td><td>¥XX万</td><td>¥XX万</td><td>X.X</td><td>¥XX</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div style="width:300px;">
+      <div class="flat-card" style="margin-bottom:12px;">
+        <div style="font-size:13px;font-weight:500;margin-bottom:8px;">执行策略复盘</div>
+        <div style="font-size:12px;line-height:1.8;color:var(--text-secondary);">
+          <strong>第1阶段：</strong>[测试期策略]<br>
+          <strong>第2阶段：</strong>[放量期策略]<br>
+          <strong>第3阶段：</strong>[优化期策略]
+        </div>
+      </div>
+      <div class="flat-card-accent">
+        <div style="font-size:13px;font-weight:500;color:var(--mystic-purple);margin-bottom:6px;">客户评价</div>
+        <p style="font-size:12px;line-height:1.8;color:var(--text-secondary);font-style:italic;">
+          "[客户对合作效果的评价原话]"
+        </p>
+        <div style="font-size:11px;color:var(--gray-400);margin-top:6px;text-align:right;">
+          — [客户姓名]，[职位]
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-footer"><span>天机智投 · 竞标方案</span><span>08</span></div>
+</div>
+
+<!-- ========== SLIDE 9: 数据看板 ========== -->
+<div class="slide-label">Slide 9 · 数据看板 Dashboard</div>
+<div class="slide" style="padding:44px 48px 40px;">
+  <div class="brand-bar-left"></div>
+  <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:20px;">
+    <span class="tag tag-purple">04</span>
+    <h2 style="font-size:24px;font-weight:700;">数据驱动 · 实时效果追踪</h2>
+  </div>
+  <div style="display:flex;gap:16px;margin-bottom:16px;">
+    <div class="metric-card" style="flex:1;border-top:3px solid var(--mystic-purple);">
+      <div class="num">XX%</div>
+      <div class="label">平均ROI提升</div>
+      <div class="trend trend-up">↑ vs 行业均值</div>
+    </div>
+    <div class="metric-card" style="flex:1;border-top:3px solid var(--tech-cyan);">
+      <div class="num">-XX%</div>
+      <div class="label">CPA优化幅度</div>
+      <div class="trend trend-up">↓ 持续优化</div>
+    </div>
+    <div class="metric-card" style="flex:1;border-top:3px solid var(--warm-yellow);">
+      <div class="num">XX%</div>
+      <div class="label">素材迭代效率</div>
+      <div class="trend trend-up">↑ AI辅助</div>
+    </div>
+    <div class="metric-card" style="flex:1;border-top:3px solid var(--mystic-purple);">
+      <div class="num">7×24</div>
+      <div class="label">数据监控</div>
+      <div class="trend" style="color:var(--mystic-purple);">实时预警</div>
+    </div>
+  </div>
+  <div style="display:flex;gap:16px;">
+    <div class="flat-card" style="flex:1;">
+      <div style="font-size:13px;font-weight:500;margin-bottom:12px;">天机智投SaaS系统能力</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+        <div style="display:flex;align-items:center;gap:6px;font-size:12px;">
+          <div style="width:6px;height:6px;background:var(--mystic-purple);border-radius:50%;"></div>
+          全域数据实时看板
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;font-size:12px;">
+          <div style="width:6px;height:6px;background:var(--tech-cyan);border-radius:50%;"></div>
+          素材效果智能分析
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;font-size:12px;">
+          <div style="width:6px;height:6px;background:var(--warm-yellow);border-radius:50%;"></div>
+          竞品投放动态监控
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;font-size:12px;">
+          <div style="width:6px;height:6px;background:var(--mystic-purple);border-radius:50%;"></div>
+          异常消耗自动预警
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;font-size:12px;">
+          <div style="width:6px;height:6px;background:var(--tech-cyan);border-radius:50%;"></div>
+          人群资产沉淀分析
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;font-size:12px;">
+          <div style="width:6px;height:6px;background:var(--warm-yellow);border-radius:50%;"></div>
+          ROI归因与优化建议
+        </div>
+      </div>
+    </div>
+    <div class="flat-card-accent" style="width:300px;">
+      <div style="font-size:13px;font-weight:500;color:var(--mystic-purple);margin-bottom:8px;">数据透明承诺</div>
+      <div style="font-size:12px;line-height:1.8;color:var(--text-secondary);">
+        <div style="margin-bottom:6px;">✓ 每日数据日报自动推送</div>
+        <div style="margin-bottom:6px;">✓ 每周策略优化建议报告</div>
+        <div style="margin-bottom:6px;">✓ 每月深度复盘与下月规划</div>
+        <div>✓ 客户可随时登录系统查看实时数据</div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-footer"><span>天机智投 · 竞标方案</span><span>09</span></div>
+</div>
+
+<!-- ========== SLIDE 10: 报价与合作 ========== -->
+<div class="slide-label">Slide 10 · 报价与合作 Pricing</div>
+<div class="slide" style="padding:44px 48px 40px;">
+  <div class="brand-bar-left"></div>
+  <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:20px;">
+    <span class="tag tag-cyan">05</span>
+    <h2 style="font-size:24px;font-weight:700;">服务方案与费用</h2>
+  </div>
+  <div style="display:flex;gap:16px;margin-bottom:20px;">
+    <!-- 方案A -->
+    <div class="flat-card" style="flex:1;border-top:3px solid var(--gray-200);position:relative;">
+      <div style="font-size:14px;font-weight:700;margin-bottom:4px;">基础版</div>
+      <div style="font-size:11px;color:var(--gray-400);margin-bottom:16px;">适合初次尝试效果广告的品牌</div>
+      <div style="font-size:28px;font-weight:700;color:var(--text-primary);font-family:Helvetica;margin-bottom:16px;">
+        ¥XX万<span style="font-size:12px;font-weight:400;color:var(--gray-400);">/月</span>
+      </div>
+      <div style="font-size:12px;line-height:2;color:var(--text-secondary);">
+        ✓ 单渠道投放管理<br>
+        ✓ 基础数据报告（周报）<br>
+        ✓ 素材优化建议<br>
+        ✓ 月度复盘会议
+      </div>
+    </div>
+    <!-- 方案B（推荐） -->
+    <div class="flat-card-accent" style="flex:1;border-top:3px solid var(--mystic-purple);position:relative;">
+      <div style="position:absolute;top:-1px;right:16px;background:var(--mystic-purple);color:#fff;font-size:10px;padding:3px 10px;border-radius:0 0 4px 4px;">推荐</div>
+      <div style="font-size:14px;font-weight:700;margin-bottom:4px;">专业版</div>
+      <div style="font-size:11px;color:var(--gray-400);margin-bottom:16px;">适合追求效果增长的品牌</div>
+      <div style="font-size:28px;font-weight:700;color:var(--mystic-purple);font-family:Helvetica;margin-bottom:16px;">
+        ¥XX万<span style="font-size:12px;font-weight:400;color:var(--gray-400);">/月</span>
+      </div>
+      <div style="font-size:12px;line-height:2;color:var(--text-secondary);">
+        ✓ 全域多渠道投放管理<br>
+        ✓ SaaS数据看板实时查看<br>
+        ✓ 素材策划+制作（XX条/月）<br>
+        ✓ 竞品监控与策略调整<br>
+        ✓ 双周策略优化会议
+      </div>
+    </div>
+    <!-- 方案C -->
+    <div class="flat-card" style="flex:1;border-top:3px solid var(--warm-yellow);position:relative;">
+      <div style="font-size:14px;font-weight:700;margin-bottom:4px;">旗舰版</div>
+      <div style="font-size:11px;color:var(--gray-400);margin-bottom:16px;">适合全面品效合一的品牌</div>
+      <div style="font-size:28px;font-weight:700;color:var(--text-primary);font-family:Helvetica;margin-bottom:16px;">
+        ¥XX万<span style="font-size:12px;font-weight:400;color:var(--gray-400);">/月</span>
+      </div>
+      <div style="font-size:12px;line-height:2;color:var(--text-secondary);">
+        ✓ 专业版全部权益<br>
+        ✓ 品牌广告策划与执行<br>
+        ✓ 达人/KOL资源对接<br>
+        ✓ 专属项目经理1对1<br>
+        ✓ 每周策略优化会议
+      </div>
+    </div>
+  </div>
+  <div style="text-align:center;font-size:11px;color:var(--gray-400);">
+    * 以上为标准报价，具体费用根据投放规模和服务需求定制。首月可享受XX折优惠体验。
+  </div>
+  <div class="slide-footer"><span>天机智投 · 竞标方案</span><span>10</span></div>
+</div>
+
+<!-- ========== SLIDE 11: 结尾页 ========== -->
+<div class="slide-label">Slide 11 · 结尾 Thank You</div>
+<div class="slide" style="background:var(--starry-blue);display:flex;align-items:center;justify-content:center;text-align:center;">
+  <svg class="deco-constellation" style="left:60px;top:40px;opacity:0.08;" width="180" height="140" viewBox="0 0 180 140">
+    <circle cx="20" cy="40" r="2.5" fill="#fff"/><circle cx="80" cy="15" r="3" fill="#FFC043"/>
+    <circle cx="150" cy="50" r="2.5" fill="#fff"/><circle cx="120" cy="110" r="2.5" fill="#48CCE7"/>
+    <circle cx="50" cy="100" r="2" fill="#fff"/>
+    <line x1="20" y1="40" x2="80" y2="15" stroke="#fff" stroke-width="0.6"/>
+    <line x1="80" y1="15" x2="150" y2="50" stroke="#fff" stroke-width="0.6"/>
+    <line x1="150" y1="50" x2="120" y2="110" stroke="#48CCE7" stroke-width="0.6"/>
+    <line x1="120" y1="110" x2="50" y2="100" stroke="#48CCE7" stroke-width="0.6"/>
+  </svg>
+  <svg class="deco-constellation" style="right:80px;bottom:60px;opacity:0.06;" width="120" height="100" viewBox="0 0 120 100">
+    <circle cx="10" cy="30" r="2" fill="#fff"/><circle cx="60" cy="10" r="2.5" fill="#FFC043"/>
+    <circle cx="110" cy="40" r="2" fill="#fff"/><circle cx="80" cy="80" r="2" fill="#48CCE7"/>
+    <line x1="10" y1="30" x2="60" y2="10" stroke="#fff" stroke-width="0.5"/>
+    <line x1="60" y1="10" x2="110" y2="40" stroke="#fff" stroke-width="0.5"/>
+    <line x1="110" y1="40" x2="80" y2="80" stroke="#48CCE7" stroke-width="0.5"/>
+  </svg>
+  <div style="position:relative;z-index:2;">
+    <div style="font-size:11px;color:var(--warm-yellow);letter-spacing:4px;font-family:Helvetica;margin-bottom:16px;">THANK YOU</div>
+    <h1 style="font-size:36px;color:#fff;font-weight:700;margin-bottom:8px;">感谢聆听</h1>
+    <p style="font-size:14px;color:rgba(255,255,255,0.5);font-weight:300;margin-bottom:32px;">无边界 · 无限可能</p>
+    <div style="width:60px;height:2px;background:var(--warm-yellow);margin:0 auto 32px;"></div>
+    <div style="font-size:13px;color:rgba(255,255,255,0.7);line-height:2;">
+      <div>[联系人姓名] · [职位]</div>
+      <div style="font-family:Helvetica;">[手机号码] · [邮箱地址]</div>
+    </div>
+    <div style="margin-top:24px;font-size:11px;color:rgba(255,255,255,0.3);font-family:Helvetica;letter-spacing:1px;">
+      天机智投数据科技有限公司 · POTENTIAL KNOWS NO BOUNDS
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

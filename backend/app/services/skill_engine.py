@@ -1,9 +1,12 @@
 """Skill dispatch engine: intent matching → variable extraction → knowledge injection → LLM call."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -11,6 +14,24 @@ from app.models.conversation import Conversation, Message, MessageRole
 from app.models.knowledge import KnowledgeEntry, KnowledgeStatus
 from app.models.skill import Skill, SkillMode, SkillStatus
 from app.services.llm_gateway import llm_gateway
+from app.services import prompt_compiler
+
+
+@dataclass
+class PrepareResult:
+    """Output of skill_engine.prepare() — everything needed to call LLM."""
+    llm_messages: list[dict]
+    model_config: dict
+    skill_name: str | None = None
+    skill_id: int | None = None
+    skill_version: Any = None
+    workspace: Any = None
+    available_tools: list = field(default_factory=list)
+    # OpenAI-compatible tools schema，当模型支持 function calling 时传入 LLM
+    tools_schema: list[dict] = field(default_factory=list)
+    # 非流式短路结果：如果 prepare 阶段已经产出了最终回复（rule engine / data query / input eval），
+    # 则 early_return 非 None，调用方应直接返回该结果而不调用 LLM。
+    early_return: tuple[str, dict] | None = None
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +59,46 @@ _DEFAULT_SYSTEM = (
 
 class SkillEngine:
 
+    @staticmethod
+    def _build_tools_schema(tools: list) -> list[dict]:
+        """将 ToolRegistry 列表转换为 OpenAI function calling schema 格式。"""
+        result = []
+        for t in tools:
+            result.append({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": (t.description or t.display_name or t.name)[:1024],
+                    "parameters": t.input_schema or {"type": "object", "properties": {}},
+                },
+            })
+        return result
+
+    async def _needs_skill_switch(
+        self,
+        current_skill_name: str,
+        user_message: str,
+    ) -> bool:
+        """快速判断用户是否明确要切换技能，用 lite 模型节省完整 _match_skill 开销。
+        返回 True 表示需要重新匹配，False 表示继续当前技能。
+        """
+        prompt = (
+            f"当前技能：{current_skill_name}\n"
+            f"用户新消息：{user_message}\n\n"
+            "判断用户是否明确要切换到不同任务/技能。是则返回 yes，否则返回 no。只返回一个词。"
+        )
+        try:
+            result, _ = await llm_gateway.chat(
+                model_config=llm_gateway.get_lite_config(),
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=5,
+            )
+            return result.strip().lower().startswith("y")
+        except Exception as e:
+            logger.warning(f"Skill switch check failed: {e}, defaulting to no switch")
+            return False
+
     async def _match_skill(
         self, db: Session, user_message: str, model_config: dict,
         candidate_skills: list[Skill] | None = None,
@@ -60,20 +121,24 @@ class SkillEngine:
         prompt = _SKILL_MATCH_PROMPT.format(
             skill_list=skill_list, user_message=user_message
         )
-        result = await llm_gateway.chat(
-            model_config=model_config,
+        # Always use DeepSeek for intent matching — it follows "return only the name" strictly
+        try:
+            match_config = llm_gateway.get_lite_config()
+        except Exception:
+            match_config = model_config
+        result, _ = await llm_gateway.chat(
+            model_config=match_config,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             max_tokens=50,
         )
-        name = result.strip().strip('"').strip("'")
-        if name.lower() == "none":
+        first_line = result.strip().splitlines()[0].strip().strip('"').strip("'")
+        if first_line.lower() == "none":
             return None
-        # search within candidates first, then globally
         for s in skills:
-            if s.name == name:
+            if s.name == first_line:
                 return s
-        return db.query(Skill).filter(Skill.name == name).first()
+        return db.query(Skill).filter(Skill.name == first_line).first()
 
     async def _extract_variables(
         self,
@@ -87,7 +152,7 @@ class SkillEngine:
             variables=", ".join(variables),
             conversation=conversation_text,
         )
-        result = await llm_gateway.chat(
+        result, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
@@ -98,11 +163,56 @@ class SkillEngine:
         except json.JSONDecodeError:
             return {}
 
-    def _inject_knowledge(self, query: str, skill: Skill | None) -> str:
-        """Retrieve relevant knowledge chunks from Milvus and format as context."""
+    async def _rerank_hits_with_llm(
+        self,
+        query: str,
+        hits: list[dict],
+        top_k: int = 5,
+    ) -> list[dict]:
+        """用 DeepSeek lite 从候选 chunks 中筛选出最相关的 top_k 条。"""
+        if len(hits) <= top_k:
+            return hits
+        snippets = "\n".join(
+            f"[{i}] {h.get('title', '')}：{h['text'][:150]}"
+            for i, h in enumerate(hits)
+        )
+        prompt = (
+            f"用户问题：{query}\n\n候选知识片段：\n{snippets}\n\n"
+            f"请从中选出与用户问题最相关的 {top_k} 条，返回序号（逗号分隔），只返回数字。"
+        )
+        try:
+            result, _ = await llm_gateway.chat(
+                model_config=llm_gateway.get_lite_config(),
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=50,
+            )
+            indices = [int(x.strip()) for x in result.split(",") if x.strip().isdigit()]
+            selected = [hits[i] for i in indices if i < len(hits)]
+            return selected if selected else hits[:top_k]
+        except Exception as e:
+            logger.warning(f"Knowledge rerank failed, using top-{top_k} raw: {e}")
+            return hits[:top_k]
+
+    async def _inject_knowledge(
+        self,
+        query: str,
+        skill: Skill | None,
+        db=None,
+        user_id: int | None = None,
+    ) -> str:
+        """Retrieve relevant knowledge chunks from Milvus and format as context.
+
+        Access control:
+        - 自己创建的 chunk → 原文注入
+        - 已全局审批的 chunk → 原文注入
+        - 他人的且未全局发布 → 脱敏版注入（只传递认知，不暴露具体数据）
+
+        二阶段召回：粗召回 top_20 → LLM 精排 top_5
+        """
         try:
             from app.services.vector_service import search_knowledge
-            hits = search_knowledge(query, top_k=6)
+            hits = search_knowledge(query, top_k=20)
         except Exception as e:
             logger.warning(f"Knowledge search failed: {e}")
             return ""
@@ -110,12 +220,47 @@ class SkillEngine:
         if not hits:
             return ""
 
+        # LLM 二次精排
+        hits = await self._rerank_hits_with_llm(query, hits, top_k=5)
+
+        # 查询哪些 knowledge_id 是已审批的（全局可见）
+        approved_ids: set[int] = set()
+        if db:
+            try:
+                from app.models.knowledge import KnowledgeEntry, KnowledgeStatus
+                approved_entries = (
+                    db.query(KnowledgeEntry.id)
+                    .filter(KnowledgeEntry.status == KnowledgeStatus.APPROVED)
+                    .all()
+                )
+                approved_ids = {row[0] for row in approved_entries}
+            except Exception as e:
+                logger.warning(f"Failed to load approved knowledge ids: {e}")
+
         parts = []
-        seen_ids = set()
+        seen_ids: set[int] = set()
         for h in hits:
-            if h["knowledge_id"] not in seen_ids:
-                seen_ids.add(h["knowledge_id"])
-                parts.append(f"[相关知识 score={h['score']}]\n{h['text']}")
+            kid = h["knowledge_id"]
+            if kid in seen_ids:
+                continue
+            seen_ids.add(kid)
+
+            chunk_owner = h.get("created_by", 0)
+            is_own = user_id and chunk_owner == user_id
+            is_approved = kid in approved_ids
+
+            if is_own or is_approved:
+                # 原文注入
+                parts.append(f"[相关知识]\n{h['text']}")
+            else:
+                # 脱敏版注入：只传递认知，不暴露具体数据
+                desensitized = h.get("desensitized_text", "").strip()
+                if not desensitized:
+                    # 脱敏版缺失时用规则兜底
+                    from app.services.vector_service import _desensitize_rule
+                    desensitized = _desensitize_rule(h["text"])
+                if desensitized:
+                    parts.append(f"[参考认知（已脱敏）]\n{desensitized}")
 
         return "\n\n---\n\n".join(parts)
 
@@ -181,14 +326,20 @@ class SkillEngine:
             affected = exec_result.get("affected_rows", 0)
             return f"操作成功，影响 {affected} 行。\n\n{explanation}"
 
-    async def execute(
+    async def prepare(
         self,
         db: Session,
         conversation: Conversation,
         user_message: str,
         user_id: int | None = None,
-    ) -> str:
-        # Get default model config for intent matching
+        active_skill_ids: list[int] | None = None,
+    ) -> PrepareResult:
+        """Prepare everything needed for LLM call: skill matching, knowledge injection,
+        prompt compilation, and message list assembly.
+
+        If a short-circuit result is produced (rule engine / data query / input eval),
+        it is stored in PrepareResult.early_return and the caller should return it directly.
+        """
         default_config = llm_gateway.get_config(db)
 
         # Load workspace if present
@@ -204,28 +355,50 @@ class SkillEngine:
                         for wsk in workspace.workspace_skills
                         if db.get(Skill, wsk.skill_id) is not None
                     ]
+                    if active_skill_ids is not None:
+                        workspace_skills = [s for s in workspace_skills if s.id in active_skill_ids]
             except Exception as e:
                 logger.warning(f"Workspace load failed: {e}")
 
-        # 1. Match Skill on first message (or if not yet matched)
-        if not conversation.skill_id:
+        # 1. Skill matching
+        skill = None
+        current_skill = db.get(Skill, conversation.skill_id) if conversation.skill_id else None
+
+        if current_skill:
+            switch_candidates = [s for s in (workspace_skills or []) if s.id != current_skill.id]
+            if switch_candidates:
+                try:
+                    # 先用轻量判断：用户是否明确要切换技能
+                    needs_switch = await self._needs_skill_switch(current_skill.name, user_message)
+                    if needs_switch:
+                        switched = await self._match_skill(
+                            db, user_message, default_config,
+                            candidate_skills=switch_candidates,
+                        )
+                        skill = switched if switched else current_skill
+                    else:
+                        skill = current_skill
+                except Exception as e:
+                    logger.warning(f"Skill switch check failed: {e}")
+                    skill = current_skill
+            else:
+                skill = current_skill
+        else:
             try:
                 if workspace and workspace_skills:
-                    # Single skill → use directly; multiple → match within candidates
                     skill = await self._match_skill(
                         db, user_message, default_config,
                         candidate_skills=workspace_skills,
                     )
-                else:
+                if skill is None:
                     skill = await self._match_skill(db, user_message, default_config)
-                if skill:
-                    conversation.skill_id = skill.id
-                    db.flush()
             except Exception as e:
                 logger.warning(f"Skill matching failed: {e}")
                 skill = None
-        else:
-            skill = db.get(Skill, conversation.skill_id)
+
+        if skill and conversation.skill_id != skill.id:
+            conversation.skill_id = skill.id
+            db.flush()
 
         # 2. Get conversation history
         messages = (
@@ -235,10 +408,22 @@ class SkillEngine:
             .all()
         )
 
-        # 3. Get model config (from skill version or default)
+        # 3. Get model config
         skill_version = skill.versions[0] if skill and skill.versions else None
         model_config_id = skill_version.model_config_id if skill_version else None
+        if not model_config_id and workspace and getattr(workspace, "model_config_id", None):
+            model_config_id = workspace.model_config_id
         model_config = llm_gateway.get_config(db, model_config_id)
+
+        # Helper to build early PrepareResult
+        def _early(result: tuple[str, dict]) -> PrepareResult:
+            return PrepareResult(
+                llm_messages=[], model_config=model_config,
+                skill_name=skill.name if skill else None,
+                skill_id=skill.id if skill else None,
+                skill_version=skill_version, workspace=workspace,
+                early_return=result,
+            )
 
         # 4a. Structured mode: try rule engine first
         if skill and skill.mode == SkillMode.STRUCTURED:
@@ -248,24 +433,71 @@ class SkillEngine:
                     db, skill, user_message, default_config
                 )
                 if rule_result is not None:
-                    return rule_result
+                    return _early(rule_result)
             except Exception as e:
                 logger.warning(f"Rule engine failed, falling through to LLM: {e}")
 
-        # 4b. If skill has data_queries, classify intent and possibly route to data operation
+        # 4b. Data queries
         if skill and skill.data_queries:
             try:
                 from app.services.data_engine import data_engine
                 intent = await data_engine.classify_intent(user_message, default_config)
                 intent_type = intent.get("type", "ai_generate")
                 if intent_type in ("data_query", "data_mutation"):
-                    return await self._handle_data_operation(
+                    result = await self._handle_data_operation(
                         db, skill, user_message, model_config, user_id, intent_type
                     )
+                    return _early(result)
             except Exception as e:
                 logger.warning(f"Intent classification failed, falling through to LLM: {e}")
 
-        # 5. Inject available tools (workspace tools take priority over skill tools)
+        # 4c. InputEvaluator
+        if skill_version and skill_version.required_inputs:
+            from app.services.input_evaluator import input_evaluator
+            eval_result = await input_evaluator.evaluate(
+                purpose=skill.description or skill.name,
+                required_inputs=skill_version.required_inputs,
+                history_messages=messages,
+                current_message=user_message,
+            )
+            if not eval_result["pass"]:
+                questions = eval_result.get("missing_questions", [])
+                text = questions[0] if questions else "请提供更多信息。"
+                return _early((text, {}))
+
+        # 4d. Tool chain: detect tool intent and auto-consume structured output
+        available_tools = []
+        try:
+            from app.services.tool_executor import tool_executor
+            if workspace and hasattr(workspace, 'workspace_tools') and workspace.workspace_tools:
+                from app.models.tool import ToolRegistry
+                available_tools = [
+                    db.get(ToolRegistry, wt.tool_id)
+                    for wt in workspace.workspace_tools
+                    if db.get(ToolRegistry, wt.tool_id) is not None
+                ]
+            elif skill:
+                available_tools = tool_executor.get_tools_for_skill(db, skill.id)
+        except Exception as e:
+            logger.warning(f"Tool loading for chain detection failed: {e}")
+
+        if available_tools:
+            tool_intent = await self._detect_tool_intent(user_message, available_tools, default_config)
+            if tool_intent:
+                structured_ctx = self._get_latest_structured_output(messages)
+                if structured_ctx:
+                    try:
+                        tool_params = await self._map_output_to_tool_input(
+                            structured_ctx, tool_intent, default_config
+                        )
+                        result = await tool_executor.execute_tool(
+                            db, tool_intent.name, tool_params, user_id
+                        )
+                        return _early(self._format_tool_result(result, tool_intent))
+                    except Exception as e:
+                        logger.warning(f"Tool chain mapping failed, falling through to LLM: {e}")
+
+        # 5. Inject available tools
         tool_prompt = ""
         try:
             from app.services.tool_executor import tool_executor
@@ -289,32 +521,62 @@ class SkillEngine:
         # 6. Inject knowledge
         knowledge_context = ""
         if not skill or (skill and skill.auto_inject):
-            knowledge_context = self._inject_knowledge(user_message, skill)
+            knowledge_context = await self._inject_knowledge(
+                user_message, skill, db=db, user_id=user_id
+            )
 
         # 7. Build system prompt
+        extracted_vars = {}
         if skill_version:
-            system_content = skill_version.system_prompt
+            base_prompt = self._inject_templates(skill_version.system_prompt)
             if skill_version.variables:
                 history_text = "\n".join(
                     f"{m.role.value}: {m.content}" for m in messages
                 )
                 history_text += f"\nuser: {user_message}"
                 try:
-                    extracted = await self._extract_variables(
+                    extracted_vars = await self._extract_variables(
                         skill_version.variables, history_text, default_config
                     )
-                    for var, val in extracted.items():
-                        if val:
-                            system_content = system_content.replace(
-                                "{" + var.strip("{}") + "}", str(val)
-                            )
                 except Exception as e:
                     logger.warning(f"Variable extraction failed: {e}")
+
+            structured_ctx = self._get_latest_structured_output(messages)
+
+            system_content = prompt_compiler.compile(
+                system_prompt=base_prompt,
+                output_schema=skill_version.output_schema,
+                extracted_vars=extracted_vars,
+                structured_context=structured_ctx,
+            )
         else:
             system_content = _DEFAULT_SYSTEM
 
         if workspace and workspace.system_context:
             system_content += f"\n\n## 工作台附加指令\n\n{workspace.system_context}"
+
+        if workspace and getattr(workspace, "project_id", None):
+            try:
+                from app.models.project import ProjectContext
+                other_contexts = (
+                    db.query(ProjectContext)
+                    .filter(
+                        ProjectContext.project_id == workspace.project_id,
+                        ProjectContext.workspace_id != workspace.id,
+                    )
+                    .all()
+                )
+                if other_contexts:
+                    ctx_parts = []
+                    for ctx in other_contexts:
+                        ws_name = ctx.workspace.name if ctx.workspace else f"workspace#{ctx.workspace_id}"
+                        if ctx.summary:
+                            ctx_parts.append(f"**{ws_name}**: {ctx.summary}")
+                    if ctx_parts:
+                        project_ctx_text = "\n".join(ctx_parts)
+                        system_content += f"\n\n## 项目团队进展（其他成员）\n\n{project_ctx_text}"
+            except Exception as e:
+                logger.warning(f"Project context injection failed: {e}")
 
         if knowledge_context:
             system_content += f"\n\n## 参考知识\n\n{knowledge_context}"
@@ -329,19 +591,139 @@ class SkillEngine:
                 llm_messages.append({"role": m.role.value, "content": m.content})
         llm_messages.append({"role": "user", "content": user_message})
 
-        # 9. Call LLM (with Agent Loop for tool calls)
-        response = await llm_gateway.chat(
+        # 9. Context window compaction
+        llm_messages = await self._compact_if_needed(llm_messages, model_config)
+
+        return PrepareResult(
+            llm_messages=llm_messages,
             model_config=model_config,
-            messages=llm_messages,
+            skill_name=skill.name if skill else None,
+            skill_id=skill.id if skill else None,
+            skill_version=skill_version,
+            workspace=workspace,
+            available_tools=available_tools,
+            tools_schema=self._build_tools_schema(available_tools) if available_tools else [],
         )
 
-        # 10. Agent Loop: detect and execute tool calls
-        if skill and "```tool_call" in response:
-            response = await self._handle_tool_calls(
-                db, skill, response, llm_messages, model_config, user_id
+    async def _compact_if_needed(
+        self,
+        llm_messages: list[dict],
+        model_config: dict,
+        threshold: float = 0.85,
+    ) -> list[dict]:
+        """If estimated token usage exceeds threshold * context_window, summarize early history."""
+        # Simple estimate: 1 token ≈ 2 Chinese chars ≈ 4 bytes
+        total_chars = sum(len(m.get("content") or "") for m in llm_messages)
+        estimated_tokens = total_chars // 2
+
+        context_window = model_config.get("context_window", 32000)
+        if estimated_tokens <= context_window * threshold:
+            return llm_messages
+
+        # Split: keep system + last 6 turns, summarize the rest
+        system_msgs = [m for m in llm_messages if m["role"] == "system"]
+        non_system = [m for m in llm_messages if m["role"] != "system"]
+
+        keep_recent = 6  # rounds × 2 messages
+        early = non_system[:-keep_recent] if len(non_system) > keep_recent else []
+        recent = non_system[-keep_recent:]
+
+        if not early:
+            return llm_messages
+
+        try:
+            summary = await self._summarize_history(early, model_config)
+            compacted = [
+                *system_msgs,
+                {"role": "user", "content": f"[前期对话摘要]\n{summary}"},
+                *recent,
+            ]
+            new_chars = sum(len(m.get("content") or "") for m in compacted)
+            logger.info(
+                f"Context compacted: {total_chars} → {new_chars} chars "
+                f"(~{estimated_tokens} → {new_chars // 2} tokens)"
+            )
+            return compacted
+        except Exception as e:
+            logger.warning(f"Context compaction failed, using original: {e}")
+            return llm_messages
+
+    async def _summarize_history(self, messages: list[dict], model_config: dict) -> str:
+        """Summarize a list of messages into a concise paragraph."""
+        history_text = "\n".join(
+            f"{m['role']}: {m.get('content', '')[:500]}" for m in messages
+        )
+        prompt = (
+            "请用简洁的中文（200字以内）总结以下对话的主要内容和结论，"
+            "重点保留关键信息、用户需求和重要结果：\n\n"
+            f"{history_text}"
+        )
+        try:
+            lite_config = llm_gateway.get_lite_config()
+        except Exception:
+            lite_config = model_config
+        result, _ = await llm_gateway.chat(
+            model_config=lite_config,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=300,
+        )
+        return result.strip()
+
+    async def execute(
+        self,
+        db: Session,
+        conversation: Conversation,
+        user_message: str,
+        user_id: int | None = None,
+        active_skill_ids: list[int] | None = None,
+    ) -> tuple[str, dict]:
+        prep = await self.prepare(db, conversation, user_message, user_id, active_skill_ids)
+
+        # Short-circuit: prepare already produced a final result
+        if prep.early_return is not None:
+            return prep.early_return
+
+        # 9. Call LLM
+        response, llm_usage = await llm_gateway.chat(
+            model_config=prep.model_config,
+            messages=prep.llm_messages,
+        )
+
+        # 10. Structured output
+        skill_version = prep.skill_version
+        structured_output = None
+        if skill_version and skill_version.output_schema:
+            parsed = self._try_parse_structured_output(response)
+            if parsed is not None:
+                structured_output = parsed
+                response = prompt_compiler.render_structured_as_markdown(
+                    skill_version.output_schema, parsed
+                )
+
+        # 11. Agent Loop: detect and execute tool calls
+        tool_meta: dict = {}
+        if "```tool_call" in response:
+            skill = db.get(Skill, prep.skill_id) if prep.skill_id else None
+            response, tool_meta = await self._handle_tool_calls(
+                db, skill, response, prep.llm_messages, prep.model_config, user_id,
+                tools_schema=prep.tools_schema,
             )
 
-        return response
+        # 12. Auto-execute python-pptx code blocks
+        if prep.skill_name == "pptx-generation" and "```python" in response:
+            tool_meta = self._execute_pptx_code(response)
+
+        # 13. Auto-execute HTML PPT generation
+        if prep.skill_name == "pptx-generation" and not tool_meta and "```html" in response:
+            tool_meta = self._execute_html_ppt(response)
+
+        if structured_output is not None:
+            tool_meta["structured_output"] = structured_output
+
+        tool_meta["llm_usage"] = llm_usage
+
+        return response, tool_meta
 
     async def _handle_tool_calls(
         self,
@@ -352,51 +734,432 @@ class SkillEngine:
         model_config: dict,
         user_id: int | None,
         max_rounds: int = 3,
-    ) -> str:
-        """Execute tool calls found in LLM response and continue conversation."""
+        tools_schema: list[dict] | None = None,
+        native_tool_calls: list[dict] | None = None,
+    ) -> tuple[str, dict]:
+        """Execute tool calls and continue conversation.
+
+        Returns (response_text, extra_meta) where extra_meta may contain download_url etc.
+        """
+        extra_meta: dict = {}
+        async for item in self._handle_tool_calls_stream(
+            db, skill, response, llm_messages, model_config, user_id, max_rounds,
+            tools_schema=tools_schema, native_tool_calls=native_tool_calls,
+        ):
+            if isinstance(item, tuple):
+                response, extra_meta = item
+        return response, extra_meta
+
+    async def _execute_tools_parallel(
+        self,
+        db: Session,
+        tool_calls: list[dict],
+        user_id: int | None,
+    ) -> list[tuple[dict, dict]]:
+        """并行执行所有工具调用，返回 [(call, result), ...]。"""
         from app.services.tool_executor import tool_executor
 
-        for _ in range(max_rounds):
-            # Extract tool_call blocks
-            pattern = r"```tool_call\s*(.*?)\s*```"
-            matches = re.findall(pattern, response, re.DOTALL)
-            if not matches:
+        async def _exec_one(call: dict) -> tuple[dict, dict]:
+            tool_name = call.get("tool") or call.get("name", "")
+            raw_args = call.get("params") or call.get("arguments", "{}")
+            if isinstance(raw_args, str):
+                try:
+                    params = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    params = {}
+            else:
+                params = raw_args
+            result = await tool_executor.execute_tool(db, tool_name, params, user_id)
+            return call, result
+
+        return list(await asyncio.gather(*[_exec_one(c) for c in tool_calls]))
+
+    async def _handle_tool_calls_stream(
+        self,
+        db: Session,
+        skill,
+        response: str,
+        llm_messages: list[dict],
+        model_config: dict,
+        user_id: int | None,
+        max_rounds: int = 3,
+        tools_schema: list[dict] | None = None,
+        native_tool_calls: list[dict] | None = None,
+    ):
+        """Streaming version: yields SSE-ready dicts for tool_call events, then yields (response, meta) at end.
+
+        支持两种工具调用模式：
+        - native_tool_calls 非空：原生 function calling（模型支持时）
+        - 否则：解析 response 中的 ```tool_call``` 文本块（fallback）
+        """
+        extra_meta: dict = {}
+        block_idx = 1  # 0 is the initial text block
+
+        for round_num in range(max_rounds):
+            # 解析本轮工具调用列表
+            if round_num == 0 and native_tool_calls:
+                # 原生 function calling：直接使用结构化数据
+                calls = native_tool_calls
+                use_native = True
+            else:
+                # 文本 fallback：从 response 解析 ```tool_call``` 块
+                pattern = r"```tool_call\s*(.*?)\s*```"
+                raw_matches = re.findall(pattern, response, re.DOTALL)
+                calls = []
+                for m in raw_matches:
+                    try:
+                        parsed = json.loads(m)
+                        calls.append(parsed)
+                    except json.JSONDecodeError:
+                        pass
+                use_native = False
+
+            if not calls:
                 break
 
+            yield {"event": "round_start", "data": {"round": round_num + 1, "max_rounds": max_rounds}}
+
+            # 并行触发所有工具（先发 start 事件，再并行执行）
+            call_indices: dict[int, dict] = {}  # block_idx → call
+            for call in calls:
+                tool_name = call.get("tool") or call.get("name", "")
+                raw_args = call.get("params") or call.get("arguments", {})
+                params = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                yield {"event": "content_block_start", "data": {
+                    "index": block_idx, "type": "tool_call",
+                    "tool": tool_name, "input": params,
+                }}
+                yield {"event": "tool_progress", "data": {
+                    "index": block_idx, "message": f"执行 {tool_name}...",
+                }}
+                call_indices[block_idx] = call
+                block_idx += 1
+
+            # 并行执行
+            pairs = await self._execute_tools_parallel(db, calls, user_id)
+
+            # 收集结果并发送 stop 事件
             tool_results = []
-            for match in matches:
-                try:
-                    call = json.loads(match)
-                    tool_name = call.get("tool", "")
-                    params = call.get("params", {})
-                    result = await tool_executor.execute_tool(db, tool_name, params, user_id)
-                    tool_results.append(
-                        f"工具 `{tool_name}` 执行结果：\n```json\n{json.dumps(result, ensure_ascii=False, indent=2)}\n```"
-                    )
-                except Exception as e:
-                    tool_results.append(f"工具调用解析失败：{e}")
+            result_block_start = block_idx - len(calls)
+            for i, (call, result) in enumerate(pairs):
+                tool_name = call.get("tool") or call.get("name", "")
+                ok = result.get("ok", False)
+
+                if ok and isinstance(result.get("result"), dict):
+                    tool_result_data = result["result"]
+                    if "download_url" in tool_result_data:
+                        extra_meta["download_url"] = tool_result_data["download_url"]
+                    if "filename" in tool_result_data:
+                        extra_meta["download_filename"] = tool_result_data["filename"]
+
+                result_str = json.dumps(result, ensure_ascii=False, indent=2)
+                yield {"event": "content_block_stop", "data": {
+                    "index": result_block_start + i, "type": "tool_call",
+                    "tool": tool_name, "result": result_str, "ok": ok,
+                }}
+                tool_results.append(f"工具 `{tool_name}` 执行结果：\n```json\n{result_str}\n```")
 
             if not tool_results:
+                yield {"event": "round_end", "data": {"round": round_num + 1, "has_next": False}}
                 break
 
-            # Continue the conversation with tool results
             tool_result_text = "\n\n".join(tool_results)
-            llm_messages.append({"role": "assistant", "content": response})
-            llm_messages.append({
-                "role": "user",
-                "content": f"[工具执行结果]\n\n{tool_result_text}\n\n请基于以上工具结果，给出最终回复。",
-            })
 
-            response = await llm_gateway.chat(
+            # 构建下一轮 messages
+            if use_native:
+                # 原生 function calling：使用规范的 tool / tool role 消息格式
+                tool_calls_msg: list[dict] = []
+                for call in calls:
+                    raw_args = call.get("params") or call.get("arguments", {})
+                    tool_calls_msg.append({
+                        "id": call.get("id", f"call_{call.get('name', '')}"),
+                        "type": "function",
+                        "function": {
+                            "name": call.get("name", ""),
+                            "arguments": raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False),
+                        },
+                    })
+                llm_messages.append({"role": "assistant", "content": None, "tool_calls": tool_calls_msg})
+                for call, result in pairs:
+                    llm_messages.append({
+                        "role": "tool",
+                        "tool_call_id": call.get("id", f"call_{call.get('name', '')}"),
+                        "content": json.dumps(result, ensure_ascii=False),
+                    })
+            else:
+                # 文本 fallback：将结果作为 user 消息追加
+                llm_messages.append({"role": "assistant", "content": response})
+                llm_messages.append({
+                    "role": "user",
+                    "content": f"[工具执行结果]\n\n{tool_result_text}\n\n请基于以上工具结果，给出最终回复。不需要重复展示JSON，直接告知用户结果即可。",
+                })
+
+            # 流式下一轮 LLM 响应
+            yield {"event": "content_block_start", "data": {"index": block_idx, "type": "text"}}
+            new_response = ""
+            next_native_calls: list[dict] = []
+
+            async for chunk_type, chunk_data in llm_gateway.chat_stream_typed(
                 model_config=model_config,
                 messages=llm_messages,
-            )
+                tools=tools_schema if use_native else None,
+            ):
+                if chunk_type == "tool_call":
+                    next_native_calls.append(chunk_data)
+                elif chunk_type == "content":
+                    new_response += chunk_data
+                    yield {"event": "content_block_delta", "data": {"index": block_idx, "delta": {"text": chunk_data}}}
+                    yield {"event": "delta", "data": {"text": chunk_data}}
 
-            # If no more tool calls, done
-            if "```tool_call" not in response:
+            yield {"event": "content_block_stop", "data": {"index": block_idx}}
+            block_idx += 1
+            response = new_response
+
+            has_next = bool(next_native_calls) or "```tool_call" in response
+            yield {"event": "round_end", "data": {"round": round_num + 1, "has_next": has_next}}
+
+            if not has_next:
                 break
 
-        return response
+            # 下一轮使用原生 tool_calls（若有）
+            native_tool_calls = next_native_calls if next_native_calls else None
+
+        response = re.sub(r"```tool_call\s*.*?\s*```", "", response, flags=re.DOTALL).strip()
+        yield (response, extra_meta)
+
+
+    # ── Structured output helpers ──────────────────────────────────
+
+    @staticmethod
+    def _get_latest_structured_output(messages: list[Message]) -> dict | None:
+        """Find the most recent structured_output from conversation history."""
+        for msg in reversed(messages):
+            if msg.role == MessageRole.ASSISTANT and msg.metadata_:
+                so = msg.metadata_.get("structured_output")
+                if so:
+                    return so
+        return None
+
+    @staticmethod
+    def _try_parse_structured_output(response: str) -> dict | None:
+        """Attempt to parse LLM response as JSON structured output.
+
+        Handles both raw JSON and JSON wrapped in ```json blocks.
+        """
+        text = response.strip()
+        # Strip ```json ... ``` wrapper if present
+        m = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+        if m:
+            text = m.group(1).strip()
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    async def _detect_tool_intent(
+        self,
+        user_message: str,
+        available_tools: list,
+        model_config: dict,
+    ) -> object | None:
+        """Detect if user wants to invoke a specific tool (e.g. '做成PPT', '生成Excel')."""
+        if not available_tools:
+            return None
+
+        tool_list = "\n".join(
+            f"- {t.name}: {t.display_name} — {t.description or '无描述'}"
+            for t in available_tools
+        )
+        prompt = (
+            "判断用户是否想调用以下某个工具。如果是，返回工具name；否则返回 none。\n"
+            "只返回工具name或none，不要其他内容。\n\n"
+            f"可用工具:\n{tool_list}\n\n"
+            f"用户消息: {user_message}"
+        )
+        try:
+            lite_config = llm_gateway.get_lite_config()
+        except Exception:
+            lite_config = model_config
+        result, _ = await llm_gateway.chat(
+            model_config=lite_config,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=50,
+        )
+        name = result.strip().splitlines()[0].strip().strip('"').strip("'")
+        if name.lower() == "none":
+            return None
+        for t in available_tools:
+            if t.name == name:
+                return t
+        return None
+
+    async def _map_output_to_tool_input(
+        self,
+        structured_output: dict,
+        tool,
+        model_config: dict,
+    ) -> dict:
+        """Use LLM to map a structured output to a tool's input_schema."""
+        tool_schema = json.dumps(tool.input_schema or {}, ensure_ascii=False, indent=2)
+        data_json = json.dumps(structured_output, ensure_ascii=False, indent=2)
+        prompt = (
+            f"你有以下结构化数据：\n```json\n{data_json}\n```\n\n"
+            f"目标工具 `{tool.name}` 的 input_schema：\n```json\n{tool_schema}\n```\n\n"
+            "请将数据映射为工具需要的参数格式。只返回JSON，不要其他内容。"
+        )
+        try:
+            lite_config = llm_gateway.get_lite_config()
+        except Exception:
+            lite_config = model_config
+        result, _ = await llm_gateway.chat(
+            model_config=lite_config,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=2000,
+        )
+        raw = re.sub(r"```(?:json)?|```", "", result).strip()
+        return json.loads(raw)
+
+    @staticmethod
+    def _format_tool_result(result: dict, tool) -> tuple[str, dict]:
+        """Format tool execution result for display + metadata."""
+        meta: dict = {}
+        if result.get("ok") and isinstance(result.get("result"), dict):
+            data = result["result"]
+            if "download_url" in data:
+                meta["download_url"] = data["download_url"]
+            if "filename" in data:
+                meta["download_filename"] = data["filename"]
+
+        if result.get("ok"):
+            content = f"已使用工具 **{tool.display_name}** 完成操作。"
+            if meta.get("download_url"):
+                content += f"\n\n文件已生成，点击下载。"
+        else:
+            content = f"工具 `{tool.name}` 执行失败：{result.get('error', '未知错误')}"
+
+        return content, meta
+
+    def _inject_templates(self, system_prompt: str) -> str:
+        """Replace {{TEMPLATE_CLASSES}} with dynamically read CSS class reference from template files."""
+        if "{{TEMPLATE_CLASSES}}" not in system_prompt:
+            return system_prompt
+
+        from pathlib import Path
+        tmpl_dir = Path(__file__).parent.parent / "tools" / "ppt_templates"
+        parts = []
+        for tmpl_path in sorted(tmpl_dir.glob("*.html")):
+            name = tmpl_path.stem
+            html = tmpl_path.read_text(encoding="utf-8")
+            # Extract only the <style> block
+            m = re.search(r"<style>(.*?)</style>", html, re.DOTALL | re.IGNORECASE)
+            if not m:
+                continue
+            css = m.group(1)
+            # Extract class names only (e.g. .sketch-box, .flat-card)
+            class_names = re.findall(r"\.([\w-]+)\s*\{", css)
+            unique = list(dict.fromkeys(class_names))  # preserve order, dedupe
+            parts.append(f"### {name} 模板可用 class\n" + ", ".join(f".{c}" for c in unique))
+
+        injected = "\n\n".join(parts) if parts else "（模板文件未找到）"
+        return system_prompt.replace("{{TEMPLATE_CLASSES}}", injected)
+
+    def _execute_pptx_code(self, response: str) -> dict:
+        """Extract python code block from LLM response and execute it to generate a pptx file."""
+        import os
+        import uuid
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        # Extract first ```python ... ``` block
+        pattern = r"```python\s*(.*?)\s*```"
+        matches = re.findall(pattern, response, re.DOTALL)
+        if not matches:
+            return {}
+
+        code = matches[0]
+
+        # Ensure output goes to uploads/generated/
+        upload_dir = os.environ.get("UPLOAD_DIR", "./uploads")
+        generated_dir = Path(upload_dir) / "generated"
+        generated_dir.mkdir(parents=True, exist_ok=True)
+
+        file_id = f"{uuid.uuid4().hex}.pptx"
+        file_path = generated_dir / file_id
+
+        # Inject output path into code: replace any prs.save(...) with our path
+        if "prs.save(" in code:
+            code = re.sub(r'prs\.save\([^)]+\)', f'prs.save("{file_path}")', code)
+        else:
+            code += f'\nprs.save("{file_path}")\n'
+
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+                f.write(code)
+                tmp_path = f.name
+
+            result = subprocess.run(
+                ["python3", tmp_path],
+                capture_output=True, text=True, timeout=120
+            )
+            os.unlink(tmp_path)
+
+            if result.returncode != 0:
+                logger.error(f"pptx code execution failed: {result.stderr}")
+                return {}
+
+            if not file_path.exists():
+                return {}
+
+            return {
+                "download_url": f"/api/files/{file_id}",
+                "download_filename": "演示文稿.pptx",
+            }
+        except Exception as e:
+            logger.error(f"pptx code execution error: {e}")
+            return {}
+
+
+    def _execute_html_ppt(self, response: str) -> dict:
+        """Extract HTML slides block from LLM response and generate HTML PPT file.
+
+        Expects LLM to output:
+          TEMPLATE: sketch|flat
+          TITLE: 标题
+
+          ```html
+          <slides html here>
+          ```
+        """
+        import re as _re
+
+        # Extract template hint (line starting with TEMPLATE:)
+        template_match = _re.search(r"TEMPLATE:\s*(\w+)", response, _re.IGNORECASE)
+        template = template_match.group(1).lower() if template_match else "flat"
+
+        # Extract title hint
+        title_match = _re.search(r"TITLE:\s*(.+)", response, _re.IGNORECASE)
+        title = title_match.group(1).strip() if title_match else "演示文稿"
+
+        # Extract ```html ... ``` block
+        html_match = _re.search(r"```html\s*(.*?)\s*```", response, _re.DOTALL)
+        if not html_match:
+            return {}
+
+        slides_html = html_match.group(1)
+
+        from app.tools.html_ppt_generator import execute as ppt_execute
+        result = ppt_execute({"template": template, "title": title, "slides_html": slides_html})
+        if "download_url" not in result:
+            logger.error(f"html_ppt_generator failed: {result.get('error')}")
+            return {}
+
+        return {
+            "download_url": result["download_url"],
+            "download_filename": result.get("filename", "演示文稿.html"),
+        }
 
 
 skill_engine = SkillEngine()

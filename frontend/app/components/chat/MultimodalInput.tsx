@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useRef, useState, useCallback } from "react";
 
 interface MultimodalInputProps {
   onSubmit: (data: { text?: string; files?: File[] }) => void;
@@ -12,6 +12,7 @@ export function MultimodalInput({
   placeholder = "输入消息或粘贴内容... (Ctrl+Enter 发送)",
 }: MultimodalInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [attachments, setAttachments] = useState<File[]>([]);
   const [isDragOver, setIsDragOver] = useState(false);
 
@@ -53,14 +54,18 @@ export function MultimodalInput({
     setIsDragOver(true);
   };
 
+  const ALLOWED_EXTS = [".txt", ".pdf", ".docx", ".pptx", ".md", ".xlsx", ".xls", ".csv",
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".mp3", ".wav", ".m4a", ".ogg", ".flac"];
+  const isAllowedFile = (f: File) =>
+    ALLOWED_EXTS.some((ext) => f.name.toLowerCase().endsWith(ext)) ||
+    f.type.startsWith("image/");
+
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragOver(false);
     const files = e.dataTransfer?.files;
     if (files && files.length > 0) {
-      const validFiles = Array.from(files).filter((f) =>
-        f.type.startsWith("image/") || f.type.startsWith("text/")
-      );
+      const validFiles = Array.from(files).filter(isAllowedFile);
       setAttachments((prev) => [...prev, ...validFiles]);
     }
   };
@@ -72,6 +77,15 @@ export function MultimodalInput({
   const removeAttachment = (idx: number) => {
     setAttachments((prev) => prev.filter((_, i) => i !== idx));
   };
+
+  const handleFileInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (files && files.length > 0) {
+      setAttachments((prev) => [...prev, ...Array.from(files)]);
+    }
+    // reset so same file can be re-selected
+    e.target.value = "";
+  }, []);
 
   const handleSubmit = () => {
     const text = textareaRef.current?.value.trim();
@@ -117,6 +131,25 @@ export function MultimodalInput({
 
       {/* Input area */}
       <div className="flex items-end gap-2 p-2">
+        {/* Hidden file input */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept=".txt,.pdf,.docx,.pptx,.md,.xlsx,.xls,.csv,.jpg,.jpeg,.png,.webp,.bmp,.mp3,.wav,.m4a,.ogg,.flac"
+          className="hidden"
+          onChange={handleFileInputChange}
+        />
+        {/* File upload button */}
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={isLoading}
+          title="上传文件（支持 PDF/Word/PPT/Excel/TXT/MD/CSV/图片/音频）"
+          className="flex-shrink-0 border-2 border-[#1A202C] bg-white text-[#1A202C] px-2 py-2 text-[10px] font-bold hover:bg-gray-100 disabled:opacity-50 transition-colors"
+        >
+          📎
+        </button>
         <div className="flex-1 relative">
           <textarea
             ref={textareaRef}

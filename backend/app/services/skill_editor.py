@@ -71,7 +71,7 @@ class SkillEditor:
             instruction=instruction,
         )
 
-        result = await llm_gateway.chat(
+        result, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[
                 {"role": "system", "content": system},
@@ -142,6 +142,10 @@ class SkillEditor:
                 "variables",
                 latest.variables if latest else [],
             ),
+            output_schema=proposed.get(
+                "output_schema",
+                latest.output_schema if latest else None,
+            ),
             model_config_id=latest.model_config_id if latest else None,
             created_by=user_id,
             change_note=change_note,
@@ -189,18 +193,24 @@ class SkillEditor:
             "current_version": latest.version if latest else 0,
         }
 
-        suggestion_text = "\n\n".join(
-            f"意见 #{s.id}:\n问题：{s.problem_desc}\n期望方向：{s.expected_direction}"
-            + (f"\n示例：{s.case_example}" if s.case_example else "")
-            for s in suggestions
-        )
+        parts = []
+        for s in suggestions:
+            # 部分采纳：用 review_note（管理者框选的片段）替代完整内容
+            if s.status.value == "partial" and s.review_note:
+                parts.append(f"意见 #{s.id}（部分采纳）:\n{s.review_note}")
+            else:
+                entry = f"意见 #{s.id}:\n问题：{s.problem_desc}\n期望方向：{s.expected_direction}"
+                if s.case_example:
+                    entry += f"\n示例：{s.case_example}"
+                parts.append(entry)
+        suggestion_text = "\n\n".join(parts)
 
         system = _EDIT_SYSTEM.format(
             skill_json=json.dumps(current, ensure_ascii=False, indent=2),
             instruction=f"根据以下用户反馈意见迭代该Skill：\n\n{suggestion_text}",
         )
 
-        result = await llm_gateway.chat(
+        result, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[
                 {"role": "system", "content": system},

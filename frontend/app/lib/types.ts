@@ -56,6 +56,13 @@ export interface Skill {
   department_id?: number | null;
 }
 
+export type ReviewStage =
+  | "auto_approved"
+  | "pending_dept"
+  | "dept_approved_pending_super"
+  | "approved"
+  | "rejected";
+
 export interface KnowledgeEntry {
   id: number;
   title: string;
@@ -66,6 +73,13 @@ export interface KnowledgeEntry {
   platform_tags: string[];
   topic_tags: string[];
   source_type: string;
+  capture_mode: string;
+  review_level: number;
+  review_level_label: string;
+  review_stage: ReviewStage;
+  review_stage_label: string;
+  sensitivity_flags: string[];
+  auto_review_note: string | null;
   created_at: string;
 }
 

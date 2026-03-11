@@ -1,6 +1,8 @@
 """Milvus 向量服务：知识切片、向量化、语义检索。"""
 from __future__ import annotations
 
+import logging
+
 from pymilvus import (
     Collection,
     CollectionSchema,
@@ -12,6 +14,8 @@ from pymilvus import (
 
 from app.config import settings
 
+logger = logging.getLogger(__name__)
+
 COLLECTION_NAME = "knowledge_chunks"
 DIM = 1024  # BAAI/bge-m3 dense vector dimension
 
@@ -21,11 +25,14 @@ _embed_model = None
 
 # ─── Embedding ────────────────────────────────────────────────────────────────
 
+_BGE_M3_PATH = "/Users/xia/.cache/huggingface/hub/models--BAAI--bge-m3/snapshots/5617a9f61b028005a4858fdac845db406aefb181"
+
+
 def _get_embed_model():
     global _embed_model
     if _embed_model is None:
         from FlagEmbedding import BGEM3FlagModel  # lazy import (heavy)
-        _embed_model = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
+        _embed_model = BGEM3FlagModel(_BGE_M3_PATH, use_fp16=True)
     return _embed_model
 
 
@@ -57,10 +64,12 @@ def get_collection() -> Collection:
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
             FieldSchema(name="knowledge_id", dtype=DataType.INT64),
             FieldSchema(name="chunk_index", dtype=DataType.INT64),
+            FieldSchema(name="created_by", dtype=DataType.INT64),
             FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=8000),
+            FieldSchema(name="desensitized_text", dtype=DataType.VARCHAR, max_length=8000),
             FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=DIM),
         ]
-        schema = CollectionSchema(fields, description="Knowledge chunks for semantic search")
+        schema = CollectionSchema(fields, description="Knowledge chunks with ownership & desensitized text")
         col = Collection(COLLECTION_NAME, schema)
         col.create_index(
             "embedding",
@@ -97,10 +106,80 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str
     return chunks
 
 
+# ─── Desensitisation ─────────────────────────────────────────────────────────
+
+def _desensitize_chunks_llm(chunks: list[str]) -> list[str]:
+    """Batch-desensitize chunks via DeepSeek (lite model).
+    Falls back to rule-based desensitization on failure.
+    """
+    from app.services.llm_gateway import llm_gateway
+
+    try:
+        config = llm_gateway.get_lite_config()
+    except Exception:
+        return [_desensitize_rule(c) for c in chunks]
+
+    results = []
+    for chunk in chunks:
+        try:
+            prompt = (
+                "你是知识脱敏助手。将下面的文本转换为通用认知：\n"
+                "- 保留方法论、行业趋势、思维框架、通用洞察\n"
+                "- 具体公司名/品牌名 → 「某品牌」「某公司」\n"
+                "- 具体数字/金额/百分比 → 「一定比例」「若干」\n"
+                "- 人名/联系方式 → 删除\n"
+                "- 保持核心信息的可用性，不要改变原有结构\n"
+                "- 直接输出脱敏后的文本，不要加解释\n\n"
+                f"原文：\n{chunk}"
+            )
+            import httpx
+            import os
+            api_key = os.getenv(config["api_key_env"], "")
+            resp = httpx.post(
+                f"{config['api_base']}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": config["model_id"],
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 1000,
+                    "temperature": 0.3,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            text = resp.json()["choices"][0]["message"]["content"].strip()
+            results.append(text)
+        except Exception as e:
+            logger.warning(f"LLM desensitize failed for chunk, fallback to rules: {e}")
+            results.append(_desensitize_rule(chunk))
+
+    return results
+
+
+def _desensitize_rule(text: str) -> str:
+    """Rule-based fallback: regex replacement for common sensitive patterns."""
+    import re
+    # 金额
+    text = re.sub(r"[\d,]+\.?\d*\s*[万亿元美元]", "若干金额", text)
+    # 百分比
+    text = re.sub(r"\d+\.?\d*\s*%", "一定比例", text)
+    # 电话
+    text = re.sub(r"1[3-9]\d{9}", "***电话***", text)
+    # 邮箱
+    text = re.sub(r"[\w.+-]+@[\w-]+\.[\w.]+", "***邮箱***", text)
+    # 连续数字 (>= 4 位，可能是 ID、账号等)
+    text = re.sub(r"\b\d{4,}\b", "****", text)
+    return text
+
+
 # ─── Public API ───────────────────────────────────────────────────────────────
 
-def index_knowledge(knowledge_id: int, text: str) -> list[int]:
-    """Chunk text, embed, and insert into Milvus. Returns list of primary key IDs."""
+def index_knowledge(
+    knowledge_id: int,
+    text: str,
+    created_by: int = 0,
+) -> list[int]:
+    """Chunk text, embed, desensitize, and insert into Milvus."""
     col = get_collection()
     chunks = chunk_text(text)
     if not chunks:
@@ -108,11 +187,16 @@ def index_knowledge(knowledge_id: int, text: str) -> list[int]:
 
     embeddings = embed_texts(chunks)
 
+    # Generate desensitized versions
+    desensitized = _desensitize_chunks_llm(chunks)
+
     result = col.insert([
-        [knowledge_id] * len(chunks),   # knowledge_id
-        list(range(len(chunks))),        # chunk_index
-        chunks,                          # text
-        embeddings,                      # embedding
+        [knowledge_id] * len(chunks),    # knowledge_id
+        list(range(len(chunks))),         # chunk_index
+        [created_by] * len(chunks),       # created_by
+        chunks,                           # text
+        desensitized,                     # desensitized_text
+        embeddings,                       # embedding
     ])
     col.flush()
     return list(result.primary_keys)
@@ -123,7 +207,8 @@ def search_knowledge(
     top_k: int = 8,
     knowledge_id_filter: list[int] = None,
 ) -> list[dict]:
-    """Semantic search. Returns list of {knowledge_id, chunk_index, text, score}."""
+    """Semantic search. Returns list of {knowledge_id, chunk_index, text,
+    desensitized_text, created_by, score}."""
     col = get_collection()
     q_embedding = embed_query(query)
 
@@ -138,7 +223,7 @@ def search_knowledge(
         param={"metric_type": "COSINE", "params": {"ef": 128}},
         limit=top_k,
         expr=expr,
-        output_fields=["knowledge_id", "chunk_index", "text"],
+        output_fields=["knowledge_id", "chunk_index", "text", "desensitized_text", "created_by"],
     )
 
     hits = []
@@ -147,6 +232,8 @@ def search_knowledge(
             "knowledge_id": hit.entity.get("knowledge_id"),
             "chunk_index": hit.entity.get("chunk_index"),
             "text": hit.entity.get("text"),
+            "desensitized_text": hit.entity.get("desensitized_text", ""),
+            "created_by": hit.entity.get("created_by", 0),
             "score": round(float(hit.score), 4),
         })
     return hits

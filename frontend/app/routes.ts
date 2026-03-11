@@ -20,29 +20,37 @@ export default [
       route(":id", "routes/app/chat/conversation.tsx"),
     ]),
 
-    // Knowledge (employee)
-    route("knowledge/new", "routes/app/knowledge/new.tsx"),
+    // Confirmations
+    route("confirmations", "routes/app/confirmations/index.tsx"),
+
+    // Tasks (待办)
+    route("tasks", "routes/app/tasks/index.tsx"),
+
+    // Knowledge Management
     route("knowledge/my", "routes/app/knowledge/my.tsx"),
+    // knowledge/new now redirects to knowledge/my (form is inline)
+    route("knowledge/new", "routes/app/knowledge/new.tsx"),
+
+    // Skills unified page
+    route("skills", "routes/app/skills/index.tsx"),
 
     // Business data
     route("data", "routes/app/data/index.tsx"),
     route("data/:tableName", "routes/app/data/table.tsx"),
 
-    // Skill suggestions (employee)
-    route("suggestions/new", "routes/app/suggestions/new.tsx"),
-    route("suggestions/my", "routes/app/suggestions/my.tsx"),
+    // Intel
+    route("intel", "routes/app/intel/index.tsx"),
+    route("intel/sources", "routes/app/intel/sources.tsx"),
 
-    // Web apps (all users)
+    // Web apps
     route("web-apps", "routes/app/web-apps/index.tsx"),
 
-    // Intel (all users)
-    route("intel", "routes/app/intel/index.tsx"),
-
-    // My workspaces (all users)
+    // My workspaces
     route("workspaces/my", "routes/app/workspaces/my.tsx"),
 
-    // Confirmations (pending questions)
-    route("confirmations", "routes/app/confirmations/index.tsx"),
+    // Suggestions (kept for backwards compat, but removed from nav)
+    route("suggestions/new", "routes/app/suggestions/new.tsx"),
+    route("suggestions/my", "routes/app/suggestions/my.tsx"),
 
     // Admin
     layout("routes/app/admin/layout.tsx", [

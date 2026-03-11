@@ -33,6 +33,13 @@ export function Layout({ children }: { children: React.ReactNode }) {
         <Links />
       </head>
       <body>
+        <script dangerouslySetInnerHTML={{ __html: `
+          (function() {
+            function pd(e) { e.preventDefault(); }
+            window.addEventListener('dragover', pd, true);
+            window.addEventListener('drop', pd, true);
+          })();
+        `}} />
         {children}
         <ScrollRestoration />
         <Scripts />

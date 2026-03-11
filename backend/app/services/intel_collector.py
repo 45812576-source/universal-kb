@@ -1,4 +1,4 @@
-"""External intelligence collection engine: RSS / Crawler / Manual."""
+"""External intelligence collection engine: RSS / Crawler (crawl4ai) / Deep Crawl / Manual."""
 from __future__ import annotations
 
 import datetime
@@ -8,7 +8,14 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app.models.intel import IntelEntry, IntelEntryStatus, IntelSource, IntelSourceType
+from app.models.intel import (
+    IntelEntry,
+    IntelEntryStatus,
+    IntelSource,
+    IntelSourceType,
+    IntelTask,
+    IntelTaskStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +47,8 @@ class IntelCollector:
         # Title-based dedup (exact match)
         exists = db.query(IntelEntry).filter(IntelEntry.title == title).first()
         return exists is not None
+
+    # ── RSS ────────────────────────────────────────────────────────────────────
 
     async def collect_rss(self, db: Session, source: IntelSource) -> int:
         """Collect entries from an RSS feed."""
@@ -82,64 +91,251 @@ class IntelCollector:
         logger.info(f"RSS source '{source.name}' collected {count} new entries")
         return count
 
-    async def collect_crawler(self, db: Session, source: IntelSource) -> int:
-        """Crawl a webpage and extract articles."""
-        try:
-            import httpx
-            from bs4 import BeautifulSoup
-        except ImportError:
-            logger.error("httpx or beautifulsoup4 not installed")
-            return 0
+    # ── Crawler (crawl4ai) ─────────────────────────────────────────────────────
+
+    async def collect_crawler(self, db: Session, source: IntelSource, task: Optional[IntelTask] = None) -> int:
+        """Crawl a single URL using crawl4ai with JS rendering support."""
+        from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 
         config = source.config or {}
         url = config.get("url", "")
-        article_selector = config.get("article_selector", "article")
-        title_selector = config.get("title_selector", "h1, h2")
-        content_selector = config.get("content_selector", "p")
-
         if not url:
             return 0
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            try:
-                resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                resp.raise_for_status()
-            except Exception as e:
-                logger.error(f"Crawler failed for {url}: {e}")
-                return 0
+        browser_config = BrowserConfig(headless=True, verbose=False)
+        run_config = CrawlerRunConfig(
+            wait_until="networkidle",
+            word_count_threshold=50,
+        )
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        articles = soup.select(article_selector)
-        count = 0
-
-        for article in articles[:10]:
-            title_el = article.select_one(title_selector)
-            title = title_el.get_text(strip=True) if title_el else ""
-            if not title:
-                continue
-
-            content_els = article.select(content_selector)
-            content = " ".join(el.get_text(strip=True) for el in content_els)
-
-            link_el = article.find("a", href=True)
-            link = link_el["href"] if link_el else url
-
-            if self._is_duplicate(db, link, title):
-                continue
-
-            intel = IntelEntry(
-                source_id=source.id,
-                title=title,
-                content=content[:5000] if content else None,
-                url=link,
-                status=IntelEntryStatus.PENDING,
-                auto_collected=True,
+        # 如果有自定义 wait_selector，使用 CSS 等待
+        wait_selector = config.get("wait_selector")
+        if wait_selector:
+            run_config = CrawlerRunConfig(
+                wait_until="networkidle",
+                wait_for=f"css:{wait_selector}",
+                word_count_threshold=50,
             )
-            db.add(intel)
-            count += 1
 
-        db.commit()
+        if task:
+            task.total_urls = 1
+            db.commit()
+
+        count = 0
+        try:
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                result = await crawler.arun(url=url, config=run_config)
+                if result.success:
+                    title = result.metadata.get("title", "") if result.metadata else ""
+                    if not title:
+                        title = url
+
+                    if not self._is_duplicate(db, url, title):
+                        # 取 markdown 内容，截取前 5000 字作为 content
+                        markdown_content = result.markdown or ""
+                        intel = IntelEntry(
+                            source_id=source.id,
+                            title=title[:500],
+                            content=markdown_content[:5000] if markdown_content else None,
+                            raw_markdown=markdown_content if markdown_content else None,
+                            url=url,
+                            depth=0,
+                            status=IntelEntryStatus.PENDING,
+                            auto_collected=True,
+                        )
+                        db.add(intel)
+                        count += 1
+                        db.commit()
+                else:
+                    logger.warning(f"Crawl failed for {url}: {result.error_message}")
+        except Exception as e:
+            logger.error(f"Crawler error for {url}: {e}")
+            if task:
+                task.error_message = str(e)
+
+        if task:
+            task.crawled_urls = 1
+            task.new_entries = count
+            db.commit()
+
         return count
+
+    # ── Deep Crawl (crawl4ai BFS) ─────────────────────────────────────────────
+
+    async def collect_deep_crawl(self, db: Session, source: IntelSource, task: Optional[IntelTask] = None) -> int:
+        """Deep crawl using crawl4ai BFS strategy — recursive multi-page crawl."""
+        from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+        from crawl4ai.deep_crawling import BFSDeepCrawlStrategy
+        from crawl4ai.deep_crawling.filters import FilterChain, URLPatternFilter, DomainFilter
+
+        config = source.config or {}
+        url = config.get("url", "")
+        if not url:
+            return 0
+
+        max_depth = config.get("max_depth", 2)
+        max_pages = config.get("max_pages", 20)
+        include_external = config.get("include_external", False)
+        url_patterns = config.get("url_patterns", [])
+
+        # 构建过滤链
+        filters = []
+        if not include_external:
+            from urllib.parse import urlparse
+            domain = urlparse(url).netloc
+            filters.append(DomainFilter(allowed_domains=[domain]))
+        if url_patterns:
+            filters.append(URLPatternFilter(patterns=url_patterns))
+
+        deep_strategy = BFSDeepCrawlStrategy(
+            max_depth=max_depth,
+            max_pages=max_pages,
+            filter_chain=FilterChain(filters) if filters else None,
+            include_external=include_external,
+        )
+
+        browser_config = BrowserConfig(headless=True, verbose=False)
+        run_config = CrawlerRunConfig(
+            deep_crawl_strategy=deep_strategy,
+            wait_until="networkidle",
+            word_count_threshold=50,
+        )
+
+        if task:
+            task.total_urls = max_pages
+            db.commit()
+
+        count = 0
+        try:
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                results = await crawler.arun(url=url, config=run_config)
+                # deep crawl 返回结果列表
+                if not isinstance(results, list):
+                    results = [results]
+
+                if task:
+                    task.total_urls = len(results)
+                    db.commit()
+
+                for i, result in enumerate(results):
+                    if not result.success:
+                        continue
+
+                    page_url = result.url or url
+                    title = ""
+                    if result.metadata:
+                        title = result.metadata.get("title", "")
+                    if not title:
+                        title = page_url
+
+                    if self._is_duplicate(db, page_url, title):
+                        if task:
+                            task.crawled_urls = i + 1
+                            db.commit()
+                        continue
+
+                    markdown_content = result.markdown or ""
+                    # 推算深度：根据 result 的 depth 属性或默认 0
+                    depth = getattr(result, "depth", 0)
+
+                    intel = IntelEntry(
+                        source_id=source.id,
+                        title=title[:500],
+                        content=markdown_content[:5000] if markdown_content else None,
+                        raw_markdown=markdown_content if markdown_content else None,
+                        url=page_url,
+                        depth=depth,
+                        status=IntelEntryStatus.PENDING,
+                        auto_collected=True,
+                    )
+                    db.add(intel)
+                    count += 1
+
+                    if task:
+                        task.crawled_urls = i + 1
+                        task.new_entries = count
+                        db.commit()
+
+                db.commit()
+        except Exception as e:
+            logger.error(f"Deep crawl error for {url}: {e}")
+            if task:
+                task.error_message = str(e)
+                db.commit()
+
+        return count
+
+    # ── Batch Crawl ────────────────────────────────────────────────────────────
+
+    async def collect_batch(self, db: Session, source: IntelSource, task: Optional[IntelTask] = None) -> int:
+        """Batch crawl multiple URLs concurrently using crawl4ai arun_many."""
+        from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+
+        config = source.config or {}
+        urls = config.get("urls", [])
+        if not urls:
+            return 0
+
+        browser_config = BrowserConfig(headless=True, verbose=False)
+        run_config = CrawlerRunConfig(
+            wait_until="networkidle",
+            word_count_threshold=50,
+        )
+
+        if task:
+            task.total_urls = len(urls)
+            db.commit()
+
+        count = 0
+        try:
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                results = await crawler.arun_many(urls=urls, config=run_config)
+                for i, result in enumerate(results):
+                    if not result.success:
+                        continue
+
+                    page_url = result.url or urls[i] if i < len(urls) else ""
+                    title = ""
+                    if result.metadata:
+                        title = result.metadata.get("title", "")
+                    if not title:
+                        title = page_url
+
+                    if self._is_duplicate(db, page_url, title):
+                        if task:
+                            task.crawled_urls = i + 1
+                            db.commit()
+                        continue
+
+                    markdown_content = result.markdown or ""
+                    intel = IntelEntry(
+                        source_id=source.id,
+                        title=title[:500],
+                        content=markdown_content[:5000] if markdown_content else None,
+                        raw_markdown=markdown_content if markdown_content else None,
+                        url=page_url,
+                        depth=0,
+                        status=IntelEntryStatus.PENDING,
+                        auto_collected=True,
+                    )
+                    db.add(intel)
+                    count += 1
+
+                    if task:
+                        task.crawled_urls = i + 1
+                        task.new_entries = count
+                        db.commit()
+
+                db.commit()
+        except Exception as e:
+            logger.error(f"Batch crawl error: {e}")
+            if task:
+                task.error_message = str(e)
+                db.commit()
+
+        return count
+
+    # ── LLM Processing ─────────────────────────────────────────────────────────
 
     async def process_entry(self, db: Session, entry: IntelEntry, model_config: dict) -> None:
         """Use LLM to clean and tag an intel entry."""
@@ -156,7 +352,7 @@ class IntelCollector:
         )
 
         try:
-            result = await llm_gateway.chat(
+            result, _ = await llm_gateway.chat(
                 model_config=model_config,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
@@ -180,43 +376,67 @@ class IntelCollector:
         except Exception as e:
             logger.warning(f"Entry processing failed for id={entry.id}: {e}")
 
-    async def run_source(self, db: Session, source: IntelSource) -> int:
+    # ── Orchestrator ───────────────────────────────────────────────────────────
+
+    async def run_source(self, db: Session, source: IntelSource, task: Optional[IntelTask] = None) -> int:
         """Run collection for a single source."""
         if not source.is_active:
             return 0
 
-        if source.source_type == IntelSourceType.RSS:
-            count = await self.collect_rss(db, source)
-        elif source.source_type == IntelSourceType.CRAWLER:
-            count = await self.collect_crawler(db, source)
-        else:
-            count = 0
+        if task:
+            task.status = IntelTaskStatus.RUNNING
+            task.started_at = datetime.datetime.utcnow()
+            db.commit()
 
-        source.last_run_at = datetime.datetime.utcnow()
-        db.commit()
+        try:
+            if source.source_type == IntelSourceType.RSS:
+                count = await self.collect_rss(db, source)
+            elif source.source_type == IntelSourceType.CRAWLER:
+                count = await self.collect_crawler(db, source, task=task)
+            elif source.source_type == IntelSourceType.DEEP_CRAWL:
+                count = await self.collect_deep_crawl(db, source, task=task)
+            else:
+                count = 0
 
-        # Process new entries with LLM
-        if count > 0:
-            try:
-                from app.services.llm_gateway import llm_gateway
-                model_config = llm_gateway.get_config(db)
-                # Get the entries we just added (most recent)
-                new_entries = (
-                    db.query(IntelEntry)
-                    .filter(
-                        IntelEntry.source_id == source.id,
-                        IntelEntry.industry == None,  # noqa: E711
+            source.last_run_at = datetime.datetime.utcnow()
+            db.commit()
+
+            # Process new entries with LLM
+            if count > 0:
+                try:
+                    from app.services.llm_gateway import llm_gateway
+                    model_config = llm_gateway.get_config(db)
+                    new_entries = (
+                        db.query(IntelEntry)
+                        .filter(
+                            IntelEntry.source_id == source.id,
+                            IntelEntry.industry == None,  # noqa: E711
+                        )
+                        .order_by(IntelEntry.created_at.desc())
+                        .limit(count)
+                        .all()
                     )
-                    .order_by(IntelEntry.created_at.desc())
-                    .limit(count)
-                    .all()
-                )
-                for entry in new_entries:
-                    await self.process_entry(db, entry, model_config)
-            except Exception as e:
-                logger.warning(f"Batch processing failed: {e}")
+                    for entry in new_entries:
+                        await self.process_entry(db, entry, model_config)
+                except Exception as e:
+                    logger.warning(f"Batch processing failed: {e}")
 
-        return count
+            if task:
+                task.status = IntelTaskStatus.COMPLETED
+                task.new_entries = count
+                task.finished_at = datetime.datetime.utcnow()
+                db.commit()
+
+            return count
+
+        except Exception as e:
+            logger.error(f"Source run failed for '{source.name}': {e}")
+            if task:
+                task.status = IntelTaskStatus.FAILED
+                task.error_message = str(e)
+                task.finished_at = datetime.datetime.utcnow()
+                db.commit()
+            return 0
 
 
 intel_collector = IntelCollector()

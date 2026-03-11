@@ -1,13 +1,69 @@
-import { useLoaderData, useSearchParams } from "react-router";
+import { useState } from "react";
+import { data, redirect, useActionData, useLoaderData, useNavigation, useSearchParams } from "react-router";
+import { Form } from "react-router";
 import type { Route } from "./+types/my";
 import { requireUser } from "~/lib/auth.server";
-import { apiFetch } from "~/lib/api";
+import { apiFetch, ApiError } from "~/lib/api";
 import type { KnowledgeEntry } from "~/lib/types";
 
 export async function loader({ request }: Route.LoaderArgs) {
   const { token } = await requireUser(request);
-  const entries = await apiFetch("/api/knowledge", { token });
-  return { entries };
+  const url = new URL(request.url);
+  const source_type = url.searchParams.get("source_type") || "";
+  const status = url.searchParams.get("status") || "";
+  const params = new URLSearchParams();
+  if (source_type) params.set("source_type", source_type);
+  if (status) params.set("status", status);
+  const entries = await apiFetch(`/api/knowledge${params.toString() ? "?" + params : ""}`, { token });
+  return { entries, source_type, status };
+}
+
+export async function action({ request }: Route.ActionArgs) {
+  const { token } = await requireUser(request);
+  const form = await request.formData();
+  const mode = form.get("mode") as string;
+
+  const tagsFromField = (field: string) =>
+    (form.get(field) as string || "")
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+
+  try {
+    if (mode === "text") {
+      const result = await apiFetch("/api/knowledge", {
+        method: "POST",
+        body: JSON.stringify({
+          title: form.get("title") as string,
+          content: form.get("content") as string,
+          category: form.get("category") as string,
+          industry_tags: tagsFromField("industry_tags"),
+          platform_tags: tagsFromField("platform_tags"),
+          topic_tags: tagsFromField("topic_tags"),
+        }),
+        token,
+      });
+      return redirect(`/knowledge/my?submitted=${result.id}`);
+    } else {
+      const uploadForm = new FormData();
+      uploadForm.set("title", form.get("title") as string);
+      uploadForm.set("category", form.get("category") as string);
+      uploadForm.set("industry_tags", JSON.stringify(tagsFromField("industry_tags")));
+      uploadForm.set("platform_tags", JSON.stringify(tagsFromField("platform_tags")));
+      uploadForm.set("topic_tags", JSON.stringify(tagsFromField("topic_tags")));
+      const file = form.get("file") as File;
+      uploadForm.set("file", file);
+      const result = await apiFetch("/api/knowledge/upload", {
+        method: "POST",
+        body: uploadForm,
+        token,
+      });
+      return redirect(`/knowledge/my?submitted=${result.id}`);
+    }
+  } catch (e) {
+    if (e instanceof ApiError) return data({ error: e.message }, { status: e.status });
+    return data({ error: "提交失败，请重试" }, { status: 500 });
+  }
 }
 
 const STATUS_INFO: Record<string, { label: string; color: string }> = {
@@ -15,6 +71,14 @@ const STATUS_INFO: Record<string, { label: string; color: string }> = {
   approved: { label: "已通过", color: "bg-[#CCF2FF] text-[#00A3C4] border-[#00D1FF]" },
   rejected: { label: "已拒绝", color: "bg-red-100 text-red-700 border-red-400" },
   archived: { label: "已归档", color: "bg-gray-100 text-gray-500 border-gray-400" },
+};
+
+const SOURCE_LABELS: Record<string, string> = {
+  manual: "手动录入",
+  upload: "文件上传",
+  auto_collected: "自动采集",
+  chat_output: "对话产出",
+  chat_upload: "对话上传",
 };
 
 const CATEGORY_LABELS: Record<string, string> = {
@@ -26,20 +90,212 @@ const CATEGORY_LABELS: Record<string, string> = {
   external: "外部资料",
 };
 
+const CATEGORIES = [
+  { value: "experience", label: "经验总结" },
+  { value: "methodology", label: "方法论" },
+  { value: "case_study", label: "案例" },
+  { value: "data", label: "数据资产" },
+  { value: "template", label: "模板" },
+  { value: "external", label: "外部资料" },
+];
+
+function PixelInput({ className, ...props }: React.InputHTMLAttributes<HTMLInputElement>) {
+  return (
+    <input
+      {...props}
+      className={`w-full border-2 border-[#1A202C] bg-white px-3 py-2 text-xs font-bold focus:outline-none focus:border-[#00D1FF] ${className || ""}`}
+    />
+  );
+}
+
+function FieldLabel({ children, required }: { children: React.ReactNode; required?: boolean }) {
+  return (
+    <label className="block text-[10px] font-bold uppercase tracking-widest text-gray-500 mb-1.5">
+      {children}{required && <span className="text-[#00D1FF] ml-1">*</span>}
+    </label>
+  );
+}
+
+function CreateForm({ onCancel }: { onCancel: () => void }) {
+  const actionData = useActionData<typeof action>() as any;
+  const navigation = useNavigation();
+  const [mode, setMode] = useState<"text" | "file">("text");
+  const isSubmitting = navigation.state !== "idle";
+
+  return (
+    <div className="mb-6 pixel-border bg-white overflow-hidden">
+      <div className="bg-[#2D3748] text-white px-4 py-2.5 flex items-center justify-between border-b-2 border-[#1A202C]">
+        <span className="text-[10px] font-bold uppercase tracking-widest">New_Knowledge_Entry</span>
+        <div className="flex items-center gap-3">
+          <div className="flex space-x-1.5">
+            <div className="w-2 h-2 bg-red-400" />
+            <div className="w-2 h-2 bg-yellow-400" />
+            <div className="w-2 h-2 bg-green-400" />
+          </div>
+          <button
+            type="button"
+            onClick={onCancel}
+            className="text-gray-400 hover:text-white text-xs font-bold"
+          >
+            [收起]
+          </button>
+        </div>
+      </div>
+
+      <div className="p-5">
+        {actionData?.error && (
+          <div className="mb-4 border-2 border-red-400 bg-red-50 px-4 py-3 text-xs font-bold text-red-700 uppercase">
+            [ERROR] {actionData.error}
+          </div>
+        )}
+
+        {/* Mode toggle */}
+        <div className="flex border-2 border-[#1A202C] mb-5 w-fit">
+          <button
+            type="button"
+            onClick={() => setMode("text")}
+            className={`px-4 py-1.5 text-[10px] font-bold uppercase tracking-widest transition-colors ${
+              mode === "text" ? "bg-[#1A202C] text-white" : "bg-white text-gray-600 hover:bg-gray-100"
+            }`}
+          >
+            文字录入
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("file")}
+            className={`px-4 py-1.5 text-[10px] font-bold uppercase tracking-widest border-l-2 border-[#1A202C] transition-colors ${
+              mode === "file" ? "bg-[#1A202C] text-white" : "bg-white text-gray-600 hover:bg-gray-100"
+            }`}
+          >
+            文件上传
+          </button>
+        </div>
+
+        <Form
+          method="post"
+          encType={mode === "file" ? "multipart/form-data" : undefined}
+          className="space-y-4"
+        >
+          <input type="hidden" name="mode" value={mode} />
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <FieldLabel required>标题</FieldLabel>
+              <PixelInput name="title" required placeholder="例: 618大促投放ROI提升方法论" />
+            </div>
+            <div>
+              <FieldLabel>分类</FieldLabel>
+              <select
+                name="category"
+                className="w-full border-2 border-[#1A202C] bg-white px-3 py-2 text-xs font-bold focus:outline-none focus:border-[#00D1FF]"
+              >
+                {CATEGORIES.map((c) => (
+                  <option key={c.value} value={c.value}>{c.label}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {mode === "text" ? (
+            <div>
+              <FieldLabel required>内容</FieldLabel>
+              <textarea
+                name="content"
+                required
+                rows={6}
+                className="w-full border-2 border-[#1A202C] bg-white px-3 py-2.5 text-xs font-bold focus:outline-none focus:border-[#00D1FF] resize-y"
+                placeholder="请详细描述你的经验、方法或案例..."
+              />
+            </div>
+          ) : (
+            <div>
+              <FieldLabel required>文件</FieldLabel>
+              <div className="border-2 border-dashed border-[#1A202C] px-6 py-6 text-center bg-white">
+                <p className="text-[10px] font-bold uppercase text-gray-400 mb-2">
+                  支持 PDF / DOCX / PPTX / MD / TXT
+                </p>
+                <input
+                  type="file"
+                  name="file"
+                  required
+                  accept=".pdf,.docx,.pptx,.md,.txt"
+                  className="block w-full text-xs font-bold text-gray-500 file:mr-3 file:py-1.5 file:px-4 file:border-2 file:border-[#1A202C] file:bg-[#CCF2FF] file:text-xs file:font-bold file:uppercase cursor-pointer"
+                />
+              </div>
+            </div>
+          )}
+
+          <div className="border-2 border-[#1A202C] bg-[#EBF4F7] p-3 space-y-2">
+            <p className="text-[9px] font-bold text-[#00A3C4] uppercase tracking-widest">
+              — 标签（逗号分隔，可选）
+            </p>
+            <div className="grid grid-cols-3 gap-3">
+              <div>
+                <FieldLabel>行业</FieldLabel>
+                <PixelInput name="industry_tags" placeholder="电商, 快消" />
+              </div>
+              <div>
+                <FieldLabel>平台</FieldLabel>
+                <PixelInput name="platform_tags" placeholder="天猫, 抖音" />
+              </div>
+              <div>
+                <FieldLabel>主题</FieldLabel>
+                <PixelInput name="topic_tags" placeholder="ROI优化, 数据分析" />
+              </div>
+            </div>
+          </div>
+
+          <div className="flex gap-3">
+            <button
+              type="submit"
+              disabled={isSubmitting}
+              className="bg-[#1A202C] text-white px-6 py-2 text-[10px] font-bold uppercase tracking-widest hover:bg-black disabled:opacity-50 pixel-border transition-colors"
+            >
+              {isSubmitting ? "提交中..." : "> 提交审核"}
+            </button>
+            <button
+              type="button"
+              onClick={onCancel}
+              className="border-2 border-[#1A202C] bg-white px-6 py-2 text-[10px] font-bold uppercase tracking-widest text-gray-600 hover:bg-gray-100 transition-colors"
+            >
+              取消
+            </button>
+          </div>
+        </Form>
+      </div>
+    </div>
+  );
+}
+
 export default function MyKnowledge() {
-  const { entries } = useLoaderData<typeof loader>() as { entries: KnowledgeEntry[] };
+  const { entries, source_type, status } = useLoaderData<typeof loader>() as {
+    entries: KnowledgeEntry[];
+    source_type: string;
+    status: string;
+  };
   const [searchParams] = useSearchParams();
   const justSubmitted = searchParams.get("submitted");
+  const [showForm, setShowForm] = useState(false);
 
   return (
     <div className="min-h-full bg-[#F0F4F8]">
       {/* Header */}
-      <div className="border-b-2 border-[#1A202C] bg-[#EBF4F7] px-6 py-4 flex items-center gap-4">
-        <div className="w-1.5 h-5 bg-[#00D1FF]" />
-        <div>
-          <h1 className="text-xs font-bold uppercase tracking-widest text-[#1A202C]">我的知识</h1>
-          <p className="text-[9px] text-gray-500 uppercase font-bold mt-0.5">查看提交的所有知识条目</p>
+      <div className="border-b-2 border-[#1A202C] bg-[#EBF4F7] px-6 py-4 flex items-center justify-between">
+        <div className="flex items-center gap-4">
+          <div className="w-1.5 h-5 bg-[#00D1FF]" />
+          <div>
+            <h1 className="text-xs font-bold uppercase tracking-widest text-[#1A202C]">我的知识</h1>
+            <p className="text-[9px] text-gray-500 uppercase font-bold mt-0.5">知识条目管理与录入</p>
+          </div>
         </div>
+        {!showForm && (
+          <button
+            onClick={() => setShowForm(true)}
+            className="bg-[#1A202C] text-white px-4 py-2 text-[10px] font-bold uppercase tracking-widest hover:bg-black pixel-border transition-colors"
+          >
+            + 录入新知识
+          </button>
+        )}
       </div>
 
       <div className="p-6 max-w-5xl">
@@ -49,9 +305,53 @@ export default function MyKnowledge() {
           </div>
         )}
 
+        {/* Inline create form */}
+        {showForm && <CreateForm onCancel={() => setShowForm(false)} />}
+
+        {/* Filters */}
+        <form method="get" className="flex gap-3 mb-4 flex-wrap">
+          <select
+            name="source_type"
+            defaultValue={source_type}
+            className="border-2 border-[#1A202C] bg-white px-3 py-1.5 text-[10px] font-bold uppercase focus:outline-none focus:border-[#00D1FF]"
+          >
+            <option value="">全部来源</option>
+            <option value="manual">手动录入</option>
+            <option value="upload">文件上传</option>
+            <option value="chat_output">对话产出</option>
+            <option value="chat_upload">对话上传</option>
+            <option value="auto_collected">自动采集</option>
+          </select>
+          <select
+            name="status"
+            defaultValue={status}
+            className="border-2 border-[#1A202C] bg-white px-3 py-1.5 text-[10px] font-bold uppercase focus:outline-none focus:border-[#00D1FF]"
+          >
+            <option value="">全部状态</option>
+            <option value="pending">待审核</option>
+            <option value="approved">已通过</option>
+            <option value="rejected">已拒绝</option>
+          </select>
+          <button
+            type="submit"
+            className="border-2 border-[#1A202C] bg-white px-4 py-1.5 text-[10px] font-bold uppercase hover:bg-[#EBF4F7] transition-colors"
+          >
+            筛选
+          </button>
+          {(source_type || status) && (
+            <a
+              href="/knowledge/my"
+              className="border-2 border-gray-400 bg-white px-4 py-1.5 text-[10px] font-bold uppercase text-gray-500 hover:bg-gray-100 transition-colors"
+            >
+              清除
+            </a>
+          )}
+        </form>
+
+        {/* List */}
         <div className="pixel-border bg-white overflow-hidden">
           <div className="bg-[#2D3748] text-white px-4 py-2.5 flex items-center justify-between border-b-2 border-[#1A202C]">
-            <span className="text-[10px] font-bold uppercase tracking-widest">Knowledge_List</span>
+            <span className="text-[10px] font-bold uppercase tracking-widest">Knowledge_List ({entries.length})</span>
             <div className="flex space-x-1.5">
               <div className="w-2 h-2 bg-red-400" />
               <div className="w-2 h-2 bg-yellow-400" />
@@ -63,6 +363,7 @@ export default function MyKnowledge() {
               <tr className="border-b-2 border-[#1A202C] bg-[#F0F4F8]">
                 <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-gray-500">标题</th>
                 <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-gray-500">分类</th>
+                <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-gray-500">来源</th>
                 <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-gray-500">状态</th>
                 <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-gray-500">标签</th>
                 <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-gray-500">提交时间</th>
@@ -80,6 +381,11 @@ export default function MyKnowledge() {
                     </td>
                     <td className="py-3 px-4 text-[10px] font-bold uppercase text-gray-500">
                       {CATEGORY_LABELS[e.category] || e.category}
+                    </td>
+                    <td className="py-3 px-4">
+                      <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 bg-[#EBF4F7] border border-gray-300 text-gray-600">
+                        {SOURCE_LABELS[e.source_type] || e.source_type}
+                      </span>
                     </td>
                     <td className="py-3 px-4">
                       <span className={`inline-block border px-2 py-0.5 text-[9px] font-bold uppercase ${si.color}`}>
@@ -103,11 +409,14 @@ export default function MyKnowledge() {
               })}
               {entries.length === 0 && (
                 <tr>
-                  <td colSpan={5} className="py-12 text-center text-xs font-bold uppercase text-gray-400">
+                  <td colSpan={6} className="py-12 text-center text-xs font-bold uppercase text-gray-400">
                     暂无数据 —{" "}
-                    <a href="/knowledge/new" className="text-[#00A3C4] hover:underline">
+                    <button
+                      onClick={() => setShowForm(true)}
+                      className="text-[#00A3C4] hover:underline"
+                    >
                       去录入第一条
-                    </a>
+                    </button>
                   </td>
                 </tr>
               )}

@@ -145,7 +145,7 @@ class RuleEngine:
         prompt = _PARAM_EXTRACT_PROMPT.format(
             param_list=param_list, user_message=user_message
         )
-        result = await llm_gateway.chat(
+        result, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,

@@ -1,7 +1,9 @@
 """Tool execution engine: MCP / builtin / HTTP."""
 from __future__ import annotations
 
+import asyncio
 import importlib
+import inspect
 import json
 import logging
 import subprocess
@@ -35,7 +37,7 @@ class ToolExecutor:
 
         try:
             if tool.tool_type == ToolType.BUILTIN:
-                result = await self._execute_builtin(tool, params)
+                result = await self._execute_builtin(tool, params, db=db, user_id=user_id)
             elif tool.tool_type == ToolType.HTTP:
                 result = await self._execute_http(tool, params)
             elif tool.tool_type == ToolType.MCP:
@@ -48,8 +50,18 @@ class ToolExecutor:
             logger.error(f"Tool '{tool_name}' execution failed: {e}")
             return {"ok": False, "error": str(e)}
 
-    async def _execute_builtin(self, tool: ToolRegistry, params: dict) -> Any:
-        """Dynamically import and call a Python builtin tool."""
+    async def _execute_builtin(
+        self,
+        tool: ToolRegistry,
+        params: dict,
+        db: Session | None = None,
+        user_id: int | None = None,
+    ) -> Any:
+        """Dynamically import and call a Python builtin tool.
+
+        Injects db/user_id when the tool function accepts them,
+        so existing tools (ppt_generator, excel_generator) are unaffected.
+        """
         config = tool.config or {}
         module_path = config.get("module", f"app.tools.{tool.name}")
         func_name = config.get("function", "execute")
@@ -57,12 +69,18 @@ class ToolExecutor:
         module = importlib.import_module(module_path)
         func = getattr(module, func_name)
 
-        # Support both sync and async functions
-        import asyncio
+        # Build kwargs — inject db/user_id only if the function declares them
+        sig = inspect.signature(func)
+        kwargs: dict[str, Any] = {"params": params}
+        if "db" in sig.parameters:
+            kwargs["db"] = db
+        if "user_id" in sig.parameters:
+            kwargs["user_id"] = user_id
+
         if asyncio.iscoroutinefunction(func):
-            return await func(params)
+            return await func(**kwargs)
         else:
-            return func(params)
+            return func(**kwargs)
 
     async def _execute_http(self, tool: ToolRegistry, params: dict) -> Any:
         """Call an external HTTP API."""

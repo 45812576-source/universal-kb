@@ -155,7 +155,8 @@ class LarkBot:
         """Run the skill engine and return response text."""
         from app.services.skill_engine import skill_engine
         try:
-            return await skill_engine.execute(db, conversation, user_message, user_id)
+            response, _ = await skill_engine.execute(db, conversation, user_message, user_id)
+            return response
         except Exception as e:
             logger.error(f"Skill engine error in Lark bot: {e}")
             return "抱歉，处理您的请求时出现错误，请稍后再试。"

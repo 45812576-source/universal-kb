@@ -29,8 +29,10 @@ class Workspace(Base):
     visibility = Column(String(20), default="all")  # all / department
     welcome_message = Column(Text, default="你好，有什么可以帮你的？")
     system_context = Column(Text, nullable=True)
+    model_config_id = Column(Integer, ForeignKey("model_configs.id"), nullable=True)
     sort_order = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(
         DateTime,
@@ -51,6 +53,7 @@ class WorkspaceSkill(Base):
     skill_id = Column(Integer, ForeignKey("skills.id"), nullable=False)
 
     workspace = relationship("Workspace", back_populates="workspace_skills")
+    skill = relationship("Skill", foreign_keys=[skill_id])
 
 
 class WorkspaceTool(Base):
@@ -61,6 +64,7 @@ class WorkspaceTool(Base):
     tool_id = Column(Integer, ForeignKey("tool_registry.id"), nullable=False)
 
     workspace = relationship("Workspace", back_populates="workspace_tools")
+    tool = relationship("ToolRegistry", foreign_keys=[tool_id])
 
 
 class WorkspaceDataTable(Base):
