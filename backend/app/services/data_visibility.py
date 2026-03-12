@@ -1,4 +1,8 @@
-"""Three-level data visibility: detail / desensitized / stats."""
+"""三级数据可见性 + 权限引擎集成
+
+原有接口 (determine_level / desensitize_row / apply_visibility) 保持不变，
+新增 apply_with_permission_engine 方法接入三层脱敏。
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -8,6 +12,8 @@ from app.models.user import Role, User
 
 
 class DataVisibility:
+
+    # ── 原有三级可见性逻辑（保持不变） ───────────────────────────────────────
 
     def determine_level(
         self,
@@ -22,19 +28,15 @@ class DataVisibility:
         owner_field = ownership.owner_field
         dept_field = ownership.department_field
 
-        # Owner: full detail
         if owner_field and row.get(owner_field) == user.id:
             return VisibilityLevel.DETAIL.value
 
-        # Same department: desensitized
         if dept_field and user.department_id and row.get(dept_field) == user.department_id:
             return VisibilityLevel.DESENSITIZED.value
 
-        # Dept admin can see desensitized for all rows
         if user.role == Role.DEPT_ADMIN:
             return VisibilityLevel.DESENSITIZED.value
 
-        # Otherwise stats only
         return VisibilityLevel.STATS.value
 
     def desensitize_row(self, row: dict, desensitize_config: dict) -> dict:
@@ -77,8 +79,66 @@ class DataVisibility:
                 cfg = desensitize_config or {}
                 result.append(self.desensitize_row(row, cfg))
             # stats level: row is excluded from per-row results
-            # (aggregate stats should be returned separately if needed)
         return result
+
+    # ── 新增：接入 PermissionEngine 三层脱敏 ─────────────────────────────────
+
+    def apply_with_permission_engine(
+        self,
+        rows: list[dict],
+        user: User,
+        skill_id: int,
+        data_domain_id: int | None,
+        db: Any,
+        ownership: DataOwnership | None = None,
+        desensitize_config: dict | None = None,
+    ) -> list[dict]:
+        """先跑原有三级可见性过滤，再通过 PermissionEngine 做三层字段脱敏。
+
+        调用方传入 skill_id + data_domain_id（均可为 0/None），
+        引擎会自动合并 Skill级 > 角色级 > 全局默认规则。
+        """
+        # 步骤1：原有三级可见性（行过滤）
+        if ownership:
+            rows = self.apply_visibility(rows, user, ownership, desensitize_config)
+
+        if not rows:
+            return rows
+
+        # 步骤2：字段级三层脱敏
+        try:
+            from app.services.permission_engine import permission_engine
+            rows = permission_engine.apply_data_masks(
+                user=user,
+                skill_id=skill_id or 0,
+                data=rows,
+                data_domain_id=data_domain_id,
+                db=db,
+            )
+        except Exception:
+            # 脱敏失败不影响主流程，降级返回原始行过滤结果
+            pass
+
+        return rows
+
+    def apply_output_mask(
+        self,
+        data: dict,
+        user: User,
+        data_domain_id: int,
+        db: Any,
+    ) -> dict:
+        """对单条输出记录做输出侧遮罩（⑥步骤）。"""
+        try:
+            from app.services.permission_engine import permission_engine
+            return permission_engine.apply_output_masks(
+                user=user,
+                data=data,
+                data_domain_id=data_domain_id,
+                db=db,
+            )
+        except Exception:
+            return data
 
 
 data_visibility = DataVisibility()

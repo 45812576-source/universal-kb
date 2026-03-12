@@ -654,8 +654,40 @@ def update_status(
         skill.scope = scope
     if department_id is not None:
         skill.department_id = department_id
+
+    # 发布时自动生成 SkillPolicy（幂等）
+    if status == SkillStatus.PUBLISHED.value:
+        _ensure_skill_policy(skill_id, user, db)
+
     db.commit()
     return {"id": skill_id, "status": status, "scope": skill.scope}
+
+
+def _ensure_skill_policy(skill_id: int, user: User, db) -> None:
+    """发布时自动生成 SkillPolicy（若已存在则跳过）。
+    默认 publish_scope 按 skill.scope 映射：
+      personal → self_only, department → same_role, company → org_wide
+    """
+    from app.models.permission import SkillPolicy, PublishScope
+    existing = db.query(SkillPolicy).filter(SkillPolicy.skill_id == skill_id).first()
+    if existing:
+        return
+
+    skill = db.get(Skill, skill_id)
+    scope_map = {
+        "personal": PublishScope.SELF_ONLY,
+        "department": PublishScope.SAME_ROLE,
+        "company": PublishScope.ORG_WIDE,
+    }
+    publish_scope = scope_map.get(skill.scope or "personal", PublishScope.SAME_ROLE)
+
+    policy = SkillPolicy(
+        skill_id=skill_id,
+        publish_scope=publish_scope,
+        default_data_scope={},
+    )
+    db.add(policy)
+    db.flush()
 
 
 class AIEditRequest(BaseModel):
