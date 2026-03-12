@@ -13,7 +13,7 @@ from sqlalchemy.dialects import mysql
 
 # revision identifiers
 revision: str = "n4o5p6q7r8s9"
-down_revision: Union[str, None] = "m3n4o5p6q7r8"
+down_revision: Union[str, None] = "60d57209f955"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
