@@ -927,7 +927,10 @@ class SkillEngine:
                         _tool_obj = db.query(_TR).filter(_TR.name == tool_name).first()
                     except Exception:
                         pass
-                    schema_hint = json.dumps(_tool_obj.input_schema or {}, ensure_ascii=False) if _tool_obj else "{}"
+                    try:
+                        schema_hint = json.dumps(_tool_obj.input_schema or {}, ensure_ascii=False) if _tool_obj else "{}"
+                    except Exception:
+                        schema_hint = "{}"
                     error_context = (
                         f"工具 `{tool_name}` 执行失败。\n"
                         f"错误信息：{result.get('error')}\n"

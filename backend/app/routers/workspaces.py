@@ -132,6 +132,7 @@ def _employee_draft_count(db: Session, user_id: int) -> int:
         .filter(
             Workspace.created_by == user_id,
             Workspace.status == WorkspaceStatus.DRAFT,
+            Workspace.is_active == True,
         )
         .count()
     )

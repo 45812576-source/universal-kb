@@ -201,6 +201,7 @@ async def stream_message(
     )
     db.add(user_msg)
     db.flush()
+    print(f"DEBUG_OUTER: db_id={id(db)}, user_msg.id={user_msg.id}, conv_id={conv_id}")
 
     def _sse(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -371,11 +372,16 @@ async def stream_message(
             )
             db.add(assistant_msg)
 
+            all_msgs_in_session = list(db.query(Message).all())
+            print(f"DEBUG: all_msgs={[(m.id, m.conversation_id) for m in all_msgs_in_session]}")
             msg_count = db.query(Message).filter(Message.conversation_id == conv_id).count()
+            print(f"DEBUG: msg_count={msg_count}, conv_id={conv_id}, db_id={id(db)}, req.content[:20]={req.content[:20]!r}")
             if msg_count <= 2:
                 conv.title = req.content[:60]
+                print(f"DEBUG: setting title to {conv.title!r}")
 
             db.commit()
+            print(f"DEBUG: after commit, conv.title={conv.title!r}")
 
             # Estimate token usage for context warning
             total_input_chars = sum(len(m.get("content") or "") for m in prep.llm_messages)
@@ -666,6 +672,10 @@ async def upload_stream_message(
     if not conv or conv.user_id != user.id:
         raise HTTPException(404, "Conversation not found")
 
+    # Read file before generator starts — UploadFile may be closed once response streaming begins
+    file_content_bytes = await file.read()
+    file_filename = file.filename or ""
+
     def _sse(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
@@ -675,11 +685,10 @@ async def upload_stream_message(
             yield _sse("status", {"stage": "uploading"})
 
             os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-            ext = os.path.splitext(file.filename or "")[1]
+            ext = os.path.splitext(file_filename)[1]
             saved_path = os.path.join(settings.UPLOAD_DIR, f"{uuid.uuid4()}{ext}")
-            content_bytes = await file.read()
             with open(saved_path, "wb") as f:
-                f.write(content_bytes)
+                f.write(file_content_bytes)
 
             # 2. Parse phase
             yield _sse("status", {"stage": "parsing"})
@@ -725,7 +734,7 @@ async def upload_stream_message(
                     f"，建议归入知识库：{', '.join(cls_result.target_kb_ids)}"
                 )
 
-            file_label = f"[文件: {file.filename}]" + (" [FOE摘要]" if foe_summary else "")
+            file_label = f"[文件: {file_filename}]" + (" [FOE摘要]" if foe_summary else "")
             user_text = f"{file_label}\n{chat_content}"
             if message:
                 user_text = f"{message}\n\n{user_text}"
@@ -736,7 +745,7 @@ async def upload_stream_message(
                 conversation_id=conv_id,
                 role=MessageRole.USER,
                 content=user_text,
-                metadata_={"file_upload": True, "filename": file.filename},
+                metadata_={"file_upload": True, "filename": file_filename},
             )
             db.add(user_msg)
             db.flush()
@@ -751,7 +760,7 @@ async def upload_stream_message(
                 kb_db = _SessionLocal()
                 try:
                     kb_entry = KnowledgeEntry(
-                        title=file.filename or "上传文件",
+                        title=file_filename or "上传文件",
                         content=file_text,
                         summary=_foe_summary,
                         category=cls_result.taxonomy_board if cls_result else "experience",
@@ -797,7 +806,7 @@ async def upload_stream_message(
                 msg_metadata = {
                     "skill_id": conv.skill_id,
                     "skill_name": skill_name,
-                    "file_upload": True, "filename": file.filename,
+                    "file_upload": True, "filename": file_filename,
                     "model_id": llm_usage.get("model_id"),
                     "input_tokens": llm_usage.get("input_tokens", 0),
                     "output_tokens": llm_usage.get("output_tokens", 0),
@@ -809,7 +818,7 @@ async def upload_stream_message(
                 )
                 db.add(assistant_msg)
                 if db.query(Message).filter(Message.conversation_id == conv_id).count() <= 2:
-                    conv.title = f"[文件] {file.filename}"[:60]
+                    conv.title = f"[文件] {file_filename}"[:60]
                 db.commit()
                 await kb_task
                 yield _sse("delta", {"text": response_text})
@@ -878,7 +887,7 @@ async def upload_stream_message(
                 "skill_id": conv.skill_id,
                 "skill_name": skill_name,
                 "file_upload": True,
-                "filename": file.filename,
+                "filename": file_filename,
                 "kb_entry_id": kb_entry_id,
                 **tool_meta,
             }
@@ -889,7 +898,7 @@ async def upload_stream_message(
             )
             db.add(assistant_msg)
             if db.query(Message).filter(Message.conversation_id == conv_id).count() <= 2:
-                conv.title = f"[文件] {file.filename}"[:60]
+                conv.title = f"[文件] {file_filename}"[:60]
             db.commit()
 
             total_input_chars = sum(len(m.get("content") or "") for m in prep.llm_messages)

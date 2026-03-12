@@ -171,14 +171,17 @@ def create_skill(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    # 员工限额：最多 3 个未发布 Skill
+    # 员工无权创建 Skill
     if user.role == Role.EMPLOYEE:
+        raise HTTPException(403, "员工不能创建 Skill")
+
+    # DEPT_ADMIN 限额：最多 3 个未发布 Skill
+    if user.role == Role.DEPT_ADMIN:
         unpublished_count = (
             db.query(Skill)
             .filter(
                 Skill.created_by == user.id,
                 Skill.status != SkillStatus.PUBLISHED,
-                Skill.is_active == True,
             )
             .count()
         )

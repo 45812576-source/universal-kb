@@ -96,16 +96,18 @@ def list_sources(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    if user.role == Role.EMPLOYEE:
+        raise HTTPException(403, "员工无权查看情报源")
     is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
     q = db.query(IntelSource)
 
     if mine or not is_admin:
         # Non-admins or explicit "mine" filter: only show sources user manages or is authorized for
-        from sqlalchemy import or_, func
+        from sqlalchemy import or_, cast, String
         q = q.filter(
             or_(
                 IntelSource.managed_by == user.id,
-                func.json_contains(IntelSource.authorized_user_ids, str(user.id)) == 1,
+                cast(IntelSource.authorized_user_ids, String).contains(str(user.id)),
             )
         )
 

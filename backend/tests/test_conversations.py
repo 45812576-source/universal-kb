@@ -113,7 +113,7 @@ def test_send_message_and_get_reply(client, db):
 
     with patch(
         "app.services.skill_engine.SkillEngine.execute",
-        new=AsyncMock(return_value="模拟回复"),
+        new=AsyncMock(return_value=("模拟回复", {})),
     ):
         resp = client.post(
             f"/api/conversations/{conv_id}/messages",
@@ -138,7 +138,7 @@ def test_send_message_persisted_in_history(client, db):
 
     with patch(
         "app.services.skill_engine.SkillEngine.execute",
-        new=AsyncMock(return_value="回复内容"),
+        new=AsyncMock(return_value=("回复内容", {})),
     ):
         client.post(
             f"/api/conversations/{conv_id}/messages",
@@ -163,7 +163,7 @@ def test_send_message_updates_conversation_title(client, db):
 
     with patch(
         "app.services.skill_engine.SkillEngine.execute",
-        new=AsyncMock(return_value="OK"),
+        new=AsyncMock(return_value=("OK", {})),
     ):
         client.post(
             f"/api/conversations/{conv_id}/messages",
@@ -184,7 +184,7 @@ def test_send_message_to_nonexistent_conv(client, db):
 
     with patch(
         "app.services.skill_engine.SkillEngine.execute",
-        new=AsyncMock(return_value="OK"),
+        new=AsyncMock(return_value=("OK", {})),
     ):
         resp = client.post(
             "/api/conversations/99999/messages",
@@ -208,7 +208,7 @@ def test_send_message_to_other_users_conv(client, db):
 
     with patch(
         "app.services.skill_engine.SkillEngine.execute",
-        new=AsyncMock(return_value="OK"),
+        new=AsyncMock(return_value=("OK", {})),
     ):
         resp = client.post(
             f"/api/conversations/{conv_id}/messages",

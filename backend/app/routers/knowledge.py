@@ -199,11 +199,24 @@ def list_knowledge(
 ):
     q = db.query(KnowledgeEntry)
 
-    # 文件浏览器：只看自己创建的（知识搜索另有接口，保持可见已审批）
+    # 员工可见：自己创建的 + 已审批通过的
     if user.role == Role.EMPLOYEE:
-        q = q.filter(KnowledgeEntry.created_by == user.id)
+        from sqlalchemy import or_
+        q = q.filter(
+            or_(
+                KnowledgeEntry.created_by == user.id,
+                KnowledgeEntry.status == KnowledgeStatus.APPROVED,
+            )
+        )
     elif user.role == Role.DEPT_ADMIN:
-        q = q.filter(KnowledgeEntry.created_by == user.id)
+        from sqlalchemy import or_
+        q = q.filter(
+            or_(
+                KnowledgeEntry.created_by == user.id,
+                KnowledgeEntry.department_id == user.department_id,
+                KnowledgeEntry.status == KnowledgeStatus.APPROVED,
+            )
+        )
     # SUPER_ADMIN sees all
 
     if status:

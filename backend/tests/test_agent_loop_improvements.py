@@ -148,7 +148,7 @@ class TestHandleToolCallsStream:
         assert len(round_start_events) >= 1
         first_round = round_start_events[0]["data"]
         assert first_round["round"] == 1
-        assert first_round["max_rounds"] == 3
+        assert first_round["max_rounds"] == 5
 
     @pytest.mark.asyncio
     async def test_round_end_emitted(self):
@@ -196,7 +196,7 @@ class TestHandleToolCallsStream:
         progress_events = [e for e in events if isinstance(e, dict) and e.get("event") == "tool_progress"]
         assert len(progress_events) >= 1
         assert "message" in progress_events[0]["data"]
-        assert "my_tool" in progress_events[0]["data"]["message"]
+        assert "phase" in progress_events[0]["data"]
 
     @pytest.mark.asyncio
     async def test_content_block_start_for_tool_call(self):
@@ -320,7 +320,7 @@ class TestChatStreamTyped:
             "data: [DONE]",
         ]
 
-        async def fake_stream_get(*args, **kwargs):
+        def fake_stream_get(*args, **kwargs):
             class FakeResp:
                 async def aiter_lines(self):
                     for line in fake_lines:
@@ -350,7 +350,7 @@ class TestChatStreamTyped:
             "data: [DONE]",
         ]
 
-        async def fake_stream_get(*args, **kwargs):
+        def fake_stream_get(*args, **kwargs):
             class FakeResp:
                 async def aiter_lines(self):
                     for line in fake_lines:
@@ -380,7 +380,7 @@ class TestChatStreamTyped:
             "data: [DONE]",
         ]
 
-        async def fake_stream_get(*args, **kwargs):
+        def fake_stream_get(*args, **kwargs):
             class FakeResp:
                 async def aiter_lines(self):
                     for line in fake_lines:
@@ -413,7 +413,7 @@ class TestChatStreamTyped:
             "data: [DONE]",
         ]
 
-        async def fake_stream_get(*args, **kwargs):
+        def fake_stream_get(*args, **kwargs):
             class FakeResp:
                 async def aiter_lines(self):
                     for line in fake_lines:

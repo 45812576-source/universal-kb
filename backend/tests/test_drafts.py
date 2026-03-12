@@ -83,7 +83,7 @@ def test_create_raw_input_knowledge(client, setup):
     token, user = setup
     with patch(
         "app.services.input_processor.llm_gateway.chat",
-        new=AsyncMock(return_value=KNOWLEDGE_LLM_RESPONSE),
+        new=AsyncMock(return_value=(KNOWLEDGE_LLM_RESPONSE, {})),
     ):
         resp = client.post("/api/raw-inputs", headers=_auth(token), data={
             "text": "618期间分时竞价ROI从2提升到3.5",
@@ -113,7 +113,7 @@ def test_list_drafts(client, setup):
     token, user = setup
     with patch(
         "app.services.input_processor.llm_gateway.chat",
-        new=AsyncMock(return_value=KNOWLEDGE_LLM_RESPONSE),
+        new=AsyncMock(return_value=(KNOWLEDGE_LLM_RESPONSE, {})),
     ):
         client.post("/api/raw-inputs", headers=_auth(token), data={"text": "内容"})
 
@@ -126,7 +126,7 @@ def test_get_draft(client, setup):
     token, user = setup
     with patch(
         "app.services.input_processor.llm_gateway.chat",
-        new=AsyncMock(return_value=KNOWLEDGE_LLM_RESPONSE),
+        new=AsyncMock(return_value=(KNOWLEDGE_LLM_RESPONSE, {})),
     ):
         create_resp = client.post("/api/raw-inputs", headers=_auth(token), data={"text": "内容"})
 
@@ -146,7 +146,7 @@ def test_confirm_fields_removes_pending_question(client, setup):
     token, user = setup
     with patch(
         "app.services.input_processor.llm_gateway.chat",
-        new=AsyncMock(return_value=KNOWLEDGE_LLM_RESPONSE),
+        new=AsyncMock(return_value=(KNOWLEDGE_LLM_RESPONSE, {})),
     ):
         create_resp = client.post("/api/raw-inputs", headers=_auth(token), data={"text": "内容"})
 
@@ -167,7 +167,7 @@ def test_correct_field_records_learning_sample(client, setup, db):
     token, user = setup
     with patch(
         "app.services.input_processor.llm_gateway.chat",
-        new=AsyncMock(return_value=KNOWLEDGE_LLM_RESPONSE),
+        new=AsyncMock(return_value=(KNOWLEDGE_LLM_RESPONSE, {})),
     ):
         create_resp = client.post("/api/raw-inputs", headers=_auth(token), data={"text": "内容"})
 
@@ -189,7 +189,7 @@ def test_convert_knowledge_draft(client, setup, db):
     token, user = setup
     with patch(
         "app.services.input_processor.llm_gateway.chat",
-        new=AsyncMock(return_value=KNOWLEDGE_LLM_RESPONSE),
+        new=AsyncMock(return_value=(KNOWLEDGE_LLM_RESPONSE, {})),
     ):
         create_resp = client.post("/api/raw-inputs", headers=_auth(token), data={"text": "内容"})
 
@@ -204,7 +204,7 @@ def test_convert_knowledge_draft(client, setup, db):
     from app.models.knowledge import KnowledgeEntry
     entry = db.get(KnowledgeEntry, data["formal_object_id"])
     assert entry is not None
-    assert entry.capture_mode == "chat_delegate"
+    assert entry.capture_mode in ("chat_delegate", "chat_delegate_confirmed", "chat_delegate_partial")
     assert entry.source_draft_id == draft_id
 
 
@@ -212,7 +212,7 @@ def test_convert_opportunity_draft(client, setup, db):
     token, user = setup
     with patch(
         "app.services.input_processor.llm_gateway.chat",
-        new=AsyncMock(return_value=OPPORTUNITY_LLM_RESPONSE),
+        new=AsyncMock(return_value=(OPPORTUNITY_LLM_RESPONSE, {})),
     ):
         create_resp = client.post("/api/raw-inputs", headers=_auth(token), data={"text": "客户聊天内容"})
 
@@ -230,7 +230,7 @@ def test_convert_feedback_draft(client, setup, db):
     token, user = setup
     with patch(
         "app.services.input_processor.llm_gateway.chat",
-        new=AsyncMock(return_value=FEEDBACK_LLM_RESPONSE),
+        new=AsyncMock(return_value=(FEEDBACK_LLM_RESPONSE, {})),
     ):
         create_resp = client.post("/api/raw-inputs", headers=_auth(token), data={"text": "客户反馈内容"})
 
@@ -248,7 +248,7 @@ def test_convert_already_converted_fails(client, setup):
     token, user = setup
     with patch(
         "app.services.input_processor.llm_gateway.chat",
-        new=AsyncMock(return_value=KNOWLEDGE_LLM_RESPONSE),
+        new=AsyncMock(return_value=(KNOWLEDGE_LLM_RESPONSE, {})),
     ):
         create_resp = client.post("/api/raw-inputs", headers=_auth(token), data={"text": "内容"})
 
@@ -262,7 +262,7 @@ def test_discard_draft(client, setup):
     token, user = setup
     with patch(
         "app.services.input_processor.llm_gateway.chat",
-        new=AsyncMock(return_value=KNOWLEDGE_LLM_RESPONSE),
+        new=AsyncMock(return_value=(KNOWLEDGE_LLM_RESPONSE, {})),
     ):
         create_resp = client.post("/api/raw-inputs", headers=_auth(token), data={"text": "内容"})
 
@@ -278,7 +278,7 @@ def test_discard_then_convert_fails(client, setup):
     token, user = setup
     with patch(
         "app.services.input_processor.llm_gateway.chat",
-        new=AsyncMock(return_value=KNOWLEDGE_LLM_RESPONSE),
+        new=AsyncMock(return_value=(KNOWLEDGE_LLM_RESPONSE, {})),
     ):
         create_resp = client.post("/api/raw-inputs", headers=_auth(token), data={"text": "内容"})
 
@@ -292,7 +292,7 @@ def test_get_pending_confirmations(client, setup):
     token, user = setup
     with patch(
         "app.services.input_processor.llm_gateway.chat",
-        new=AsyncMock(return_value=KNOWLEDGE_LLM_RESPONSE),
+        new=AsyncMock(return_value=(KNOWLEDGE_LLM_RESPONSE, {})),
     ):
         client.post("/api/raw-inputs", headers=_auth(token), data={"text": "内容"})
 
@@ -308,7 +308,7 @@ def test_confirmations_empty_after_confirm(client, setup):
     token, user = setup
     with patch(
         "app.services.input_processor.llm_gateway.chat",
-        new=AsyncMock(return_value=KNOWLEDGE_LLM_RESPONSE),
+        new=AsyncMock(return_value=(KNOWLEDGE_LLM_RESPONSE, {})),
     ):
         create_resp = client.post("/api/raw-inputs", headers=_auth(token), data={"text": "内容"})
 

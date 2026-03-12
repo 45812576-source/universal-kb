@@ -93,7 +93,7 @@ async def test_process_knowledge_raw_input(db, user_with_model):
 
     with patch(
         "app.services.input_processor.llm_gateway.chat",
-        new=AsyncMock(return_value=KNOWLEDGE_LLM_RESPONSE),
+        new=AsyncMock(return_value=(KNOWLEDGE_LLM_RESPONSE, {})),
     ):
         draft = await process_raw_input(ri.id, db)
 
@@ -128,7 +128,7 @@ async def test_process_opportunity_raw_input(db, user_with_model):
 
     with patch(
         "app.services.input_processor.llm_gateway.chat",
-        new=AsyncMock(return_value=OPPORTUNITY_LLM_RESPONSE),
+        new=AsyncMock(return_value=(OPPORTUNITY_LLM_RESPONSE, {})),
     ):
         draft = await process_raw_input(ri.id, db)
 
