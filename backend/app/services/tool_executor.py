@@ -7,14 +7,33 @@ import inspect
 import json
 import logging
 import subprocess
+import time
 from typing import Any
 
 import httpx
+import jsonschema
 from sqlalchemy.orm import Session
 
 from app.models.tool import ToolRegistry, ToolType
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_params(tool: ToolRegistry, params: dict) -> str | None:
+    """Validate params against tool's input_schema. Returns error string or None."""
+    schema = tool.input_schema
+    if not schema:
+        return None
+    try:
+        jsonschema.validate(instance=params, schema=schema)
+        return None
+    except jsonschema.ValidationError as e:
+        # Build a friendly error message
+        path = " -> ".join(str(p) for p in e.absolute_path) if e.absolute_path else "根字段"
+        return f"参数校验失败（{path}）：{e.message}"
+    except jsonschema.SchemaError as e:
+        logger.warning(f"Tool '{tool.name}' has invalid schema: {e}")
+        return None  # schema itself is broken, skip validation
 
 
 class ToolExecutor:
@@ -26,29 +45,53 @@ class ToolExecutor:
         params: dict,
         user_id: int | None = None,
     ) -> dict:
-        """Unified entry point. Returns {"ok": bool, "result": Any, "error": str}."""
+        """Unified entry point. Returns {"ok": bool, "result": Any, "error": str, "duration_ms": int, "phases": list}."""
         tool = db.query(ToolRegistry).filter(
             ToolRegistry.name == tool_name,
             ToolRegistry.is_active == True,
         ).first()
 
         if not tool:
-            return {"ok": False, "error": f"Tool '{tool_name}' not found or inactive"}
+            return {"ok": False, "error": f"工具 '{tool_name}' 不存在或已停用", "phases": []}
 
+        phases = []
+
+        # Schema validation
+        validation_error = _validate_params(tool, params)
+        if validation_error:
+            schema_str = json.dumps(tool.input_schema or {}, ensure_ascii=False)
+            return {
+                "ok": False,
+                "error": (
+                    f"{validation_error}\n"
+                    f"工具期望的参数格式：{schema_str}"
+                ),
+                "phases": ["validation_failed"],
+            }
+        phases.append("validated")
+
+        # Get per-tool timeout from config (default 60s)
+        config = tool.config or {}
+        timeout_s = config.get("timeout", 60)
+
+        start_ms = int(time.monotonic() * 1000)
         try:
             if tool.tool_type == ToolType.BUILTIN:
                 result = await self._execute_builtin(tool, params, db=db, user_id=user_id)
             elif tool.tool_type == ToolType.HTTP:
-                result = await self._execute_http(tool, params)
+                result = await self._execute_http(tool, params, timeout_s=timeout_s)
             elif tool.tool_type == ToolType.MCP:
-                result = await self._execute_mcp(tool, params)
+                result = await self._execute_mcp(tool, params, timeout_s=timeout_s)
             else:
-                return {"ok": False, "error": f"Unknown tool type: {tool.tool_type}"}
+                return {"ok": False, "error": f"未知工具类型: {tool.tool_type}", "phases": phases}
 
-            return {"ok": True, "result": result}
+            phases.append("executed")
+            duration_ms = int(time.monotonic() * 1000) - start_ms
+            return {"ok": True, "result": result, "duration_ms": duration_ms, "phases": phases}
         except Exception as e:
+            duration_ms = int(time.monotonic() * 1000) - start_ms
             logger.error(f"Tool '{tool_name}' execution failed: {e}")
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": str(e), "duration_ms": duration_ms, "phases": phases}
 
     async def _execute_builtin(
         self,
@@ -82,14 +125,14 @@ class ToolExecutor:
         else:
             return func(**kwargs)
 
-    async def _execute_http(self, tool: ToolRegistry, params: dict) -> Any:
+    async def _execute_http(self, tool: ToolRegistry, params: dict, timeout_s: int = 60) -> Any:
         """Call an external HTTP API."""
         config = tool.config or {}
         url = config.get("url", "")
         method = config.get("method", "POST").upper()
         headers = config.get("headers", {})
 
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
             if method == "GET":
                 resp = await client.get(url, params=params, headers=headers)
             else:
@@ -97,7 +140,7 @@ class ToolExecutor:
             resp.raise_for_status()
             return resp.json()
 
-    async def _execute_mcp(self, tool: ToolRegistry, params: dict) -> Any:
+    async def _execute_mcp(self, tool: ToolRegistry, params: dict, timeout_s: int = 60) -> Any:
         """Start MCP server subprocess and call via stdio JSON-RPC."""
         config = tool.config or {}
         command = config.get("command", "")
@@ -125,7 +168,7 @@ class ToolExecutor:
             [command] + args,
             input=rpc_request.encode(),
             capture_output=True,
-            timeout=60,
+            timeout=timeout_s,
             env=proc_env,
         )
 
@@ -153,20 +196,75 @@ class ToolExecutor:
         """Format tool list for injection into system prompt."""
         if not tools:
             return ""
-        lines = ["## 可用工具", ""]
+
+        lines = [
+            "## 可用工具",
+            "",
+            "你可以调用以下工具来完成用户的需求。",
+            "",
+        ]
+
         for t in tools:
-            schema_str = json.dumps(t.input_schema or {}, ensure_ascii=False, indent=2)
-            lines.append(f"### {t.name} ({t.display_name})")
+            schema = t.input_schema or {}
+            schema_str = json.dumps(schema, ensure_ascii=False, indent=2)
+
+            # 提取 required 字段列表
+            required_fields = schema.get("required", [])
+            properties = schema.get("properties", {})
+
+            lines.append(f"### 工具：{t.name}（{t.display_name}）")
+
             if t.description:
-                lines.append(t.description)
-            lines.append(f"参数Schema:\n```json\n{schema_str}\n```")
+                lines.append(f"**功能说明**：{t.description}")
+
+            # 从 config 提取 usage_hint
+            config = t.config or {}
+            usage_hint = config.get("usage_hint", "")
+            if usage_hint:
+                lines.append(f"**使用场景**：{usage_hint}")
+
+            # 参数说明（human-friendly）
+            if properties:
+                lines.append("**参数说明**：")
+                for field_name, field_def in properties.items():
+                    field_desc = field_def.get("description", "")
+                    field_type = field_def.get("type", "any")
+                    required_mark = "（必填）" if field_name in required_fields else "（选填）"
+                    lines.append(f"- `{field_name}` [{field_type}]{required_mark}：{field_desc}")
+
+            lines.append(f"**参数 Schema**：\n```json\n{schema_str}\n```")
             lines.append("")
-        lines.append(
-            "当需要调用工具时，请在回复中包含如下JSON块（用```tool_call和```包裹）：\n"
-            "```tool_call\n"
-            '{"tool": "tool_name", "params": {...}}\n'
-            "```"
-        )
+
+        lines += [
+            "## 工具调用规范",
+            "",
+            "### 何时调用",
+            "- 当用户需求明确匹配某个工具时，**必须主动调用**，不要仅用文字描述",
+            "- 不确定时宁可调用（工具失败可重试），不要遗漏用户的工具需求",
+            "",
+            "### 调用格式",
+            "在回复中包含 JSON 块（用 ```tool_call 和 ``` 包裹）：",
+            "```tool_call",
+            '{"tool": "tool_name", "params": {"key": "value"}}',
+            "```",
+            "",
+            "### 正确示例",
+            '用户说「帮我生成一份Excel」→ 调用工具，参数从对话上下文提取',
+            "",
+            "### 错误示例（禁止）",
+            '- ❌ 只说「我可以帮你生成Excel」但不调用工具',
+            '- ❌ 参数不符合 Schema（如必填字段缺失）',
+            '- ❌ 在 tool_call 块外写 JSON',
+            "",
+            "### 多工具并行",
+            "如果需要多个工具，可在同一条回复中包含多个 tool_call 块，它们会并行执行。",
+            "",
+            "### 处理结果",
+            "- 工具成功：基于结果给出清晰回复，**不要重复展示原始 JSON**",
+            "- 工具失败：检查错误信息中的参数要求，**修正参数后重试**，最多重试2次",
+            "- 多次失败：换一种方式满足用户需求，并说明原因",
+        ]
+
         return "\n".join(lines)
 
 

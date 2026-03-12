@@ -37,8 +37,11 @@ def compile(
     if output_schema:
         schema_json = json.dumps(output_schema, ensure_ascii=False, indent=2)
         result += (
-            "\n\n## 输出格式要求\n"
-            "严格按以下 JSON Schema 返回结果，只返回 JSON，不要包含其他内容。\n"
+            "\n\n## 输出格式要求（必须严格遵守）\n"
+            "**重要**：你必须严格按以下 JSON Schema 返回结果。\n"
+            "- 只返回 JSON，不要包含任何解释、前缀或后缀\n"
+            "- 不要用 ```json 包裹，直接返回纯 JSON\n"
+            "- 所有必填字段都必须有值，不要返回 null\n"
             f"```json\n{schema_json}\n```"
         )
 

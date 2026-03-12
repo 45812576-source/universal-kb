@@ -74,6 +74,7 @@ class TaskFromMessage(BaseModel):
 class TaskGenerate(BaseModel):
     description: str
     assignee_id: Optional[int] = None
+    auto_execute: bool = False  # True 时走 PEV 三层引擎自动拆解并执行
 
 
 def _build_task_query(db: Session, user: User, status: Optional[str], priority: Optional[str], parent_only: bool = True):
@@ -250,7 +251,40 @@ async def generate_tasks(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """AI拆解：输入描述 → LLM 拆为多个子任务（按艾森豪威尔矩阵标注优先级）"""
+    """AI拆解：输入描述 → LLM 拆为多个子任务（按艾森豪威尔矩阵标注优先级）。
+    auto_execute=True 时走 PEV 三层引擎自动执行。"""
+    if req.auto_execute:
+        from app.models.pev_job import PEVJob
+        from app.services.pev import pev_orchestrator
+        import asyncio
+
+        pev_job = PEVJob(
+            scenario="task_decomp",
+            goal=req.description,
+            user_id=user.id,
+            config={
+                "assignee_id": req.assignee_id or user.id,
+                "skip_verify": False,
+            },
+        )
+        db.add(pev_job)
+        db.commit()
+        db.refresh(pev_job)
+
+        # 后台运行（非阻塞）
+        async def _run_pev():
+            from app.database import SessionLocal
+            bg_db = SessionLocal()
+            try:
+                bg_job = bg_db.get(PEVJob, pev_job.id)
+                async for _ in pev_orchestrator.run(bg_db, bg_job):
+                    pass
+            finally:
+                bg_db.close()
+
+        asyncio.create_task(_run_pev())
+        return {"pev_job_id": pev_job.id, "status": "launched", "message": "PEV 任务已启动，正在后台执行"}
+
     try:
         model_config = llm_gateway.get_config(db)
     except ValueError as e:

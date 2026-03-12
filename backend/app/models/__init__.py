@@ -15,3 +15,4 @@ from app.models.feedback_item import FeedbackItem  # noqa: F401
 from app.models.opportunity import Opportunity  # noqa: F401
 from app.models.raw_input import RawInput  # noqa: F401
 from app.models.project import Project, ProjectMember, ProjectKnowledgeShare, ProjectReport, ProjectContext, ProjectStatus, ReportType  # noqa: F401
+from app.models.pev_job import PEVJob, PEVStep, PEVJobStatus, PEVStepStatus  # noqa: F401

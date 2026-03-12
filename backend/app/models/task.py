@@ -37,6 +37,7 @@ class Task(Base):
     source_id = Column(Integer, nullable=True)
     conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=True)
     workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=True)
+    pev_job_id = Column(Integer, ForeignKey("pev_jobs.id"), nullable=True)
     metadata_ = Column("metadata", JSON, default=dict)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(

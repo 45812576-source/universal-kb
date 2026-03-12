@@ -1,8 +1,10 @@
 """Intel (intelligence) collection API."""
 import datetime
+import json
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -159,6 +161,48 @@ def delete_source(
     db.delete(source)
     db.commit()
     return {"ok": True}
+
+
+@router.post("/sources/{source_id}/run-smart")
+async def trigger_source_smart(
+    source_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """使用 PEV 引擎智能采集情报，支持 SSE 流式进度。"""
+    source = db.get(IntelSource, source_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    from app.models.pev_job import PEVJob
+    from app.services.pev import pev_orchestrator
+
+    pev_job = PEVJob(
+        scenario="intel",
+        goal=f"智能采集情报源「{source.name}」（id={source_id}）的最新情报",
+        intel_task_id=None,
+        user_id=user.id,
+        config={"source_id": source_id},
+    )
+    db.add(pev_job)
+    db.commit()
+    db.refresh(pev_job)
+
+    def _sse(event: str, data: dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    async def event_generator():
+        try:
+            async for event in pev_orchestrator.run(db, pev_job):
+                yield _sse(event["event"], event["data"])
+        except Exception as e:
+            yield _sse("pev_error", {"message": str(e)})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/sources/{source_id}/run")

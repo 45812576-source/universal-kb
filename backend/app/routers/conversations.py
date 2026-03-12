@@ -204,6 +204,29 @@ async def stream_message(
 
     async def event_generator():
         try:
+            # --- PEV 升级判断（复杂多步场景） ---
+            from app.models.skill import Skill as SkillModel
+            from app.services.pev import pev_orchestrator
+            from app.models.pev_job import PEVJob
+
+            _skill_for_pev = db.get(SkillModel, conv.skill_id) if conv.skill_id else None
+            pev_scenario = await pev_orchestrator.should_upgrade(req.content, _skill_for_pev, conv, db)
+            if pev_scenario:
+                pev_job = PEVJob(
+                    scenario=pev_scenario,
+                    goal=req.content,
+                    conversation_id=conv_id,
+                    user_id=user.id,
+                    config={},
+                )
+                db.add(pev_job)
+                db.commit()
+                db.refresh(pev_job)
+
+                async for event in pev_orchestrator.run(db, pev_job):
+                    yield _sse(event["event"], event["data"])
+                return
+
             # --- Prepare phase (skill matching, knowledge, prompt) ---
             yield _sse("status", {"stage": "preparing"})
 

@@ -36,22 +36,46 @@ class PrepareResult:
 logger = logging.getLogger(__name__)
 
 _SKILL_MATCH_PROMPT = """你是意图识别系统。根据用户消息从可用Skill中选择最匹配的一个。
-若没有合适的Skill返回字符串 "none"。只返回Skill的name，不要其他内容。
+
+规则：
+- 只返回Skill的 name（精确匹配列表中的名称），不要解释、不要返回多个
+- 若没有合适的Skill，返回字符串 "none"
+- 优先匹配用户意图而非关键词
+
+示例：
+用户: "帮我写一篇小红书种草文" → content-writing（如果存在内容写作技能）
+用户: "今天天气怎么样" → none（闲聊不匹配任何技能）
+用户: "把刚才的分析做成PPT" → pptx-generation（明确的工具需求）
 
 可用Skills:
 {skill_list}
 
 用户消息: {user_message}"""
 
-_PARAM_EXTRACT_PROMPT = """从对话中提取以下变量的值。若某变量无法确定，值设为 null。
-只返回JSON对象，不要其他内容。
+_PARAM_EXTRACT_PROMPT = """从对话中提取以下变量的值。
+
+规则：
+- 若某变量无法从对话中确定，值设为 null，不要猜测
+- 可以从上下文推断（如用户说"帮我分析这个品牌"，前文提到了品牌名，则提取该品牌名）
+- 只返回 JSON 对象，不要包含其他内容
+
+示例输出：{{"product": "XX冻干猫粮", "channel": null, "target": "养猫女性"}}
 
 需要提取的变量: {variables}
 对话内容:
 {conversation}"""
 
 _DEFAULT_SYSTEM = (
-    "你是企业知识助手。根据提供的参考知识回答用户问题。"
+    "你是 Le Desk 企业知识助手，服务于企业内部团队。\n\n"
+    "## 回复规范\n"
+    "- 直接回答问题，不要加不必要的前缀（如「好的」「根据你的问题」「我来帮你」）或后缀（如「希望对你有帮助」）\n"
+    "- 回复简洁精准，优先用结构化格式（列表、表格）呈现复杂信息\n"
+    "- 如果引用了参考知识，在回答末尾用「📎 参考知识」标注来源\n"
+    "- 如果知识不足以回答，如实说明并建议获取信息的途径，不要编造\n\n"
+    "## 禁止行为\n"
+    "- 不要重复用户的问题\n"
+    "- 不要在回答中展示原始 JSON 数据\n"
+    "- 不要自我介绍或解释你的能力\n"
     "如果引用了知识，请在回答末尾标注「参考知识」。"
     "如果知识不足以回答，请如实说明。"
 )
@@ -85,7 +109,9 @@ class SkillEngine:
         prompt = (
             f"当前技能：{current_skill_name}\n"
             f"用户新消息：{user_message}\n\n"
-            "判断用户是否明确要切换到不同任务/技能。是则返回 yes，否则返回 no。只返回一个词。"
+            "判断用户是否明确要切换到不同任务/技能（如「帮我写文案」→「做成PPT」是切换，"
+            "「修改一下」「继续」「再详细点」是沿用当前技能）。\n"
+            "返回 yes 或 no，只返回一个词。"
         )
         try:
             result, _ = await llm_gateway.chat(
@@ -482,7 +508,11 @@ class SkillEngine:
             logger.warning(f"Tool loading for chain detection failed: {e}")
 
         if available_tools:
-            tool_intent = await self._detect_tool_intent(user_message, available_tools, default_config)
+            # 工具过多时先精选
+            selected_tools = await self._select_tools_for_message(
+                user_message, available_tools, default_config
+            )
+            tool_intent = await self._detect_tool_intent(user_message, selected_tools, default_config)
             if tool_intent:
                 structured_ctx = self._get_latest_structured_output(messages)
                 if structured_ctx:
@@ -496,6 +526,19 @@ class SkillEngine:
                         return _early(self._format_tool_result(result, tool_intent))
                     except Exception as e:
                         logger.warning(f"Tool chain mapping failed, falling through to LLM: {e}")
+                else:
+                    # 直接从用户消息 + 对话历史提取工具参数
+                    try:
+                        tool_params = await self._extract_tool_params(
+                            user_message, messages, tool_intent, default_config
+                        )
+                        if tool_params is not None:
+                            result = await tool_executor.execute_tool(
+                                db, tool_intent.name, tool_params, user_id
+                            )
+                            return _early(self._format_tool_result(result, tool_intent))
+                    except Exception as e:
+                        logger.warning(f"Direct tool param extraction failed, falling through to LLM: {e}")
 
         # 5. Inject available tools
         tool_prompt = ""
@@ -584,6 +627,15 @@ class SkillEngine:
         if tool_prompt:
             system_content += f"\n\n{tool_prompt}"
 
+        # 追加通用行为约束（仅当 system_content 中没有自带约束时）
+        if "回复规范" not in system_content and "禁止行为" not in system_content:
+            system_content += (
+                "\n\n## 重要提醒\n"
+                "- 直接回答，不要重复用户的问题\n"
+                "- 不要以「好的」「当然」等词开头\n"
+                "- 如果调用了工具，基于结果给出清晰回复，不要展示原始 JSON\n"
+            )
+
         # 8. Build message list for LLM
         llm_messages = [{"role": "system", "content": system_content}]
         for m in messages:
@@ -635,7 +687,7 @@ class SkillEngine:
             summary = await self._summarize_history(early, model_config)
             compacted = [
                 *system_msgs,
-                {"role": "user", "content": f"[前期对话摘要]\n{summary}"},
+                {"role": "user", "content": f"[系统消息：前期对话摘要，非用户发言]\n{summary}"},
                 *recent,
             ]
             new_chars = sum(len(m.get("content") or "") for m in compacted)
@@ -654,8 +706,11 @@ class SkillEngine:
             f"{m['role']}: {m.get('content', '')[:500]}" for m in messages
         )
         prompt = (
-            "请用简洁的中文（200字以内）总结以下对话的主要内容和结论，"
-            "重点保留关键信息、用户需求和重要结果：\n\n"
+            "请用简洁的中文（200字以内）总结以下对话的主要内容和结论。\n"
+            "要求：\n"
+            "1. 必须保留用户的原始请求/目标（第一条 user 消息的核心意图）\n"
+            "2. 保留关键信息、重要结果和已完成的步骤\n"
+            "3. 如有工具调用，保留工具名称和关键结果\n\n"
             f"{history_text}"
         )
         try:
@@ -733,7 +788,7 @@ class SkillEngine:
         llm_messages: list[dict],
         model_config: dict,
         user_id: int | None,
-        max_rounds: int = 3,
+        max_rounds: int = 5,
         tools_schema: list[dict] | None = None,
         native_tool_calls: list[dict] | None = None,
     ) -> tuple[str, dict]:
@@ -782,7 +837,7 @@ class SkillEngine:
         llm_messages: list[dict],
         model_config: dict,
         user_id: int | None,
-        max_rounds: int = 3,
+        max_rounds: int = 5,
         tools_schema: list[dict] | None = None,
         native_tool_calls: list[dict] | None = None,
     ):
@@ -794,6 +849,14 @@ class SkillEngine:
         """
         extra_meta: dict = {}
         block_idx = 1  # 0 is the initial text block
+        consecutive_failures = 0  # 连续失败计数，用于早停
+
+        # 提取原始用户请求用于目标复述（注意力操纵，防止多轮工具调用中任务漂移）
+        original_user_request = ""
+        for m in reversed(llm_messages):
+            if m.get("role") == "user":
+                original_user_request = (m.get("content") or "")[:200]
+                break
 
         for round_num in range(max_rounds):
             # 解析本轮工具调用列表
@@ -830,7 +893,8 @@ class SkillEngine:
                     "tool": tool_name, "input": params,
                 }}
                 yield {"event": "tool_progress", "data": {
-                    "index": block_idx, "message": f"执行 {tool_name}...",
+                    "index": block_idx, "message": f"校验参数...",
+                    "phase": "validating",
                 }}
                 call_indices[block_idx] = call
                 block_idx += 1
@@ -844,6 +908,7 @@ class SkillEngine:
             for i, (call, result) in enumerate(pairs):
                 tool_name = call.get("tool") or call.get("name", "")
                 ok = result.get("ok", False)
+                duration_ms = result.get("duration_ms")
 
                 if ok and isinstance(result.get("result"), dict):
                     tool_result_data = result["result"]
@@ -856,11 +921,47 @@ class SkillEngine:
                 yield {"event": "content_block_stop", "data": {
                     "index": result_block_start + i, "type": "tool_call",
                     "tool": tool_name, "result": result_str, "ok": ok,
+                    "duration_ms": duration_ms,
                 }}
-                tool_results.append(f"工具 `{tool_name}` 执行结果：\n```json\n{result_str}\n```")
+
+                if ok:
+                    tool_results.append(f"工具 `{tool_name}` 执行结果：\n```json\n{result_str}\n```")
+                else:
+                    # 构建富上下文错误，帮助 LLM 自我修正
+                    raw_args = call.get("params") or call.get("arguments", {})
+                    params_used = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    # 获取工具的 input_schema 用于提示
+                    from app.services.tool_executor import tool_executor as _te
+                    _tool_obj = None
+                    try:
+                        from app.models.tool import ToolRegistry as _TR
+                        _tool_obj = db.query(_TR).filter(_TR.name == tool_name).first()
+                    except Exception:
+                        pass
+                    schema_hint = json.dumps(_tool_obj.input_schema or {}, ensure_ascii=False) if _tool_obj else "{}"
+                    error_context = (
+                        f"工具 `{tool_name}` 执行失败。\n"
+                        f"错误信息：{result.get('error')}\n"
+                        f"传入参数：{json.dumps(params_used, ensure_ascii=False)}\n"
+                        f"工具期望的参数格式：{schema_hint}\n"
+                        f"请检查参数并重试，或换一种方式完成用户的需求。"
+                    )
+                    tool_results.append(error_context)
 
             if not tool_results:
                 yield {"event": "round_end", "data": {"round": round_num + 1, "has_next": False}}
+                break
+
+            # 连续失败早停：所有工具都失败时计数+1，有任何成功则重置
+            all_failed = all(not r.get("ok", False) for _, r in pairs)
+            if all_failed:
+                consecutive_failures += 1
+            else:
+                consecutive_failures = 0
+
+            if consecutive_failures >= 2:
+                logger.warning(f"Agent loop early stop: {consecutive_failures} consecutive all-fail rounds")
+                yield {"event": "round_end", "data": {"round": round_num + 1, "has_next": False, "reason": "consecutive_failures"}}
                 break
 
             tool_result_text = "\n\n".join(tool_results)
@@ -888,10 +989,14 @@ class SkillEngine:
                     })
             else:
                 # 文本 fallback：将结果作为 user 消息追加
+                # 目标复述：多轮时追加原始用户请求，防止任务漂移
+                goal_reminder = ""
+                if round_num >= 1 and original_user_request:
+                    goal_reminder = f"\n\n[提醒] 用户的原始请求是：{original_user_request}"
                 llm_messages.append({"role": "assistant", "content": response})
                 llm_messages.append({
                     "role": "user",
-                    "content": f"[工具执行结果]\n\n{tool_result_text}\n\n请基于以上工具结果，给出最终回复。不需要重复展示JSON，直接告知用户结果即可。",
+                    "content": f"[工具执行结果]\n\n{tool_result_text}\n\n请基于以上工具结果，给出最终回复。不需要重复展示JSON，直接告知用户结果即可。{goal_reminder}",
                 })
 
             # 流式下一轮 LLM 响应
@@ -993,6 +1098,91 @@ class SkillEngine:
             if t.name == name:
                 return t
         return None
+
+    async def _extract_tool_params(
+        self,
+        user_message: str,
+        messages: list,
+        tool,
+        model_config: dict,
+    ) -> dict | None:
+        """从用户消息和对话历史中直接提取工具参数（不依赖 structured_output）。
+        若参数不足以调用工具，返回 None（让 LLM 通过对话补全）。
+        """
+        schema = tool.input_schema or {}
+        schema_str = json.dumps(schema, ensure_ascii=False, indent=2)
+        required_fields = schema.get("required", [])
+
+        # 组装近期对话上下文（最近6条）
+        recent = messages[-6:] if len(messages) > 6 else messages
+        history_text = "\n".join(
+            f"{m.role.value}: {m.content[:300]}" for m in recent
+            if hasattr(m, "role") and hasattr(m, "content")
+        )
+
+        prompt = (
+            f"从以下对话中提取调用工具 `{tool.name}` 所需的参数。\n\n"
+            f"工具参数 Schema：\n```json\n{schema_str}\n```\n\n"
+            f"对话历史：\n{history_text}\n\n"
+            f"用户当前消息：{user_message}\n\n"
+            f"必填参数：{required_fields}\n\n"
+            "只返回 JSON 对象（符合 Schema），如果必填参数无法从对话中确定，返回 null。"
+        )
+        try:
+            lite_config = llm_gateway.get_lite_config()
+        except Exception:
+            lite_config = model_config
+        result, _ = await llm_gateway.chat(
+            model_config=lite_config,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=1000,
+        )
+        raw = result.strip()
+        if raw.lower() == "null":
+            return None
+        raw = re.sub(r"```(?:json)?|```", "", raw).strip()
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    async def _select_tools_for_message(
+        self,
+        user_message: str,
+        available_tools: list,
+        model_config: dict,
+    ) -> list:
+        """当工具超过 5 个时，用 lite 模型精选最相关的 3-5 个工具。"""
+        if len(available_tools) <= 5:
+            return available_tools
+
+        tool_list = "\n".join(
+            f"- {t.name}: {t.display_name} — {t.description or '无描述'}"
+            for t in available_tools
+        )
+        prompt = (
+            f"用户消息：{user_message}\n\n"
+            f"可用工具列表：\n{tool_list}\n\n"
+            "从以上工具中选出最相关的 3-5 个（返回 tool name，逗号分隔），只返回名称，不要其他内容。"
+        )
+        try:
+            lite_config = llm_gateway.get_lite_config()
+        except Exception:
+            lite_config = model_config
+        try:
+            result, _ = await llm_gateway.chat(
+                model_config=lite_config,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=100,
+            )
+            selected_names = {n.strip().strip('"').strip("'") for n in result.split(",")}
+            selected = [t for t in available_tools if t.name in selected_names]
+            return selected if selected else available_tools[:5]
+        except Exception as e:
+            logger.warning(f"Tool selection failed, using first 5: {e}")
+            return available_tools[:5]
 
     async def _map_output_to_tool_input(
         self,
