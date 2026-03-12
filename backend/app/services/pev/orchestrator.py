@@ -161,7 +161,9 @@ class PEVOrchestrator:
                 }
 
                 # ─── Phase 3: Verifying（每步）──────────────────────────────
-                if skip_verify or not result.get("ok"):
+                # crawl/sub_task 类型：执行成功即视为通过，不做 LLM 语义校验
+                _no_llm_verify = step.step_type in ("crawl", "sub_task")
+                if skip_verify or _no_llm_verify or not result.get("ok"):
                     if result.get("ok"):
                         step.status = PEVStepStatus.PASSED
                         step_passed = True

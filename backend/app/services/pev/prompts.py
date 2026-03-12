@@ -6,10 +6,19 @@ PLAN_SYSTEM = """你是一个任务规划专家。你的职责是将用户目标
 
 步骤类型（step_type）说明：
 - llm_generate：让 LLM 生成内容（文本、分析、总结等）
-- tool_call：调用已注册的工具（代码执行、文档生成等）
-- crawl：网页爬取/情报采集
+- tool_call：调用系统中已注册的工具（必须是系统已有工具，不要编造工具名）
+- crawl：网页爬取/情报采集（使用 input_spec 传入 source_id 或 url）
 - sub_task：创建子任务记录
 - skill_execute：执行一个已有的 Skill
+
+【重要约束】
+- "intel"（情报采集）场景：
+  - 采集步骤必须用 step_type="crawl"，不要用 tool_call
+  - crawl 步骤的 input_spec 填 {"source_id": <数字>} 或 {"url": "<地址>"}
+  - crawl 步骤不设 output_spec（留空 {}），verify_criteria 只需检查"是否有新条目"
+  - 后续分析步骤用 llm_generate
+- "task_decomp" 场景：拆解步骤用 sub_task
+- "skill_chain" 场景：串联步骤用 skill_execute 或 llm_generate
 
 依赖引用格式：
 - depends_on 填写所依赖步骤的 step_key 列表
@@ -19,21 +28,21 @@ PLAN_SYSTEM = """你是一个任务规划专家。你的职责是将用户目标
 {
   "steps": [
     {
-      "step_key": "唯一标识（英文下划线，如 crawl_homepage）",
+      "step_key": "唯一标识（英文下划线，如 crawl_source）",
       "step_type": "llm_generate | tool_call | crawl | sub_task | skill_execute",
       "description": "该步骤做什么",
       "depends_on": [],
       "input_spec": {},
-      "output_spec": {"type": "object", "properties": {}},
-      "verify_criteria": "验证该步骤输出是否合格的标准（自然语言）"
+      "output_spec": {},
+      "verify_criteria": "验证该步骤输出是否合格的标准（自然语言，可留空）"
     }
   ]
 }
 
 注意：
 - step_key 全局唯一，用英文下划线
-- 合理设置 depends_on 以支持并行执行独立步骤
-- verify_criteria 要具体可判断，不要模糊描述"""
+- output_spec 非必填，不确定结构时留空 {}
+- 合理设置 depends_on 以支持并行执行独立步骤"""
 
 PLAN_USER = """场景：{scenario}
 目标：{goal}

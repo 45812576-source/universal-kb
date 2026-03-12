@@ -516,6 +516,7 @@ class SkillEngine:
             if tool_intent:
                 structured_ctx = self._get_latest_structured_output(messages)
                 if structured_ctx:
+                    # structured output 存在时：映射字段直接调用工具（适合 PPT/Excel 生成等输出驱动型工具）
                     try:
                         tool_params = await self._map_output_to_tool_input(
                             structured_ctx, tool_intent, default_config
@@ -526,19 +527,7 @@ class SkillEngine:
                         return _early(self._format_tool_result(result, tool_intent))
                     except Exception as e:
                         logger.warning(f"Tool chain mapping failed, falling through to LLM: {e}")
-                else:
-                    # 直接从用户消息 + 对话历史提取工具参数
-                    try:
-                        tool_params = await self._extract_tool_params(
-                            user_message, messages, tool_intent, default_config
-                        )
-                        if tool_params is not None:
-                            result = await tool_executor.execute_tool(
-                                db, tool_intent.name, tool_params, user_id
-                            )
-                            return _early(self._format_tool_result(result, tool_intent))
-                    except Exception as e:
-                        logger.warning(f"Direct tool param extraction failed, falling through to LLM: {e}")
+                # 无 structured output 时：让 LLM 决定何时调用工具及参数（适合对话式工具如 brainstorming）
 
         # 5. Inject available tools
         tool_prompt = ""

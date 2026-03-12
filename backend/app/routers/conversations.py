@@ -1,8 +1,11 @@
 import asyncio
 import json
+import logging
 import os
 import uuid
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
@@ -375,7 +378,7 @@ async def stream_message(
             db.commit()
 
             # Estimate token usage for context warning
-            total_input_chars = sum(len(m.get("content", "")) for m in prep.llm_messages)
+            total_input_chars = sum(len(m.get("content") or "") for m in prep.llm_messages)
             estimated_input_tokens = total_input_chars // 2  # rough char-to-token ratio for CJK
             estimated_output_tokens = len(response) // 2
             model_context_limit = prep.model_config.get("context_window", 32000)
@@ -393,10 +396,13 @@ async def stream_message(
 
         except Exception as e:
             import traceback
+            tb_str = traceback.format_exc()
             traceback.print_exc()
             error_type = _classify_error(e)
+            error_msg = str(e) or f"{type(e).__name__} (see server log)"
+            logger.error(f"Stream error [{type(e).__name__}]: {error_msg}\n{tb_str}")
             yield _sse("error", {
-                "message": str(e),
+                "message": error_msg,
                 "error_type": error_type,
                 "retryable": error_type in ("network", "rate_limit"),
             })
@@ -886,7 +892,7 @@ async def upload_stream_message(
                 conv.title = f"[文件] {file.filename}"[:60]
             db.commit()
 
-            total_input_chars = sum(len(m.get("content", "")) for m in prep.llm_messages)
+            total_input_chars = sum(len(m.get("content") or "") for m in prep.llm_messages)
             estimated_input_tokens = total_input_chars // 2
             estimated_output_tokens = len(response) // 2
             model_context_limit = prep.model_config.get("context_window", 32000)
@@ -904,10 +910,13 @@ async def upload_stream_message(
 
         except Exception as e:
             import traceback
+            tb_str = traceback.format_exc()
             traceback.print_exc()
             error_type = _classify_error(e)
+            error_msg = str(e) or f"{type(e).__name__} (see server log)"
+            logger.error(f"Stream error [{type(e).__name__}]: {error_msg}\n{tb_str}")
             yield _sse("error", {
-                "message": str(e),
+                "message": error_msg,
                 "error_type": error_type,
                 "retryable": error_type in ("network", "rate_limit"),
             })

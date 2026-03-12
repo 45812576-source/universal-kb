@@ -3,12 +3,19 @@ from whisperlivekit import TranscriptionEngine, AudioProcessor
 import asyncio
 
 router = APIRouter()
-_engine = None  # 懒加载，首次连接时初始化
+_engine = None
 
 
 def _load_engine():
     """同步加载模型，在线程池中调用避免阻塞 event loop。"""
-    return TranscriptionEngine(model_size="large-v3", lan="zh")
+    return TranscriptionEngine(model_size="large-v3", lan="zh", pcm_input=True)
+
+
+async def preload_engine():
+    """服务启动时预热模型，避免首次使用时等待。"""
+    global _engine
+    loop = asyncio.get_event_loop()
+    _engine = await loop.run_in_executor(None, _load_engine)
 
 
 async def get_engine():

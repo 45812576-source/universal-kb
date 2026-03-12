@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -26,6 +27,14 @@ async def startup_event():
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(f"Intel scheduler startup failed: {e}")
+
+    # 后台预热 ASR 模型，避免首次语音输入等待
+    try:
+        from app.routers.asr import preload_engine
+        asyncio.create_task(preload_engine())
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"ASR preload failed: {e}")
 
     try:
         from apscheduler.schedulers.background import BackgroundScheduler

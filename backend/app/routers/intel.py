@@ -179,7 +179,11 @@ async def trigger_source_smart(
 
     pev_job = PEVJob(
         scenario="intel",
-        goal=f"智能采集情报源「{source.name}」（id={source_id}）的最新情报",
+        goal=(
+            f"智能采集情报源「{source.name}」（source_id={source_id}，类型={source.source_type.value}）的最新情报。"
+            f"采集步骤请使用 step_type=crawl，input_spec 填写 {{\"source_id\": {source_id}}}，output_spec 留空。"
+            f"采集完成后用 step_type=llm_generate 对新条目做简要汇总。"
+        ),
         intel_task_id=None,
         user_id=user.id,
         config={"source_id": source_id},
