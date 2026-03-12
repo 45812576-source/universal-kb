@@ -16,3 +16,16 @@ from app.models.opportunity import Opportunity  # noqa: F401
 from app.models.raw_input import RawInput  # noqa: F401
 from app.models.project import Project, ProjectMember, ProjectKnowledgeShare, ProjectReport, ProjectContext, ProjectStatus, ReportType  # noqa: F401
 from app.models.pev_job import PEVJob, PEVStep, PEVJobStatus, PEVStepStatus  # noqa: F401
+from app.models.permission import (  # noqa: F401
+    Position, DataDomain, DataScopePolicy,
+    MaskAction, PublishScope,
+    GlobalDataMask, RoleMaskOverride, SkillMaskOverride,
+    SkillPolicy, RolePolicyOverride, RoleOutputMask,
+    SchemaStatus, SkillOutputSchema,
+    ConnectionDirection, SkillAgentConnection,
+    HandoffTemplateType, HandoffTemplate, HandoffSchemaCache,
+    ApprovalRequestType, ApprovalStatus, ApprovalRequest,
+    ApprovalActionType, ApprovalAction,
+    PermissionAuditLog,
+    HandoffExecutionStatus, HandoffExecution,
+)

@@ -49,6 +49,7 @@ async def startup_event():
 
 # Register new models with Base.metadata
 from app.models import raw_input, draft, opportunity, feedback_item  # noqa: F401
+from app.models import permission  # noqa: F401
 
 from app.routers import auth, admin, skills, knowledge, conversations  # noqa: E402
 from app.routers import business_tables, data_tables, audit, skill_suggestions, contributions  # noqa: E402
@@ -60,6 +61,8 @@ from app.routers import drafts  # noqa: E402
 from app.routers import tasks  # noqa: E402
 from app.routers import projects  # noqa: E402
 from app.routers import asr  # noqa: E402
+from app.routers import permissions  # noqa: E402
+from app.routers import skill_policies, approvals, handoff, output_schemas  # noqa: E402
 app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(skills.router)
@@ -83,3 +86,8 @@ app.include_router(drafts.router)
 app.include_router(tasks.router)
 app.include_router(projects.router)
 app.include_router(asr.router)
+app.include_router(permissions.router)
+app.include_router(skill_policies.router)
+app.include_router(approvals.router)
+app.include_router(handoff.router)
+app.include_router(output_schemas.router)
