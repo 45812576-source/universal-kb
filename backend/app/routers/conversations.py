@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -40,6 +40,13 @@ def _classify_error(e: Exception) -> str:
 class SendMessage(BaseModel):
     content: str
     active_skill_ids: list[int] | None = None
+
+    @field_validator("content")
+    @classmethod
+    def content_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("消息内容不能为空")
+        return v
 
 
 class ConversationCreate(BaseModel):
@@ -118,14 +125,14 @@ async def send_message(
     if not conv or conv.user_id != user.id:
         raise HTTPException(404, "Conversation not found")
 
-    # Persist user message
+    # Persist user message immediately so it survives any downstream failure
     user_msg = Message(
         conversation_id=conv_id,
         role=MessageRole.USER,
         content=req.content,
     )
     db.add(user_msg)
-    db.flush()
+    db.commit()
 
     # Execute skill engine
     try:
@@ -193,21 +200,30 @@ async def stream_message(
     if not conv or conv.user_id != user.id:
         raise HTTPException(404, "Conversation not found")
 
-    # Persist user message
+    # Persist user message — commit immediately so it survives if SSE is dropped mid-stream
     user_msg = Message(
         conversation_id=conv_id,
         role=MessageRole.USER,
         content=req.content,
     )
     db.add(user_msg)
-    db.flush()
-    print(f"DEBUG_OUTER: db_id={id(db)}, user_msg.id={user_msg.id}, conv_id={conv_id}")
+    db.commit()
+
+    # Capture user.id as a plain int before the generator closes over it —
+    # the ORM User object becomes detached once the session flushes/expires.
+    current_user_id = user.id
 
     def _sse(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     async def event_generator():
         try:
+            # Re-fetch conv inside generator to avoid detached instance issues after outer flush
+            conv = db.get(Conversation, conv_id)
+            if not conv:
+                yield _sse("error", {"message": "Conversation not found", "error_type": "server_error", "retryable": False})
+                return
+
             # --- PEV 升级判断（复杂多步场景） ---
             from app.models.skill import Skill as SkillModel
             from app.services.pev import pev_orchestrator
@@ -220,15 +236,32 @@ async def stream_message(
                     scenario=pev_scenario,
                     goal=req.content,
                     conversation_id=conv_id,
-                    user_id=user.id,
+                    user_id=current_user_id,
                     config={},
                 )
                 db.add(pev_job)
                 db.commit()
                 db.refresh(pev_job)
 
+                pev_summary = ""
                 async for event in pev_orchestrator.run(db, pev_job):
                     yield _sse(event["event"], event["data"])
+                    if event["event"] == "pev_done":
+                        pev_summary = event["data"].get("summary", "")
+
+                # 持久化 PEV 结果为 assistant 消息，并发 done 事件让前端关闭 isSending
+                pev_msg = Message(
+                    conversation_id=conv_id,
+                    role=MessageRole.ASSISTANT,
+                    content=pev_summary or f"任务已完成（{pev_job.scenario}）",
+                    metadata_={"pev_job_id": pev_job.id, "skill_id": conv.skill_id},
+                )
+                db.add(pev_msg)
+                msg_count = db.query(Message).filter(Message.conversation_id == conv_id).count()
+                if msg_count <= 2:
+                    conv.title = req.content[:60]
+                db.commit()
+                yield _sse("done", {"message_id": pev_msg.id, "metadata": {"pev_job_id": pev_job.id}})
                 return
 
             # --- Prepare phase (skill matching, knowledge, prompt) ---
@@ -236,7 +269,7 @@ async def stream_message(
 
             prep = await skill_engine.prepare(
                 db, conv, req.content,
-                user_id=user.id,
+                user_id=current_user_id,
                 active_skill_ids=req.active_skill_ids,
             )
 
@@ -278,6 +311,7 @@ async def stream_message(
             yield _sse("status", {"stage": "generating", "skill_name": skill_name})
 
             full_content = ""
+            full_thinking = ""
             block_idx = 0
             current_block_type = None  # "text" | "thinking" | None
             native_tool_calls: list[dict] = []
@@ -288,6 +322,7 @@ async def stream_message(
                 tools=prep.tools_schema or None,
             ):
                 if chunk_type == "thinking":
+                    full_thinking += chunk_data
                     if current_block_type != "thinking":
                         if current_block_type is not None:
                             yield _sse("content_block_stop", {"index": block_idx})
@@ -336,10 +371,15 @@ async def stream_message(
                 from app.models.skill import Skill as SkillModel
                 skill_obj = db.get(SkillModel, prep.skill_id) if prep.skill_id else None
                 yield _sse("status", {"stage": "tool_calling"})
+                # When LLM returns only tool_calls (no text), block_idx=0 and current_block_type=None.
+                # _handle_tool_calls_stream must start from 0 so it doesn't create sparse array holes.
+                _next_block_idx = block_idx + (1 if current_block_type is not None else 0)
                 async for item in skill_engine._handle_tool_calls_stream(
                     db, skill_obj, response, prep.llm_messages, prep.model_config, user.id,
                     tools_schema=prep.tools_schema or None,
                     native_tool_calls=native_tool_calls or None,
+                    start_block_idx=_next_block_idx,
+                    thinking_content=full_thinking,
                 ):
                     if isinstance(item, tuple):
                         response, tool_meta = item
@@ -372,16 +412,11 @@ async def stream_message(
             )
             db.add(assistant_msg)
 
-            all_msgs_in_session = list(db.query(Message).all())
-            print(f"DEBUG: all_msgs={[(m.id, m.conversation_id) for m in all_msgs_in_session]}")
             msg_count = db.query(Message).filter(Message.conversation_id == conv_id).count()
-            print(f"DEBUG: msg_count={msg_count}, conv_id={conv_id}, db_id={id(db)}, req.content[:20]={req.content[:20]!r}")
             if msg_count <= 2:
                 conv.title = req.content[:60]
-                print(f"DEBUG: setting title to {conv.title!r}")
 
             db.commit()
-            print(f"DEBUG: after commit, conv.title={conv.title!r}")
 
             # Estimate token usage for context warning
             total_input_chars = sum(len(m.get("content") or "") for m in prep.llm_messages)
@@ -587,7 +622,7 @@ async def upload_and_chat(
         finally:
             kb_db.close()
 
-    # 先把用户消息存入 DB（此时 skill_engine 从历史读到它，current_message 不重复传）
+    # 先把用户消息存入 DB 并 commit，切换 tab 时消息不会丢失
     user_msg = Message(
         conversation_id=conv_id,
         role=MessageRole.USER,
@@ -595,7 +630,7 @@ async def upload_and_chat(
         metadata_={"file_upload": True, "filename": file.filename},
     )
     db.add(user_msg)
-    db.flush()
+    db.commit()
 
     # 并行执行 KB 存储和 skill_engine（current_message="" 避免重复评估）
     kb_task = _asyncio.create_task(_save_to_kb())
@@ -676,6 +711,10 @@ async def upload_stream_message(
     file_content_bytes = await file.read()
     file_filename = file.filename or ""
 
+    # Capture user.id as a plain int before the generator closes over it —
+    # the ORM User object becomes detached once the session flushes/expires.
+    current_user_id = user.id
+
     def _sse(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
@@ -740,7 +779,7 @@ async def upload_stream_message(
                 user_text = f"{message}\n\n{user_text}"
             user_text += cls_context
 
-            # Save user message
+            # Save user message immediately so it survives if SSE is dropped mid-stream
             user_msg = Message(
                 conversation_id=conv_id,
                 role=MessageRole.USER,
@@ -748,7 +787,7 @@ async def upload_stream_message(
                 metadata_={"file_upload": True, "filename": file_filename},
             )
             db.add(user_msg)
-            db.flush()
+            db.commit()
 
             # KB save in background
             _user_id = user.id
@@ -794,7 +833,7 @@ async def upload_stream_message(
 
             prep = await skill_engine.prepare(
                 db, conv, user_text,
-                user_id=user.id,
+                user_id=current_user_id,
                 active_skill_ids=parsed_skill_ids,
             )
 
@@ -829,6 +868,7 @@ async def upload_stream_message(
             yield _sse("status", {"stage": "generating", "skill_name": skill_name})
 
             full_content = ""
+            full_thinking = ""
             block_idx = 0
             current_block_type = None
             native_tool_calls: list[dict] = []
@@ -839,6 +879,7 @@ async def upload_stream_message(
                 tools=prep.tools_schema or None,
             ):
                 if chunk_type == "thinking":
+                    full_thinking += chunk_data
                     if current_block_type != "thinking":
                         if current_block_type is not None:
                             yield _sse("content_block_stop", {"index": block_idx})
@@ -870,10 +911,13 @@ async def upload_stream_message(
                 from app.models.skill import Skill as SkillModel
                 skill_obj = db.get(SkillModel, prep.skill_id) if prep.skill_id else None
                 yield _sse("status", {"stage": "tool_calling"})
+                _next_block_idx = block_idx + (1 if current_block_type is not None else 0)
                 async for item in skill_engine._handle_tool_calls_stream(
                     db, skill_obj, response, prep.llm_messages, prep.model_config, user.id,
                     tools_schema=prep.tools_schema or None,
                     native_tool_calls=native_tool_calls or None,
+                    start_block_idx=_next_block_idx,
+                    thinking_content=full_thinking,
                 ):
                     if isinstance(item, tuple):
                         response, tool_meta = item
@@ -940,6 +984,7 @@ async def upload_stream_message(
 class ConversationPatch(BaseModel):
     title: Optional[str] = None
     skill_id: Optional[int] = None  # None = keep current; -1 = clear
+    is_active: Optional[bool] = None
 
 
 @router.patch("/{conv_id}")
@@ -956,6 +1001,8 @@ def patch_conversation(
         conv.title = req.title[:60]
     if req.skill_id is not None:
         conv.skill_id = None if req.skill_id == -1 else req.skill_id
+    if req.is_active is not None:
+        conv.is_active = req.is_active
     db.commit()
     return {"ok": True, "title": conv.title, "skill_id": conv.skill_id}
 

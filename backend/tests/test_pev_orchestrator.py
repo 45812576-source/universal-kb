@@ -320,7 +320,7 @@ class TestShouldUpgrade:
             mock_gw.get_lite_config.return_value = {"model_id": "deepseek-chat", "max_tokens": 512}
             mock_gw.chat = AsyncMock(return_value=("intel", {}))
             result = await orch.should_upgrade(
-                "帮我从5个渠道采集竞品最新动态并汇总分析",
+                "帮我从5个不同渠道采集竞品的最新产品动态、价格变化和用户评价数据，然后进行系统性汇总对比分析并自动生成完整报告",
                 None, conv, MagicMock()
             )
 
@@ -354,7 +354,7 @@ class TestShouldUpgrade:
             mock_gw.get_lite_config.return_value = {"model_id": "deepseek-chat", "max_tokens": 512}
             mock_gw.chat = AsyncMock(return_value=("task_decomp", {}))
             result = await orch.should_upgrade(
-                "把新品上市计划拆解成详细执行任务并自动创建",
+                "把新品上市的整体计划拆解成详细执行任务列表，然后依次创建日历事项并分配给相关责任人，最后自动生成项目甘特图",
                 None, conv, MagicMock()
             )
 

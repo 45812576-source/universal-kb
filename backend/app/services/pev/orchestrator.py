@@ -81,7 +81,20 @@ class PEVOrchestrator:
         job.total_steps = len(sorted_steps)
         db.commit()
 
-        yield {"event": "pev_plan", "data": {"steps": [s.get("step_key") for s in sorted_steps]}}
+        yield {
+            "event": "pev_plan_ready",
+            "data": {
+                "step_count": len(sorted_steps),
+                "steps": [
+                    {
+                        "step_key": s.get("step_key"),
+                        "description": s.get("description", ""),
+                        "step_type": s.get("step_type", "llm_generate"),
+                    }
+                    for s in sorted_steps
+                ],
+            },
+        }
 
         # ─── Phase 2: Executing ───────────────────────────────────────────────
         job.status = PEVJobStatus.EXECUTING
@@ -283,10 +296,33 @@ class PEVOrchestrator:
         db: Session,
     ) -> str | None:
         """判断是否应升级到 PEV 引擎。返回 scenario 字符串或 None。"""
+        # ── 规则短路：大部分消息无需 LLM 判断 ──
+        msg = user_message.strip()
+        if len(msg) < 50:
+            return None
+
+        # 多步骤关键词检查：无论有无 skill，都要先过关键词门槛再走 LLM
+        _MULTI_STEP_KEYWORDS = ("然后", "接着", "分步", "依次", "第一步", "步骤",
+                                 "再生成", "再制作", "串联", "多个步骤", "自动执行")
+        if not any(kw in msg for kw in _MULTI_STEP_KEYWORDS):
+            return None
+
+        # 明确排除：情报采集关键词不存在时 intel 不可能成立
+        _INTEL_KEYWORDS = ("采集", "调研", "情报", "多个信息源", "搜集", "汇总分析")
+        # 如果没有明显的 intel 意图且没有 skill_chain/task_decomp 意图，也直接排除
+        # （此处只做第一层过滤，最终由 LLM 判断）
+
         try:
             lite_config = llm_gateway.get_lite_config()
             skill_name = skill.name if skill else "（无）"
-            history_count = len(conv.messages) if hasattr(conv, "messages") and conv.messages else 0
+            # 安全获取 history_count，避免 lazy load 问题
+            try:
+                from app.models.conversation import Message
+                history_count = db.query(Message).filter(
+                    Message.conversation_id == conv.id
+                ).count()
+            except Exception:
+                history_count = 0
 
             messages = [
                 {"role": "system", "content": UPGRADE_CHECK_SYSTEM},

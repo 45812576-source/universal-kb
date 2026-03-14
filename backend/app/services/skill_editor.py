@@ -21,16 +21,18 @@ _EDIT_SYSTEM = """你是 Skill 编辑助手。根据用户的修改指令，对 
 {instruction}
 
 ## 要求
-- 理解用户意图，对 Skill 的 system_prompt、variables、knowledge_tags、data_queries 进行修改
+- 理解用户意图，对 Skill 的 system_prompt、variables、required_inputs、knowledge_tags、data_queries 进行修改
 - 只修改需要改动的字段，其他保持不变
 - 输出严格 JSON，不要 markdown 代码块，格式：
 {{
   "system_prompt": "完整的新 prompt 内容",
   "variables": ["var1", "var2"],
+  "required_inputs": [{{"key": "product", "label": "产品名称", "desc": "你的具体产品是什么", "example": "XX猫粮"}}],
   "knowledge_tags": ["tag1", "tag2"],
   "data_queries": [...],
   "change_note": "本次修改说明"
 }}
+- required_inputs 是用户开始任务前必须提供的信息项，每项含 key/label/desc/example 四个字段
 - 如果某字段无需修改，保留原值
 - change_note 用中文简短描述本次修改"""
 
@@ -63,6 +65,7 @@ class SkillEditor:
             "data_queries": skill.data_queries or [],
             "system_prompt": latest.system_prompt if latest else "",
             "variables": latest.variables or [] if latest else [],
+            "required_inputs": latest.required_inputs or [] if latest else [],
             "current_version": latest.version if latest else 0,
         }
 
@@ -91,7 +94,7 @@ class SkillEditor:
 
         # Build diff: only fields that changed
         diff = {}
-        for field in ("system_prompt", "variables", "knowledge_tags", "data_queries"):
+        for field in ("system_prompt", "variables", "required_inputs", "knowledge_tags", "data_queries"):
             old_val = current.get(field)
             new_val = proposed.get(field)
             if old_val != new_val:
@@ -142,6 +145,10 @@ class SkillEditor:
                 "variables",
                 latest.variables if latest else [],
             ),
+            required_inputs=proposed.get(
+                "required_inputs",
+                latest.required_inputs if latest else [],
+            ),
             output_schema=proposed.get(
                 "output_schema",
                 latest.output_schema if latest else None,
@@ -190,6 +197,7 @@ class SkillEditor:
             "data_queries": skill.data_queries or [],
             "system_prompt": latest.system_prompt if latest else "",
             "variables": latest.variables or [] if latest else [],
+            "required_inputs": latest.required_inputs or [] if latest else [],
             "current_version": latest.version if latest else 0,
         }
 

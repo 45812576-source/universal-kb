@@ -25,7 +25,15 @@ class Department(Base):
 
     parent = relationship("Department", remote_side=[id], back_populates="children")
     children = relationship("Department", back_populates="parent")
-    users = relationship("User", back_populates="department")
+    users = relationship("User", back_populates="department", foreign_keys="User.department_id")
+
+    def get_all_descendant_ids(self, db) -> set[int]:
+        """递归获取当前部门及所有子部门的ID集合"""
+        result = {self.id}
+        children = db.query(Department).filter(Department.parent_id == self.id).all()
+        for child in children:
+            result |= child.get_all_descendant_ids(db)
+        return result
 
 
 class User(Base):
@@ -37,8 +45,25 @@ class User(Base):
     display_name = Column(String(100), nullable=False)
     role = Column(Enum(Role), default=Role.EMPLOYEE)
     department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
+    managed_department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
     is_active = Column(Boolean, default=True)
     lark_user_id = Column(String(100), nullable=True)
+    position_id = Column(Integer, ForeignKey("positions.id"), nullable=True)
+    report_to_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
-    department = relationship("Department", back_populates="users")
+    department = relationship("Department", back_populates="users", foreign_keys=[department_id])
+    managed_department = relationship("Department", foreign_keys=[managed_department_id])
+    position = relationship("Position", back_populates="users", foreign_keys=[position_id])
+    report_to = relationship("User", remote_side=[id], foreign_keys=[report_to_id])
+
+    def get_managed_department_ids(self, db) -> set[int]:
+        """获取此用户管辖的所有部门ID（含子部门递归）。
+        super_admin 返回空集（由调用方特判），无管辖部门返回空集。
+        """
+        if not self.managed_department_id:
+            return set()
+        managed = db.query(Department).get(self.managed_department_id)
+        if not managed:
+            return set()
+        return managed.get_all_descendant_ids(db)

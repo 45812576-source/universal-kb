@@ -276,6 +276,20 @@ class DataEngine:
 
         return table
 
+    def classify_intent_fast(self, user_message: str) -> dict | None:
+        """规则前置：通过关键词快速判定数据意图，无需 LLM。返回 None 表示无法判定。"""
+        msg = user_message.strip()
+        _QUERY_KW = ("查询", "多少", "列出", "统计", "几个", "几条", "有哪些", "查一下", "看看", "筛选", "搜索", "汇总")
+        _MUTATION_KW = ("修改", "更新", "添加", "删除", "新增", "插入", "改成", "设为", "录入")
+        _COMPUTE_KW = ("计算", "算一下", "返点", "公式", "求和", "平均")
+        if any(kw in msg for kw in _QUERY_KW):
+            return {"type": "data_query"}
+        if any(kw in msg for kw in _MUTATION_KW):
+            return {"type": "data_mutation"}
+        if any(kw in msg for kw in _COMPUTE_KW):
+            return {"type": "computation"}
+        return None
+
     async def classify_intent(
         self,
         user_message: str,

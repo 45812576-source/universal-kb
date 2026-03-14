@@ -23,6 +23,7 @@ class SkillCreate(BaseModel):
     auto_inject: bool = True
     system_prompt: str
     variables: list[str] = []
+    required_inputs: list[dict] = []
     model_config_id: Optional[int] = None
     output_schema: Optional[dict] = None
 
@@ -30,6 +31,7 @@ class SkillCreate(BaseModel):
 class SkillVersionCreate(BaseModel):
     system_prompt: str
     variables: list[str] = []
+    required_inputs: list[dict] = []
     model_config_id: Optional[int] = None
     change_note: str = ""
     output_schema: Optional[dict] = None
@@ -214,6 +216,7 @@ def create_skill(
         version=1,
         system_prompt=req.system_prompt,
         variables=req.variables,
+        required_inputs=req.required_inputs,
         model_config_id=req.model_config_id,
         output_schema=req.output_schema,
         created_by=user.id,
@@ -290,6 +293,7 @@ async def upload_skill_md(
             version=new_ver,
             system_prompt=parsed["system_prompt"],
             variables=parsed["variables"],
+            required_inputs=latest.required_inputs if latest else [],
             model_config_id=latest.model_config_id if latest else None,
             output_schema=latest.output_schema if latest else None,
             created_by=user.id,
@@ -369,6 +373,7 @@ async def batch_upload_skill_md(
                 version=new_ver,
                 system_prompt=parsed["system_prompt"],
                 variables=parsed["variables"],
+                required_inputs=latest.required_inputs if latest else [],
                 model_config_id=latest.model_config_id if latest else None,
                 output_schema=latest.output_schema if latest else None,
                 created_by=user.id,
@@ -563,6 +568,7 @@ def get_skill(
             "id": v.id,
             "version": v.version,
             "variables": v.variables or [],
+            "required_inputs": v.required_inputs or [],
             "model_config_id": v.model_config_id,
             "output_schema": v.output_schema,
             "change_note": v.change_note,
@@ -617,6 +623,7 @@ def add_version(
         version=max_ver + 1,
         system_prompt=req.system_prompt,
         variables=req.variables,
+        required_inputs=req.required_inputs,
         model_config_id=req.model_config_id,
         output_schema=req.output_schema,
         created_by=user.id,

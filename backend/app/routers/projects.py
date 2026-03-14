@@ -19,6 +19,42 @@ router = APIRouter(prefix="/api/projects", tags=["projects"])
 MAX_MEMBERS = 5
 
 
+# ─── 权限：按角色过滤项目字段 ─────────────────────────────────────────────────
+
+def _filter_project_fields(data: dict, user: User, db: Session) -> dict:
+    """根据用户岗位的 DataScopePolicy(project 域) 过滤项目返回字段。
+
+    super_admin / dept_admin / 无 position → 不过滤。
+    有 position 但没配 project 域 → 不过滤（宽松策略）。
+    output_mask 存的是 excluded 字段列表。
+    """
+    if user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
+        return data
+    if not user.position_id:
+        return data
+    try:
+        from app.models.permission import DataScopePolicy, DataDomain, PolicyResourceType
+        # 找到 project 数据域
+        project_domain = db.query(DataDomain).filter(DataDomain.name == "project").first()
+        if not project_domain:
+            return data
+        scope = (
+            db.query(DataScopePolicy)
+            .filter(
+                DataScopePolicy.target_position_id == user.position_id,
+                DataScopePolicy.resource_type == PolicyResourceType.DATA_DOMAIN,
+                DataScopePolicy.data_domain_id == project_domain.id,
+            )
+            .first()
+        )
+        if not scope or not scope.output_mask:
+            return data
+        excluded = set(scope.output_mask)
+        return {k: v for k, v in data.items() if k not in excluded}
+    except Exception:
+        return data
+
+
 # ─── Serialisation ────────────────────────────────────────────────────────────
 
 def _member_dict(m: ProjectMember) -> dict:
@@ -40,6 +76,7 @@ def _project_dict(p: Project, include_members: bool = False) -> dict:
         "name": p.name,
         "description": p.description,
         "status": p.status.value,
+        "project_type": getattr(p, "project_type", "custom") or "custom",
         "owner_id": p.owner_id,
         "owner_name": p.owner.display_name if p.owner else None,
         "department_id": p.department_id,
@@ -74,6 +111,10 @@ def _context_dict(c: ProjectContext) -> dict:
         "workspace_id": c.workspace_id,
         "workspace_name": c.workspace.name if c.workspace else None,
         "summary": c.summary,
+        "requirements": getattr(c, "requirements", None),
+        "acceptance_criteria": getattr(c, "acceptance_criteria", None),
+        "handoff_status": getattr(c, "handoff_status", "none") or "none",
+        "handoff_at": c.handoff_at.isoformat() if getattr(c, "handoff_at", None) else None,
         "updated_at": c.updated_at.isoformat() if c.updated_at else None,
     }
 
@@ -85,11 +126,18 @@ class MemberInput(BaseModel):
     role_desc: str
 
 
+class DevMembersInput(BaseModel):
+    requester_user_id: int  # 需求方
+    developer_user_id: int  # 开发方
+
+
 class ProjectCreate(BaseModel):
     name: str
     description: str = ""
     department_id: Optional[int] = None
+    project_type: str = "custom"  # "dev" | "custom"
     members: list[MemberInput] = []
+    dev_members: Optional[DevMembersInput] = None
 
 
 class ProjectUpdate(BaseModel):
@@ -132,8 +180,10 @@ def create_project(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """创建项目（负责人填写名称、背景、成员列表+分工描述）。"""
-    if len(req.members) > MAX_MEMBERS:
+    """创建项目。dev 类型自动创建固定 workspace，custom 类型走 LLM 规划流程。"""
+    project_type = req.project_type if req.project_type in ("dev", "custom") else "custom"
+
+    if project_type == "custom" and len(req.members) > MAX_MEMBERS:
         raise HTTPException(400, f"项目成员最多 {MAX_MEMBERS} 人")
 
     project = Project(
@@ -142,16 +192,18 @@ def create_project(
         owner_id=user.id,
         department_id=req.department_id or user.department_id,
         status=ProjectStatus.DRAFT,
+        project_type=project_type,
     )
     db.add(project)
     db.flush()
 
-    for m in req.members:
-        db.add(ProjectMember(
-            project_id=project.id,
-            user_id=m.user_id,
-            role_desc=m.role_desc,
-        ))
+    if project_type == "custom":
+        for m in req.members:
+            db.add(ProjectMember(
+                project_id=project.id,
+                user_id=m.user_id,
+                role_desc=m.role_desc,
+            ))
 
     db.commit()
     db.refresh(project)
@@ -181,7 +233,7 @@ def list_projects(
     member_projects = [p for p in member_projects if p and p.status != ProjectStatus.ARCHIVED]
 
     all_projects = owned + member_projects
-    return [_project_dict(p) for p in all_projects]
+    return [_filter_project_fields(_project_dict(p), user, db) for p in all_projects]
 
 
 @router.get("/{project_id}")
@@ -218,7 +270,7 @@ def get_project(
         }
         for s in shares
     ]
-    return result
+    return _filter_project_fields(result, user, db)
 
 
 @router.post("/{project_id}/generate")
@@ -276,6 +328,173 @@ async def apply_plan(
     db.commit()
     db.refresh(project)
     return _project_dict(project, include_members=True)
+
+
+@router.post("/{project_id}/apply-dev-template")
+async def apply_dev_template(
+    project_id: int,
+    req: DevMembersInput,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """为 dev 项目创建固定的 chat + opencode workspace，并激活项目。"""
+    project = _get_project_or_404(project_id, db)
+    _require_owner(project, user)
+
+    if getattr(project, "project_type", "custom") != "dev":
+        raise HTTPException(400, "仅 dev 类型项目可使用此端点")
+
+    from app.services.project_engine import project_engine
+    result = await project_engine.apply_dev_template(
+        project=project,
+        requester_user_id=req.requester_user_id,
+        developer_user_id=req.developer_user_id,
+        db=db,
+    )
+
+    project.status = ProjectStatus.ACTIVE
+    db.commit()
+    db.refresh(project)
+
+    detail = _project_dict(project, include_members=True)
+    detail.update(result)
+    return detail
+
+
+@router.post("/{project_id}/handoff")
+async def submit_handoff(
+    project_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """从 chat workspace 提取需求，推送到 dev workspace 的 system_context。"""
+    project = _get_project_or_404(project_id, db)
+    if not _is_member_or_owner(project, user):
+        raise HTTPException(403, "无权操作该项目")
+
+    if getattr(project, "project_type", "custom") != "dev":
+        raise HTTPException(400, "仅 dev 类型项目支持需求交接")
+
+    # 找到 chat workspace（需求方成员）
+    chat_member = next(
+        (m for m in project.members if m.workspace and m.workspace.workspace_type == "chat"),
+        None,
+    )
+    if not chat_member or not chat_member.workspace_id:
+        raise HTTPException(400, "未找到需求方 workspace")
+
+    # 找到 dev workspace（开发方成员）
+    dev_member = next(
+        (m for m in project.members if m.workspace and m.workspace.workspace_type == "opencode"),
+        None,
+    )
+
+    from app.services.project_engine import project_engine
+    result = await project_engine.extract_requirements(
+        project=project,
+        workspace_id=chat_member.workspace_id,
+        db=db,
+    )
+
+    # 将需求注入到 dev workspace 的 system_context
+    if dev_member and dev_member.workspace_id:
+        dev_ws = db.get(Workspace, dev_member.workspace_id)
+        if dev_ws:
+            handoff_section = (
+                f"\n\n---\n## 需求交接（来自业务方）\n\n"
+                f"### 功能需求\n{result['requirements']}\n\n"
+                f"### 验收标准\n{result['acceptance_criteria']}"
+            )
+            existing = dev_ws.system_context or ""
+            # 避免重复追加：先去掉旧的交接段落
+            import re
+            existing = re.sub(r"\n\n---\n## 需求交接.*$", "", existing, flags=re.DOTALL)
+            dev_ws.system_context = existing + handoff_section
+            db.commit()
+
+    return result
+
+
+@router.get("/{project_id}/handoff")
+def get_handoff(
+    project_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """查看当前交接状态和内容。"""
+    project = _get_project_or_404(project_id, db)
+    if not _is_member_or_owner(project, user):
+        raise HTTPException(403, "无权查看该项目")
+
+    chat_member = next(
+        (m for m in project.members if m.workspace and m.workspace.workspace_type == "chat"),
+        None,
+    )
+    if not chat_member or not chat_member.workspace_id:
+        return {"handoff_status": "none", "requirements": None, "acceptance_criteria": None}
+
+    ctx = db.query(ProjectContext).filter(
+        ProjectContext.project_id == project_id,
+        ProjectContext.workspace_id == chat_member.workspace_id,
+    ).first()
+
+    if not ctx:
+        return {"handoff_status": "none", "requirements": None, "acceptance_criteria": None}
+
+    return {
+        "handoff_status": getattr(ctx, "handoff_status", "none") or "none",
+        "requirements": getattr(ctx, "requirements", None),
+        "acceptance_criteria": getattr(ctx, "acceptance_criteria", None),
+        "handoff_at": ctx.handoff_at.isoformat() if getattr(ctx, "handoff_at", None) else None,
+    }
+
+
+@router.get("/by-workspace/{workspace_id}")
+def get_project_by_workspace(
+    workspace_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """根据 workspace_id 反查所属项目及交接内容（用于 DevStudio 展示）。"""
+    member = db.query(ProjectMember).filter(
+        ProjectMember.workspace_id == workspace_id
+    ).first()
+
+    if not member:
+        return None
+
+    project = db.get(Project, member.project_id)
+    if not project:
+        return None
+
+    if not _is_member_or_owner(project, user):
+        return None
+
+    if getattr(project, "project_type", "custom") != "dev":
+        return None
+
+    # 查找 chat workspace 的 context（含交接内容）
+    chat_member = next(
+        (m for m in project.members if m.workspace and m.workspace.workspace_type == "chat"),
+        None,
+    )
+    handoff_data = {"handoff_status": "none", "requirements": None, "acceptance_criteria": None}
+    if chat_member and chat_member.workspace_id:
+        ctx = db.query(ProjectContext).filter(
+            ProjectContext.project_id == project.id,
+            ProjectContext.workspace_id == chat_member.workspace_id,
+        ).first()
+        if ctx:
+            handoff_data = {
+                "handoff_status": getattr(ctx, "handoff_status", "none") or "none",
+                "requirements": getattr(ctx, "requirements", None),
+                "acceptance_criteria": getattr(ctx, "acceptance_criteria", None),
+                "handoff_at": ctx.handoff_at.isoformat() if getattr(ctx, "handoff_at", None) else None,
+            }
+
+    result = _project_dict(project, include_members=False)
+    result["handoff"] = handoff_data
+    return result
 
 
 @router.patch("/{project_id}")

@@ -69,6 +69,10 @@ export default [
       route("admin/workspaces/:id", "routes/app/admin/workspaces/detail.tsx"),
       route("admin/skill-market", "routes/app/admin/skill-market/index.tsx"),
       route("admin/mcp-tokens", "routes/app/admin/mcp-tokens/index.tsx"),
+      route("admin/approvals", "routes/app/admin/approvals.tsx"),
+      route("admin/skill-policies", "routes/app/admin/skill-policies.tsx"),
+      route("admin/mask-config", "routes/app/admin/mask-config.tsx"),
+      route("admin/output-schemas", "routes/app/admin/output-schemas.tsx"),
     ]),
   ]),
 ] satisfies RouteConfig;

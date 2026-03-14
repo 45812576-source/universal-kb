@@ -3,7 +3,7 @@ import { test as base } from "@playwright/test";
 import { login } from "./helpers";
 
 export const test = base.extend<{ authedPage: any }>({
-  authedPage: async ({ page }, use) => {
+  authedPage: async ({ page }: { page: any }, use: (page: any) => Promise<void>) => {
     await login(page);
     await use(page);
   },

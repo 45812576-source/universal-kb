@@ -1,5 +1,5 @@
 // frontend/e2e/helpers.ts
-import { Page } from "@playwright/test";
+import type { Page } from "@playwright/test";
 
 export async function login(page: Page, username = "admin", password = "admin123") {
   await page.goto("/login");

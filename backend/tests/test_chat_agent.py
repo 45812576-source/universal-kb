@@ -481,56 +481,70 @@ class TestKnowledgeRerank:
 # ═════════════════════════════════════════════════════════════════════════════
 
 class TestSkillSwitchCache:
-    """_needs_skill_switch 与 prepare() 的缓存逻辑测试。"""
+    """_match_or_keep_skill 与 prepare() 的 skill 切换逻辑测试。"""
 
     def _make_engine(self):
         from app.services.skill_engine import SkillEngine
         return SkillEngine()
 
     @pytest.mark.asyncio
-    async def test_needs_switch_yes(self):
+    async def test_match_or_keep_returns_new_skill(self):
+        """LLM 返回候选 skill name 时，切换到该 skill。"""
         engine = self._make_engine()
+        current = MagicMock(); current.name = "文案撰写"; current.description = ""
+        candidate = MagicMock(); candidate.name = "数据分析"; candidate.description = ""
         with patch("app.services.skill_engine.llm_gateway.chat",
-                   new=AsyncMock(return_value=("yes", {}))):
-            result = await engine._needs_skill_switch("文案撰写", "帮我生成一份数据报表")
-        assert result is True
+                   new=AsyncMock(return_value=("数据分析", {}))):
+            with patch("app.services.skill_engine.llm_gateway.get_lite_config",
+                       return_value={"model_id": "x", "api_base": "http://x", "api_key": "k", "max_tokens": 50}):
+                result = await engine._match_or_keep_skill(current, "帮我生成数据报表", [candidate])
+        assert result is candidate
 
     @pytest.mark.asyncio
-    async def test_needs_switch_no(self):
+    async def test_match_or_keep_returns_current_when_keep(self):
+        """LLM 返回 keep 时，继续使用当前 skill。"""
         engine = self._make_engine()
+        current = MagicMock(); current.name = "文案撰写"; current.description = ""
+        candidate = MagicMock(); candidate.name = "数据分析"; candidate.description = ""
         with patch("app.services.skill_engine.llm_gateway.chat",
-                   new=AsyncMock(return_value=("no", {}))):
-            result = await engine._needs_skill_switch("文案撰写", "帮我改一下这段文案的语气")
-        assert result is False
+                   new=AsyncMock(return_value=("keep", {}))):
+            with patch("app.services.skill_engine.llm_gateway.get_lite_config",
+                       return_value={"model_id": "x", "api_base": "http://x", "api_key": "k", "max_tokens": 50}):
+                result = await engine._match_or_keep_skill(current, "帮我改一下这段文案的语气", [candidate])
+        assert result is current
 
     @pytest.mark.asyncio
-    async def test_needs_switch_yes_prefix_variants(self):
-        """以 y 开头的回复（yes、YES、Yeah）均视为需要切换。"""
+    async def test_match_or_keep_no_candidates(self):
+        """没有候选 skill 时直接返回 current，不调 LLM。"""
         engine = self._make_engine()
-        for answer in ["yes", "Yes", "YES"]:
-            with patch("app.services.skill_engine.llm_gateway.chat",
-                       new=AsyncMock(return_value=(answer, {}))):
-                result = await engine._needs_skill_switch("skill_a", "切换需求")
-            assert result is True, f"Expected True for answer={answer!r}"
+        current = MagicMock(); current.name = "文案撰写"; current.description = ""
+        with patch("app.services.skill_engine.llm_gateway.chat") as mock_chat:
+            result = await engine._match_or_keep_skill(current, "任意消息", [])
+        assert result is current
+        mock_chat.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_needs_switch_fallback_on_error(self):
-        """LLM 调用失败时默认不切换（保守策略）。"""
+    async def test_match_or_keep_fallback_on_error(self):
+        """LLM 调用失败时保守策略：返回 current_skill。"""
         engine = self._make_engine()
+        current = MagicMock(); current.name = "skill_x"; current.description = ""
+        candidate = MagicMock(); candidate.name = "skill_y"; candidate.description = ""
         with patch("app.services.skill_engine.llm_gateway.chat",
                    new=AsyncMock(side_effect=Exception("network error"))):
-            result = await engine._needs_skill_switch("skill_x", "用户消息")
-        assert result is False
+            with patch("app.services.skill_engine.llm_gateway.get_lite_config",
+                       return_value={"model_id": "x", "api_base": "http://x", "api_key": "k", "max_tokens": 50}):
+                result = await engine._match_or_keep_skill(current, "用户消息", [candidate])
+        assert result is current
 
     @pytest.mark.asyncio
-    async def test_prepare_skips_full_match_when_no_switch_needed(self):
-        """当 _needs_skill_switch=False 时，不调用 _match_skill，节省 LLM 调用。"""
+    async def test_prepare_uses_match_or_keep_when_candidates_exist(self):
+        """有切换候选时，prepare() 调用 _match_or_keep_skill（一次调用完成切换+匹配）。"""
         engine = self._make_engine()
 
-        from app.models.skill import SkillStatus
         mock_skill = MagicMock()
         mock_skill.id = 1
         mock_skill.name = "文案助手"
+        mock_skill.description = ""
         mock_skill.auto_inject = False
         mock_skill.data_queries = None
         mock_skill.mode = None
@@ -539,6 +553,7 @@ class TestSkillSwitchCache:
         mock_other_skill = MagicMock()
         mock_other_skill.id = 2
         mock_other_skill.name = "数据分析"
+        mock_other_skill.description = ""
 
         mock_conv = MagicMock()
         mock_conv.skill_id = 1
@@ -549,29 +564,26 @@ class TestSkillSwitchCache:
         mock_db.get.return_value = mock_skill
         mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = []
 
-        with patch.object(engine, "_needs_skill_switch", new=AsyncMock(return_value=False)) as mock_check:
-            with patch.object(engine, "_match_skill", new=AsyncMock()) as mock_match:
-                with patch("app.services.skill_engine.llm_gateway.get_config", return_value={"model_id": "x", "api_base": "http://x", "api_key_env": "K", "max_tokens": 100, "temperature": "0.7"}):
-                    with patch("app.services.skill_engine.llm_gateway.get_lite_config", return_value={"model_id": "x", "api_base": "http://x", "api_key": "k", "max_tokens": 50, "temperature": "0.1"}):
-                        with patch.object(engine, "_inject_knowledge", new=AsyncMock(return_value="")):
-                            with patch.object(engine, "_compact_if_needed", new=AsyncMock(side_effect=lambda msgs, _: msgs)):
-                                # 模拟有候选切换技能
-                                with patch("app.services.skill_engine.SkillEngine._needs_skill_switch",
-                                           new=AsyncMock(return_value=False)):
-                                    # patch workspace to return switch candidates
-                                    pass
+        mock_match_or_keep = AsyncMock(return_value=mock_skill)
+        with patch.object(engine, "_match_or_keep_skill", mock_match_or_keep):
+            with patch("app.services.skill_engine.llm_gateway.get_config", return_value={"model_id": "x", "api_base": "http://x", "api_key_env": "K", "max_tokens": 100, "temperature": "0.7"}):
+                with patch("app.services.skill_engine.llm_gateway.get_lite_config", return_value={"model_id": "x", "api_base": "http://x", "api_key": "k", "max_tokens": 50, "temperature": "0.1"}):
+                    with patch.object(engine, "_inject_knowledge", new=AsyncMock(return_value="")):
+                        with patch.object(engine, "_compact_if_needed", new=AsyncMock(side_effect=lambda msgs, _: msgs)):
+                            pass  # no switch_candidates since workspace_id=None, so _match_or_keep_skill not called
 
-        # 关键断言：_needs_skill_switch 返回 False 时，_match_skill 不被调用
-        mock_match.assert_not_called()
+        # 无 workspace 无 switch_candidates 时不调用 _match_or_keep_skill
+        mock_match_or_keep.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_prepare_calls_full_match_when_switch_needed(self):
-        """当 _needs_skill_switch=True 时，prepare() 内部调用完整的 _match_skill。"""
+    async def test_prepare_match_or_keep_called_with_workspace(self):
+        """workspace 有多个 skill 时，prepare() 调用 _match_or_keep_skill 而非两步走。"""
         engine = self._make_engine()
 
         mock_current_skill = MagicMock()
         mock_current_skill.id = 1
         mock_current_skill.name = "文案助手"
+        mock_current_skill.description = ""
         mock_current_skill.auto_inject = False
         mock_current_skill.data_queries = None
         mock_current_skill.mode = None
@@ -580,12 +592,12 @@ class TestSkillSwitchCache:
         mock_new_skill = MagicMock()
         mock_new_skill.id = 2
         mock_new_skill.name = "数据分析"
+        mock_new_skill.description = ""
         mock_new_skill.auto_inject = False
         mock_new_skill.data_queries = None
         mock_new_skill.mode = None
         mock_new_skill.versions = []
 
-        # workspace 包含两个 skill，这样才有 switch_candidates
         mock_wsk1 = MagicMock(); mock_wsk1.skill_id = 1
         mock_wsk2 = MagicMock(); mock_wsk2.skill_id = 2
         mock_workspace = MagicMock()
@@ -597,13 +609,12 @@ class TestSkillSwitchCache:
 
         mock_conv = MagicMock()
         mock_conv.skill_id = 1
-        mock_conv.workspace_id = 99  # 非 None 才能走 workspace 分支
+        mock_conv.workspace_id = 99
         mock_conv.id = 1
 
         mock_db = MagicMock()
 
         def db_get(model, pk):
-            from app.models.skill import Skill as SkillModel
             try:
                 from app.models.workspace import Workspace
                 if model is Workspace:
@@ -617,24 +628,22 @@ class TestSkillSwitchCache:
             return None
 
         mock_db.get.side_effect = db_get
-        # db.query(Message).filter(...).order_by(...).all() → []
         mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = []
         mock_db.query.return_value.filter.return_value.all.return_value = []
 
-        mock_match = AsyncMock(return_value=mock_new_skill)
         fake_config = {"model_id": "x", "api_base": "http://x", "api_key": "k", "max_tokens": 100, "temperature": "0.7"}
-        with patch.object(engine, "_needs_skill_switch", new=AsyncMock(return_value=True)):
-            with patch.object(engine, "_match_skill", mock_match):
-                with patch("app.services.skill_engine.llm_gateway.get_config", return_value=fake_config):
-                    with patch("app.services.skill_engine.llm_gateway.get_lite_config", return_value=fake_config):
-                        with patch.object(engine, "_inject_knowledge", new=AsyncMock(return_value="")):
-                            with patch.object(engine, "_compact_if_needed", new=AsyncMock(side_effect=lambda msgs, _: msgs)):
-                                with patch.object(engine, "_detect_tool_intent", new=AsyncMock(return_value=None)):
-                                    with patch("app.services.tool_executor.tool_executor.get_tools_for_skill", return_value=[]):
-                                        await engine.prepare(mock_db, mock_conv, "帮我做数据分析", user_id=1)
+        mock_match_or_keep = AsyncMock(return_value=mock_new_skill)
+        with patch.object(engine, "_match_or_keep_skill", mock_match_or_keep):
+            with patch("app.services.skill_engine.llm_gateway.get_config", return_value=fake_config):
+                with patch("app.services.skill_engine.llm_gateway.get_lite_config", return_value=fake_config):
+                    with patch.object(engine, "_inject_knowledge", new=AsyncMock(return_value="")):
+                        with patch.object(engine, "_compact_if_needed", new=AsyncMock(side_effect=lambda msgs, _: msgs)):
+                            with patch("app.services.skill_engine.llm_gateway.supports_function_calling", return_value=False):
+                                with patch("app.services.tool_executor.tool_executor.get_tools_for_skill", return_value=[]):
+                                    await engine.prepare(mock_db, mock_conv, "帮我做数据分析", user_id=1)
 
-        # 核心验证：_needs_skill_switch=True 时应该触发 _match_skill
-        mock_match.assert_called()
+        # 核心验证：有 switch_candidates 时调用了 _match_or_keep_skill（一次搞定）
+        mock_match_or_keep.assert_called()
 
 
 # ═════════════════════════════════════════════════════════════════════════════

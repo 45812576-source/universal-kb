@@ -123,6 +123,22 @@ const ICONS = {
     pattern: ["GGGGGGG","G.....G","GWWWWWG","G.WWW.G","G..W..G","G.....G","GGGGGGG","......."],
     colors: { G: "#38A169", W: "#C6F6D5" },
   },
+  approvals: {
+    pattern: [".YYYYY.","Y.....Y","Y..G..Y","Y.GGG.Y","Y.G...Y","Y.....Y",".YYYYY.","......."],
+    colors: { Y: "#D69E2E", G: "#38A169" },
+  },
+  skillPolicy: {
+    pattern: ["GGGGGGG","G.....G","G.GGG.G","G.G.G.G","G.GGG.G","G.....G","GGGGGGG","......."],
+    colors: { G: "#38A169" },
+  },
+  maskConfig: {
+    pattern: ["PPPPPPP","P.....P","P.PPP.P","P.P.P.P","P.PPP.P","P.....P","PPPPPPP","......."],
+    colors: { P: "#805AD5" },
+  },
+  outputSchema: {
+    pattern: ["TTTTTTT","T.....T","T.TTT.T","T.T...T","T.TTT.T","T.....T","TTTTTTT","......."],
+    colors: { T: "#319795" },
+  },
   // collapse toggle arrows
   chevronDown: {
     pattern: [".......",".......",".CCCCC.","..CCC..","...C...",".......",".......","......."],
@@ -276,20 +292,42 @@ export default function AppLayout() {
               <NavItem to="/intel" label="情报中心" icon={ICONS.intel} collapsed={collapsed} />
             </NavGroup>
 
-            {/* 管理 */}
+            {/* 内容管理 */}
             {isAdmin && (
-              <NavGroup label="管理" storageKey="nav_group_admin" collapsed={collapsed}>
+              <NavGroup label="内容管理" storageKey="nav_group_content" collapsed={collapsed}>
                 <NavItem to="/admin/knowledge" label="知识审核" icon={ICONS.review} collapsed={collapsed} />
-                <NavItem to="/admin/skills" label="Skill管理" icon={ICONS.skillsAdmin} collapsed={collapsed} />
-                <NavItem to="/admin/models" label="模型配置" icon={ICONS.models} collapsed={collapsed} />
+                <NavItem to="/admin/skills" label="Skill 管理" icon={ICONS.skillsAdmin} collapsed={collapsed} />
                 <NavItem to="/admin/business-tables" label="业务表管理" icon={ICONS.bizTable} collapsed={collapsed} />
+                <NavItem to="/admin/workspaces" label="工作台管理" icon={ICONS.workspaceAdmin} collapsed={collapsed} />
+              </NavGroup>
+            )}
+
+            {/* AI 配置 */}
+            {isAdmin && (
+              <NavGroup label="AI 配置" storageKey="nav_group_ai" collapsed={collapsed}>
+                <NavItem to="/admin/models" label="模型配置" icon={ICONS.models} collapsed={collapsed} />
                 <NavItem to="/admin/tools" label="工具管理" icon={ICONS.tools} collapsed={collapsed} />
                 <NavItem to="/admin/skill-market" label="外部市场" icon={ICONS.skillMarket} collapsed={collapsed} />
                 <NavItem to="/admin/mcp-tokens" label="MCP Token" icon={ICONS.mcpToken} collapsed={collapsed} />
                 <NavItem to="/admin/intel" label="情报管理" icon={ICONS.intelAdmin} collapsed={collapsed} />
-                <NavItem to="/admin/workspaces" label="工作台管理" icon={ICONS.workspaceAdmin} collapsed={collapsed} />
-                <NavItem to="/admin/audit" label="操作审计" icon={ICONS.audit} collapsed={collapsed} />
+              </NavGroup>
+            )}
+
+            {/* 权限安全 */}
+            {isAdmin && (
+              <NavGroup label="权限安全" storageKey="nav_group_permission" collapsed={collapsed}>
+                <NavItem to="/admin/approvals" label="审批管理" icon={ICONS.approvals} collapsed={collapsed} />
+                <NavItem to="/admin/skill-policies" label="Skill 策略" icon={ICONS.skillPolicy} collapsed={collapsed} />
+                <NavItem to="/admin/mask-config" label="脱敏配置" icon={ICONS.maskConfig} collapsed={collapsed} />
+                <NavItem to="/admin/output-schemas" label="输出 Schema" icon={ICONS.outputSchema} collapsed={collapsed} />
+              </NavGroup>
+            )}
+
+            {/* 系统运营 */}
+            {isAdmin && (
+              <NavGroup label="系统运营" storageKey="nav_group_system" collapsed={collapsed}>
                 <NavItem to="/admin/contributions" label="贡献排行" icon={ICONS.contrib} collapsed={collapsed} />
+                <NavItem to="/admin/audit" label="操作审计" icon={ICONS.audit} collapsed={collapsed} />
                 {isSuperAdmin && (
                   <NavItem to="/admin/users" label="用户管理" icon={ICONS.users} collapsed={collapsed} />
                 )}

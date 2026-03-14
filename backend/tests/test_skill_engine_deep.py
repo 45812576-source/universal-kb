@@ -45,8 +45,7 @@ class TestPrepareInputEvaluator:
         skill.versions = [skill_version]
         skill.scope = "company"
 
-        with patch.object(engine, "_match_skill", return_value=skill), \
-             patch.object(engine, "_get_latest_skill_version", return_value=skill_version):
+        with patch.object(engine, "_match_skill", return_value=skill):
             from app.services.input_evaluator import input_evaluator
             eval_result = {"pass": False, "missing_questions": ["请告诉我品牌名称是什么？"]}
             with patch.object(input_evaluator, "evaluate", new=AsyncMock(return_value=eval_result)):
@@ -98,7 +97,6 @@ class TestPrepareRuleEngine:
         skill.versions = [skill_version]
 
         with patch.object(engine, "_match_skill", return_value=skill), \
-             patch.object(engine, "_get_latest_skill_version", return_value=skill_version), \
              patch("app.services.llm_gateway.llm_gateway.get_config", return_value={}):
             with patch("app.services.rule_engine.rule_engine.try_evaluate",
                        new=AsyncMock(return_value=("规则命中结果", {}))):
@@ -133,7 +131,6 @@ class TestPrepareRuleEngine:
         skill.versions = [skill_version]
 
         with patch.object(engine, "_match_skill", return_value=skill), \
-             patch.object(engine, "_get_latest_skill_version", return_value=skill_version), \
              patch("app.services.llm_gateway.llm_gateway.get_config", return_value={"context_window": 32000}), \
              patch("app.services.rule_engine.rule_engine.try_evaluate", new=AsyncMock(return_value=None)):
             prep = await engine.prepare(db, conv, "普通输入")
@@ -317,38 +314,42 @@ class TestExtractVariables:
     @pytest.mark.asyncio
     async def test_extracts_variables_from_history(self):
         engine = _make_engine()
-        messages = [
-            {"role": "user", "content": "我是小红书运营，品牌是「奈雪的茶」，目标是年轻女性"},
-        ]
-        variables = [{"name": "品牌名", "description": "品牌名称"}]
+        # _extract_variables(variables: list[str], conversation_text: str, model_config: dict)
+        variables = ["品牌名", "目标受众"]
+        conversation_text = "我是小红书运营，品牌是「奈雪的茶」，目标是年轻女性"
 
         with patch("app.services.llm_gateway.llm_gateway.chat",
                    new=AsyncMock(return_value=('{"品牌名": "奈雪的茶"}', {}))):
-            result = await engine._extract_variables(messages, variables, {})
+            result = await engine._extract_variables(variables, conversation_text, {})
 
         assert result.get("品牌名") == "奈雪的茶"
 
     @pytest.mark.asyncio
-    async def test_extract_failure_returns_empty_dict(self):
+    async def test_extract_failure_propagates(self):
         engine = _make_engine()
-        messages = [{"role": "user", "content": "你好"}]
-        variables = [{"name": "品牌名", "description": "品牌名称"}]
+        variables = ["品牌名"]
+        conversation_text = "你好"
 
         with patch("app.services.llm_gateway.llm_gateway.chat",
                    new=AsyncMock(side_effect=Exception("LLM 失败"))):
-            result = await engine._extract_variables(messages, variables, {})
+            try:
+                await engine._extract_variables(variables, conversation_text, {})
+                raised = False
+            except Exception:
+                raised = True
 
-        assert result == {}
+        # 方法本身不捕获异常，由调用方处理
+        assert raised
 
     @pytest.mark.asyncio
     async def test_malformed_llm_response_returns_empty_dict(self):
         engine = _make_engine()
-        messages = [{"role": "user", "content": "你好"}]
-        variables = [{"name": "x", "description": "x"}]
+        variables = ["x"]
+        conversation_text = "你好"
 
         with patch("app.services.llm_gateway.llm_gateway.chat",
                    new=AsyncMock(return_value=("不是JSON格式的回复", {}))):
-            result = await engine._extract_variables(messages, variables, {})
+            result = await engine._extract_variables(variables, conversation_text, {})
 
         assert isinstance(result, dict)
 

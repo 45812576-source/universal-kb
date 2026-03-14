@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     LARK_VERIFICATION_TOKEN: str = ""
     LARK_ENCRYPT_KEY: str = ""
 
+    # LLM API Keys (forwarded to opencode web process)
+    KIMI_API_KEY: str = ""
+    DEEPSEEK_API_KEY: str = ""
+
     class Config:
         env_file = ".env"
         extra = "ignore"

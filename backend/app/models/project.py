@@ -9,6 +9,11 @@ from sqlalchemy.orm import relationship
 from app.database import Base
 
 
+class ProjectType(str, enum.Enum):
+    DEV = "dev"
+    CUSTOM = "custom"
+
+
 class ProjectStatus(str, enum.Enum):
     DRAFT = "draft"
     ACTIVE = "active"
@@ -27,7 +32,8 @@ class Project(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(200), nullable=False)
     description = Column(Text, nullable=True)
-    status = Column(Enum(ProjectStatus), default=ProjectStatus.DRAFT, nullable=False)
+    status = Column(Enum(ProjectStatus, values_callable=lambda x: [e.value for e in x]), default=ProjectStatus.DRAFT, nullable=False)
+    project_type = Column(String(20), default="custom", nullable=False)
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
     max_members = Column(Integer, default=5)
@@ -82,7 +88,7 @@ class ProjectReport(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
-    report_type = Column(Enum(ReportType), nullable=False)
+    report_type = Column(Enum(ReportType, values_callable=lambda x: [e.value for e in x]), nullable=False)
     content = Column(Text, nullable=True)
     period_start = Column(Date, nullable=True)
     period_end = Column(Date, nullable=True)
@@ -98,6 +104,10 @@ class ProjectContext(Base):
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
     workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
     summary = Column(Text, nullable=True)
+    requirements = Column(Text, nullable=True)
+    acceptance_criteria = Column(Text, nullable=True)
+    handoff_status = Column(String(20), default="none")
+    handoff_at = Column(DateTime, nullable=True)
     updated_at = Column(
         DateTime,
         default=datetime.datetime.utcnow,

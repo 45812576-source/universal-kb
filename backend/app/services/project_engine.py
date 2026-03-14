@@ -50,6 +50,20 @@ workspace名称: {workspace_name}
 
 只返回摘要文本，不要其他内容。"""
 
+_EXTRACT_REQUIREMENTS_PROMPT = """你是需求分析专家。请从以下业务需求对话中，提取出结构化的需求信息，供开发人员实施。
+
+项目名称: {project_name}
+项目背景: {project_description}
+
+需求方最近对话（最多30轮）:
+{conversation_text}
+
+请返回 JSON 格式，只返回 JSON，不要其他内容：
+{{
+  "requirements": "需求摘要（结构化的功能点列表，每个功能点单独一行，用数字编号）",
+  "acceptance_criteria": "验收标准（每条单独一行，明确可验证的条件）"
+}}"""
+
 _GENERATE_REPORT_PROMPT = """请根据以下项目信息生成一份{report_type_label}报告。
 
 项目名称: {project_name}
@@ -242,6 +256,178 @@ class ProjectEngine:
                 ))
 
         db.commit()
+
+    async def extract_requirements(
+        self,
+        project,
+        workspace_id: int,
+        db: Session,
+    ) -> dict:
+        """从 chat workspace 对话中提取需求摘要和验收标准，存入 ProjectContext。"""
+        from app.models.project import ProjectContext
+        from app.models.conversation import Conversation, Message
+
+        # 获取该 workspace 最近30条消息
+        conv = db.query(Conversation).filter(
+            Conversation.workspace_id == workspace_id,
+            Conversation.is_active == True,
+        ).order_by(Conversation.updated_at.desc()).first()
+
+        if not conv:
+            raise ValueError("该 workspace 暂无对话记录")
+
+        messages = (
+            db.query(Message)
+            .filter(Message.conversation_id == conv.id)
+            .order_by(Message.created_at.desc())
+            .limit(30)
+            .all()
+        )
+        if not messages:
+            raise ValueError("该 workspace 暂无消息")
+
+        messages = list(reversed(messages))
+        conversation_text = "\n".join(
+            f"{m.role.value}: {m.content[:300]}" for m in messages
+        )
+
+        prompt = _EXTRACT_REQUIREMENTS_PROMPT.format(
+            project_name=project.name,
+            project_description=project.description or "",
+            conversation_text=conversation_text,
+        )
+
+        model_config = llm_gateway.get_config(db)
+        response, _ = await llm_gateway.chat(
+            model_config=model_config,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=2000,
+        )
+
+        import re
+        text = response.strip()
+        m = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+        if m:
+            text = m.group(1).strip()
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError:
+            logger.error(f"extract_requirements JSON parse failed: {text[:200]}")
+            raise ValueError("LLM返回格式错误，请重试")
+
+        requirements = result.get("requirements", "")
+        acceptance_criteria = result.get("acceptance_criteria", "")
+
+        # 更新或创建 ProjectContext（chat workspace 对应的那条）
+        ctx = db.query(ProjectContext).filter(
+            ProjectContext.project_id == project.id,
+            ProjectContext.workspace_id == workspace_id,
+        ).first()
+        if ctx:
+            ctx.requirements = requirements
+            ctx.acceptance_criteria = acceptance_criteria
+            ctx.handoff_status = "submitted"
+            ctx.handoff_at = datetime.datetime.utcnow()
+        else:
+            db.add(ProjectContext(
+                project_id=project.id,
+                workspace_id=workspace_id,
+                requirements=requirements,
+                acceptance_criteria=acceptance_criteria,
+                handoff_status="submitted",
+                handoff_at=datetime.datetime.utcnow(),
+            ))
+        db.commit()
+
+        return {"requirements": requirements, "acceptance_criteria": acceptance_criteria}
+
+    async def apply_dev_template(
+        self,
+        project,
+        requester_user_id: int,
+        developer_user_id: int,
+        db: Session,
+    ) -> dict:
+        """为 dev 类型项目创建固定的 chat + opencode workspace。"""
+        from app.models.workspace import Workspace, WorkspaceStatus
+        from app.models.project import ProjectMember
+
+        # 创建需求方 chat workspace
+        chat_ws = Workspace(
+            name=f"{project.name} · 需求工作台",
+            description="业务需求讨论与确认",
+            icon="chat",
+            color="#00D1FF",
+            category="项目",
+            status=WorkspaceStatus.PUBLISHED,
+            created_by=requester_user_id,
+            department_id=project.department_id,
+            visibility="department",
+            welcome_message="你好！请描述你的需求，我会帮你整理成开发可执行的规格。",
+            system_context=f"你是 {project.name} 项目的需求分析助手。帮助业务方澄清、整理和确认功能需求。项目背景：{project.description or ''}",
+            project_id=project.id,
+            workspace_type="chat",
+        )
+        db.add(chat_ws)
+        db.flush()
+
+        # 创建开发方 opencode workspace
+        dev_ws = Workspace(
+            name=f"{project.name} · 开发工作台",
+            description="代码实施与开发",
+            icon="code",
+            color="#6B46C1",
+            category="项目",
+            status=WorkspaceStatus.PUBLISHED,
+            created_by=developer_user_id,
+            department_id=project.department_id,
+            visibility="department",
+            welcome_message="",
+            system_context=f"项目：{project.name}\n背景：{project.description or ''}\n\n（需求将在需求交接后自动注入此处）",
+            project_id=project.id,
+            workspace_type="opencode",
+        )
+        db.add(dev_ws)
+        db.flush()
+
+        # 创建 ProjectMember 记录
+        # 需求方
+        req_member = db.query(ProjectMember).filter(
+            ProjectMember.project_id == project.id,
+            ProjectMember.user_id == requester_user_id,
+        ).first()
+        if req_member:
+            req_member.workspace_id = chat_ws.id
+            req_member.role_desc = "需求定义"
+        else:
+            db.add(ProjectMember(
+                project_id=project.id,
+                user_id=requester_user_id,
+                role_desc="需求定义",
+                workspace_id=chat_ws.id,
+                task_order=1,
+            ))
+
+        # 开发方
+        dev_member = db.query(ProjectMember).filter(
+            ProjectMember.project_id == project.id,
+            ProjectMember.user_id == developer_user_id,
+        ).first()
+        if dev_member:
+            dev_member.workspace_id = dev_ws.id
+            dev_member.role_desc = "代码实施"
+        else:
+            db.add(ProjectMember(
+                project_id=project.id,
+                user_id=developer_user_id,
+                role_desc="代码实施",
+                workspace_id=dev_ws.id,
+                task_order=2,
+            ))
+
+        db.commit()
+        return {"chat_workspace_id": chat_ws.id, "dev_workspace_id": dev_ws.id}
 
     async def generate_report(
         self,

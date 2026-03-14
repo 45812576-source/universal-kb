@@ -29,6 +29,11 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
             "display_name": user.display_name,
             "role": user.role.value,
             "department_id": user.department_id,
+            "position_id": user.position_id,
+            "report_to_id": user.report_to_id,
+            "report_to_name": user.report_to.display_name if user.report_to else None,
+            "is_active": user.is_active,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
         },
     }
 
@@ -41,4 +46,9 @@ def me(user: User = Depends(get_current_user)):
         "display_name": user.display_name,
         "role": user.role.value,
         "department_id": user.department_id,
+        "position_id": user.position_id,
+        "report_to_id": user.report_to_id,
+        "report_to_name": user.report_to.display_name if user.report_to else None,
+        "is_active": user.is_active,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
     }

@@ -20,6 +20,7 @@ class DataVisibility:
         user: User,
         row: dict,
         ownership: DataOwnership,
+        db=None,
     ) -> str:
         """Return 'detail', 'desensitized', or 'stats' for a given row + user."""
         if user.role == Role.SUPER_ADMIN:
@@ -34,7 +35,13 @@ class DataVisibility:
         if dept_field and user.department_id and row.get(dept_field) == user.department_id:
             return VisibilityLevel.DESENSITIZED.value
 
+        # dept_admin 对管辖范围内的数据有脱敏视图
         if user.role == Role.DEPT_ADMIN:
+            if db and dept_field and user.managed_department_id:
+                managed_ids = user.get_managed_department_ids(db)
+                row_dept = row.get(dept_field)
+                if row_dept and row_dept in managed_ids:
+                    return VisibilityLevel.DESENSITIZED.value
             return VisibilityLevel.DESENSITIZED.value
 
         return VisibilityLevel.STATS.value

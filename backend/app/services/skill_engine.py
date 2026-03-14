@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.models.conversation import Conversation, Message, MessageRole
 from app.models.knowledge import KnowledgeEntry, KnowledgeStatus
 from app.models.skill import Skill, SkillMode, SkillStatus
+from app.models.user import User
 from app.services.llm_gateway import llm_gateway
 from app.services import prompt_compiler
 
@@ -76,6 +77,13 @@ _DEFAULT_SYSTEM = (
     "- 不要重复用户的问题\n"
     "- 不要在回答中展示原始 JSON 数据\n"
     "- 不要自我介绍或解释你的能力\n"
+    "- 不要在回复末尾加任何引导语，如「不吝点赞」「欢迎转发」「觉得有用请收藏」「关注我」等\n\n"
+    "## 工具缺失时的处理\n"
+    "- 当用户提出需要特定工具才能完成的请求（如创建日程、发邮件、查数据库等），但当前没有对应工具时：\n"
+    "  1. 明确告知用户该功能暂不支持\n"
+    "  2. 如果有 task_creator 工具可用，主动询问是否改为创建一个待办任务来跟踪此事\n"
+    "  3. 如果连 task_creator 也没有，简洁说明并建议用户手动处理\n"
+    "- 不要假装能做到、也不要沉默跳过，要给用户一个明确的替代方案\n"
     "如果引用了知识，请在回答末尾标注「参考知识」。"
     "如果知识不足以回答，请如实说明。"
 )
@@ -98,32 +106,48 @@ class SkillEngine:
             })
         return result
 
-    async def _needs_skill_switch(
+    async def _match_or_keep_skill(
         self,
-        current_skill_name: str,
+        current_skill: "Skill",
         user_message: str,
-    ) -> bool:
-        """快速判断用户是否明确要切换技能，用 lite 模型节省完整 _match_skill 开销。
-        返回 True 表示需要重新匹配，False 表示继续当前技能。
+        candidates: list["Skill"],
+    ) -> "Skill":
+        """一次 LLM 调用完成「是否切换 + 切换到哪个」判断。
+        返回应使用的 Skill（可能是 current_skill 本身）。
         """
+        if not candidates:
+            return current_skill
+
+        skill_list = "\n".join(
+            f"- {s.name}: {s.description or '无描述'}" for s in candidates
+        )
         prompt = (
-            f"当前技能：{current_skill_name}\n"
+            f"当前技能：{current_skill.name}（{current_skill.description or '无描述'}）\n"
             f"用户新消息：{user_message}\n\n"
-            "判断用户是否明确要切换到不同任务/技能（如「帮我写文案」→「做成PPT」是切换，"
-            "「修改一下」「继续」「再详细点」是沿用当前技能）。\n"
-            "返回 yes 或 no，只返回一个词。"
+            f"可切换的其他技能：\n{skill_list}\n\n"
+            "判断规则：\n"
+            "- 只有用户明确说出切换意图（如「换一个」「用XX技能」「切换到」），才返回目标技能的 name\n"
+            "- 继续当前话题、追问、补充信息、说「好的」「继续」等，一律返回 keep\n"
+            "- 拿不准时，返回 keep\n"
+            "只返回一个词。"
         )
         try:
             result, _ = await llm_gateway.chat(
                 model_config=llm_gateway.get_lite_config(),
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
-                max_tokens=5,
+                max_tokens=50,
             )
-            return result.strip().lower().startswith("y")
+            answer = result.strip().splitlines()[0].strip().strip('"').strip("'")
+            if answer.lower() == "keep":
+                return current_skill
+            for s in candidates:
+                if s.name == answer:
+                    return s
+            return current_skill
         except Exception as e:
-            logger.warning(f"Skill switch check failed: {e}, defaulting to no switch")
-            return False
+            logger.warning(f"Skill match_or_keep failed: {e}, keeping current")
+            return current_skill
 
     async def _match_skill(
         self, db: Session, user_message: str, model_config: dict,
@@ -138,8 +162,6 @@ class SkillEngine:
 
         if not skills:
             return None
-        if len(skills) == 1:
-            return skills[0]
 
         skill_list = "\n".join(
             f"- {s.name}: {s.description or '无描述'}" for s in skills
@@ -246,8 +268,13 @@ class SkillEngine:
         if not hits:
             return ""
 
-        # LLM 二次精排
-        hits = await self._rerank_hits_with_llm(query, hits, top_k=5)
+        # 条件精排：高置信度或候选数少时跳过 LLM 精排
+        if len(hits) <= 5:
+            pass  # 无需精排
+        elif len(hits) >= 5 and all(h.get("score", 0) > 0.75 for h in hits[:5]):
+            hits = hits[:5]  # top5 高置信度，直接截断
+        else:
+            hits = await self._rerank_hits_with_llm(query, hits, top_k=5)
 
         # 查询哪些 knowledge_id 是已审批的（全局可见）
         approved_ids: set[int] = set()
@@ -346,6 +373,41 @@ class SkillEngine:
         if operation == "read":
             rows = exec_result["rows"]
             columns = exec_result["columns"]
+
+            # ── 权限：对查询结果做字段级脱敏 ──
+            if rows and user_id and skill:
+                try:
+                    from app.services.data_visibility import data_visibility
+                    caller = db.get(User, user_id)
+                    if caller:
+                        # 查找 table 对应的 data_domain_id
+                        _table_name = allowed_table_names[0] if allowed_table_names else ""
+                        _bt = db.query(BusinessTable).filter(
+                            BusinessTable.table_name == _table_name
+                        ).first() if _table_name else None
+                        _ownership = _bt.ownership if _bt and hasattr(_bt, 'ownership') else None
+                        # 获取 data_domain_id（从 DataScopePolicy 或 BusinessTable）
+                        _domain_id = None
+                        try:
+                            from app.models.permission import DataScopePolicy
+                            _dsp = db.query(DataScopePolicy).filter(
+                                DataScopePolicy.resource_type == "business_table",
+                                DataScopePolicy.resource_id == (_bt.id if _bt else 0),
+                            ).first()
+                            _domain_id = _dsp.data_domain_id if _dsp else None
+                        except Exception:
+                            pass
+                        rows = data_visibility.apply_with_permission_engine(
+                            rows=rows,
+                            user=caller,
+                            skill_id=skill.id,
+                            data_domain_id=_domain_id,
+                            db=db,
+                            ownership=_ownership,
+                        )
+                except Exception as e:
+                    logger.warning(f"Data query mask failed: {e}")
+
             table_str = data_engine.format_results(rows, columns)
             return f"{explanation}\n\n{table_str}" if explanation else table_str
         else:
@@ -390,37 +452,66 @@ class SkillEngine:
         skill = None
         current_skill = db.get(Skill, conversation.skill_id) if conversation.skill_id else None
 
+        # active_skill_ids 限制：若当前 skill 不在激活列表内，视为无 current_skill
+        if current_skill and active_skill_ids is not None and current_skill.id not in active_skill_ids:
+            current_skill = None
+
         if current_skill:
             switch_candidates = [s for s in (workspace_skills or []) if s.id != current_skill.id]
             if switch_candidates:
                 try:
-                    # 先用轻量判断：用户是否明确要切换技能
-                    needs_switch = await self._needs_skill_switch(current_skill.name, user_message)
-                    if needs_switch:
-                        switched = await self._match_skill(
-                            db, user_message, default_config,
-                            candidate_skills=switch_candidates,
-                        )
-                        skill = switched if switched else current_skill
-                    else:
-                        skill = current_skill
+                    # 一次 LLM 调用完成切换判断 + 匹配
+                    skill = await self._match_or_keep_skill(
+                        current_skill, user_message, switch_candidates,
+                    )
                 except Exception as e:
-                    logger.warning(f"Skill switch check failed: {e}")
+                    logger.warning(f"Skill match_or_keep failed: {e}")
                     skill = current_skill
             else:
                 skill = current_skill
         else:
             try:
+                # 合并候选列表 = workspace skills + 全局 published（去重），一次匹配
                 if workspace and workspace_skills:
+                    global_skills = (
+                        db.query(Skill).filter(Skill.status == SkillStatus.PUBLISHED).all()
+                    )
+                    seen_ids = {s.id for s in workspace_skills}
+                    merged = list(workspace_skills) + [s for s in global_skills if s.id not in seen_ids]
+                    # active_skill_ids 进一步过滤（workspace 加载时已过滤过 workspace_skills，此处处理 global_skills 混入的情况）
+                    if active_skill_ids is not None:
+                        merged = [s for s in merged if s.id in active_skill_ids]
                     skill = await self._match_skill(
                         db, user_message, default_config,
-                        candidate_skills=workspace_skills,
+                        candidate_skills=merged,
                     )
-                if skill is None:
-                    skill = await self._match_skill(db, user_message, default_config)
+                else:
+                    # 无 workspace：若有 active_skill_ids 限制，只在激活列表内匹配
+                    if active_skill_ids is not None:
+                        active_skills = [
+                            db.get(Skill, sid) for sid in active_skill_ids
+                            if db.get(Skill, sid) is not None
+                        ]
+                        skill = await self._match_skill(
+                            db, user_message, default_config,
+                            candidate_skills=active_skills,
+                        )
+                    else:
+                        skill = await self._match_skill(db, user_message, default_config)
             except Exception as e:
                 logger.warning(f"Skill matching failed: {e}")
                 skill = None
+
+        # ── 权限校验：callable 检查 ──
+        if skill and user_id:
+            try:
+                from app.services.permission_engine import permission_engine
+                caller = db.get(User, user_id) if user_id else None
+                if caller and not permission_engine.check_skill_callable(caller, skill.id, db):
+                    logger.info(f"Skill {skill.name} not callable for user {user_id}, skipping")
+                    skill = None
+            except Exception as e:
+                logger.warning(f"Callable check failed: {e}")
 
         if skill and conversation.skill_id != skill.id:
             conversation.skill_id = skill.id
@@ -463,11 +554,15 @@ class SkillEngine:
             except Exception as e:
                 logger.warning(f"Rule engine failed, falling through to LLM: {e}")
 
-        # 4b. Data queries
+        # 4b. Data queries（规则前置 → LLM fallback）
         if skill and skill.data_queries:
             try:
                 from app.services.data_engine import data_engine
-                intent = await data_engine.classify_intent(user_message, default_config)
+                # 先走规则快速判定
+                intent = data_engine.classify_intent_fast(user_message)
+                if intent is None:
+                    # 规则无法判定时才调 LLM
+                    intent = await data_engine.classify_intent(user_message, default_config)
                 intent_type = intent.get("type", "ai_generate")
                 if intent_type in ("data_query", "data_mutation"):
                     result = await self._handle_data_operation(
@@ -479,17 +574,24 @@ class SkillEngine:
 
         # 4c. InputEvaluator
         if skill_version and skill_version.required_inputs:
-            from app.services.input_evaluator import input_evaluator
-            eval_result = await input_evaluator.evaluate(
-                purpose=skill.description or skill.name,
-                required_inputs=skill_version.required_inputs,
-                history_messages=messages,
-                current_message=user_message,
-            )
-            if not eval_result["pass"]:
-                questions = eval_result.get("missing_questions", [])
-                text = questions[0] if questions else "请提供更多信息。"
-                return _early((text, {}))
+            # Guard: if conversation already has enough back-and-forth, skip evaluation
+            # 每个字段最多问 1 轮（user+assistant=2条消息），超出后强制放行，避免无限追问
+            n_required = len(skill_version.required_inputs)
+            max_clarify_msgs = n_required * 2
+            if len(messages) <= max_clarify_msgs:
+                from app.services.input_evaluator import input_evaluator
+                # current_message is already in `messages` (flushed/committed in the caller),
+                # so do NOT pass it again to avoid duplicate evaluation
+                eval_result = await input_evaluator.evaluate(
+                    purpose=skill.description or skill.name,
+                    required_inputs=skill_version.required_inputs,
+                    history_messages=messages,
+                    current_message="",
+                )
+                if not eval_result["pass"]:
+                    questions = eval_result.get("missing_questions", [])
+                    text = questions[0] if questions else "请提供更多信息。"
+                    return _early((text, {}))
 
         # 4d. Tool chain: detect tool intent and auto-consume structured output
         available_tools = []
@@ -508,26 +610,30 @@ class SkillEngine:
             logger.warning(f"Tool loading for chain detection failed: {e}")
 
         if available_tools:
-            # 工具过多时先精选
-            selected_tools = await self._select_tools_for_message(
-                user_message, available_tools, default_config
-            )
-            tool_intent = await self._detect_tool_intent(user_message, selected_tools, default_config)
-            if tool_intent:
-                structured_ctx = self._get_latest_structured_output(messages)
-                if structured_ctx:
-                    # structured output 存在时：映射字段直接调用工具（适合 PPT/Excel 生成等输出驱动型工具）
-                    try:
-                        tool_params = await self._map_output_to_tool_input(
-                            structured_ctx, tool_intent, default_config
-                        )
-                        result = await tool_executor.execute_tool(
-                            db, tool_intent.name, tool_params, user_id
-                        )
-                        return _early(self._format_tool_result(result, tool_intent))
-                    except Exception as e:
-                        logger.warning(f"Tool chain mapping failed, falling through to LLM: {e}")
-                # 无 structured output 时：让 LLM 决定何时调用工具及参数（适合对话式工具如 brainstorming）
+            # native FC 模型 + 工具数不多时，跳过 lite LLM 意图检测，让主模型自己决定
+            _model_supports_fc = llm_gateway.supports_function_calling(model_config)
+            if _model_supports_fc and len(available_tools) <= 15:
+                # 跳过 _select_tools_for_message 和 _detect_tool_intent
+                pass
+            else:
+                # 非 FC 模型或工具过多：保留原有 lite LLM 精选 + 意图检测逻辑
+                selected_tools = await self._select_tools_for_message(
+                    user_message, available_tools, default_config
+                )
+                tool_intent = await self._detect_tool_intent(user_message, selected_tools, default_config)
+                if tool_intent:
+                    structured_ctx = self._get_latest_structured_output(messages)
+                    if structured_ctx:
+                        try:
+                            tool_params = await self._map_output_to_tool_input(
+                                structured_ctx, tool_intent, default_config
+                            )
+                            result = await tool_executor.execute_tool(
+                                db, tool_intent.name, tool_params, user_id
+                            )
+                            return _early(self._format_tool_result(result, tool_intent))
+                        except Exception as e:
+                            logger.warning(f"Tool chain mapping failed, falling through to LLM: {e}")
 
         # 5. Inject available tools
         tool_prompt = ""
@@ -550,28 +656,44 @@ class SkillEngine:
         except Exception as e:
             logger.warning(f"Tool loading failed: {e}")
 
-        # 6. Inject knowledge
+        # 6+7. 知识检索与变量提取并行化（两者无数据依赖）
         knowledge_context = ""
-        if not skill or (skill and skill.auto_inject):
-            knowledge_context = await self._inject_knowledge(
-                user_message, skill, db=db, user_id=user_id
-            )
-
-        # 7. Build system prompt
         extracted_vars = {}
+
+        # 准备并行任务
+        _parallel_tasks = []
+
+        need_knowledge = not skill or (skill and skill.auto_inject)
+        if need_knowledge:
+            _parallel_tasks.append(("knowledge", self._inject_knowledge(
+                user_message, skill, db=db, user_id=user_id
+            )))
+
+        need_vars = bool(skill_version and skill_version.variables)
+        if need_vars:
+            history_text = "\n".join(
+                f"{m.role.value}: {m.content}" for m in messages
+            )
+            history_text += f"\nuser: {user_message}"
+            _parallel_tasks.append(("vars", self._extract_variables(
+                skill_version.variables, history_text, default_config
+            )))
+
+        if _parallel_tasks:
+            labels = [t[0] for t in _parallel_tasks]
+            coros = [t[1] for t in _parallel_tasks]
+            results = await asyncio.gather(*coros, return_exceptions=True)
+            for label, result in zip(labels, results):
+                if isinstance(result, Exception):
+                    logger.warning(f"{label} failed: {result}")
+                elif label == "knowledge":
+                    knowledge_context = result
+                elif label == "vars":
+                    extracted_vars = result
+
+        # Build system prompt
         if skill_version:
             base_prompt = self._inject_templates(skill_version.system_prompt)
-            if skill_version.variables:
-                history_text = "\n".join(
-                    f"{m.role.value}: {m.content}" for m in messages
-                )
-                history_text += f"\nuser: {user_message}"
-                try:
-                    extracted_vars = await self._extract_variables(
-                        skill_version.variables, history_text, default_config
-                    )
-                except Exception as e:
-                    logger.warning(f"Variable extraction failed: {e}")
 
             structured_ctx = self._get_latest_structured_output(messages)
 
@@ -616,6 +738,38 @@ class SkillEngine:
         if tool_prompt:
             system_content += f"\n\n{tool_prompt}"
 
+        # ── 权限：data_scope 注入 ──
+        if skill and user_id:
+            try:
+                from app.services.permission_engine import permission_engine
+                caller = db.get(User, user_id) if user_id else None
+                if caller:
+                    scope = permission_engine.get_data_scope(caller, skill.id, db)
+                    if scope:
+                        scope_lines = []
+                        for domain, rule in scope.items():
+                            if isinstance(rule, dict):
+                                vis = rule.get("visibility", "none")
+                                fields = rule.get("fields")
+                                excluded = rule.get("excluded")
+                                parts = [f"- {domain}: 可见范围={vis}"]
+                                if fields:
+                                    parts.append(f"可见字段={','.join(fields)}")
+                                if excluded:
+                                    parts.append(f"禁止字段={','.join(excluded)}")
+                                scope_lines.append(" / ".join(parts))
+                            else:
+                                scope_lines.append(f"- {domain}: {rule}")
+                        if scope_lines:
+                            system_content += (
+                                "\n\n## 数据权限约束（严格遵守，不可绕过）\n"
+                                "以下是当前用户的数据访问范围，回答中不得涉及禁止字段，"
+                                "不得推测或虚构权限范围外的数据。\n"
+                                + "\n".join(scope_lines)
+                            )
+            except Exception as e:
+                logger.warning(f"Data scope injection failed: {e}")
+
         # 追加通用行为约束（仅当 system_content 中没有自带约束时）
         if "回复规范" not in system_content and "禁止行为" not in system_content:
             system_content += (
@@ -626,10 +780,29 @@ class SkillEngine:
             )
 
         # 8. Build message list for LLM
-        llm_messages = [{"role": "system", "content": system_content}]
+        # Skip assistant messages with empty content — they indicate failed/aborted tool-call rounds
+        # and would cause API errors (e.g. Kimi rejects empty content in history).
+        # Also drop any user message that has no following assistant reply (orphaned turns).
+        raw_pairs: list[tuple] = []  # (user_msg, assistant_msg_or_None)
+        pending_user = None
         for m in messages:
-            if m.role in (MessageRole.USER, MessageRole.ASSISTANT):
-                llm_messages.append({"role": m.role.value, "content": m.content})
+            if m.role == MessageRole.USER:
+                if pending_user is not None:
+                    raw_pairs.append((pending_user, None))
+                pending_user = m
+            elif m.role == MessageRole.ASSISTANT:
+                assistant_content = (m.content or "").strip()
+                if pending_user is not None and assistant_content:
+                    raw_pairs.append((pending_user, m))
+                    pending_user = None
+                # else: empty assistant reply → drop both turns to avoid poisoning context
+
+        llm_messages = [{"role": "system", "content": system_content}]
+        for user_m, asst_m in raw_pairs:
+            if asst_m is None:
+                continue  # orphaned user turn with no valid reply — skip entirely
+            llm_messages.append({"role": "user", "content": user_m.content})
+            llm_messages.append({"role": "assistant", "content": asst_m.content})
         llm_messages.append({"role": "user", "content": user_message})
 
         # 9. Context window compaction
@@ -728,10 +901,11 @@ class SkillEngine:
         if prep.early_return is not None:
             return prep.early_return
 
-        # 9. Call LLM
+        # 9. Call LLM（传入 tools_schema，支持 native function calling）
         response, llm_usage = await llm_gateway.chat(
             model_config=prep.model_config,
             messages=prep.llm_messages,
+            tools=prep.tools_schema or None,
         )
 
         # 10. Structured output
@@ -766,6 +940,32 @@ class SkillEngine:
             tool_meta["structured_output"] = structured_output
 
         tool_meta["llm_usage"] = llm_usage
+
+        # ── 权限：输出侧 output_mask ──
+        if structured_output and prep.skill_id and user_id:
+            try:
+                from app.services.permission_engine import permission_engine
+                from app.models.permission import SkillPolicy
+                caller = db.get(User, user_id)
+                if caller:
+                    # 尝试根据 Skill 关联的数据域做 output_mask
+                    policy = db.query(SkillPolicy).filter(
+                        SkillPolicy.skill_id == prep.skill_id
+                    ).first()
+                    if policy and policy.default_data_scope:
+                        # 对每个涉及的 data_domain 做 mask
+                        for domain_key, domain_conf in (policy.default_data_scope or {}).items():
+                            if isinstance(domain_conf, dict) and domain_conf.get("data_domain_id"):
+                                masked = permission_engine.apply_output_masks(
+                                    user=caller,
+                                    data=structured_output,
+                                    data_domain_id=domain_conf["data_domain_id"],
+                                    db=db,
+                                )
+                                structured_output = masked
+                        tool_meta["structured_output"] = structured_output
+            except Exception as e:
+                logger.warning(f"Output mask failed: {e}")
 
         return response, tool_meta
 
@@ -829,6 +1029,8 @@ class SkillEngine:
         max_rounds: int = 5,
         tools_schema: list[dict] | None = None,
         native_tool_calls: list[dict] | None = None,
+        start_block_idx: int = 1,
+        thinking_content: str = "",
     ):
         """Streaming version: yields SSE-ready dicts for tool_call events, then yields (response, meta) at end.
 
@@ -837,7 +1039,7 @@ class SkillEngine:
         - 否则：解析 response 中的 ```tool_call``` 文本块（fallback）
         """
         extra_meta: dict = {}
-        block_idx = 1  # 0 is the initial text block
+        block_idx = start_block_idx  # caller tracks how many blocks were already emitted
         consecutive_failures = 0  # 连续失败计数，用于早停
 
         # 提取原始用户请求用于目标复述（注意力操纵，防止多轮工具调用中任务漂移）
@@ -849,8 +1051,8 @@ class SkillEngine:
 
         for round_num in range(max_rounds):
             # 解析本轮工具调用列表
-            if round_num == 0 and native_tool_calls:
-                # 原生 function calling：直接使用结构化数据
+            if native_tool_calls:
+                # 原生 function calling：直接使用结构化数据（每轮都优先用，不只第0轮）
                 calls = native_tool_calls
                 use_native = True
             else:
@@ -972,7 +1174,12 @@ class SkillEngine:
                             "arguments": raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False),
                         },
                     })
-                llm_messages.append({"role": "assistant", "content": None, "tool_calls": tool_calls_msg})
+                asst_msg: dict = {"role": "assistant", "content": None, "tool_calls": tool_calls_msg}
+                # thinking 模型要求 assistant 消息必须带 reasoning_content
+                if thinking_content:
+                    asst_msg["reasoning_content"] = thinking_content
+                llm_messages.append(asst_msg)
+                thinking_content = ""  # 消费后清空，避免重复附加
                 for call, result in pairs:
                     llm_messages.append({
                         "role": "tool",
@@ -995,6 +1202,7 @@ class SkillEngine:
             yield {"event": "content_block_start", "data": {"index": block_idx, "type": "text"}}
             new_response = ""
             next_native_calls: list[dict] = []
+            next_thinking_content = ""
 
             async for chunk_type, chunk_data in llm_gateway.chat_stream_typed(
                 model_config=model_config,
@@ -1003,6 +1211,8 @@ class SkillEngine:
             ):
                 if chunk_type == "tool_call":
                     next_native_calls.append(chunk_data)
+                elif chunk_type == "thinking":
+                    next_thinking_content += chunk_data
                 elif chunk_type == "content":
                     new_response += chunk_data
                     yield {"event": "content_block_delta", "data": {"index": block_idx, "delta": {"text": chunk_data}}}
@@ -1018,8 +1228,9 @@ class SkillEngine:
             if not has_next:
                 break
 
-            # 下一轮使用原生 tool_calls（若有）
+            # 下一轮使用原生 tool_calls（若有），并传入本轮收集的 thinking
             native_tool_calls = next_native_calls if next_native_calls else None
+            thinking_content = next_thinking_content
 
         response = re.sub(r"```tool_call\s*.*?\s*```", "", response, flags=re.DOTALL).strip()
         yield (response, extra_meta)

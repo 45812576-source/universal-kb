@@ -64,15 +64,33 @@ class LLMGateway:
         return f"{api_base}/chat/completions", headers, body
 
     async def chat(self, model_config: dict, messages: list[dict],
-                   temperature: float = None, max_tokens: int = None) -> tuple[str, dict]:
-        """Returns (content, usage) where usage = {input_tokens, output_tokens, model_id}."""
-        url, headers, body = self._build_request(model_config, messages, temperature, max_tokens)
+                   temperature: float = None, max_tokens: int = None,
+                   tools: list[dict] | None = None) -> tuple[str, dict]:
+        """Returns (content, usage) where usage = {input_tokens, output_tokens, model_id}.
+
+        当 tools 非空且模型支持 function calling 时，native tool_calls 会被序列化后追加到
+        content 尾部（```tool_call 格式），与文本 fallback 保持兼容。
+        """
+        url, headers, body = self._build_request(model_config, messages, temperature, max_tokens, tools=tools)
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(url, headers=headers, json=body)
             resp.raise_for_status()
             data = resp.json()
             msg = data["choices"][0]["message"]
             content = msg.get("content") or msg.get("reasoning_content") or ""
+
+            # 处理 native function calling 响应：将 tool_calls 转为文本 fallback 格式
+            native_tool_calls = msg.get("tool_calls") or []
+            if native_tool_calls:
+                import json as _json
+                for tc in native_tool_calls:
+                    fn = tc.get("function", {})
+                    try:
+                        args = _json.loads(fn.get("arguments", "{}"))
+                    except Exception:
+                        args = {}
+                    content += f"\n```tool_call\n{_json.dumps({'id': tc.get('id', ''), 'name': fn.get('name', ''), 'arguments': args}, ensure_ascii=False)}\n```"
+
             raw_usage = data.get("usage") or {}
             usage = {
                 "input_tokens": raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens") or 0,
@@ -110,6 +128,10 @@ class LLMGateway:
 
         async with httpx.AsyncClient(timeout=120) as client:
             async with client.stream("POST", url, headers=headers, json=body) as resp:
+                if resp.status_code >= 400:
+                    error_body = await resp.aread()
+                    raise ValueError(f"LLM API error {resp.status_code}: {error_body.decode()[:300]}")
+
                 tool_calls_buf: dict[int, dict] = {}  # index → {id, name, arguments}
 
                 async for line in resp.aiter_lines():

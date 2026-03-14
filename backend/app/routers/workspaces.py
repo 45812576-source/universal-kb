@@ -65,6 +65,7 @@ def _ws_dict(ws: Workspace, user: User, include_system_context: bool = False) ->
         "tools": tools,
         "data_tables": data_tables,
         "model_config_id": ws.model_config_id,
+        "workspace_type": ws.workspace_type,
         "created_at": ws.created_at.isoformat() if ws.created_at else None,
         "updated_at": ws.updated_at.isoformat() if ws.updated_at else None,
     }
@@ -87,6 +88,7 @@ def _ws_summary(ws: Workspace) -> dict:
         "visibility": ws.visibility,
         "welcome_message": ws.welcome_message,
         "sort_order": ws.sort_order,
+        "workspace_type": ws.workspace_type or "chat",
     }
 
 
@@ -104,6 +106,7 @@ class WorkspaceCreate(BaseModel):
     model_config_id: Optional[int] = None
     department_id: Optional[int] = None
     sort_order: int = 0
+    workspace_type: str = "chat"  # chat | opencode
 
 
 class WorkspaceUpdate(BaseModel):
@@ -118,6 +121,7 @@ class WorkspaceUpdate(BaseModel):
     model_config_id: Optional[int] = None
     department_id: Optional[int] = None
     sort_order: Optional[int] = None
+    workspace_type: Optional[str] = None  # chat | opencode，仅 super_admin
 
 
 class ReviewRequest(BaseModel):
@@ -194,8 +198,9 @@ def create_workspace(
     else:
         status = WorkspaceStatus.DRAFT
 
-    # Only super_admin can set system_context
+    # Only super_admin can set system_context and workspace_type
     system_context = req.system_context if user.role == Role.SUPER_ADMIN else None
+    workspace_type = req.workspace_type if user.role == Role.SUPER_ADMIN else "chat"
 
     # Validate model_config_id if provided
     if req.model_config_id and not db.get(ModelConfig, req.model_config_id):
@@ -215,6 +220,7 @@ def create_workspace(
         sort_order=req.sort_order,
         status=status,
         created_by=user.id,
+        workspace_type=workspace_type,
     )
     db.add(ws)
     db.commit()
@@ -259,8 +265,8 @@ def update_workspace(
             raise HTTPException(403, "只能编辑自己的草稿工作台")
 
     for field, value in req.model_dump(exclude_none=True).items():
-        # Only super_admin can edit system_context and model_config_id
-        if field in ("system_context", "model_config_id") and not is_super:
+        # Only super_admin can edit system_context, model_config_id, workspace_type
+        if field in ("system_context", "model_config_id", "workspace_type") and not is_super:
             continue
         if field == "model_config_id" and value and not db.get(ModelConfig, value):
             raise HTTPException(400, "指定的模型配置不存在")
@@ -281,6 +287,9 @@ def delete_workspace(
     ws = db.get(Workspace, ws_id)
     if not ws:
         raise HTTPException(404, "Workspace not found")
+
+    if ws.workspace_type == "opencode":
+        raise HTTPException(403, "系统工作台不可删除")
 
     is_super = user.role == Role.SUPER_ADMIN
     is_dept_admin = user.role == Role.DEPT_ADMIN

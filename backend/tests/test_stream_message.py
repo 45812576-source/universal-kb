@@ -6,6 +6,16 @@ from tests.conftest import _make_user, _make_dept, _make_model_config, _login, _
 from app.models.user import Role
 
 
+@pytest.fixture(autouse=True)
+def no_pev_upgrade():
+    """Prevent PEV from hijacking the normal LLM path in stream tests."""
+    with patch(
+        "app.services.pev.orchestrator.pev_orchestrator.should_upgrade",
+        new=AsyncMock(return_value=None),
+    ):
+        yield
+
+
 def _parse_sse(text: str) -> list[dict]:
     events = []
     current_event = "message"

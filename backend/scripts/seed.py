@@ -19,34 +19,62 @@ def seed():
         db.close()
         return
 
-    # 组织架构
-    corp = Department(name="公司经营发展中心", category="后台", business_unit="公司经营发展中心")
-    db.add(corp)
-    db.flush()
+    # ─── 组织架构（三级：事业部 → 一级部门 → 二级部门）───────────────────────
 
+    # 事业部级（顶层）
+    corp = Department(name="公司经营发展中心", category="后台", business_unit="公司经营发展中心")
     cid_bu = Department(name="国内电商广告事业部", category="前台", business_unit="国内电商广告事业部")
     dic_bu = Department(name="AI云浏览器事业部", category="前台", business_unit="AI云浏览器事业部")
-    db.add_all([cid_bu, dic_bu])
+    db.add_all([corp, cid_bu, dic_bu])
     db.flush()
 
-    depts = [
-        # 后台职能
-        Department(name="总裁办", category="后台", business_unit="公司经营发展中心", parent_id=corp.id),
-        Department(name="财务部", category="后台", business_unit="公司经营发展中心", parent_id=corp.id),
-        Department(name="HR&行政部", category="后台", business_unit="公司经营发展中心", parent_id=corp.id),
-        Department(name="法务部", category="后台", business_unit="公司经营发展中心", parent_id=corp.id),
-        # 前台业务 CID
-        Department(name="CID商业化", category="前台", business_unit="国内电商广告事业部", parent_id=cid_bu.id),
-        Department(name="电商投流运营部", category="前台", business_unit="国内电商广告事业部", parent_id=cid_bu.id),
-        Department(name="商城项目部", category="前台", business_unit="国内电商广告事业部", parent_id=cid_bu.id),
-        # 前台业务 DIC
-        Department(name="DIC商业化", category="前台", business_unit="AI云浏览器事业部", parent_id=dic_bu.id),
-        # 中台产研 CID
-        Department(name="CID产研", category="中台", business_unit="国内电商广告事业部", parent_id=cid_bu.id),
-        # 中台产研 DIC
-        Department(name="DIC产研", category="中台", business_unit="AI云浏览器事业部", parent_id=dic_bu.id),
+    # 一级部门
+    # 后台 - 公司经营发展中心
+    d_ceo_office = Department(name="总裁办", category="后台", business_unit="公司经营发展中心", parent_id=corp.id)
+    d_finance = Department(name="财务部", category="后台", business_unit="公司经营发展中心", parent_id=corp.id)
+    d_hr_admin = Department(name="人力资源&行政", category="后台", business_unit="公司经营发展中心", parent_id=corp.id)
+    # 前台 - CID
+    d_cid_biz = Department(name="CID商业化", category="前台", business_unit="国内电商广告事业部", parent_id=cid_bu.id)
+    d_mall_ops = Department(name="商城运营部", category="前台", business_unit="国内电商广告事业部", parent_id=cid_bu.id)
+    d_ecom_ops = Department(name="电商投流运营部", category="前台", business_unit="国内电商广告事业部", parent_id=cid_bu.id)
+    # 前台 - DIC
+    d_dic_biz = Department(name="DIC商业化", category="前台", business_unit="AI云浏览器事业部", parent_id=dic_bu.id)
+    # 中台 - CID产研
+    d_cid_rd = Department(name="CID产研", category="中台", business_unit="国内电商广告事业部", parent_id=cid_bu.id)
+    # 中台 - DIC产研
+    d_dic_rd = Department(name="DIC产研", category="中台", business_unit="AI云浏览器事业部", parent_id=dic_bu.id)
+
+    db.add_all([d_ceo_office, d_finance, d_hr_admin,
+                d_cid_biz, d_mall_ops, d_ecom_ops,
+                d_dic_biz, d_cid_rd, d_dic_rd])
+    db.flush()
+
+    # 二级部门
+    sub_depts = [
+        # CID商业化 下属
+        Department(name="媒介服务部", category="前台", business_unit="国内电商广告事业部", parent_id=d_cid_biz.id),
+        Department(name="商务拓展及客户管理部", category="前台", business_unit="国内电商广告事业部", parent_id=d_cid_biz.id),
+        Department(name="技术产品交付部", category="前台", business_unit="国内电商广告事业部", parent_id=d_cid_biz.id),
+        # 电商投流运营部 下属
+        Department(name="创意组", category="前台", business_unit="国内电商广告事业部", parent_id=d_ecom_ops.id),
+        Department(name="广州运营部", category="前台", business_unit="国内电商广告事业部", parent_id=d_ecom_ops.id),
+        Department(name="厦门运营部", category="前台", business_unit="国内电商广告事业部", parent_id=d_ecom_ops.id),
+        # CID产研 下属
+        Department(name="灵眸独立项目", category="中台", business_unit="国内电商广告事业部", parent_id=d_cid_rd.id),
+        Department(name="前端研发部", category="中台", business_unit="国内电商广告事业部", parent_id=d_cid_rd.id),
+        Department(name="后端研发部", category="中台", business_unit="国内电商广告事业部", parent_id=d_cid_rd.id),
+        Department(name="产品部", category="中台", business_unit="国内电商广告事业部", parent_id=d_cid_rd.id),
+        Department(name="测试部", category="中台", business_unit="国内电商广告事业部", parent_id=d_cid_rd.id),
+        # DIC商业化 下属
+        Department(name="产品运营部", category="前台", business_unit="AI云浏览器事业部", parent_id=d_dic_biz.id),
+        # DIC产研 下属
+        # 注意：DIC产研的二级部门名与CID产研有重名，加前缀区分
+        Department(name="DIC前端研发部", category="中台", business_unit="AI云浏览器事业部", parent_id=d_dic_rd.id),
+        Department(name="DIC后端研发部", category="中台", business_unit="AI云浏览器事业部", parent_id=d_dic_rd.id),
+        Department(name="DIC产品部", category="中台", business_unit="AI云浏览器事业部", parent_id=d_dic_rd.id),
+        Department(name="DIC测试部", category="中台", business_unit="AI云浏览器事业部", parent_id=d_dic_rd.id),
     ]
-    db.add_all(depts)
+    db.add_all(sub_depts)
     db.flush()
 
     # 超级管理员

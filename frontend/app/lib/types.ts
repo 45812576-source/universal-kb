@@ -6,6 +6,54 @@ export interface User {
   display_name: string;
   role: Role;
   department_id: number | null;
+  department_name?: string | null;
+  position_id?: number | null;
+  position_name?: string | null;
+  is_active?: boolean;
+}
+
+export interface Position {
+  id: number;
+  name: string;
+  department_id: number | null;
+  department_name: string | null;
+  description: string | null;
+  created_at: string;
+}
+
+export interface DataDomainField {
+  name: string;
+  label: string;
+  sensitive: boolean;
+}
+
+export interface DataDomain {
+  id: number;
+  name: string;
+  display_name: string;
+  description: string | null;
+  fields: DataDomainField[];
+  created_at: string;
+}
+
+export type PolicyTargetType = "position" | "role";
+export type PolicyResourceType = "business_table" | "data_domain";
+export type VisibilityScope = "own" | "dept" | "all";
+
+export interface DataScopePolicy {
+  id: number;
+  target_type: PolicyTargetType;
+  target_position_id: number | null;
+  target_position_name: string | null;
+  target_role: string | null;
+  resource_type: PolicyResourceType;
+  business_table_id: number | null;
+  business_table_name: string | null;
+  data_domain_id: number | null;
+  data_domain_name: string | null;
+  visibility_level: VisibilityScope;
+  output_mask: string[];
+  created_at: string;
 }
 
 export interface Conversation {
