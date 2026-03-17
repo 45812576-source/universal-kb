@@ -32,16 +32,14 @@ _singleton: dict = {
 
 OPENCODE_FIXED_PORT = 17171   # 固定端口，重启后不变
 
-KIMI_DEFAULT_MODEL = "kimi-for-coding/k2p5"
+BAILIAN_DEFAULT_MODEL = "bailian-coding-plan/glm-5"
 
 
 def _write_opencode_config(workdir: str) -> None:
-    """在 workdir 写入 opencode.json，仅指定默认 model。
-    kimi-for-coding 是内置 provider，通过 KIMI_API_KEY 环境变量鉴权，不需要 provider 覆盖。
-    """
+    """workdir 的 opencode.json 仅占位，实际配置由全局 ~/.config/opencode/config.json 管理。"""
     config: dict = {
         "$schema": "https://opencode.ai/config.schema.json",
-        "model": KIMI_DEFAULT_MODEL,
+        "model": BAILIAN_DEFAULT_MODEL,
     }
     config_path = os.path.join(workdir, "opencode.json")
     with open(config_path, "w", encoding="utf-8") as f:
@@ -110,15 +108,15 @@ async def _ensure_singleton() -> dict:
         os.makedirs(workdir, exist_ok=True)
 
         from app.config import settings as _settings
-        kimi_key = getattr(_settings, "KIMI_API_KEY", "") or os.environ.get("KIMI_API_KEY", "")
+        bailian_key = getattr(_settings, "BAILIAN_API_KEY", "") or os.environ.get("BAILIAN_API_KEY", "")
 
-        # 写入 opencode.json（含 provider endpoint 和默认 model）
+        # 写入 workdir opencode.json（仅默认 model，provider 配置在全局 config.json）
         _write_opencode_config(workdir)
 
-        # kimi-for-coding provider 读取 KIMI_API_KEY 环境变量
+        # bailian-coding-plan 自定义 provider 通过 {env:BAILIAN_API_KEY} 读取
         proc_env = os.environ.copy()
-        if kimi_key:
-            proc_env["KIMI_API_KEY"] = kimi_key
+        if bailian_key:
+            proc_env["BAILIAN_API_KEY"] = bailian_key
 
         new_proc = await asyncio.create_subprocess_exec(
             opencode_bin, "web",

@@ -1,6 +1,8 @@
 import asyncio
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="Universal KB API", version="0.1.0")
 
@@ -93,3 +95,8 @@ app.include_router(approvals.router)
 app.include_router(handoff.router)
 app.include_router(output_schemas.router)
 app.include_router(dev_studio.router)
+
+# 头像静态文件服务
+_avatar_dir = Path("./uploads/avatars")
+_avatar_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/api/avatars", StaticFiles(directory=str(_avatar_dir)), name="avatars")

@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     # LLM API Keys (forwarded to opencode web process)
     KIMI_API_KEY: str = ""
     DEEPSEEK_API_KEY: str = ""
+    BAILIAN_API_KEY: str = ""
 
     class Config:
         env_file = ".env"

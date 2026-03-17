@@ -4,12 +4,12 @@ import base64
 
 
 def _call_kimi_vision(image_path: str) -> str:
-    """Call Kimi vision API to describe an image."""
+    """Call Kimi vision API (via 百炼 Coding Plan) to describe an image."""
     import openai
 
-    api_key = os.environ.get("KIMI_API_KEY", "")
+    api_key = os.environ.get("BAILIAN_API_KEY", "")
     if not api_key:
-        raise ValueError("KIMI_API_KEY 环境变量未设置")
+        raise ValueError("BAILIAN_API_KEY 环境变量未设置")
 
     with open(image_path, "rb") as f:
         b64_data = base64.b64encode(f.read()).decode("utf-8")
@@ -21,7 +21,7 @@ def _call_kimi_vision(image_path: str) -> str:
 
     client = openai.OpenAI(
         api_key=api_key,
-        base_url="https://api.moonshot.cn/v1",
+        base_url="https://coding.dashscope.aliyuncs.com/apps/anthropic/v1",
     )
     resp = client.chat.completions.create(
         model="kimi-k2.5",
