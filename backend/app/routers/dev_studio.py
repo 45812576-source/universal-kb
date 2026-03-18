@@ -97,7 +97,7 @@ async def _ensure_singleton() -> dict:
 
         # 已有进程且还活着，直接复用
         if proc is not None and proc.returncode is None:
-            return {"port": _singleton["port"], "url": f"http://127.0.0.1:{_singleton['port']}"}
+            return {"port": _singleton["port"], "url": "/opencode"}
 
         opencode_bin = _find_opencode()
         if not opencode_bin:
@@ -118,12 +118,21 @@ async def _ensure_singleton() -> dict:
         if bailian_key:
             proc_env["BAILIAN_API_KEY"] = bailian_key
 
+        # CORS 允许来源：从环境变量 FRONTEND_ORIGIN 读取（支持内网穿透域名）
+        frontend_origins = [
+            o.strip()
+            for o in os.environ.get("FRONTEND_ORIGIN", "http://localhost:5023").split(",")
+            if o.strip()
+        ]
+        cors_args = []
+        for origin in frontend_origins:
+            cors_args += ["--cors", origin]
+
         new_proc = await asyncio.create_subprocess_exec(
             opencode_bin, "web",
             "--port", str(OPENCODE_FIXED_PORT),
             "--hostname", "127.0.0.1",
-            "--cors", "http://localhost:5023",
-            "--cors", "http://localhost:3000",
+            *cors_args,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             cwd=workdir,
@@ -141,7 +150,7 @@ async def _ensure_singleton() -> dict:
         _singleton["port"] = OPENCODE_FIXED_PORT
         _singleton["workdir"] = workdir
 
-        return {"port": OPENCODE_FIXED_PORT, "url": f"http://127.0.0.1:{OPENCODE_FIXED_PORT}"}
+        return {"port": OPENCODE_FIXED_PORT, "url": "/opencode"}
 
 
 # ─── GET /instance — 获取（或启动）单例 ───────────────────────────────────────

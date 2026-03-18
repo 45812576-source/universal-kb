@@ -656,13 +656,45 @@ def update_status(
         raise HTTPException(404, "Skill not found")
     if status not in [s.value for s in SkillStatus]:
         raise HTTPException(400, f"Invalid status: {status}")
+
+    # DEPT_ADMIN 申请发布 → 转为审核中，创建审批单等超管审批
+    if status == SkillStatus.PUBLISHED.value and user.role == Role.DEPT_ADMIN:
+        if scope is not None:
+            skill.scope = scope
+        if department_id is not None:
+            skill.department_id = department_id
+        skill.status = SkillStatus.REVIEWING
+        db.flush()
+        # 幂等：同一 skill 不重复创建待审批单
+        from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus
+        existing_approval = (
+            db.query(ApprovalRequest)
+            .filter(
+                ApprovalRequest.target_id == skill_id,
+                ApprovalRequest.target_type == "skill",
+                ApprovalRequest.status == ApprovalStatus.PENDING,
+            )
+            .first()
+        )
+        if not existing_approval:
+            approval = ApprovalRequest(
+                request_type=ApprovalRequestType.SKILL_PUBLISH,
+                target_id=skill_id,
+                target_type="skill",
+                requester_id=user.id,
+                status=ApprovalStatus.PENDING,
+            )
+            db.add(approval)
+        db.commit()
+        return {"id": skill_id, "status": SkillStatus.REVIEWING.value, "scope": skill.scope}
+
     skill.status = status
     if scope is not None:
         skill.scope = scope
     if department_id is not None:
         skill.department_id = department_id
 
-    # 发布时自动生成 SkillPolicy（幂等）
+    # SUPER_ADMIN 直接发布时生成 SkillPolicy
     if status == SkillStatus.PUBLISHED.value:
         _ensure_skill_policy(skill_id, user, db)
 

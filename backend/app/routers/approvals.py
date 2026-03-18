@@ -197,6 +197,14 @@ def act_on_approval(
     # 更新申请状态
     if req.action == "approve":
         r.status = ApprovalStatus.APPROVED
+        # 若是 skill 发布审批，自动把 skill 状态改为 published
+        if r.request_type == ApprovalRequestType.SKILL_PUBLISH and r.target_type == "skill" and r.target_id:
+            from app.models.skill import Skill, SkillStatus
+            skill = db.get(Skill, r.target_id)
+            if skill:
+                skill.status = SkillStatus.PUBLISHED
+                from app.routers.skills import _ensure_skill_policy
+                _ensure_skill_policy(r.target_id, user, db)
     elif req.action == "reject":
         r.status = ApprovalStatus.REJECTED
     elif req.action == "add_conditions":
