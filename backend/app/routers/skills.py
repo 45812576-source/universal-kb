@@ -310,12 +310,16 @@ async def upload_skill_md(
             "version": new_ver,
         }
     else:
-        # Create new skill, auto-publish
+        # Create new skill — DEPT_ADMIN 需走审批，SUPER_ADMIN 直接发布
+        if user.role == Role.SUPER_ADMIN:
+            new_status = SkillStatus.PUBLISHED
+        else:
+            new_status = SkillStatus.REVIEWING
         skill = Skill(
             name=parsed["name"],
             description=parsed["description"],
             mode="hybrid",
-            status=SkillStatus.PUBLISHED,
+            status=new_status,
             scope="company",
             auto_inject=True,
             created_by=user.id,
@@ -331,6 +335,16 @@ async def upload_skill_md(
             change_note="从 md 文件上传创建",
         )
         db.add(v)
+        if new_status == SkillStatus.REVIEWING:
+            from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus as AStatus
+            approval = ApprovalRequest(
+                request_type=ApprovalRequestType.SKILL_PUBLISH,
+                target_id=skill.id,
+                target_type="skill",
+                requester_id=user.id,
+                status=AStatus.PENDING,
+            )
+            db.add(approval)
         db.commit()
         db.refresh(skill)
         return {
@@ -338,6 +352,7 @@ async def upload_skill_md(
             "id": skill.id,
             "name": skill.name,
             "version": 1,
+            "status": new_status.value,
         }
 
 
