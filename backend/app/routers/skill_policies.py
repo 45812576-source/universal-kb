@@ -27,11 +27,13 @@ _admin = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN))
 class SkillPolicyCreate(BaseModel):
     skill_id: int
     publish_scope: str = "same_role"
+    view_scope: str = "org_wide"
     default_data_scope: dict = {}
 
 
 class SkillPolicyUpdate(BaseModel):
     publish_scope: Optional[str] = None
+    view_scope: Optional[str] = None
     default_data_scope: Optional[dict] = None
 
 
@@ -61,6 +63,7 @@ def _policy(p: SkillPolicy) -> dict:
         "id": p.id,
         "skill_id": p.skill_id,
         "publish_scope": p.publish_scope,
+        "view_scope": p.view_scope if p.view_scope else "org_wide",
         "default_data_scope": p.default_data_scope or {},
         "created_at": p.created_at.isoformat() if p.created_at else None,
     }

@@ -21,6 +21,16 @@ class Settings(BaseSettings):
     KIMI_API_KEY: str = ""
     DEEPSEEK_API_KEY: str = ""
     BAILIAN_API_KEY: str = ""
+    ARK_API_KEY: str = ""  # 火山引擎 ARK，备用 provider
+    LEMONDATA_API_KEY: str = ""  # LemonData，受限模型（需管理员授权）
+
+    # 百炼用量超限后自动切换到 ARK（由外部监控脚本或管理接口写入）
+    BAILIAN_FALLBACK_TO_ARK: bool = False
+
+    # 百炼 Coding Plan 三窗口额度，达到任一窗口 90% 自动切换 ARK
+    BAILIAN_QUOTA_5H: int = 6000    # 每 5 小时最多请求数
+    BAILIAN_QUOTA_7D: int = 45000   # 每 7 天最多请求数
+    BAILIAN_QUOTA_30D: int = 90000  # 每订阅月最多请求数
 
     class Config:
         env_file = ".env"

@@ -193,8 +193,8 @@ def create_skill(
                 f"最多只能有 {MAX_EMPLOYEE_UNPUBLISHED_SKILLS} 个未发布 Skill，请先发布或删除已有草稿",
             )
 
-    if db.query(Skill).filter(Skill.name == req.name).first():
-        raise HTTPException(400, f"Skill '{req.name}' already exists")
+    if db.query(Skill).filter(Skill.name == req.name, Skill.created_by == user.id).first():
+        raise HTTPException(400, f"你已有同名 Skill '{req.name}'，请修改名称或更新已有版本")
 
     # 员工创建的 Skill 固定为个人草稿，不可自行设置 scope
     skill = Skill(
@@ -262,7 +262,7 @@ def _parse_skill_md(content: str) -> dict:
 async def upload_skill_md(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Upload a .md file to create or update a Skill.
 
@@ -282,7 +282,7 @@ async def upload_skill_md(
     if not parsed["name"]:
         raise HTTPException(400, "文件缺少 frontmatter 中的 name 字段")
 
-    existing = db.query(Skill).filter(Skill.name == parsed["name"]).first()
+    existing = db.query(Skill).filter(Skill.name == parsed["name"], Skill.created_by == user.id).first()
 
     if existing:
         # Add a new version
@@ -310,17 +310,19 @@ async def upload_skill_md(
             "version": new_ver,
         }
     else:
-        # Create new skill — DEPT_ADMIN 需走审批，SUPER_ADMIN 直接发布
+        # 超管直接发布；部门管理员和员工走双重审批
         if user.role == Role.SUPER_ADMIN:
             new_status = SkillStatus.PUBLISHED
+            new_scope = "company"
         else:
             new_status = SkillStatus.REVIEWING
+            new_scope = "personal"  # 审批通过前仅本人可见
         skill = Skill(
             name=parsed["name"],
             description=parsed["description"],
             mode="hybrid",
             status=new_status,
-            scope="company",
+            scope=new_scope,
             auto_inject=True,
             created_by=user.id,
         )
@@ -337,12 +339,18 @@ async def upload_skill_md(
         db.add(v)
         if new_status == SkillStatus.REVIEWING:
             from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus as AStatus
+            # 部门管理员上传，跳过 dept 阶段，直接等超管审批
+            if user.role == Role.DEPT_ADMIN:
+                initial_stage = "super_pending"
+            else:
+                initial_stage = "dept_pending"
             approval = ApprovalRequest(
                 request_type=ApprovalRequestType.SKILL_PUBLISH,
                 target_id=skill.id,
                 target_type="skill",
                 requester_id=user.id,
                 status=AStatus.PENDING,
+                stage=initial_stage,
             )
             db.add(approval)
         db.commit()
@@ -353,6 +361,7 @@ async def upload_skill_md(
             "name": skill.name,
             "version": 1,
             "status": new_status.value,
+            "stage": initial_stage if new_status == SkillStatus.REVIEWING else None,
         }
 
 
@@ -360,7 +369,7 @@ async def upload_skill_md(
 async def batch_upload_skill_md(
     files: list[UploadFile] = File(...),
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Upload multiple .md files at once."""
     results = []
@@ -379,7 +388,7 @@ async def batch_upload_skill_md(
             results.append({"filename": f.filename, "error": "缺少 name"})
             continue
 
-        existing = db.query(Skill).filter(Skill.name == parsed["name"]).first()
+        existing = db.query(Skill).filter(Skill.name == parsed["name"], Skill.created_by == user.id).first()
         if existing:
             latest = existing.versions[0] if existing.versions else None
             new_ver = (latest.version + 1) if latest else 1
@@ -719,8 +728,8 @@ def update_status(
 
 def _ensure_skill_policy(skill_id: int, user: User, db) -> None:
     """发布时自动生成 SkillPolicy（若已存在则跳过）。
-    默认 publish_scope 按 skill.scope 映射：
-      personal → self_only, department → same_role, company → org_wide
+    publish_scope（可用范围）按 skill.scope 映射：personal→self_only, department→same_role, company→org_wide
+    view_scope（可见范围）默认比 publish_scope 宽一级（至少同部门可见）
     """
     from app.models.permission import SkillPolicy, PublishScope
     existing = db.query(SkillPolicy).filter(SkillPolicy.skill_id == skill_id).first()
@@ -734,10 +743,19 @@ def _ensure_skill_policy(skill_id: int, user: User, db) -> None:
         "company": PublishScope.ORG_WIDE,
     }
     publish_scope = scope_map.get(skill.scope or "personal", PublishScope.SAME_ROLE)
+    # view_scope 默认比 use_scope 宽一级
+    view_scope_map = {
+        PublishScope.SELF_ONLY: PublishScope.SAME_ROLE,
+        PublishScope.SAME_ROLE: PublishScope.SAME_ROLE,
+        PublishScope.CROSS_ROLE: PublishScope.ORG_WIDE,
+        PublishScope.ORG_WIDE: PublishScope.ORG_WIDE,
+    }
+    view_scope = view_scope_map.get(publish_scope, PublishScope.ORG_WIDE)
 
     policy = SkillPolicy(
         skill_id=skill_id,
         publish_scope=publish_scope,
+        view_scope=view_scope,
         default_data_scope={},
     )
     db.add(policy)
@@ -883,6 +901,11 @@ def delete_skill(
     elif user.role == Role.DEPT_ADMIN:
         if skill.department_id != user.department_id and skill.created_by != user.id:
             raise HTTPException(403, "只能删除本部门的 Skill")
+
+    # 级联删除关联记录（外键约束）
+    from sqlalchemy import text
+    db.execute(text("DELETE FROM skill_policies WHERE skill_id = :sid"), {"sid": skill_id})
+    db.execute(text("DELETE FROM approval_requests WHERE target_id = :sid AND target_type = 'skill'"), {"sid": skill_id})
     db.delete(skill)
     db.commit()
     return {"ok": True}

@@ -1,5 +1,10 @@
 """Contribution statistics API."""
-from fastapi import APIRouter, Depends, Query
+import os
+import sqlite3
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -7,6 +12,7 @@ from app.database import get_db
 from app.dependencies import get_current_user, require_role
 from app.models.conversation import Message, MessageRole
 from app.models.knowledge import KnowledgeEntry
+from app.models.opencode import OpenCodeWorkspaceMapping
 from app.models.skill import SkillAttribution, SkillSuggestion, SuggestionStatus, AttributionLevel
 from app.models.user import Department, Role, User
 
@@ -277,3 +283,361 @@ def leaderboard(
 
     entries.sort(key=lambda x: -x["influence_score"])
     return entries[:limit]
+
+
+# ─── OpenCode 用量 ─────────────────────────────────────────────────────────────
+
+OPENCODE_DB_PATH = os.environ.get(
+    "OPENCODE_DB_PATH",
+    os.path.expanduser("~/.local/share/opencode/opencode.db"),
+)
+
+
+def _read_opencode_db() -> dict[str, dict]:
+    """从 OpenCode SQLite 读取按 directory 聚合的用量数据。
+    返回 {directory: {sessions, input_tokens, output_tokens, models,
+                      files_changed, lines_added, lines_deleted, output_files}}
+    output_files: [{path, session_title}, ...] 去重后列表
+    """
+    if not os.path.exists(OPENCODE_DB_PATH):
+        return {}
+
+    import json as _json
+
+    con = sqlite3.connect(f"file:{OPENCODE_DB_PATH}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        # session 级别：代码产出 + 标题（用 directory 分组）
+        session_rows = con.execute(
+            "SELECT id, directory, title, summary_files, summary_additions, summary_deletions FROM session"
+        ).fetchall()
+
+        # message 级别：token 用量（assistant 角色，无 error）
+        msg_rows = con.execute(
+            "SELECT s.directory, m.data "
+            "FROM message m "
+            "JOIN session s ON s.id = m.session_id "
+            "WHERE json_extract(m.data, '$.role') = 'assistant' "
+            "  AND json_extract(m.data, '$.error') IS NULL"
+        ).fetchall()
+
+        # part 级别：write/edit 工具调用 → 提取 filePath
+        part_rows = con.execute(
+            "SELECT p.data, s.directory, s.title "
+            "FROM part p "
+            "JOIN session s ON s.id = p.session_id "
+            "WHERE json_extract(p.data, '$.type') = 'tool' "
+            "  AND json_extract(p.data, '$.tool') IN ('write', 'edit', 'patch')"
+        ).fetchall()
+    finally:
+        con.close()
+
+    result: dict[str, dict] = {}
+
+    def _ws(directory: str) -> dict:
+        if directory not in result:
+            result[directory] = {
+                "sessions": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "models": {},
+                "files_changed": 0,
+                "lines_added": 0,
+                "lines_deleted": 0,
+                "_file_set": set(),
+                "output_files": [],
+            }
+        return result[directory]
+
+    for row in session_rows:
+        directory = row["directory"] or "__unknown__"
+        ws = _ws(directory)
+        ws["sessions"] += 1
+        ws["files_changed"] += row["summary_files"] or 0
+        ws["lines_added"] += row["summary_additions"] or 0
+        ws["lines_deleted"] += row["summary_deletions"] or 0
+
+    for row in msg_rows:
+        directory = row["directory"] or "__unknown__"
+        try:
+            data = _json.loads(row["data"])
+        except Exception:
+            continue
+        tokens = data.get("tokens") or {}
+        cache = tokens.get("cache") or {}
+        inp = tokens.get("input") or 0
+        out = tokens.get("output") or 0
+        cr = cache.get("read") or 0
+        model = data.get("modelID") or ""
+        ws = _ws(directory)
+        ws["input_tokens"] += inp
+        ws["output_tokens"] += out
+        ws["cache_read_tokens"] += cr
+        if model:
+            ws["models"][model] = ws["models"].get(model, 0) + 1
+
+    for row in part_rows:
+        directory = row["directory"] or "__unknown__"
+        try:
+            data = _json.loads(row["data"])
+        except Exception:
+            continue
+        state = data.get("state") or {}
+        inp = state.get("input") or {}
+        file_path = inp.get("filePath") or inp.get("file_path") or ""
+        if not file_path:
+            continue
+        ws = _ws(directory)
+        if file_path not in ws["_file_set"]:
+            ws["_file_set"].add(file_path)
+            ws["output_files"].append({
+                "path": file_path,
+                "session_title": row["title"] or "",
+            })
+
+    for ws in result.values():
+        del ws["_file_set"]
+
+    return result
+
+
+# ─── Mapping CRUD ─────────────────────────────────────────────────────────────
+
+class MappingCreate(BaseModel):
+    opencode_workspace_id: str
+    opencode_workspace_name: Optional[str] = None
+    user_id: int
+
+
+class MappingUpdate(BaseModel):
+    opencode_workspace_name: Optional[str] = None
+    user_id: Optional[int] = None
+
+
+@router.get("/opencode-workspaces")
+def list_opencode_workspaces(
+    _user: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """列出 OpenCode SQLite 中所有 workspace（供超管配置映射用）。"""
+    if not os.path.exists(OPENCODE_DB_PATH):
+        return []
+    con = sqlite3.connect(f"file:{OPENCODE_DB_PATH}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT id, worktree, name, icon_color, time_created FROM project ORDER BY time_created DESC"
+        ).fetchall()
+    finally:
+        con.close()
+    return [dict(r) for r in rows]
+
+
+@router.get("/opencode-mappings")
+def list_mappings(
+    db: Session = Depends(get_db),
+    _user: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    mappings = db.query(OpenCodeWorkspaceMapping).all()
+    return [
+        {
+            "id": m.id,
+            "opencode_workspace_id": m.opencode_workspace_id,
+            "opencode_workspace_name": m.opencode_workspace_name,
+            "user_id": m.user_id,
+            "display_name": m.user.display_name if m.user else None,
+        }
+        for m in mappings
+    ]
+
+
+@router.post("/opencode-mappings")
+def create_mapping(
+    req: MappingCreate,
+    db: Session = Depends(get_db),
+    _user: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    existing = db.query(OpenCodeWorkspaceMapping).filter(
+        OpenCodeWorkspaceMapping.opencode_workspace_id == req.opencode_workspace_id
+    ).first()
+    if existing:
+        raise HTTPException(400, "该 workspace 已有映射，请先删除再重建")
+    mapping = OpenCodeWorkspaceMapping(
+        opencode_workspace_id=req.opencode_workspace_id,
+        opencode_workspace_name=req.opencode_workspace_name,
+        user_id=req.user_id,
+    )
+    db.add(mapping)
+    db.commit()
+    db.refresh(mapping)
+    return {"id": mapping.id, "ok": True}
+
+
+@router.put("/opencode-mappings/{mapping_id}")
+def update_mapping(
+    mapping_id: int,
+    req: MappingUpdate,
+    db: Session = Depends(get_db),
+    _user: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    mapping = db.get(OpenCodeWorkspaceMapping, mapping_id)
+    if not mapping:
+        raise HTTPException(404, "映射不存在")
+    if req.opencode_workspace_name is not None:
+        mapping.opencode_workspace_name = req.opencode_workspace_name
+    if req.user_id is not None:
+        mapping.user_id = req.user_id
+    db.commit()
+    return {"ok": True}
+
+
+@router.delete("/opencode-mappings/{mapping_id}")
+def delete_mapping(
+    mapping_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    mapping = db.get(OpenCodeWorkspaceMapping, mapping_id)
+    if not mapping:
+        raise HTTPException(404, "映射不存在")
+    db.delete(mapping)
+    db.commit()
+    return {"ok": True}
+
+
+# ─── OpenCode 用量统计 ─────────────────────────────────────────────────────────
+
+def compute_and_store_opencode_usage(db: Session) -> None:
+    """读取 OpenCode SQLite，按用户聚合后写入缓存表。由定时任务和手动触发调用。"""
+    import datetime as dt
+    from app.models.opencode import OpenCodeUsageCache
+    from app.models.skill import Skill, SkillStatus
+    from app.models.tool import ToolRegistry
+
+    # 取有 directory 的映射（自动方案）；无 directory 的旧映射忽略
+    mappings = db.query(OpenCodeWorkspaceMapping).filter(
+        OpenCodeWorkspaceMapping.directory != None
+    ).all()
+    ws_data = _read_opencode_db()  # key = session.directory
+
+    # 统计每个用户从 dev-studio 提交的 skill/tool 数量
+    # dev-studio 保存的 skill: source_type='local', created_by=user.id
+    # dev-studio 保存的 tool: created_by=user.id
+    skill_counts: dict[int, int] = {}
+    for row in db.query(Skill.created_by, func.count(Skill.id)).filter(
+        Skill.source_type == "local"
+    ).group_by(Skill.created_by).all():
+        if row[0]:
+            skill_counts[row[0]] = row[1]
+
+    tool_counts: dict[int, int] = {}
+    for row in db.query(ToolRegistry.created_by, func.count(ToolRegistry.id)).filter(
+        ToolRegistry.created_by.isnot(None)
+    ).group_by(ToolRegistry.created_by).all():
+        if row[0]:
+            tool_counts[row[0]] = row[1]
+
+    user_stats: dict[int, dict] = {}
+    for m in mappings:
+        uid = m.user_id
+        # 匹配所有 directory 以 m.directory 开头的 session（精确匹配或子目录）
+        if uid not in user_stats:
+            user_stats[uid] = {
+                "sessions": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "files_changed": 0,
+                "lines_added": 0,
+                "lines_deleted": 0,
+                "models": {},
+                "workspaces": [],
+                "output_files": [],
+                "_file_paths": set(),
+            }
+        s = user_stats[uid]
+        for dir_key, ws in ws_data.items():
+            if dir_key == m.directory or dir_key.startswith(m.directory + "/") or dir_key.startswith(m.directory + os.sep):
+                s["sessions"] += ws.get("sessions", 0)
+                s["input_tokens"] += ws.get("input_tokens", 0)
+                s["output_tokens"] += ws.get("output_tokens", 0)
+                s["cache_read_tokens"] += ws.get("cache_read_tokens", 0)
+                s["files_changed"] += ws.get("files_changed", 0)
+                s["lines_added"] += ws.get("lines_added", 0)
+                s["lines_deleted"] += ws.get("lines_deleted", 0)
+                for model, cnt in ws.get("models", {}).items():
+                    s["models"][model] = s["models"].get(model, 0) + cnt
+                for f in ws.get("output_files", []):
+                    if f["path"] not in s["_file_paths"]:
+                        s["_file_paths"].add(f["path"])
+                        s["output_files"].append(f)
+        s["workspaces"].append(m.opencode_workspace_name or m.directory or str(uid))
+
+    now = dt.datetime.utcnow()
+    for uid, s in user_stats.items():
+        del s["_file_paths"]
+        row = db.query(OpenCodeUsageCache).filter(OpenCodeUsageCache.user_id == uid).first()
+        if row is None:
+            row = OpenCodeUsageCache(user_id=uid)
+            db.add(row)
+        row.sessions = s["sessions"]
+        row.input_tokens = s["input_tokens"]
+        row.output_tokens = s["output_tokens"]
+        row.cache_read_tokens = s["cache_read_tokens"]
+        row.files_changed = s["files_changed"]
+        row.lines_added = s["lines_added"]
+        row.lines_deleted = s["lines_deleted"]
+        row.models = s["models"]
+        row.workspaces = s["workspaces"]
+        row.output_files = s["output_files"]
+        row.skills_submitted = skill_counts.get(uid, 0)
+        row.tools_submitted = tool_counts.get(uid, 0)
+        row.computed_at = now
+
+    db.commit()
+
+
+@router.get("/opencode-usage")
+def opencode_usage(
+    db: Session = Depends(get_db),
+    _user: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """读取缓存的 OpenCode 用量统计（每 12 小时更新一次）。"""
+    from app.models.opencode import OpenCodeUsageCache
+
+    rows = db.query(OpenCodeUsageCache).all()
+    result = []
+    for row in rows:
+        models = row.models or {}
+        top_model = max(models, key=lambda k: models[k]) if models else None
+        result.append({
+            "user_id": row.user_id,
+            "display_name": row.user.display_name if row.user else str(row.user_id),
+            "sessions": row.sessions,
+            "input_tokens": row.input_tokens,
+            "output_tokens": row.output_tokens,
+            "cache_read_tokens": row.cache_read_tokens,
+            "models": models,
+            "top_model": top_model,
+            "files_changed": row.files_changed,
+            "lines_added": row.lines_added,
+            "lines_deleted": row.lines_deleted,
+            "output_files": row.output_files or [],
+            "skills_submitted": row.skills_submitted or 0,
+            "tools_submitted": row.tools_submitted or 0,
+            "workspaces": row.workspaces or [],
+            "computed_at": row.computed_at.isoformat() if row.computed_at else None,
+        })
+
+    result.sort(key=lambda x: -(x["input_tokens"] + x["output_tokens"]))
+    return result
+
+
+@router.post("/opencode-usage/refresh")
+def refresh_opencode_usage(
+    db: Session = Depends(get_db),
+    _user: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """手动触发重新计算 OpenCode 用量缓存。"""
+    compute_and_store_opencode_usage(db)
+    return {"ok": True}

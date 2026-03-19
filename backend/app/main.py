@@ -41,8 +41,23 @@ async def startup_event():
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
         from app.services.upstream_checker import check_all_imported_skills
+        from app.routers.contributions import compute_and_store_opencode_usage
+        from app.database import SessionLocal
+
+        def _run_opencode_usage_job():
+            db = SessionLocal()
+            try:
+                compute_and_store_opencode_usage(db)
+            except Exception as ex:
+                import logging
+                logging.getLogger(__name__).warning(f"OpenCode usage job failed: {ex}")
+            finally:
+                db.close()
+
         upstream_scheduler = BackgroundScheduler()
         upstream_scheduler.add_job(check_all_imported_skills, "cron", hour=3, minute=0)
+        # 每 12 小时统计一次 OpenCode 用量（0点 和 12点）
+        upstream_scheduler.add_job(_run_opencode_usage_job, "cron", hour="0,12", minute=5)
         upstream_scheduler.start()
     except Exception as e:
         import logging
@@ -52,6 +67,7 @@ async def startup_event():
 # Register new models with Base.metadata
 from app.models import raw_input, draft, opportunity, feedback_item  # noqa: F401
 from app.models import permission  # noqa: F401
+from app.models import opencode  # noqa: F401
 
 from app.routers import auth, admin, skills, knowledge, conversations  # noqa: E402
 from app.routers import business_tables, data_tables, audit, skill_suggestions, contributions  # noqa: E402

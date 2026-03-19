@@ -396,3 +396,70 @@ def deactivate_user(
     u.is_active = False
     db.commit()
     return {"ok": True}
+
+
+# ─── Model Grants（受限模型授权）─────────────────────────────────────────────
+
+@router.get("/model-grants")
+def list_model_grants(
+    db: Session = Depends(get_db),
+    current: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """列出所有受限模型授权记录。"""
+    from app.models.opencode import UserModelGrant
+    grants = db.query(UserModelGrant).all()
+    return [
+        {
+            "id": g.id,
+            "user_id": g.user_id,
+            "display_name": g.user.display_name if g.user else None,
+            "model_key": g.model_key,
+            "granted_by": g.granted_by,
+            "granted_at": g.granted_at.isoformat() if g.granted_at else None,
+        }
+        for g in grants
+    ]
+
+
+@router.post("/model-grants/{uid}")
+def grant_model(
+    uid: int,
+    model_key: str,
+    db: Session = Depends(get_db),
+    current: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """为指定用户授权使用受限模型。"""
+    from app.models.opencode import UserModelGrant
+    from sqlalchemy.exc import IntegrityError
+    u = db.get(User, uid)
+    if not u:
+        raise HTTPException(404, "用户不存在")
+    grant = UserModelGrant(user_id=uid, model_key=model_key, granted_by=current.id)
+    db.add(grant)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(400, "已授权")
+    return {"ok": True, "user_id": uid, "model_key": model_key}
+
+
+@router.delete("/model-grants/{uid}")
+def revoke_model(
+    uid: int,
+    model_key: str,
+    db: Session = Depends(get_db),
+    current: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """撤销指定用户的受限模型授权。"""
+    from app.models.opencode import UserModelGrant
+    grant = (
+        db.query(UserModelGrant)
+        .filter(UserModelGrant.user_id == uid, UserModelGrant.model_key == model_key)
+        .first()
+    )
+    if not grant:
+        raise HTTPException(404, "授权记录不存在")
+    db.delete(grant)
+    db.commit()
+    return {"ok": True}

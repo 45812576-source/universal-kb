@@ -99,3 +99,14 @@ async def upload_avatar(
     current_user.avatar_url = f"/api/avatars/{filename}"
     db.commit()
     return {"avatar_url": current_user.avatar_url}
+
+
+@router.get("/model-grants")
+def get_model_grants(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """返回当前用户被授权使用的受限模型 key 列表。"""
+    from app.models.opencode import UserModelGrant
+    grants = db.query(UserModelGrant).filter(UserModelGrant.user_id == current_user.id).all()
+    return {"model_keys": [g.model_key for g in grants]}

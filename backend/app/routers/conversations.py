@@ -59,6 +59,29 @@ def create_conversation(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    # opencode workspace：每人只能有一个对话，若已存在则直接返回
+    if req.workspace_id:
+        from app.models.workspace import Workspace as WsModel
+        ws = db.get(WsModel, req.workspace_id)
+        if ws and ws.workspace_type == "opencode":
+            existing = (
+                db.query(Conversation)
+                .filter(
+                    Conversation.user_id == user.id,
+                    Conversation.workspace_id == req.workspace_id,
+                    Conversation.is_active == True,
+                )
+                .first()
+            )
+            if existing:
+                return {"id": existing.id, "title": existing.title, "workspace_id": existing.workspace_id}
+            # 首次创建，标题固定
+            conv = Conversation(user_id=user.id, workspace_id=req.workspace_id, title="OpenCode 开发")
+            db.add(conv)
+            db.commit()
+            db.refresh(conv)
+            return {"id": conv.id, "title": conv.title, "workspace_id": conv.workspace_id}
+
     conv = Conversation(user_id=user.id, workspace_id=req.workspace_id)
     db.add(conv)
     db.commit()
@@ -87,6 +110,7 @@ def list_conversations(
             "skill_id": c.skill_id,
             "workspace_id": c.workspace_id,
             "workspace": {"name": ws.name, "icon": ws.icon, "color": ws.color} if ws else None,
+            "workspace_type": ws.workspace_type if ws else None,
             "updated_at": c.updated_at.isoformat(),
         }
 
@@ -124,6 +148,14 @@ async def send_message(
     conv = db.get(Conversation, conv_id)
     if not conv or conv.user_id != user.id:
         raise HTTPException(404, "Conversation not found")
+
+    # opencode 工作台对话标题锁定，不随消息内容变更
+    _is_opencode_conv = False
+    if conv.workspace_id:
+        from app.models.workspace import Workspace as WsModel
+        _ws = db.get(WsModel, conv.workspace_id)
+        if _ws and _ws.workspace_type == "opencode":
+            _is_opencode_conv = True
 
     # Persist user message immediately so it survives any downstream failure
     user_msg = Message(
@@ -175,7 +207,8 @@ async def send_message(
     # Update conversation title on first exchange
     msg_count = db.query(Message).filter(Message.conversation_id == conv_id).count()
     if msg_count <= 2:
-        conv.title = req.content[:60]
+        if not _is_opencode_conv:
+            conv.title = req.content[:60]
 
     db.commit()
     return {
@@ -258,7 +291,7 @@ async def stream_message(
                 )
                 db.add(pev_msg)
                 msg_count = db.query(Message).filter(Message.conversation_id == conv_id).count()
-                if msg_count <= 2:
+                if msg_count <= 2 and not _is_opencode_conv:
                     conv.title = req.content[:60]
                 db.commit()
                 yield _sse("done", {"message_id": pev_msg.id, "metadata": {"pev_job_id": pev_job.id}})
@@ -296,7 +329,7 @@ async def stream_message(
                 )
                 db.add(assistant_msg)
                 msg_count = db.query(Message).filter(Message.conversation_id == conv_id).count()
-                if msg_count <= 2:
+                if msg_count <= 2 and not _is_opencode_conv:
                     conv.title = req.content[:60]
                 db.commit()
 
@@ -413,7 +446,7 @@ async def stream_message(
             db.add(assistant_msg)
 
             msg_count = db.query(Message).filter(Message.conversation_id == conv_id).count()
-            if msg_count <= 2:
+            if msg_count <= 2 and not _is_opencode_conv:
                 conv.title = req.content[:60]
 
             db.commit()

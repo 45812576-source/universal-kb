@@ -178,7 +178,12 @@ class SkillPolicy(Base):
         default=PublishScope.SAME_ROLE,
         nullable=False,
     )
-    default_data_scope = Column(JSON, default=dict)  # {"visibility": "own", "fields": [...]}
+    view_scope = Column(
+        Enum(PublishScope, values_callable=lambda obj: [e.value for e in obj]),
+        default=PublishScope.ORG_WIDE,
+        nullable=False,
+    )
+    default_data_scope = Column(JSON, default=dict)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     overrides = relationship("RolePolicyOverride", back_populates="skill_policy", cascade="all, delete-orphan")
@@ -363,6 +368,7 @@ class ApprovalRequest(Base):
         nullable=False,
     )
     conditions = Column(JSON, default=list)   # 附条件时的条件列表
+    stage = Column(String(20), default="dept_pending", nullable=False)  # dept_pending / super_pending
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     requester = relationship("User", foreign_keys=[requester_id])

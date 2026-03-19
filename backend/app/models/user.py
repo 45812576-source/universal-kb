@@ -51,6 +51,7 @@ class User(Base):
     position_id = Column(Integer, ForeignKey("positions.id"), nullable=True)
     report_to_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    avatar_url = Column(String(500), nullable=True)
 
     department = relationship("Department", back_populates="users", foreign_keys=[department_id])
     managed_department = relationship("Department", foreign_keys=[managed_department_id])

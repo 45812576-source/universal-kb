@@ -36,14 +36,38 @@ class ApprovalActionCreate(BaseModel):
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _req(r: ApprovalRequest, db: Session) -> dict:
+    # 关联查出目标详情
+    target_detail: dict = {}
+    if r.target_type == "skill" and r.target_id:
+        from app.models.skill import Skill, SkillVersion
+        skill = db.get(Skill, r.target_id)
+        if skill:
+            # 取最新版本的 system_prompt
+            latest_ver = (
+                db.query(SkillVersion)
+                .filter(SkillVersion.skill_id == skill.id)
+                .order_by(SkillVersion.version.desc())
+                .first()
+            )
+            target_detail = {
+                "name": skill.name,
+                "description": skill.description or "",
+                "scope": skill.scope,
+                "mode": skill.mode,
+                "system_prompt": latest_ver.system_prompt if latest_ver else "",
+                "change_note": latest_ver.change_note if latest_ver else "",
+            }
+
     return {
         "id": r.id,
         "request_type": r.request_type,
         "target_id": r.target_id,
         "target_type": r.target_type,
+        "target_detail": target_detail,
         "requester_id": r.requester_id,
         "requester_name": r.requester.display_name if r.requester else None,
         "status": r.status,
+        "stage": getattr(r, "stage", None),
         "conditions": r.conditions or [],
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "actions": [
@@ -111,6 +135,40 @@ def list_approvals(
         "page_size": page_size,
         "items": [_req(r, db) for r in items],
     }
+
+
+@router.get("/pending-count")
+def pending_count(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """返回当前用户需要处理的待审批数量（用于侧边栏红标）。"""
+    if user.role == Role.SUPER_ADMIN:
+        # 超管：stage=super_pending 的所有待审批
+        count = (
+            db.query(ApprovalRequest)
+            .filter(ApprovalRequest.status == ApprovalStatus.PENDING, ApprovalRequest.stage == "super_pending")
+            .count()
+        )
+    elif user.role == Role.DEPT_ADMIN:
+        # 部门管理员：stage=dept_pending 且 requester 在本部门的
+        from app.models.user import User as UserModel
+        from sqlalchemy import or_
+        dept_user_ids = [
+            u.id for u in db.query(UserModel).filter(UserModel.department_id == user.department_id).all()
+        ]
+        count = (
+            db.query(ApprovalRequest)
+            .filter(
+                ApprovalRequest.status == ApprovalStatus.PENDING,
+                ApprovalRequest.stage == "dept_pending",
+                ApprovalRequest.requester_id.in_(dept_user_ids),
+            )
+            .count()
+        )
+    else:
+        count = 0
+    return {"count": count}
 
 
 @router.get("/my")
@@ -196,15 +254,42 @@ def act_on_approval(
 
     # 更新申请状态
     if req.action == "approve":
-        r.status = ApprovalStatus.APPROVED
-        # 若是 skill 发布审批，自动把 skill 状态改为 published
-        if r.request_type == ApprovalRequestType.SKILL_PUBLISH and r.target_type == "skill" and r.target_id:
+        is_skill_publish = (
+            r.request_type == ApprovalRequestType.SKILL_PUBLISH
+            and r.target_type == "skill"
+            and r.target_id
+        )
+        stage = getattr(r, "stage", "dept_pending") or "dept_pending"
+
+        if is_skill_publish and stage == "dept_pending":
+            # 部门管理员通过第一步 → 进入超管审批阶段，skill 仍不发布
+            if user.role not in (Role.DEPT_ADMIN, Role.SUPER_ADMIN):
+                raise HTTPException(403, "仅部门管理员可执行第一阶段审批")
+            r.stage = "super_pending"
+            # 状态保持 PENDING，等超管再批
+        elif is_skill_publish and stage == "super_pending":
+            # 超管通过第二步 → 正式发布
+            if user.role != Role.SUPER_ADMIN:
+                raise HTTPException(403, "仅超级管理员可执行最终审批")
+            r.status = ApprovalStatus.APPROVED
             from app.models.skill import Skill, SkillStatus
             skill = db.get(Skill, r.target_id)
             if skill:
                 skill.status = SkillStatus.PUBLISHED
+                skill.scope = "company"
                 from app.routers.skills import _ensure_skill_policy
                 _ensure_skill_policy(r.target_id, user, db)
+        else:
+            # 非 skill_publish 或旧数据，保持原逻辑
+            r.status = ApprovalStatus.APPROVED
+            if is_skill_publish:
+                from app.models.skill import Skill, SkillStatus
+                skill = db.get(Skill, r.target_id)
+                if skill:
+                    skill.status = SkillStatus.PUBLISHED
+                    skill.scope = "company"
+                    from app.routers.skills import _ensure_skill_policy
+                    _ensure_skill_policy(r.target_id, user, db)
     elif req.action == "reject":
         r.status = ApprovalStatus.REJECTED
     elif req.action == "add_conditions":
