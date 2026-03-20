@@ -19,6 +19,84 @@ from app.models.tool import ToolRegistry, ToolType
 logger = logging.getLogger(__name__)
 
 
+async def _check_manifest_preconditions(
+    tool: ToolRegistry,
+    params: dict,
+    db: Session | None,
+) -> str | None:
+    """检查 manifest 声明的前置条件。返回错误描述字符串，或 None 表示通过。"""
+    config = tool.config or {}
+    manifest = config.get("manifest")
+    if not manifest:
+        return None
+
+    errors: list[str] = []
+
+    for ds in manifest.get("data_sources", []):
+        key = ds.get("key", "")
+        ds_type = ds.get("type", "")
+        required = ds.get("required", False)
+        description = ds.get("description", key)
+
+        value = params.get(key)
+
+        # ── registered_table ──────────────────────────────────────────
+        if ds_type == "registered_table":
+            if not value:
+                if required:
+                    errors.append(
+                        f"缺少必填参数 '{key}'（{description}）：需提供已注册的业务表名"
+                    )
+                continue
+            if db is not None:
+                from app.models.business import BusinessTable
+                exists = db.query(BusinessTable).filter(
+                    BusinessTable.table_name == value
+                ).first()
+                if not exists:
+                    errors.append(
+                        f"参数 '{key}' 指定的业务表 '{value}' 未在系统中注册，"
+                        f"请先在【数据管理】中注册该表，或检查表名是否正确"
+                    )
+
+        # ── uploaded_file ──────────────────────────────────────────────
+        elif ds_type == "uploaded_file":
+            if not value:
+                if required:
+                    accept = ds.get("accept", [])
+                    accept_str = "、".join(accept) if accept else "文件"
+                    errors.append(
+                        f"缺少必填参数 '{key}'（{description}）：请先上传 {accept_str} 文件，"
+                        f"再调用此工具"
+                    )
+                continue
+            # 检查扩展名
+            accept = ds.get("accept", [])
+            if accept and isinstance(value, str):
+                ext = "." + value.rsplit(".", 1)[-1].lower() if "." in value else ""
+                if ext and ext not in [a.lower() for a in accept]:
+                    errors.append(
+                        f"参数 '{key}' 文件类型不符，工具仅接受：{' '.join(accept)}"
+                    )
+
+        # ── chat_context ───────────────────────────────────────────────
+        elif ds_type == "chat_context":
+            if not value and required:
+                errors.append(
+                    f"缺少必填参数 '{key}'（{description}）：请在对话中提供相关信息"
+                )
+
+    if errors:
+        # 同时把 preconditions 说明附在错误里，帮助用户理解
+        preconditions = manifest.get("preconditions", [])
+        msg = "工具前置条件未满足：\n" + "\n".join(f"• {e}" for e in errors)
+        if preconditions:
+            msg += "\n\n工具说明的运行要求：\n" + "\n".join(f"• {p}" for p in preconditions)
+        return msg
+
+    return None
+
+
 def _validate_params(tool: ToolRegistry, params: dict) -> str | None:
     """Validate params against tool's input_schema. Returns error string or None."""
     schema = tool.input_schema
@@ -70,6 +148,16 @@ class ToolExecutor:
             }
         phases.append("validated")
 
+        # Manifest precondition check
+        manifest_error = await _check_manifest_preconditions(tool, params, db)
+        if manifest_error:
+            return {
+                "ok": False,
+                "error": manifest_error,
+                "phases": phases + ["precondition_failed"],
+            }
+        phases.append("preconditions_ok")
+
         # Get per-tool timeout from config (default 60s)
         config = tool.config or {}
         timeout_s = config.get("timeout", 60)
@@ -109,7 +197,11 @@ class ToolExecutor:
         module_path = config.get("module", f"app.tools.{tool.name}")
         func_name = config.get("function", "execute")
 
-        module = importlib.import_module(module_path)
+        import sys
+        if module_path in sys.modules:
+            module = importlib.reload(sys.modules[module_path])
+        else:
+            module = importlib.import_module(module_path)
         func = getattr(module, func_name)
 
         # Build kwargs — inject db/user_id only if the function declares them
@@ -141,45 +233,26 @@ class ToolExecutor:
             return resp.json()
 
     async def _execute_mcp(self, tool: ToolRegistry, params: dict, timeout_s: int = 60) -> Any:
-        """Start MCP server subprocess and call via stdio JSON-RPC."""
+        """Call MCP server via HTTP（服务由 mcp_installer 在审批通过时启动）。"""
         config = tool.config or {}
-        command = config.get("command", "")
-        args = config.get("args", [])
-        env = config.get("env", {})
+        url = config.get("url", "").rstrip("/")
+        if not url:
+            raise ValueError("MCP 服务尚未安装或 URL 未配置，请联系管理员重新审批")
 
-        if not command:
-            raise ValueError("MCP tool missing 'command' in config")
-
-        import os
-        proc_env = {**os.environ, **env}
-
-        # Build JSON-RPC request
-        rpc_request = json.dumps({
+        rpc_request = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": {
-                "name": tool.name,
-                "arguments": params,
-            },
-        }) + "\n"
+            "params": {"name": tool.name, "arguments": params},
+        }
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            resp = await client.post(f"{url}/rpc", json=rpc_request)
+            resp.raise_for_status()
+            data = resp.json()
 
-        proc = subprocess.run(
-            [command] + args,
-            input=rpc_request.encode(),
-            capture_output=True,
-            timeout=timeout_s,
-            env=proc_env,
-        )
-
-        if proc.returncode != 0:
-            raise RuntimeError(f"MCP process exited {proc.returncode}: {proc.stderr.decode()}")
-
-        response = json.loads(proc.stdout.decode())
-        if "error" in response:
-            raise RuntimeError(f"MCP error: {response['error']}")
-
-        return response.get("result", {})
+        if "error" in data:
+            raise RuntimeError(f"MCP error: {data['error']}")
+        return data.get("result", {})
 
     def get_tools_for_skill(self, db: Session, skill_id: int) -> list[ToolRegistry]:
         """Return active tools bound to a skill."""

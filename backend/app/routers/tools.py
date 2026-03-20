@@ -3,15 +3,28 @@ from __future__ import annotations
 
 import ast
 import datetime
+from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+_TOOLS_DIR = Path(__file__).parent.parent / "tools"
+
+
+def _write_tool_module(func_name: str, source: str) -> None:
+    """把源码写到 app/tools/<func_name>.py，让 importlib 能加载。"""
+    _TOOLS_DIR.mkdir(exist_ok=True)
+    init = _TOOLS_DIR / "__init__.py"
+    if not init.exists():
+        init.write_text("", encoding="utf-8")
+    (_TOOLS_DIR / f"{func_name}.py").write_text(source, encoding="utf-8")
+
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user, require_role
 from app.models.tool import ToolRegistry, SkillTool, ToolType, UserSavedTool
+from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus
 from app.models.user import Role, User
 from app.services.tool_executor import tool_executor
 
@@ -191,31 +204,90 @@ def update_tool(
     return _tool_dict(tool, user)
 
 
+class ToolStatusUpdate(BaseModel):
+    status: str
+    scope: str = "personal"
+    department_id: Optional[int] = None
+    deploy_info: Optional[dict] = None  # 提交发布时附带的部署说明
+
+
 @router.patch("/{tool_id}/status")
 def update_tool_status(
     tool_id: int,
-    status: str,
-    scope: str = "personal",
-    department_id: Optional[int] = None,
+    body: ToolStatusUpdate,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    status = body.status
+    scope = body.scope
+    department_id = body.department_id
     tool = db.get(ToolRegistry, tool_id)
     if not tool:
         raise HTTPException(404, "Tool not found")
     if tool.created_by != user.id and user.role != Role.SUPER_ADMIN:
         raise HTTPException(403, "无权操作")
+
     if status == "published":
-        tool.status = "published"
+        # 超管直接发布
+        if user.role == Role.SUPER_ADMIN:
+            tool.status = "published"
+            tool.scope = scope
+            tool.department_id = department_id
+            tool.is_active = True
+            db.commit()
+            return {"id": tool_id, "status": "published", "scope": scope}
+
+        # 部门管理员 → 进入审核，等超管审批（super_pending）
+        if user.role == Role.DEPT_ADMIN:
+            tool.status = "reviewing"
+            tool.scope = scope
+            tool.department_id = department_id
+            tool.updated_at = datetime.datetime.utcnow()
+            existing = db.query(ApprovalRequest).filter(
+                ApprovalRequest.request_type == ApprovalRequestType.TOOL_PUBLISH,
+                ApprovalRequest.target_id == tool_id,
+                ApprovalRequest.status == ApprovalStatus.PENDING,
+            ).first()
+            if not existing:
+                db.add(ApprovalRequest(
+                    request_type=ApprovalRequestType.TOOL_PUBLISH,
+                    target_id=tool_id,
+                    target_type="tool",
+                    requester_id=user.id,
+                    stage="super_pending",
+                ))
+            db.commit()
+            return {"id": tool_id, "status": "reviewing", "stage": "super_pending"}
+
+        # 普通员工 → 进入审核，先等部门管理员审批（dept_pending）
+        tool.status = "reviewing"
         tool.scope = scope
         tool.department_id = department_id
-        tool.is_active = True
+        tool.updated_at = datetime.datetime.utcnow()
+        existing = db.query(ApprovalRequest).filter(
+            ApprovalRequest.request_type == ApprovalRequestType.TOOL_PUBLISH,
+            ApprovalRequest.target_id == tool_id,
+            ApprovalRequest.status == ApprovalStatus.PENDING,
+        ).first()
+        if not existing:
+            db.add(ApprovalRequest(
+                request_type=ApprovalRequestType.TOOL_PUBLISH,
+                target_id=tool_id,
+                target_type="tool",
+                requester_id=user.id,
+                stage="dept_pending",
+            ))
+        db.commit()
+        return {"id": tool_id, "status": "reviewing", "stage": "dept_pending"}
+
     elif status == "archived":
         tool.status = "archived"
         tool.is_active = False
     elif status == "draft":
         tool.status = "draft"
         tool.scope = "personal"
+        tool.is_active = False
+
     tool.updated_at = datetime.datetime.utcnow()
     db.commit()
     return {"ok": True, "status": tool.status, "scope": tool.scope}
@@ -237,8 +309,98 @@ def delete_tool(
     return {"ok": True}
 
 
+def _parse_manifest_comments(source: str) -> dict:
+    """从源码注释中解析 __le_desk_manifest__ 块。
+
+    支持格式：
+        # __le_desk_manifest__
+        # invocation_mode: registered_table | file_upload | chat
+        # data_sources:
+        #   - key: table_name, type: registered_table, required: true, description: 要运算的业务表
+        #   - key: file_id, type: uploaded_file, accept: .xlsx .csv, required: false
+        # permissions: read:hr_employees, write:hr_bonus
+        # preconditions:
+        #   - table 必须包含字段 employee_id, base_salary
+    """
+    lines = source.splitlines()
+
+    # 找到 manifest 块的起始行
+    start = None
+    for i, line in enumerate(lines):
+        if "__le_desk_manifest__" in line:
+            start = i + 1
+            break
+    if start is None:
+        return {}
+
+    # 收集连续的注释行（直到空行或非注释行）
+    block_lines = []
+    for line in lines[start:]:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            block_lines.append(stripped[1:].lstrip())  # 去掉 # 和前导空格
+        elif stripped == "":
+            continue
+        else:
+            break  # 遇到代码行，停止
+
+    if not block_lines:
+        return {}
+
+    manifest: dict = {}
+    current_list_key: str | None = None
+
+    for line in block_lines:
+        if not line:
+            current_list_key = None
+            continue
+
+        # 顶层 key: value
+        if ":" in line and not line.startswith("-"):
+            key, _, val = line.partition(":")
+            key = key.strip()
+            val = val.strip()
+            if val:
+                # 逗号分隔的列表值
+                if "," in val:
+                    manifest[key] = [v.strip() for v in val.split(",") if v.strip()]
+                else:
+                    manifest[key] = val
+                current_list_key = None
+            else:
+                # 值为空 → 下面是列表
+                manifest[key] = []
+                current_list_key = key
+
+        # 列表项
+        elif line.startswith("-") and current_list_key:
+            item_str = line[1:].strip()
+            # data_sources 条目：key: xxx, type: yyy, ...
+            if "," in item_str and ":" in item_str:
+                item: dict = {}
+                for part in item_str.split(","):
+                    part = part.strip()
+                    if ":" in part:
+                        k, _, v = part.partition(":")
+                        k, v = k.strip(), v.strip()
+                        # 布尔值
+                        if v.lower() == "true":
+                            v = True
+                        elif v.lower() == "false":
+                            v = False
+                        # accept 字段转列表
+                        if k == "accept" and isinstance(v, str):
+                            v = [x.strip() for x in v.split() if x.strip()]
+                        item[k] = v
+                manifest[current_list_key].append(item)
+            else:
+                manifest[current_list_key].append(item_str)
+
+    return manifest
+
+
 def _parse_py_tool(source: str) -> dict:
-    """从 Python 源码中提取第一个函数的名称、docstring 和参数 schema。"""
+    """从 Python 源码中提取第一个函数的名称、docstring、参数 schema 和 manifest。"""
     try:
         tree = ast.parse(source)
     except SyntaxError as e:
@@ -254,6 +416,7 @@ def _parse_py_tool(source: str) -> dict:
     description = docstring.split("\n")[0].strip() if docstring else ""
 
     properties: dict = {}
+    required_args: list = []
     for arg in func.args.args:
         if arg.arg == "self":
             continue
@@ -266,9 +429,208 @@ def _parse_py_tool(source: str) -> dict:
                 arg_type = "boolean"
         properties[arg.arg] = {"type": arg_type}
 
-    input_schema = {"type": "object", "properties": properties} if properties else {}
+    # 有默认值的参数数量，用于判断必填
+    n_defaults = len(func.args.defaults)
+    n_args = len([a for a in func.args.args if a.arg != "self"])
+    n_required = n_args - n_defaults
+    for i, arg in enumerate([a for a in func.args.args if a.arg != "self"]):
+        if i < n_required:
+            required_args.append(arg.arg)
 
-    return {"name": name, "display_name": name, "description": description, "input_schema": input_schema}
+    input_schema: dict = {}
+    if properties:
+        input_schema = {"type": "object", "properties": properties}
+        if required_args:
+            input_schema["required"] = required_args
+
+    manifest = _parse_manifest_comments(source)
+
+    return {
+        "name": name,
+        "display_name": name,
+        "description": description,
+        "input_schema": input_schema,
+        "manifest": manifest,
+    }
+
+
+_VALID_INVOCATION_MODES = {"chat", "registered_table", "file_upload"}
+_VALID_SOURCE_TYPES = {"registered_table", "uploaded_file", "chat_context"}
+
+
+def _validate_manifest(manifest: dict) -> list[str]:
+    """对 manifest 做合理性检查，返回警告列表（不阻断上传）。"""
+    if not manifest:
+        return []
+
+    warnings: list[str] = []
+
+    mode = manifest.get("invocation_mode")
+    if mode and mode not in _VALID_INVOCATION_MODES:
+        warnings.append(f"invocation_mode '{mode}' 未知，合法值：{sorted(_VALID_INVOCATION_MODES)}")
+
+    for ds in manifest.get("data_sources", []):
+        ds_type = ds.get("type")
+        if ds_type and ds_type not in _VALID_SOURCE_TYPES:
+            warnings.append(f"data_sources[{ds.get('key')}].type '{ds_type}' 未知，合法值：{sorted(_VALID_SOURCE_TYPES)}")
+        if not ds.get("key"):
+            warnings.append("data_sources 条目缺少 key 字段")
+
+    return warnings
+
+
+class McpConfigRequest(BaseModel):
+    description: str
+
+
+@router.post("/generate-mcp-config")
+async def generate_mcp_config(
+    body: McpConfigRequest,
+    user: User = Depends(get_current_user),
+):
+    """用自然语言描述生成 MCP 工具的 manifest 配置。"""
+    from app.services.llm_gateway import llm_gateway
+    import json as _json
+
+    prompt = f"""你是企业内部工具配置专家。根据用户对 MCP 工具的描述，生成一份结构化配置。
+
+用户描述：{body.description}
+
+请返回如下 JSON（只返回 JSON，不要解释）：
+{{
+  "display_name": "工具中文显示名",
+  "description": "一句话功能描述",
+  "invocation_mode": "chat",
+  "data_sources": [
+    {{"key": "参数名", "type": "chat_context|registered_table|uploaded_file", "required": true, "description": "说明"}}
+  ],
+  "permissions": ["read:表名或资源"],
+  "preconditions": ["运行前提条件"],
+  "env_requirements": "需要的环境变量或外部依赖说明"
+}}
+
+规则：
+- invocation_mode 只能是 chat / registered_table / file_upload 之一
+- data_sources 只列出工具真正需要的输入参数，不需要输入则为空数组
+- permissions 格式为 read:资源名 或 write:资源名
+- 如无特殊前提条件或权限，对应字段返回空数组或空字符串"""
+
+    try:
+        model_config = llm_gateway.get_lite_config()
+        # 生成配置需要更多 token
+        model_config = {**model_config, "max_tokens": 1024}
+        content, _ = await llm_gateway.chat(
+            model_config=model_config,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        # 提取 JSON 块
+        text = content.strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        config = _json.loads(text.strip())
+    except _json.JSONDecodeError as e:
+        raise HTTPException(500, f"AI 返回格式解析失败：{e}")
+    except Exception as e:
+        raise HTTPException(500, f"生成失败：{e}")
+
+    return config
+
+
+@router.post("/upload-mcp")
+async def upload_mcp_zip(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """上传 MCP 服务 zip 包，解压并分析项目类型，创建 draft 工具记录。"""
+    import tempfile
+    import os as _os
+    from app.services.mcp_installer import analyze_zip, extract_zip
+
+    if not file.filename or not file.filename.lower().endswith(".zip"):
+        raise HTTPException(400, "只支持 .zip 文件")
+
+    # 保存上传的 zip
+    raw = await file.read()
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp.write(raw)
+        tmp_path = tmp.name
+
+    try:
+        analysis = analyze_zip(tmp_path)
+    except zipfile.BadZipFile:
+        _os.unlink(tmp_path)
+        raise HTTPException(400, "不是有效的 zip 文件")
+    except Exception as e:
+        _os.unlink(tmp_path)
+        raise HTTPException(400, f"解析失败：{e}")
+
+    # 用文件名（去掉 .zip）作为工具名基础
+    base_name = file.filename[:-4].lower().replace(" ", "_").replace("-", "_")
+    # 避免重名
+    tool_name = base_name
+    suffix = 1
+    while db.query(ToolRegistry).filter(ToolRegistry.name == tool_name, ToolRegistry.created_by == user.id).first():
+        tool_name = f"{base_name}_{suffix}"
+        suffix += 1
+
+    # 解压到安装目录
+    try:
+        install_dir = extract_zip(tmp_path, tool_name)
+    except Exception as e:
+        _os.unlink(tmp_path)
+        raise HTTPException(500, f"解压失败：{e}")
+    finally:
+        _os.unlink(tmp_path)
+
+    # 创建 draft 工具记录
+    existing = db.query(ToolRegistry).filter(
+        ToolRegistry.name == tool_name, ToolRegistry.created_by == user.id
+    ).first()
+
+    config = {
+        "install_dir": str(install_dir),
+        "project_type": analysis["project_type"],
+        "run_cmd": analysis["run_cmd"],
+    }
+
+    if existing:
+        existing.config = config
+        existing.updated_at = datetime.datetime.utcnow()
+        db.commit()
+        tool_id = existing.id
+        action = "updated"
+    else:
+        tool = ToolRegistry(
+            name=tool_name,
+            display_name=tool_name,
+            description="",
+            tool_type=ToolType.MCP,
+            config=config,
+            input_schema={},
+            output_format="json",
+            is_active=False,
+            scope="personal",
+            status="draft",
+            created_by=user.id,
+        )
+        db.add(tool)
+        db.commit()
+        db.refresh(tool)
+        tool_id = tool.id
+        action = "created"
+
+    return {
+        "action": action,
+        "id": tool_id,
+        "name": tool_name,
+        "project_type": analysis["project_type"],
+        "run_cmd": analysis["run_cmd"],
+        "warnings": analysis["warnings"],
+    }
 
 
 @router.post("/upload-py")
@@ -289,6 +651,13 @@ async def upload_tool_py(
 
     parsed = _parse_py_tool(source)
     func_name = parsed["name"]
+    manifest = parsed.get("manifest", {})
+
+    # 写到磁盘，importlib 才能加载
+    try:
+        _write_tool_module(func_name, source)
+    except OSError as e:
+        raise HTTPException(500, f"写入工具模块失败：{e}")
 
     existing = (
         db.query(ToolRegistry)
@@ -299,17 +668,23 @@ async def upload_tool_py(
     if existing:
         existing.description = parsed["description"] or existing.description
         existing.input_schema = parsed["input_schema"]
-        existing.config = {**(existing.config or {}), "source": source}
+        existing.config = {**(existing.config or {}), "source": source, "manifest": manifest}
         existing.updated_at = datetime.datetime.utcnow()
         db.commit()
-        return {"action": "updated", "id": existing.id, "name": func_name}
+        return {
+            "action": "updated",
+            "id": existing.id,
+            "name": func_name,
+            "manifest": manifest,
+            "manifest_warnings": _validate_manifest(manifest),
+        }
     else:
         tool = ToolRegistry(
             name=func_name,
             display_name=parsed["display_name"],
             description=parsed["description"],
             tool_type=ToolType.BUILTIN,
-            config={"source": source},
+            config={"source": source, "manifest": manifest},
             input_schema=parsed["input_schema"],
             output_format="json",
             is_active=False,
@@ -320,7 +695,13 @@ async def upload_tool_py(
         db.add(tool)
         db.commit()
         db.refresh(tool)
-        return {"action": "created", "id": tool.id, "name": func_name}
+        return {
+            "action": "created",
+            "id": tool.id,
+            "name": func_name,
+            "manifest": manifest,
+            "manifest_warnings": _validate_manifest(manifest),
+        }
 
 
 @router.post("/{tool_id}/test")

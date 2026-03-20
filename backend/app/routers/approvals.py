@@ -42,7 +42,6 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
         from app.models.skill import Skill, SkillVersion
         skill = db.get(Skill, r.target_id)
         if skill:
-            # 取最新版本的 system_prompt
             latest_ver = (
                 db.query(SkillVersion)
                 .filter(SkillVersion.skill_id == skill.id)
@@ -56,6 +55,26 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
                 "mode": skill.mode,
                 "system_prompt": latest_ver.system_prompt if latest_ver else "",
                 "change_note": latest_ver.change_note if latest_ver else "",
+            }
+    elif r.target_type == "tool" and r.target_id:
+        from app.models.tool import ToolRegistry
+        tool = db.get(ToolRegistry, r.target_id)
+        if tool:
+            config = tool.config or {}
+            manifest = config.get("manifest", {})
+            deploy_info = config.get("deploy_info", {})
+            target_detail = {
+                "name": tool.display_name,
+                "tool_name": tool.name,
+                "description": tool.description or "",
+                "tool_type": tool.tool_type.value if tool.tool_type else "",
+                "scope": tool.scope or "personal",
+                "input_schema": tool.input_schema or {},
+                "invocation_mode": manifest.get("invocation_mode", ""),
+                "data_sources": manifest.get("data_sources", []),
+                "permissions": manifest.get("permissions", deploy_info.get("permissions", [])),
+                "preconditions": manifest.get("preconditions", []),
+                "deploy_info": deploy_info,
             }
 
     return {
@@ -222,7 +241,7 @@ def create_approval(
 
 
 @router.post("/{request_id}/actions")
-def act_on_approval(
+async def act_on_approval(
     request_id: int,
     req: ApprovalActionCreate,
     db: Session = Depends(get_db),
@@ -259,6 +278,11 @@ def act_on_approval(
             and r.target_type == "skill"
             and r.target_id
         )
+        is_tool_publish = (
+            r.request_type == ApprovalRequestType.TOOL_PUBLISH
+            and r.target_type == "tool"
+            and r.target_id
+        )
         stage = getattr(r, "stage", "dept_pending") or "dept_pending"
 
         if is_skill_publish and stage == "dept_pending":
@@ -266,7 +290,6 @@ def act_on_approval(
             if user.role not in (Role.DEPT_ADMIN, Role.SUPER_ADMIN):
                 raise HTTPException(403, "仅部门管理员可执行第一阶段审批")
             r.stage = "super_pending"
-            # 状态保持 PENDING，等超管再批
         elif is_skill_publish and stage == "super_pending":
             # 超管通过第二步 → 正式发布
             if user.role != Role.SUPER_ADMIN:
@@ -279,8 +302,34 @@ def act_on_approval(
                 skill.scope = "company"
                 from app.routers.skills import _ensure_skill_policy
                 _ensure_skill_policy(r.target_id, user, db)
+        elif is_tool_publish and stage == "dept_pending":
+            # 部门管理员通过第一步 → 进入超管审批，tool 仍不发布
+            if user.role not in (Role.DEPT_ADMIN, Role.SUPER_ADMIN):
+                raise HTTPException(403, "仅部门管理员可执行第一阶段审批")
+            r.stage = "super_pending"
+        elif is_tool_publish and stage == "super_pending":
+            # 超管通过第二步 → 安装并启动 MCP 服务，正式发布
+            if user.role != Role.SUPER_ADMIN:
+                raise HTTPException(403, "仅超级管理员可执行最终审批")
+            r.status = ApprovalStatus.APPROVED
+            from app.models.tool import ToolRegistry, ToolType
+            tool = db.get(ToolRegistry, r.target_id)
+            if tool:
+                tool.status = "published"
+                import datetime as _dt
+                tool.updated_at = _dt.datetime.utcnow()
+                db.commit()
+                # MCP 工具：自动安装依赖并启动服务
+                if tool.tool_type == ToolType.MCP:
+                    from app.services.mcp_installer import install_and_start
+                    install_result = await install_and_start(db, tool)
+                    if not install_result["ok"]:
+                        a.comment = (a.comment or "") + f"\n[MCP 安装失败] {install_result['error']}"
+                        tool.is_active = False
+                else:
+                    tool.is_active = True
         else:
-            # 非 skill_publish 或旧数据，保持原逻辑
+            # 其他审批类型，保持原逻辑
             r.status = ApprovalStatus.APPROVED
             if is_skill_publish:
                 from app.models.skill import Skill, SkillStatus
@@ -290,8 +339,38 @@ def act_on_approval(
                     skill.scope = "company"
                     from app.routers.skills import _ensure_skill_policy
                     _ensure_skill_policy(r.target_id, user, db)
+            elif is_tool_publish:
+                from app.models.tool import ToolRegistry, ToolType
+                tool = db.get(ToolRegistry, r.target_id)
+                if tool:
+                    tool.status = "published"
+                    import datetime as _dt
+                    tool.updated_at = _dt.datetime.utcnow()
+                    db.commit()
+                    if tool.tool_type == ToolType.MCP:
+                        from app.services.mcp_installer import install_and_start
+                        install_result = await install_and_start(db, tool)
+                        if not install_result["ok"]:
+                            a.comment = (a.comment or "") + f"\n[MCP 安装失败] {install_result['error']}"
+                            tool.is_active = False
+                    else:
+                        tool.is_active = True
     elif req.action == "reject":
         r.status = ApprovalStatus.REJECTED
+        # 驳回时把 skill/tool 状态回退到 draft
+        if r.target_type == "skill" and r.target_id:
+            from app.models.skill import Skill, SkillStatus
+            skill = db.get(Skill, r.target_id)
+            if skill and skill.status.value == "reviewing":
+                skill.status = SkillStatus.DRAFT
+        elif r.target_type == "tool" and r.target_id:
+            from app.models.tool import ToolRegistry
+            tool = db.get(ToolRegistry, r.target_id)
+            if tool and tool.status == "reviewing":
+                tool.status = "draft"
+                tool.is_active = False
+                import datetime as _dt
+                tool.updated_at = _dt.datetime.utcnow()
     elif req.action == "add_conditions":
         r.status = ApprovalStatus.CONDITIONS
         if req.conditions:

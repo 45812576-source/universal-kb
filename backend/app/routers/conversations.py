@@ -7,8 +7,9 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
@@ -728,21 +729,45 @@ async def upload_and_chat(
 
 @router.post("/{conv_id}/messages/upload-stream")
 async def upload_stream_message(
+    request: Request,
     conv_id: int,
-    message: Optional[str] = Form(None),
-    file: UploadFile = File(...),
-    active_skill_ids: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """SSE streaming endpoint for file upload: upload + parse + stream LLM response."""
+    """SSE streaming endpoint for file upload: upload + parse + stream LLM response.
+
+    支持两种上传模式：
+    - 单文件：字段名 `file`（UploadFile）
+    - 多文件拼盘：字段名 `file_<key>`，每个 key 对应 manifest data_source 中的 uploaded_file slot
+    """
     conv = db.get(Conversation, conv_id)
     if not conv or conv.user_id != user.id:
         raise HTTPException(404, "Conversation not found")
 
-    # Read file before generator starts — UploadFile may be closed once response streaming begins
-    file_content_bytes = await file.read()
-    file_filename = file.filename or ""
+    # 动态解析 multipart form，兼容单文件和多文件拼盘
+    form = await request.form()
+    message: Optional[str] = form.get("message")
+    active_skill_ids: Optional[str] = form.get("active_skill_ids")
+
+    # 收集所有文件：单文件走 `file` 字段，多文件走 `file_<key>` 字段
+    # uploaded_files: list of (key, filename, bytes)
+    uploaded_files: list[tuple[str, str, bytes]] = []
+    for field_name, field_value in form.multi_items():
+        if not isinstance(field_value, StarletteUploadFile):
+            continue
+        if field_name == "file":
+            content = await field_value.read()
+            uploaded_files.append(("file", field_value.filename or "", content))
+        elif field_name.startswith("file_"):
+            key = field_name[5:]  # strip "file_" prefix
+            content = await field_value.read()
+            uploaded_files.append((key, field_value.filename or "", content))
+
+    if not uploaded_files:
+        raise HTTPException(400, "至少需要上传一个文件")
+
+    # 兼容原有单文件变量名，多文件时取第一个作为代表（用于 title 等展示）
+    _primary_key, file_filename, file_content_bytes = uploaded_files[0]
 
     # Capture user.id as a plain int before the generator closes over it —
     # the ORM User object becomes detached once the session flushes/expires.
@@ -753,51 +778,76 @@ async def upload_stream_message(
 
     async def event_generator():
         try:
-            # 1. Upload phase
+            # 1. Upload phase — 保存所有文件到磁盘
             yield _sse("status", {"stage": "uploading"})
 
             os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-            ext = os.path.splitext(file_filename)[1]
-            saved_path = os.path.join(settings.UPLOAD_DIR, f"{uuid.uuid4()}{ext}")
-            with open(saved_path, "wb") as f:
-                f.write(file_content_bytes)
 
-            # 2. Parse phase
+            # saved_files: list of (key, original_filename, saved_path)
+            saved_files: list[tuple[str, str, str]] = []
+            for _key, _fname, _bytes in uploaded_files:
+                ext = os.path.splitext(_fname)[1]
+                _path = os.path.join(settings.UPLOAD_DIR, f"{uuid.uuid4()}{ext}")
+                with open(_path, "wb") as f:
+                    f.write(_bytes)
+                saved_files.append((_key, _fname, _path))
+
+            # 2. Parse phase — 逐文件提取文本
             yield _sse("status", {"stage": "parsing"})
 
-            try:
-                file_text = extract_text(saved_path)
-            except ValueError as e:
-                os.unlink(saved_path)
-                yield _sse("error", {"message": str(e), "error_type": "server_error", "retryable": False})
-                return
-
-            # Classification (best effort)
             from app.services.knowledge_classifier import classify
-            cls_result = None
-            try:
-                cls_result = await classify(file_text, db)
-            except Exception:
-                pass
-
-            # FOE summarize for long texts
             _FOE_THRESHOLD = 2000
-            chat_content = file_text
-            foe_summary = None
-            if len(file_text) > _FOE_THRESHOLD:
-                yield _sse("status", {"stage": "summarizing"})
-                try:
-                    from app.utils.file_parser import foe_summarize
-                    _cfg = llm_gateway.get_lite_config()
-                    foe_summary = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: foe_summarize(raw_text=file_text, llm_cfg=_cfg),
-                    )
-                    chat_content = foe_summary
-                except Exception:
-                    pass
 
-            # Build user text
+            # 每个文件独立解析，结果收集后拼装
+            # parsed_parts: list of (key, filename, raw_text, chat_content, foe_summary)
+            parsed_parts = []
+            primary_cls_result = None  # 用第一个文件的分类结果
+
+            for _key, _fname, _path in saved_files:
+                try:
+                    _raw = extract_text(_path)
+                except ValueError as e:
+                    os.unlink(_path)
+                    yield _sse("error", {"message": f"[{_fname}] {e}", "error_type": "server_error", "retryable": False})
+                    return
+
+                _foe = None
+                _chat = _raw
+                if len(_raw) > _FOE_THRESHOLD:
+                    yield _sse("status", {"stage": "summarizing"})
+                    try:
+                        from app.utils.file_parser import foe_summarize
+                        _cfg = llm_gateway.get_lite_config()
+                        _foe = await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda r=_raw: foe_summarize(raw_text=r, llm_cfg=_cfg),
+                        )
+                        _chat = _foe
+                    except Exception:
+                        pass
+
+                # Classification — 只对第一个文件做，避免多次调用
+                if primary_cls_result is None:
+                    try:
+                        primary_cls_result = await classify(_raw, db)
+                    except Exception:
+                        pass
+
+                parsed_parts.append((_key, _fname, _raw, _chat, _foe))
+
+            # 多文件时 foe_summary 取第一个文件的（用于 KB 保存）
+            foe_summary = parsed_parts[0][4] if parsed_parts else None
+            # 主文件文本（第一个，用于单文件兼容路径）
+            file_text = parsed_parts[0][2] if parsed_parts else ""
+            cls_result = primary_cls_result
+
+            # Build user text — 多文件拼装
+            file_segments = []
+            for _key, _fname, _raw, _chat, _foe in parsed_parts:
+                _label = f"[文件({_key}): {_fname}]" + (" [FOE摘要]" if _foe else "")
+                file_segments.append(f"{_label}\n{_chat}")
+            combined_file_text = "\n\n---\n\n".join(file_segments)
+
             cls_context = ""
             if cls_result:
                 cls_context = (
@@ -806,18 +856,22 @@ async def upload_stream_message(
                     f"，建议归入知识库：{', '.join(cls_result.target_kb_ids)}"
                 )
 
-            file_label = f"[文件: {file_filename}]" + (" [FOE摘要]" if foe_summary else "")
-            user_text = f"{file_label}\n{chat_content}"
+            user_text = combined_file_text
             if message:
                 user_text = f"{message}\n\n{user_text}"
             user_text += cls_context
 
             # Save user message immediately so it survives if SSE is dropped mid-stream
+            _filenames = [fn for _, fn, *_ in parsed_parts]
             user_msg = Message(
                 conversation_id=conv_id,
                 role=MessageRole.USER,
                 content=user_text,
-                metadata_={"file_upload": True, "filename": file_filename},
+                metadata_={
+                    "file_upload": True,
+                    "filename": file_filename,  # 主文件（兼容旧字段）
+                    "filenames": _filenames,     # 多文件完整列表
+                },
             )
             db.add(user_msg)
             db.commit()
@@ -875,10 +929,13 @@ async def upload_stream_message(
             if prep.early_return is not None:
                 response_text, early_meta = prep.early_return
                 llm_usage = early_meta.pop("llm_usage", {})
+                _title_label = file_filename if len(uploaded_files) == 1 else f"{file_filename} 等{len(uploaded_files)}个文件"
                 msg_metadata = {
                     "skill_id": conv.skill_id,
                     "skill_name": skill_name,
-                    "file_upload": True, "filename": file_filename,
+                    "file_upload": True,
+                    "filename": file_filename,
+                    "filenames": _filenames,
                     "model_id": llm_usage.get("model_id"),
                     "input_tokens": llm_usage.get("input_tokens", 0),
                     "output_tokens": llm_usage.get("output_tokens", 0),
@@ -890,7 +947,8 @@ async def upload_stream_message(
                 )
                 db.add(assistant_msg)
                 if db.query(Message).filter(Message.conversation_id == conv_id).count() <= 2:
-                    conv.title = f"[文件] {file_filename}"[:60]
+                    conv.title = f"[文件] {_title_label}"[:60]
+                    db.add(conv)
                 db.commit()
                 await kb_task
                 yield _sse("delta", {"text": response_text})
@@ -965,6 +1023,7 @@ async def upload_stream_message(
                 "skill_name": skill_name,
                 "file_upload": True,
                 "filename": file_filename,
+                "filenames": _filenames,
                 "kb_entry_id": kb_entry_id,
                 **tool_meta,
             }
@@ -974,8 +1033,10 @@ async def upload_stream_message(
                 content=response, metadata_=msg_metadata,
             )
             db.add(assistant_msg)
+            _title_label = file_filename if len(uploaded_files) == 1 else f"{file_filename} 等{len(uploaded_files)}个文件"
             if db.query(Message).filter(Message.conversation_id == conv_id).count() <= 2:
-                conv.title = f"[文件] {file_filename}"[:60]
+                conv.title = f"[文件] {_title_label}"[:60]
+                db.add(conv)
             db.commit()
 
             total_input_chars = sum(len(m.get("content") or "") for m in prep.llm_messages)

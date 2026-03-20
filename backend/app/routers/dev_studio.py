@@ -640,7 +640,9 @@ def save_tool(
         output_format=req.output_format,
         config=req.config,
         created_by=user.id,
-        is_active=True,
+        is_active=False,
+        scope="personal",
+        status="draft",
     )
     db.add(tool)
     db.commit()
