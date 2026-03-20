@@ -570,12 +570,18 @@ async def upload_mcp_zip(
 
     # 用文件名（去掉 .zip）作为工具名基础
     base_name = file.filename[:-4].lower().replace(" ", "_").replace("-", "_")
-    # 避免重名
-    tool_name = base_name
-    suffix = 1
-    while db.query(ToolRegistry).filter(ToolRegistry.name == tool_name, ToolRegistry.created_by == user.id).first():
-        tool_name = f"{base_name}_{suffix}"
-        suffix += 1
+    # 同一用户上传同名文件 → 直接 update；与他人重名 → 加 suffix 避让
+    existing = db.query(ToolRegistry).filter(
+        ToolRegistry.name == base_name, ToolRegistry.created_by == user.id
+    ).first()
+    if existing:
+        tool_name = base_name
+    else:
+        tool_name = base_name
+        suffix = 1
+        while db.query(ToolRegistry).filter(ToolRegistry.name == tool_name).first():
+            tool_name = f"{base_name}_{suffix}"
+            suffix += 1
 
     # 解压到安装目录
     try:
@@ -585,11 +591,6 @@ async def upload_mcp_zip(
         raise HTTPException(500, f"解压失败：{e}")
     finally:
         _os.unlink(tmp_path)
-
-    # 创建 draft 工具记录
-    existing = db.query(ToolRegistry).filter(
-        ToolRegistry.name == tool_name, ToolRegistry.created_by == user.id
-    ).first()
 
     config = {
         "install_dir": str(install_dir),
