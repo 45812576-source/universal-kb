@@ -22,10 +22,13 @@ class ToolRegistry(Base):
     display_name = Column(String(200), nullable=False)
     description = Column(Text)
     tool_type = Column(Enum(ToolType, values_callable=lambda x: [e.value for e in x]), nullable=False)
-    config = Column(JSON, default=dict)           # MCP: {command, args, env} / HTTP: {url, method, headers}
-    input_schema = Column(JSON, default=dict)      # JSON Schema for tool parameters
-    output_format = Column(String(50), default="json")  # json / file / text
+    config = Column(JSON, default=dict)
+    input_schema = Column(JSON, default=dict)
+    output_format = Column(String(50), default="json")
     is_active = Column(Boolean, default=True)
+    scope = Column(String(20), default="personal")       # personal / department / company
+    status = Column(String(20), default="draft")         # draft / published / archived
+    department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(
@@ -35,6 +38,15 @@ class ToolRegistry(Base):
     )
 
     skills = relationship("Skill", secondary="skill_tools", back_populates="bound_tools")
+
+
+class UserSavedTool(Base):
+    __tablename__ = "user_saved_tools"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    tool_id = Column(Integer, ForeignKey("tool_registry.id"), nullable=False)
+    saved_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
 class SkillTool(Base):

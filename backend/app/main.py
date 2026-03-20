@@ -1,4 +1,5 @@
 import asyncio
+import os
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,9 +7,13 @@ from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="Universal KB API", version="0.1.0")
 
+_default_origins = ["http://localhost:3000", "http://localhost:5173", "http://localhost:5023"]
+_extra = os.getenv("FRONTEND_ORIGIN", "")
+_allowed_origins = _default_origins + [o.strip() for o in _extra.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://localhost:5023"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

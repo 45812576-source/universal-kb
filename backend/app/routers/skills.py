@@ -904,8 +904,28 @@ def delete_skill(
 
     # 级联删除关联记录（外键约束）
     from sqlalchemy import text
-    db.execute(text("DELETE FROM skill_policies WHERE skill_id = :sid"), {"sid": skill_id})
-    db.execute(text("DELETE FROM approval_requests WHERE target_id = :sid AND target_type = 'skill'"), {"sid": skill_id})
+    sid = skill_id
+    # skill_policies 下的子表先删
+    db.execute(text("DELETE FROM skill_mask_overrides WHERE skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM role_policy_overrides WHERE skill_policy_id IN (SELECT id FROM skill_policies WHERE skill_id = :sid)"), {"sid": sid})
+    db.execute(text("DELETE FROM role_output_masks WHERE skill_policy_id IN (SELECT id FROM skill_policies WHERE skill_id = :sid)"), {"sid": sid})
+    db.execute(text("DELETE FROM skill_output_schemas WHERE skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM skill_agent_connections WHERE skill_policy_id IN (SELECT id FROM skill_policies WHERE skill_id = :sid) OR connected_skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM handoff_executions WHERE upstream_skill_id = :sid OR downstream_skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM handoff_schema_caches WHERE upstream_skill_id = :sid OR downstream_skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM handoff_templates WHERE upstream_skill_id = :sid OR downstream_skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM skill_policies WHERE skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM approval_requests WHERE target_id = :sid AND target_type = 'skill'"), {"sid": sid})
+    # skill 自身关联表
+    db.execute(text("DELETE FROM skill_attributions WHERE skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM skill_tools WHERE skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM skill_upstream_checks WHERE skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM skill_data_queries WHERE skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM user_saved_skills WHERE skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM skill_suggestions WHERE skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM skill_versions WHERE skill_id = :sid"), {"sid": sid})
+    # conversations 置空 skill_id（保留对话记录）
+    db.execute(text("UPDATE conversations SET skill_id = NULL WHERE skill_id = :sid"), {"sid": sid})
     db.delete(skill)
     db.commit()
     return {"ok": True}
