@@ -1,0 +1,297 @@
+{
+  "$schema": "https://opencode.ai/config.schema.json",
+  "model": "bailian-coding-plan/glm-5",
+  "provider": {
+    "bailian-coding-plan": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "百炼 Coding Plan",
+      "options": {
+        "baseURL": "https://coding.dashscope.aliyuncs.com/apps/anthropic/v1",
+        "apiKey": "sk-sp-1e97c37199ba430a8071de908184f2da"
+      },
+      "models": {
+        "qwen3.5-plus": {
+          "name": "Qwen3.5 Plus",
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "options": {
+            "thinking": {
+              "type": "enabled",
+              "budgetTokens": 8192
+            }
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          }
+        },
+        "qwen3-coder-next": {
+          "name": "Qwen3 Coder Next",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 262144,
+            "output": 65536
+          }
+        },
+        "qwen3-coder-plus": {
+          "name": "Qwen3 Coder Plus",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          }
+        },
+        "glm-5": {
+          "name": "GLM-5",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "options": {
+            "thinking": {
+              "type": "enabled",
+              "budgetTokens": 8192
+            }
+          },
+          "limit": {
+            "context": 202752,
+            "output": 16384
+          }
+        },
+        "glm-4.7": {
+          "name": "GLM-4.7 (百炼)",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          }
+        },
+        "kimi-k2.5": {
+          "name": "Kimi K2.5 (百炼)",
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "options": {
+            "thinking": {
+              "type": "enabled",
+              "budgetTokens": 8192
+            }
+          },
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          }
+        },
+        "MiniMax-M2.5": {
+          "name": "MiniMax M2.5 (百炼)",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          }
+        }
+      }
+    },
+    "ark": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "火山引擎 ARK",
+      "options": {
+        "baseURL": "https://ark.cn-beijing.volces.com/api/coding/v3",
+        "apiKey": "5e59a1b7-06d1-4d66-a3c1-8dcb7a3d487f"
+      },
+      "models": {
+        "doubao-seed-2.0-code": {
+          "name": "Doubao Seed 2.0 Code",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          }
+        },
+        "doubao-seed-2.0-pro": {
+          "name": "Doubao Seed 2.0 Pro",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          }
+        },
+        "doubao-seed-2.0-lite": {
+          "name": "Doubao Seed 2.0 Lite",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          }
+        },
+        "doubao-seed-code": {
+          "name": "Doubao Seed Code",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          }
+        },
+        "minimax-m2.5": {
+          "name": "MiniMax M2.5 (ARK)",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          }
+        },
+        "glm-4.7": {
+          "name": "GLM-4.7 (ARK)",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          }
+        },
+        "deepseek-v3.2": {
+          "name": "DeepSeek V3.2",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 65536,
+            "output": 16384
+          }
+        },
+        "kimi-k2.5": {
+          "name": "Kimi K2.5 (ARK)",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          }
+        }
+      }
+    },
+    "lemondata": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "LemonData",
+      "options": {
+        "baseURL": "https://api.lemondata.cc/v1",
+        "apiKey": "sk-DN2XBqoZuJQYHr2FigwCGbBMDKq9VEVBihFizPN0mfx7v2bl"
+      },
+      "models": {
+        "gpt-5.4": {
+          "name": "GPT-5.4",
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 128000,
+            "output": 16384
+          }
+        }
+      }
+    }
+  }
+}

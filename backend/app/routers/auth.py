@@ -90,11 +90,20 @@ async def upload_avatar(
     if len(data) > _MAX_AVATAR_SIZE:
         raise HTTPException(status_code=400, detail="图片不超过 5MB")
 
-    ext = file.filename.rsplit(".", 1)[-1] if "." in (file.filename or "") else "jpg"
-    filename = f"avatar_{current_user.id}_{uuid.uuid4().hex[:8]}.{ext}"
+    # 压缩并统一转为 JPEG，最大 256x256，保存大小通常 < 30KB
+    from PIL import Image as _Image
+    import io as _io
+    img = _Image.open(_io.BytesIO(data))
+    img = img.convert("RGB")
+    img.thumbnail((256, 256), _Image.LANCZOS)
+    buf = _io.BytesIO()
+    img.save(buf, format="JPEG", quality=85, optimize=True)
+    compressed = buf.getvalue()
+
+    filename = f"avatar_{current_user.id}_{uuid.uuid4().hex[:8]}.jpg"
     avatar_dir = Path(settings.UPLOAD_DIR) / "avatars"
     avatar_dir.mkdir(parents=True, exist_ok=True)
-    (avatar_dir / filename).write_bytes(data)
+    (avatar_dir / filename).write_bytes(compressed)
 
     current_user.avatar_url = f"/api/avatars/{filename}"
     db.commit()

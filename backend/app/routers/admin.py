@@ -252,7 +252,7 @@ def suggested_users(
     """返回推荐同事列表（合作次数 > 二级部门 > 一级部门 > BU），最多6个。支持 q 搜索。"""
     from app.models.project import ProjectMember
 
-    exclude_ids: set[int] = {current.id}
+    exclude_ids: set[int] = set()
     if exclude:
         for x in exclude.split(","):
             try:

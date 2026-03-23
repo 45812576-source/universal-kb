@@ -1,0 +1,1 @@
+INFO  2026-03-20T15:48:12 +305ms service=default version=1.2.25 args=["web","--port","17175","--hostname","127.0.0.1","--cors","https://brittni-unprospering-pia.ngrok-free.dev","--cors","http://localhost:5023"] opencode

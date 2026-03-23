@@ -22,6 +22,7 @@ class Conversation(Base):
     title = Column(Text, default="新对话")
     skill_id = Column(Integer, ForeignKey("skills.id"), nullable=True)
     workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(
@@ -30,6 +31,7 @@ class Conversation(Base):
         onupdate=datetime.datetime.utcnow,
     )
 
+    project = relationship("Project", foreign_keys=[project_id])
     messages = relationship(
         "Message", back_populates="conversation", order_by="Message.created_at"
     )

@@ -1,7 +1,7 @@
 """项目模块 API 路由。"""
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -515,6 +515,55 @@ def update_project(
     return _project_dict(project, include_members=True)
 
 
+@router.post("/{project_id}/members")
+def add_member(
+    project_id: int,
+    req: MemberInput,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """为项目添加成员（仅负责人）。"""
+    project = _get_project_or_404(project_id, db)
+    _require_owner(project, user)
+
+    if len(project.members) >= MAX_MEMBERS:
+        raise HTTPException(400, f"项目成员最多 {MAX_MEMBERS} 人")
+
+    # 防重复
+    if any(m.user_id == req.user_id for m in project.members):
+        raise HTTPException(400, "该用户已是项目成员")
+
+    member = ProjectMember(
+        project_id=project_id,
+        user_id=req.user_id,
+        role_desc=req.role_desc,
+    )
+    db.add(member)
+    db.commit()
+    db.refresh(member)
+    return _member_dict(member)
+
+
+@router.delete("/{project_id}/members/{member_id}")
+def remove_member(
+    project_id: int,
+    member_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """移除项目成员（仅负责人）。"""
+    project = _get_project_or_404(project_id, db)
+    _require_owner(project, user)
+
+    member = db.get(ProjectMember, member_id)
+    if not member or member.project_id != project_id:
+        raise HTTPException(404, "成员不存在")
+
+    db.delete(member)
+    db.commit()
+    return {"ok": True}
+
+
 @router.post("/{project_id}/complete")
 def complete_project(
     project_id: int,
@@ -679,3 +728,239 @@ def delete_knowledge_share(
     db.delete(share)
     db.commit()
     return {"ok": True}
+
+
+# ─── 项目对话 ──────────────────────────────────────────────────────────────────
+
+@router.get("/{project_id}/conversations")
+def list_project_conversations(
+    project_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """返回该项目所有成员的对话列表（群组视图）。"""
+    project = _get_project_or_404(project_id, db)
+    if not _is_member_or_owner(project, user):
+        raise HTTPException(403, "无权访问该项目")
+
+    from app.models.conversation import Conversation
+    convs = (
+        db.query(Conversation)
+        .filter(
+            Conversation.project_id == project_id,
+            Conversation.is_active == True,
+        )
+        .order_by(Conversation.updated_at.desc())
+        .all()
+    )
+
+    result = []
+    for c in convs:
+        owner = db.get(User, c.user_id) if c.user_id else None
+        last_msg = c.messages[-1] if c.messages else None
+        result.append({
+            "id": c.id,
+            "owner_id": c.user_id,
+            "owner_name": owner.display_name if owner else None,
+            "last_message": last_msg.content[:100] if last_msg else None,
+            "updated_at": c.updated_at.isoformat(),
+        })
+    return result
+
+
+@router.post("/{project_id}/knowledge/upload")
+async def upload_project_knowledge(
+    project_id: int,
+    file: UploadFile = File(...),
+    title: Optional[str] = Form(None),
+    category: str = Form("experience"),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """上传文件到项目知识库，自动写入 project_knowledge_shares。"""
+    import os
+    import uuid
+    from app.config import settings
+    from app.models.knowledge import KnowledgeEntry
+    from app.services.knowledge_service import submit_knowledge
+    from app.utils.file_parser import extract_text
+
+    project = _get_project_or_404(project_id, db)
+    if not _is_member_or_owner(project, user):
+        raise HTTPException(403, "无权操作该项目")
+
+    if not file:
+        raise HTTPException(400, "请上传文件")
+
+    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+    ext = os.path.splitext(file.filename or "")[1]
+    saved_path = os.path.join(settings.UPLOAD_DIR, f"{uuid.uuid4()}{ext}")
+
+    with open(saved_path, "wb") as f:
+        f.write(await file.read())
+
+    try:
+        content = extract_text(saved_path)
+    except ValueError as e:
+        os.unlink(saved_path)
+        raise HTTPException(400, str(e))
+
+    entry_title = title or file.filename or "项目文件"
+
+    from app.services.review_policy import review_policy
+    sensitive_flags = review_policy.detect_sensitive(content)
+    strategic_flags = review_policy.detect_strategic(content)
+    capture_mode = "upload" if (sensitive_flags or strategic_flags) else "upload_ai_clean"
+
+    entry = KnowledgeEntry(
+        title=entry_title,
+        content=content,
+        category=category,
+        industry_tags=[],
+        platform_tags=[],
+        topic_tags=[],
+        created_by=user.id,
+        department_id=user.department_id,
+        source_type="upload",
+        source_file=file.filename,
+        capture_mode=capture_mode,
+    )
+    db.add(entry)
+    db.flush()
+
+    try:
+        from app.services.knowledge_classifier import classify, apply_classification_to_entry
+        cls_result = await classify(content, db)
+        if cls_result:
+            apply_classification_to_entry(entry, cls_result)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Auto-classification failed: {e}")
+
+    entry = submit_knowledge(db, entry)
+
+    # 自动关联到项目知识库
+    share = ProjectKnowledgeShare(
+        project_id=project_id,
+        user_id=user.id,
+        knowledge_id=entry.id,
+    )
+    db.add(share)
+    db.commit()
+
+    try:
+        from app.services import vector_service
+        vector_service.index_knowledge(entry.id, content, created_by=user.id)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Vector indexing failed: {e}")
+
+    return {
+        "ok": True,
+        "knowledge_id": entry.id,
+        "title": entry_title,
+        "status": entry.status.value,
+        "content_length": len(content),
+    }
+
+
+class ExtractTasksRequest(BaseModel):
+    conversation_id: int
+
+
+@router.post("/{project_id}/extract-tasks")
+async def extract_project_tasks(
+    project_id: int,
+    req: ExtractTasksRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """从对话中 AI 提取任务/进度/bug，写入 tasks 表。"""
+    project = _get_project_or_404(project_id, db)
+    if not _is_member_or_owner(project, user):
+        raise HTTPException(403, "无权操作该项目")
+
+    from app.models.conversation import Conversation, Message
+    conv = db.get(Conversation, req.conversation_id)
+    if not conv or conv.project_id != project_id:
+        raise HTTPException(404, "对话不存在或不属于该项目")
+
+    msgs = (
+        db.query(Message)
+        .filter(Message.conversation_id == req.conversation_id)
+        .order_by(Message.created_at)
+        .all()
+    )
+    if not msgs:
+        return {"tasks": []}
+
+    conversation_text = "\n".join(
+        f"[{m.role.value}] {m.content[:300]}" for m in msgs[-30:]
+    )
+
+    extract_prompt = f"""从以下项目对话中提取任务、进度节点和 bug。
+
+对话内容：
+{conversation_text}
+
+请返回 JSON 数组，每个元素包含：
+- title: 任务标题（简短，不超过50字）
+- description: 详细描述
+- type: "task" | "bug" | "milestone"
+- priority: "urgent_important" | "important" | "urgent" | "neither"
+
+只返回 JSON 数组，不要其他内容。如果没有可提取的任务，返回空数组 []。"""
+
+    from app.services.llm_gateway import llm_gateway
+    import json
+    try:
+        result, _ = await llm_gateway.chat(
+            model_config=llm_gateway.get_config(db),
+            messages=[{"role": "user", "content": extract_prompt}],
+            temperature=0.2,
+            max_tokens=1000,
+        )
+        raw = result.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        items = json.loads(raw.strip())
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Task extraction failed: {e}")
+        return {"tasks": [], "error": str(e)}
+
+    from app.models.task import Task, TaskPriority, TaskStatus
+    created = []
+    for item in items[:10]:  # 最多10条
+        priority_val = item.get("priority", "neither")
+        try:
+            priority = TaskPriority(priority_val)
+        except ValueError:
+            priority = TaskPriority.NEITHER
+
+        task = Task(
+            title=str(item.get("title", ""))[:200],
+            description=item.get("description", ""),
+            priority=priority,
+            status=TaskStatus.PENDING,
+            assignee_id=user.id,
+            created_by_id=user.id,
+            source_type="ai_extracted",
+            source_id=req.conversation_id,
+            conversation_id=req.conversation_id,
+            project_id=project_id,
+            metadata_={"type": item.get("type", "task")},
+        )
+        db.add(task)
+        db.flush()
+        created.append({
+            "id": task.id,
+            "title": task.title,
+            "type": item.get("type", "task"),
+            "priority": priority.value,
+        })
+
+    db.commit()
+    return {"tasks": created}

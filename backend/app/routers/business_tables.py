@@ -14,6 +14,104 @@ from app.services.llm_gateway import llm_gateway
 router = APIRouter(prefix="/api/business-tables", tags=["business-tables"])
 
 
+def _flatten_bitable_cell(v):
+    """将飞书多维表格单元格的原始值展平为可读字符串或基础类型。
+
+    覆盖类型：
+      type=1  多行文本    -> list of {text, type}
+      type=2  数字        -> float
+      type=3  单选        -> str
+      type=4  多选        -> list of str
+      type=5  日期        -> ms timestamp -> 北京时间字符串
+      type=11 人员        -> list of {name, ...}
+      type=17 附件        -> list of {name, ...}
+      type=18 单向关联    -> {link_record_ids: [...]}
+      type=19 查找引用    -> {type, value: [...]}  value 内容与对应字段类型一致
+      type=20 公式/查找   -> {type, value: [...]}  同上
+    """
+    import datetime
+
+    if v is None:
+        return None
+
+    # ── 查找引用 / 公式（type=19/20）：外层是 {type, value:[...]} ──
+    if isinstance(v, dict) and "type" in v and "value" in v:
+        inner_type = v["type"]
+        inner_vals = v["value"]
+        if not isinstance(inner_vals, list) or not inner_vals:
+            return None
+        # 对 value 数组里每一项递归解析，再拼接
+        parts = []
+        for item in inner_vals:
+            parts.append(_flatten_bitable_cell_inner(item, inner_type))
+        result = "、".join(str(p) for p in parts if p not in (None, ""))
+        return result if result else None
+
+    # ── 单向/双向关联 {link_record_ids: [...]} ──
+    if isinstance(v, dict) and "link_record_ids" in v:
+        ids = v["link_record_ids"]
+        if not ids:
+            return None
+        return "、".join(str(i) for i in ids)
+
+    # ── 普通 list（多行文本 type=1、附件 type=17 等）──
+    if isinstance(v, list):
+        parts = []
+        for item in v:
+            if isinstance(item, dict):
+                if "text" in item:
+                    parts.append(str(item["text"]))
+                elif "name" in item:
+                    parts.append(str(item["name"]))
+                else:
+                    parts.append(str(item))
+            else:
+                parts.append(str(item))
+        return "".join(parts) if parts else None
+
+    # ── 毫秒时间戳（type=5 日期直接返回数字）──
+    if isinstance(v, (int, float)) and v > 1e12:
+        dt = datetime.datetime.fromtimestamp(v / 1000, tz=datetime.timezone(datetime.timedelta(hours=8)))
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── 基础类型 str/int/float/bool ──
+    return v
+
+
+def _flatten_bitable_cell_inner(item, field_type: int):
+    """处理 value 数组内的单个元素（用于查找引用/公式字段）。"""
+    import datetime
+
+    if item is None:
+        return None
+
+    # type=5 日期：ms 时间戳
+    if field_type == 5 and isinstance(item, (int, float)):
+        dt = datetime.datetime.fromtimestamp(item / 1000, tz=datetime.timezone(datetime.timedelta(hours=8)))
+        return dt.strftime("%Y-%m-%d")
+
+    # type=11 人员：{name, ...}
+    if field_type == 11 and isinstance(item, dict):
+        return item.get("name") or item.get("display_name") or item.get("id", "")
+
+    # type=1 多行文本：{text, type}
+    if isinstance(item, dict) and "text" in item:
+        return str(item["text"])
+
+    # type=17 附件：{name, ...}
+    if isinstance(item, dict) and "name" in item:
+        return str(item["name"])
+
+    # 数字/字符串/布尔直接返回
+    if isinstance(item, (int, float)):
+        return str(item) if field_type not in (2, 20) else item
+    if isinstance(item, str):
+        return item
+
+    return str(item)
+
+
+
 class GenerateFromDescRequest(BaseModel):
     description: str
     model_config_id: int = None
@@ -278,6 +376,10 @@ def delete_business_table(
     return {"ok": True}
 
 
+class ResolveWikiRequest(BaseModel):
+    wiki_token: str     # from wiki URL: /wiki/{wiki_token}
+
+
 class ProbeBitableRequest(BaseModel):
     app_token: str      # from bitable URL: /base/{app_token}
     table_id: str       # from bitable URL: ?table={table_id}
@@ -296,6 +398,61 @@ class ProbeTableRequest(BaseModel):
     table_name: str
 
 
+@router.post("/resolve-wiki")
+async def resolve_wiki(
+    req: ResolveWikiRequest,
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """Resolve a Feishu Wiki node token → bitable app_token + table list."""
+    from app.services.lark_client import lark_client
+    try:
+        token = await lark_client.get_tenant_access_token()
+    except Exception as e:
+        raise HTTPException(400, f"飞书认证失败: {e}")
+
+    import httpx
+    base = "https://open.feishu.cn/open-apis"
+    headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"}
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            f"{base}/wiki/v2/spaces/get_node",
+            headers=headers,
+            params={"token": req.wiki_token, "obj_type": "wiki"},
+        )
+        data = r.json()
+        if data.get("code") != 0:
+            raise HTTPException(400, f"Wiki 节点解析失败: {data.get('msg')} (code={data.get('code')})")
+
+        node = data.get("data", {}).get("node", {})
+        obj_type = node.get("obj_type", "")
+        obj_token = node.get("obj_token", "")
+        title = node.get("title", "")
+
+        if obj_type != "bitable":
+            raise HTTPException(400, f"该 Wiki 页面不是多维表格（类型: {obj_type}），无法导入")
+
+        # Fetch table list for this bitable
+        r2 = await client.get(
+            f"{base}/bitable/v1/apps/{obj_token}/tables",
+            headers=headers,
+            params={"page_size": 100},
+        )
+        data2 = r2.json()
+        tables = []
+        if data2.get("code") == 0:
+            tables = [
+                {"table_id": t["table_id"], "name": t.get("name", t["table_id"])}
+                for t in data2.get("data", {}).get("items", [])
+            ]
+
+    return {
+        "app_token": obj_token,
+        "title": title,
+        "tables": tables,
+    }
+
+
 @router.post("/probe-bitable")
 async def probe_bitable(
     req: ProbeBitableRequest,
@@ -309,7 +466,7 @@ async def probe_bitable(
         raise HTTPException(400, f"飞书认证失败: {e}")
 
     base = "https://open.feishu.cn/open-apis"
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"}
 
     import httpx
     async with httpx.AsyncClient(timeout=15) as client:
@@ -342,15 +499,7 @@ async def probe_bitable(
         preview_rows = []
         for rec in records:
             row = {fn: rec.get("fields", {}).get(fn) for fn in field_names}
-            # flatten cell values (bitable returns rich objects for some types)
-            flat = {}
-            for k, v in row.items():
-                if isinstance(v, list) and v and isinstance(v[0], dict) and "text" in v[0]:
-                    flat[k] = "".join(item.get("text", "") for item in v)
-                elif isinstance(v, dict) and "text" in v:
-                    flat[k] = v["text"]
-                else:
-                    flat[k] = v
+            flat = {k: _flatten_bitable_cell(v) for k, v in row.items()}
             preview_rows.append(flat)
 
     return {
@@ -408,7 +557,7 @@ async def sync_bitable(
         raise HTTPException(400, f"飞书认证失败: {e}")
 
     base = "https://open.feishu.cn/open-apis"
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"}
 
     import httpx
     async with httpx.AsyncClient(timeout=30) as client:

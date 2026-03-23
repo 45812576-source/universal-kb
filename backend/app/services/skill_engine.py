@@ -248,6 +248,7 @@ class SkillEngine:
         skill: Skill | None,
         db=None,
         user_id: int | None = None,
+        project_id: int | None = None,
     ) -> str:
         """Retrieve relevant knowledge chunks from Milvus and format as context.
 
@@ -276,7 +277,7 @@ class SkillEngine:
         else:
             hits = await self._rerank_hits_with_llm(query, hits, top_k=5)
 
-        # 查询哪些 knowledge_id 是已审批的（全局可见）
+        # 查询哪些 knowledge_id 是已审批的（全局可见）或项目关联的（项目成员全量可见）
         approved_ids: set[int] = set()
         if db:
             try:
@@ -289,6 +290,20 @@ class SkillEngine:
                 approved_ids = {row[0] for row in approved_entries}
             except Exception as e:
                 logger.warning(f"Failed to load approved knowledge ids: {e}")
+
+            # 项目知识：对项目成员全量可见（原文注入，不脱敏）
+            if project_id:
+                try:
+                    from app.models.project import ProjectKnowledgeShare
+                    project_kb_ids = {
+                        row[0] for row in
+                        db.query(ProjectKnowledgeShare.knowledge_id)
+                        .filter(ProjectKnowledgeShare.project_id == project_id)
+                        .all()
+                    }
+                    approved_ids |= project_kb_ids
+                except Exception as e:
+                    logger.warning(f"Failed to load project knowledge ids: {e}")
 
         parts = []
         seen_ids: set[int] = set()
@@ -664,9 +679,10 @@ class SkillEngine:
         _parallel_tasks = []
 
         need_knowledge = not skill or (skill and skill.auto_inject)
+        _project_id = getattr(conversation, "project_id", None)
         if need_knowledge:
             _parallel_tasks.append(("knowledge", self._inject_knowledge(
-                user_message, skill, db=db, user_id=user_id
+                user_message, skill, db=db, user_id=user_id, project_id=_project_id
             )))
 
         need_vars = bool(skill_version and skill_version.variables)

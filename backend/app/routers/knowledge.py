@@ -79,6 +79,9 @@ def _entry_dict(e: KnowledgeEntry) -> dict:
         "sensitivity_flags": e.sensitivity_flags or [],
         "auto_review_note": e.auto_review_note,
         "folder_id": e.folder_id,
+        "taxonomy_board": e.taxonomy_board,
+        "taxonomy_code": e.taxonomy_code,
+        "taxonomy_path": e.taxonomy_path or [],
         "created_at": e.created_at.isoformat(),
     }
 
@@ -426,11 +429,11 @@ def list_folders(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """返回当前用户可见的所有文件夹（扁平列表，前端自行构建树）。"""
-    q = db.query(KnowledgeFolder)
-    # 文件浏览器只显示自己创建的文件夹；超管看全部
-    if user.role != Role.SUPER_ADMIN:
-        q = q.filter(KnowledgeFolder.created_by == user.id)
+    """返回当前用户自己创建的文件夹（扁平列表，前端自行构建树）。
+    "我的整理"文件夹属于个人空间，任何角色都只看自己的；
+    超管/部门管理员的跨用户权限体现在系统归档视图里。
+    """
+    q = db.query(KnowledgeFolder).filter(KnowledgeFolder.created_by == user.id)
     folders = q.order_by(KnowledgeFolder.sort_order, KnowledgeFolder.id).all()
     return [_folder_dict(f) for f in folders]
 
@@ -693,14 +696,14 @@ def move_entry_to_folder(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """把知识条目移动到指定文件夹（folder_id=None 表示移到根）。"""
+    """把知识条目移动到指定文件夹（folder_id=None 表示移到根）。
+    超管可移动任何条目；其他角色只能移动自己创建的条目。
+    """
     entry = db.get(KnowledgeEntry, kid)
     if not entry:
         raise HTTPException(404, "Knowledge entry not found")
-    if user.role == Role.EMPLOYEE and entry.created_by != user.id:
-        raise HTTPException(403, "只能移动自己的知识条目")
-    if user.role == Role.DEPT_ADMIN and entry.created_by != user.id and entry.department_id != user.department_id:
-        raise HTTPException(403, "只能移动本部门的知识条目")
+    if user.role != Role.SUPER_ADMIN and entry.created_by != user.id:
+        raise HTTPException(403, "只有超级管理员可以移动他人的知识条目")
     entry.folder_id = folder_id
     db.commit()
     return {"ok": True, "folder_id": folder_id}

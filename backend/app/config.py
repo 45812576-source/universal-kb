@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     MILVUS_PORT: int = 19530
     REDIS_URL: str = "redis://localhost:6379"
     UPLOAD_DIR: str = "./uploads"
+    # 每用户 opencode 工作目录根路径（持久化，重启不丢失）
+    STUDIO_WORKSPACE_ROOT: str = "~/studio_workspaces"
 
     # Feishu (Lark) integration
     LARK_APP_ID: str = ""

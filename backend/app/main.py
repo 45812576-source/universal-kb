@@ -59,10 +59,44 @@ async def startup_event():
             finally:
                 db.close()
 
+        def _run_daily_project_summary():
+            import asyncio
+            from app.models.project import Project, ProjectStatus
+            from app.services.project_engine import project_engine
+            db = SessionLocal()
+            try:
+                projects = db.query(Project).filter(Project.status == ProjectStatus.ACTIVE).all()
+                for p in projects:
+                    try:
+                        asyncio.run(project_engine.daily_project_summary(p, db))
+                    except Exception as ex:
+                        import logging
+                        logging.getLogger(__name__).warning(f"daily_summary failed project {p.id}: {ex}")
+            finally:
+                db.close()
+
+        def _run_todo_reminder():
+            import asyncio
+            from app.models.project import Project, ProjectStatus
+            from app.services.project_engine import project_engine
+            db = SessionLocal()
+            try:
+                projects = db.query(Project).filter(Project.status == ProjectStatus.ACTIVE).all()
+                for p in projects:
+                    try:
+                        asyncio.run(project_engine.inject_todo_reminder(p, db))
+                    except Exception as ex:
+                        import logging
+                        logging.getLogger(__name__).warning(f"todo_reminder failed project {p.id}: {ex}")
+            finally:
+                db.close()
+
         upstream_scheduler = BackgroundScheduler()
         upstream_scheduler.add_job(check_all_imported_skills, "cron", hour=3, minute=0)
         # 每 12 小时统计一次 OpenCode 用量（0点 和 12点）
         upstream_scheduler.add_job(_run_opencode_usage_job, "cron", hour="0,12", minute=5)
+        upstream_scheduler.add_job(_run_daily_project_summary, "cron", hour=23, minute=0)
+        upstream_scheduler.add_job(_run_todo_reminder, "cron", hour=9, minute=0)
         upstream_scheduler.start()
     except Exception as e:
         import logging

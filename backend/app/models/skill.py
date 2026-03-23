@@ -97,6 +97,10 @@ class Skill(Base):
     # 是否在 Skill 执行后自动触发"沉淀为知识"
     auto_save_output = Column(Boolean, default=False)
 
+    # 复杂 Skill 的附属文件（zip 包上传时提取的非 .md 文件）
+    # 每项格式: {"filename": "ref.py", "path": "uploads/skills/42/ref.py", "size": 1234}
+    source_files = Column(JSON, default=list, nullable=True)
+
     # Upstream tracking fields
     source_type = Column(String(20), default="local")  # local / imported / forked
     upstream_url = Column(String(500), nullable=True)

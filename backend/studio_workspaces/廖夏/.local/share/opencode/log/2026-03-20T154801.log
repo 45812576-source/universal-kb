@@ -1,0 +1,292 @@
+INFO  2026-03-20T15:48:01 +465ms service=default version=1.2.25 args=["web","--port","17175","--hostname","127.0.0.1","--cors","https://brittni-unprospering-pia.ngrok-free.dev","--cors","http://localhost:5023"] opencode
+INFO  2026-03-20T15:48:01 +0ms service=db path=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4/.local/share/opencode/opencode.db opening database
+INFO  2026-03-20T15:48:01 +2ms service=db count=8 mode=bundled applying migrations
+INFO  2026-03-20T15:48:01 +6ms service=json-migration storage directory does not exist, skipping migration
+INFO  2026-03-20T15:48:01 +0ms service=config path=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4/.config/opencode/config.json loading
+INFO  2026-03-20T15:48:01 +0ms service=config path=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4/.config/opencode/opencode.json loading
+INFO  2026-03-20T15:48:01 +2ms service=config path=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4/.config/opencode/opencode.jsonc loading
+INFO  2026-03-20T15:48:01 +121ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:01 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:01 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:01 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:01 +5ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:01 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:01 +46ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+INFO  2026-03-20T15:48:01 +2ms service=config path=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4/opencode.json loading
+ERROR 2026-03-20T15:48:01 +4ms service=server error=ConfigInvalidError failed
+ERROR 2026-03-20T15:48:01 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:01 +1ms service=server status=completed duration=59 method=GET path=/ request
+INFO  2026-03-20T15:48:01 +0ms service=server status=completed duration=53 method=GET path=/ request
+INFO  2026-03-20T15:48:01 +27ms service=server method=GET path=/favicon.ico request
+INFO  2026-03-20T15:48:01 +0ms service=server status=started method=GET path=/favicon.ico request
+INFO  2026-03-20T15:48:01 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:01 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:01 +21ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:01 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:01 +0ms service=server status=completed duration=22 method=GET path=/favicon.ico request
+INFO  2026-03-20T15:48:02 +455ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:02 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:02 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:02 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:02 +56ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:02 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:02 +0ms service=server status=completed duration=56 method=GET path=/ request
+INFO  2026-03-20T15:48:02 +503ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:02 +1ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:02 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:02 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:02 +49ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:02 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:02 +0ms service=server status=completed duration=49 method=GET path=/ request
+INFO  2026-03-20T15:48:03 +504ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:03 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:03 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:03 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:03 +59ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:03 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:03 +0ms service=server status=completed duration=60 method=GET path=/ request
+INFO  2026-03-20T15:48:03 +504ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:03 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:03 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:03 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:03 +59ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:03 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:03 +0ms service=server status=completed duration=59 method=GET path=/ request
+INFO  2026-03-20T15:48:04 +503ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:04 +1ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:04 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:04 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:04 +59ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:04 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:04 +0ms service=server status=completed duration=59 method=GET path=/ request
+INFO  2026-03-20T15:48:04 +505ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:04 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:04 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:04 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:04 +55ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:04 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:04 +0ms service=server status=completed duration=56 method=GET path=/ request
+INFO  2026-03-20T15:48:05 +504ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:05 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:05 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:05 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:05 +48ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:05 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:05 +0ms service=server status=completed duration=49 method=GET path=/ request
+INFO  2026-03-20T15:48:06 +503ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:06 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:06 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:06 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:06 +54ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:06 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:06 +0ms service=server status=completed duration=55 method=GET path=/ request
+INFO  2026-03-20T15:48:06 +504ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:06 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:06 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:06 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:06 +55ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:06 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:06 +0ms service=server status=completed duration=56 method=GET path=/ request
+INFO  2026-03-20T15:48:07 +504ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:07 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:07 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:07 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:07 +53ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:07 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:07 +0ms service=server status=completed duration=54 method=GET path=/ request
+INFO  2026-03-20T15:48:07 +503ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:07 +1ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:07 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:07 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:07 +49ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:07 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:07 +0ms service=server status=completed duration=49 method=GET path=/ request
+INFO  2026-03-20T15:48:08 +504ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:08 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:08 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:08 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:08 +53ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:08 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:08 +0ms service=server status=completed duration=54 method=GET path=/ request
+INFO  2026-03-20T15:48:08 +503ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:08 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:08 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:08 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:08 +56ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:08 +1ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:08 +0ms service=server status=completed duration=58 method=GET path=/ request
+INFO  2026-03-20T15:48:09 +503ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:09 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:09 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:09 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:09 +55ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:09 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:09 +0ms service=server status=completed duration=56 method=GET path=/ request
+INFO  2026-03-20T15:48:09 +504ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:09 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:09 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:09 +1ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:09 +56ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:09 +1ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:09 +0ms service=server status=completed duration=58 method=GET path=/ request
+INFO  2026-03-20T15:48:10 +503ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:10 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:10 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:10 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:10 +54ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:10 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:10 +0ms service=server status=completed duration=55 method=GET path=/ request
+INFO  2026-03-20T15:48:11 +504ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:11 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:11 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:11 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:11 +57ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:11 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:11 +0ms service=server status=completed duration=57 method=GET path=/ request
+INFO  2026-03-20T15:48:11 +503ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:11 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:11 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:11 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:11 +38ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:11 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:11 +0ms service=server status=completed duration=39 method=GET path=/ request
+INFO  2026-03-20T15:48:12 +649ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:12 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:12 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:12 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:12 +22ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:12 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:12 +0ms service=server status=completed duration=22 method=GET path=/ request
+INFO  2026-03-20T15:48:12 +504ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:12 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:12 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:12 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:12 +55ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:12 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:12 +0ms service=server status=completed duration=56 method=GET path=/ request
+INFO  2026-03-20T15:48:13 +505ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:13 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:13 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:13 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:13 +54ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:13 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:13 +0ms service=server status=completed duration=55 method=GET path=/ request
+INFO  2026-03-20T15:48:13 +504ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:13 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:13 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:13 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:13 +53ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:13 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:13 +0ms service=server status=completed duration=53 method=GET path=/ request
+INFO  2026-03-20T15:48:14 +503ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:14 +1ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:14 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:14 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:14 +55ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:14 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:14 +0ms service=server status=completed duration=55 method=GET path=/ request
+INFO  2026-03-20T15:48:15 +503ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:15 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:15 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:15 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:15 +47ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:15 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:15 +0ms service=server status=completed duration=48 method=GET path=/ request
+INFO  2026-03-20T15:48:15 +504ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:15 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:15 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:15 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:15 +58ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:15 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:15 +0ms service=server status=completed duration=59 method=GET path=/ request
+INFO  2026-03-20T15:48:16 +503ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:16 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:16 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:16 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:16 +56ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:16 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:16 +0ms service=server status=completed duration=56 method=GET path=/ request
+INFO  2026-03-20T15:48:16 +504ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:16 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:16 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:16 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:16 +54ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:16 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:16 +0ms service=server status=completed duration=55 method=GET path=/ request
+INFO  2026-03-20T15:48:17 +504ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:17 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:17 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:17 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:17 +50ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:17 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:17 +0ms service=server status=completed duration=51 method=GET path=/ request
+INFO  2026-03-20T15:48:17 +505ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:17 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:17 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:17 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:17 +49ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:17 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:17 +0ms service=server status=completed duration=49 method=GET path=/ request
+INFO  2026-03-20T15:48:18 +503ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:18 +1ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:18 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:18 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:18 +50ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:18 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:18 +0ms service=server status=completed duration=51 method=GET path=/ request
+INFO  2026-03-20T15:48:18 +504ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:18 +1ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:18 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:18 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:18 +53ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:18 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:18 +0ms service=server status=completed duration=54 method=GET path=/ request
+INFO  2026-03-20T15:48:19 +505ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:19 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:19 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:19 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:19 +58ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:19 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:19 +0ms service=server status=completed duration=58 method=GET path=/ request
+INFO  2026-03-20T15:48:20 +505ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:20 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:20 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:20 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:20 +60ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:20 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:20 +0ms service=server status=completed duration=60 method=GET path=/ request
+INFO  2026-03-20T15:48:20 +504ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:20 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:20 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:20 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:20 +52ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:20 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:20 +0ms service=server status=completed duration=53 method=GET path=/ request
+INFO  2026-03-20T15:48:21 +503ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:21 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:21 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:21 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:21 +49ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:21 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:21 +0ms service=server status=completed duration=50 method=GET path=/ request
+INFO  2026-03-20T15:48:21 +501ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:21 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:21 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:21 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:21 +38ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:21 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:21 +0ms service=server status=completed duration=39 method=GET path=/ request
+INFO  2026-03-20T15:48:22 +503ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:22 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:22 +1ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:22 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:22 +54ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:22 +0ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:22 +1ms service=server status=completed duration=55 method=GET path=/ request
+INFO  2026-03-20T15:48:22 +503ms service=server method=GET path=/ request
+INFO  2026-03-20T15:48:22 +0ms service=server status=started method=GET path=/ request
+INFO  2026-03-20T15:48:22 +0ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 creating instance
+INFO  2026-03-20T15:48:22 +0ms service=project directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 fromDirectory
+INFO  2026-03-20T15:48:22 +41ms service=default directory=/Users/xia/project/universal-kb/backend/studio_workspaces/user_4 bootstrapping
+ERROR 2026-03-20T15:48:22 +1ms service=server error=ConfigInvalidError failed
+INFO  2026-03-20T15:48:22 +0ms service=server status=completed duration=42 method=GET path=/ request

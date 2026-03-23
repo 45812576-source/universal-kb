@@ -52,6 +52,7 @@ class SendMessage(BaseModel):
 
 class ConversationCreate(BaseModel):
     workspace_id: Optional[int] = None
+    project_id: Optional[int] = None
 
 
 @router.post("")
@@ -83,36 +84,70 @@ def create_conversation(
             db.refresh(conv)
             return {"id": conv.id, "title": conv.title, "workspace_id": conv.workspace_id}
 
-    conv = Conversation(user_id=user.id, workspace_id=req.workspace_id)
+    # project 对话：每人只维护一个（类似 opencode 逻辑）
+    if req.project_id and not req.workspace_id:
+        existing = (
+            db.query(Conversation)
+            .filter(
+                Conversation.user_id == user.id,
+                Conversation.project_id == req.project_id,
+                Conversation.is_active == True,
+            )
+            .first()
+        )
+        if existing:
+            return {"id": existing.id, "title": existing.title, "workspace_id": existing.workspace_id, "project_id": existing.project_id}
+        conv = Conversation(user_id=user.id, project_id=req.project_id, title="项目对话")
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+        return {"id": conv.id, "title": conv.title, "workspace_id": conv.workspace_id, "project_id": conv.project_id}
+
+    conv = Conversation(user_id=user.id, workspace_id=req.workspace_id, project_id=req.project_id)
     db.add(conv)
     db.commit()
     db.refresh(conv)
-    return {"id": conv.id, "title": conv.title, "workspace_id": conv.workspace_id}
+    return {"id": conv.id, "title": conv.title, "workspace_id": conv.workspace_id, "project_id": conv.project_id}
 
 
 @router.get("")
 def list_conversations(
+    project_id: Optional[int] = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    convs = (
-        db.query(Conversation)
-        .filter(Conversation.user_id == user.id, Conversation.is_active == True)
-        .order_by(Conversation.updated_at.desc())
-        .limit(50)
-        .all()
-    )
+    q = db.query(Conversation).filter(Conversation.is_active == True)
+    if project_id is not None:
+        # 项目群组视图：返回该项目所有成员的对话
+        from app.models.project import ProjectMember
+        member_ids = [
+            row[0] for row in
+            db.query(ProjectMember.user_id).filter(ProjectMember.project_id == project_id).all()
+        ]
+        q = q.filter(
+            Conversation.project_id == project_id,
+            Conversation.user_id.in_(member_ids),
+        )
+    else:
+        q = q.filter(Conversation.user_id == user.id)
+    convs = q.order_by(Conversation.updated_at.desc()).limit(50).all()
     def _conv_dict(c: Conversation) -> dict:
         from app.models.workspace import Workspace
         ws = db.get(Workspace, c.workspace_id) if c.workspace_id else None
+        owner = db.get(User, c.user_id) if c.user_id else None
+        last_msg = c.messages[-1] if c.messages else None
         return {
             "id": c.id,
             "title": c.title,
             "skill_id": c.skill_id,
             "workspace_id": c.workspace_id,
+            "project_id": c.project_id,
             "workspace": {"name": ws.name, "icon": ws.icon, "color": ws.color} if ws else None,
             "workspace_type": ws.workspace_type if ws else None,
             "updated_at": c.updated_at.isoformat(),
+            "owner_id": c.user_id,
+            "owner_name": owner.display_name if owner else None,
+            "last_message": last_msg.content[:100] if last_msg else None,
         }
 
     return [_conv_dict(c) for c in convs]
@@ -125,8 +160,20 @@ def get_messages(
     user: User = Depends(get_current_user),
 ):
     conv = db.get(Conversation, conv_id)
-    if not conv or conv.user_id != user.id:
+    if not conv:
         raise HTTPException(404, "Conversation not found")
+    # 项目对话：项目成员可互相查看消息
+    if conv.project_id:
+        from app.models.project import ProjectMember
+        is_member = db.query(ProjectMember).filter(
+            ProjectMember.project_id == conv.project_id,
+            ProjectMember.user_id == user.id,
+        ).first()
+        if not is_member and conv.user_id != user.id:
+            raise HTTPException(403, "无权访问该对话")
+    elif conv.user_id != user.id:
+        raise HTTPException(404, "Conversation not found")
+    owner = db.get(User, conv.user_id) if conv.user_id else None
     return [
         {
             "id": m.id,
@@ -134,6 +181,8 @@ def get_messages(
             "content": m.content,
             "metadata": m.metadata_,
             "created_at": m.created_at.isoformat(),
+            "sender_id": conv.user_id,
+            "sender_name": owner.display_name if owner else None,
         }
         for m in conv.messages
     ]
@@ -257,6 +306,14 @@ async def stream_message(
             if not conv:
                 yield _sse("error", {"message": "Conversation not found", "error_type": "server_error", "retryable": False})
                 return
+
+            # opencode 工作台对话标题锁定，不随消息内容变更
+            _is_opencode_conv = False
+            if conv.workspace_id:
+                from app.models.workspace import Workspace as WsModel
+                _ws = db.get(WsModel, conv.workspace_id)
+                if _ws and _ws.workspace_type == "opencode":
+                    _is_opencode_conv = True
 
             # --- PEV 升级判断（复杂多步场景） ---
             from app.models.skill import Skill as SkillModel

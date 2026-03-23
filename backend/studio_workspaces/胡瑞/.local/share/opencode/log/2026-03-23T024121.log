@@ -1,0 +1,2 @@
+INFO  2026-03-23T02:41:21 +1147ms service=default version=1.2.25 args=["web","--port","17188","--hostname","127.0.0.1","--cors","https://brittni-unprospering-pia.ngrok-free.dev","--cors","http://localhost:5023"] opencode
+INFO  2026-03-23T02:41:21 +1ms service=config path=/Users/xia/project/universal-kb/backend/studio_workspaces/user_17/.config/opencode/config.json loading

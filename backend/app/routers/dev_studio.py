@@ -21,16 +21,18 @@ from app.models.user import User
 
 router = APIRouter(prefix="/api/dev-studio", tags=["dev-studio"])
 
-# ─── 全局单例 ──────────────────────────────────────────────────────────────────
-# 整个后端进程只启动一个 opencode web，所有用户共用
-_singleton: dict = {
-    "proc": None,
-    "port": None,
-    "workdir": None,
-    "lock": None,   # asyncio.Lock，运行时初始化
-}
+# ─── 按用户隔离的实例池 ────────────────────────────────────────────────────────
+# 每个 user_id 对应独立的 opencode 进程 + workdir + 端口
+# 结构：{user_id: {"proc": Process, "port": int, "workdir": str, "lock": Lock}}
+_user_instances: dict = {}
+_instances_lock: object = None   # 全局 asyncio.Lock，保护 _user_instances 写入
 
-OPENCODE_FIXED_PORT = 17171   # 固定端口，重启后不变
+OPENCODE_BASE_PORT = 17171   # user_id=1 → 17172, user_id=2 → 17173, ...
+
+
+def _port_for_user(user_id: int) -> int:
+    """每个用户分配固定端口，重启后不变。端口 = BASE + user_id。"""
+    return OPENCODE_BASE_PORT + user_id
 
 BAILIAN_DEFAULT_MODEL = "bailian-coding-plan/glm-5"
 ARK_DEFAULT_MODEL = "ark/doubao-seed-2.0-code"
@@ -75,21 +77,33 @@ def _prune_events() -> None:
 
 
 def _read_files_total() -> int:
-    """从 OpenCode SQLite 读取所有 session 的 summary_files 累计总量。"""
+    """从所有用户的 OpenCode SQLite 汇总 summary_files 总量。"""
     import sqlite3 as _sqlite3
-    db_path = os.environ.get(
-        "OPENCODE_DB_PATH",
-        os.path.expanduser("~/.local/share/opencode/opencode.db"),
-    )
-    if not os.path.exists(db_path):
-        return 0
-    try:
-        con = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        row = con.execute("SELECT COALESCE(SUM(summary_files), 0) FROM session").fetchone()
-        con.close()
-        return int(row[0]) if row else 0
-    except Exception:
-        return 0
+    total = 0
+    db_paths = []
+
+    # 各用户独立目录
+    for uid, inst in list(_user_instances.items()):
+        from app.config import settings as _cfg3
+        _studio_root = os.path.abspath(os.path.expanduser(getattr(_cfg3, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
+        wdir = inst.get("workdir") or os.path.join(_studio_root, f"user_{uid}")
+        db_paths.append(os.path.join(wdir, ".local", "share", "opencode", "opencode.db"))
+
+    # 兜底：全局路径（向后兼容）
+    global_db = os.environ.get("OPENCODE_DB_PATH", os.path.expanduser("~/.local/share/opencode/opencode.db"))
+    db_paths.append(global_db)
+
+    for db_path in db_paths:
+        if not os.path.exists(db_path):
+            continue
+        try:
+            con = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            row = con.execute("SELECT COALESCE(SUM(summary_files), 0) FROM session").fetchone()
+            con.close()
+            total += int(row[0]) if row else 0
+        except Exception:
+            pass
+    return total
 
 
 async def _bailian_usage_monitor() -> None:
@@ -136,14 +150,17 @@ async def _bailian_usage_monitor() -> None:
 
                 bailian_key = os.environ.get("BAILIAN_API_KEY", "")
                 ark_key = os.environ.get("ARK_API_KEY", "")
-                workdir = _singleton.get("workdir") or os.path.join(tempfile.gettempdir(), "ledesk_dev_studio")
-                os.makedirs(workdir, exist_ok=True)
-                _write_opencode_config(workdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=True)
-
-                proc = _singleton.get("proc")
-                if proc is not None and proc.returncode is None:
-                    proc.terminate()
-                    _singleton["proc"] = None
+                # 更新所有已启动用户实例的 opencode.json，并重启进程
+                for uid, inst in list(_user_instances.items()):
+                    from app.config import settings as _cfg2
+                    _studio_root = os.path.abspath(os.path.expanduser(getattr(_cfg2, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
+                    wdir = inst.get("workdir") or os.path.join(_studio_root, f"user_{uid}")
+                    os.makedirs(wdir, exist_ok=True)
+                    _write_opencode_config(wdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=True)
+                    proc = inst.get("proc")
+                    if proc is not None and proc.returncode is None:
+                        proc.terminate()
+                        inst["proc"] = None
         except Exception as e:
             logging.getLogger(__name__).warning(f"[BailianMonitor] 采样失败: {e}")
 
@@ -336,39 +353,71 @@ async def _wait_ready(port: int, retries: int = 20) -> bool:
     return False
 
 
-async def _ensure_singleton() -> dict:
-    """确保全局 opencode web 实例在跑，返回 {port, url}。"""
-    # 延迟初始化 lock（event loop 在 startup 之后才存在）
-    if _singleton["lock"] is None:
-        _singleton["lock"] = asyncio.Lock()
+async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
+    """确保该用户的 opencode web 实例在跑，返回 {port, url}。每用户独立进程+workdir+端口。"""
+    global _instances_lock
+    # 延迟初始化全局锁
+    if _instances_lock is None:
+        _instances_lock = asyncio.Lock()
 
-    async with _singleton["lock"]:
-        proc: Optional[asyncio.subprocess.Process] = _singleton["proc"]
+    # 确保该用户有独立的实例槽和锁
+    async with _instances_lock:
+        if user_id not in _user_instances:
+            _user_instances[user_id] = {
+                "proc": None,
+                "port": _port_for_user(user_id),
+                "workdir": None,
+                "lock": asyncio.Lock(),
+            }
+
+    inst = _user_instances[user_id]
+    async with inst["lock"]:
+        proc: Optional[asyncio.subprocess.Process] = inst["proc"]
 
         # 已有进程且还活着，直接复用
         if proc is not None and proc.returncode is None:
-            return {"port": _singleton["port"], "url": "/opencode"}
+            return {"port": inst["port"], "url": "/opencode"}
 
         opencode_bin = _find_opencode()
         if not opencode_bin:
             raise HTTPException(503, "opencode 未安装，请先运行: npm install -g opencode-ai")
 
-        # 固定 workdir（重启后同一目录，保留上下文）
-        workdir = os.path.join(tempfile.gettempdir(), "ledesk_dev_studio")
+        # 每用户独立持久化 workdir，用姓名命名（重启后保留文件和 session 历史）
+        from app.config import settings as _cfg
+        import re
+        studio_root = os.path.abspath(os.path.expanduser(getattr(_cfg, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
+        # 用 display_name 做目录名，去掉不安全字符，兜底用 user_{id}
+        safe_name = re.sub(r'[^\w\u4e00-\u9fff\-]', '_', display_name).strip('_') if display_name else ""
+        folder_name = safe_name if safe_name else f"user_{user_id}"
+        workdir = os.path.join(studio_root, folder_name)
+        is_new = not os.path.exists(workdir)
         os.makedirs(workdir, exist_ok=True)
+
+        # 首次创建：初始化项目目录结构
+        if is_new:
+            for subdir in ["src", "docs", "scripts", ".local/share", ".config"]:
+                os.makedirs(os.path.join(workdir, subdir), exist_ok=True)
+            readme = os.path.join(workdir, "README.md")
+            with open(readme, "w", encoding="utf-8") as f:
+                f.write(f"# {display_name or folder_name} 的工作台\n\n这是你的专属开发工作台，文件会持久保存。\n")
 
         from app.config import settings as _settings
         bailian_key = getattr(_settings, "BAILIAN_API_KEY", "") or os.environ.get("BAILIAN_API_KEY", "")
         ark_key = getattr(_settings, "ARK_API_KEY", "") or os.environ.get("ARK_API_KEY", "")
         lemondata_key = getattr(_settings, "LEMONDATA_API_KEY", "") or os.environ.get("LEMONDATA_API_KEY", "")
-        # 运行时开关优先，其次读配置文件
         use_ark_fallback = _runtime_fallback["use_ark"] or getattr(_settings, "BAILIAN_FALLBACK_TO_ARK", False)
 
-        # 写入完整 opencode.json（含 provider 配置），每次启动刷新确保配置最新
         _write_opencode_config(workdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=use_ark_fallback, lemondata_key=lemondata_key)
 
-        # provider key 通过环境变量传入（{env:XXX} 语法备用）
+        # 每用户独立数据目录（持久化，session db 隔离）
+        user_data_dir = os.path.join(workdir, ".local", "share")
+        os.makedirs(user_data_dir, exist_ok=True)
+        user_config_dir = os.path.join(workdir, ".config")
+        os.makedirs(user_config_dir, exist_ok=True)
+
         proc_env = os.environ.copy()
+        proc_env["XDG_DATA_HOME"] = user_data_dir
+        proc_env["XDG_CONFIG_HOME"] = user_config_dir
         if bailian_key:
             proc_env["BAILIAN_API_KEY"] = bailian_key
         if ark_key:
@@ -376,7 +425,6 @@ async def _ensure_singleton() -> dict:
         if lemondata_key:
             proc_env["LEMONDATA_API_KEY"] = lemondata_key
 
-        # CORS 允许来源：从环境变量 FRONTEND_ORIGIN 读取（支持内网穿透域名）
         frontend_origins = [
             o.strip()
             for o in os.environ.get("FRONTEND_ORIGIN", "http://localhost:5023").split(",")
@@ -386,9 +434,10 @@ async def _ensure_singleton() -> dict:
         for origin in frontend_origins:
             cors_args += ["--cors", origin]
 
+        port = inst["port"]
         new_proc = await asyncio.create_subprocess_exec(
             opencode_bin, "web",
-            "--port", str(OPENCODE_FIXED_PORT),
+            "--port", str(port),
             "--hostname", "127.0.0.1",
             *cors_args,
             stdout=asyncio.subprocess.DEVNULL,
@@ -397,22 +446,20 @@ async def _ensure_singleton() -> dict:
             env=proc_env,
         )
 
-        ready = await _wait_ready(OPENCODE_FIXED_PORT)
+        ready = await _wait_ready(port)
         if not ready:
-            # 进程可能已自行退出，安全 terminate
             if new_proc.returncode is None:
                 new_proc.terminate()
             raise HTTPException(503, "opencode web 启动超时，请重试")
 
-        _singleton["proc"] = new_proc
-        _singleton["port"] = OPENCODE_FIXED_PORT
-        _singleton["workdir"] = workdir
+        inst["proc"] = new_proc
+        inst["workdir"] = workdir
 
         # 启动百炼用量监控（全局只跑一个）
         if _usage_counter["monitor_task"] is None or _usage_counter["monitor_task"].done():
             _usage_counter["monitor_task"] = asyncio.create_task(_bailian_usage_monitor())
 
-        return {"port": OPENCODE_FIXED_PORT, "url": "/opencode"}
+        return {"port": port, "url": "/opencode"}
 
 
 # ─── 运行时 fallback 开关（不重启进程，只刷新 opencode.json + 可选重启进程）──
@@ -437,15 +484,15 @@ async def set_provider_fallback(
     ark_key = getattr(_settings, "ARK_API_KEY", "") or os.environ.get("ARK_API_KEY", "")
     lemondata_key = getattr(_settings, "LEMONDATA_API_KEY", "") or os.environ.get("LEMONDATA_API_KEY", "")
 
-    workdir = _singleton.get("workdir") or os.path.join(tempfile.gettempdir(), "ledesk_dev_studio")
-    os.makedirs(workdir, exist_ok=True)
-    _write_opencode_config(workdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=enable, lemondata_key=lemondata_key)
-
-    # 终止现有进程，让下次请求触发重启（刷新配置）
-    proc = _singleton.get("proc")
-    if proc is not None and proc.returncode is None:
-        proc.terminate()
-        _singleton["proc"] = None
+    # 更新所有已启动用户实例的配置，并逐一重启
+    for uid, inst in list(_user_instances.items()):
+        wdir = inst.get("workdir") or os.path.join(tempfile.gettempdir(), f"ledesk_studio_user_{uid}")
+        os.makedirs(wdir, exist_ok=True)
+        _write_opencode_config(wdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=enable, lemondata_key=lemondata_key)
+        proc = inst.get("proc")
+        if proc is not None and proc.returncode is None:
+            proc.terminate()
+            inst["proc"] = None
 
     return {
         "fallback_enabled": enable,
@@ -482,18 +529,14 @@ async def get_provider_status(
     }
 
 
-# ─── GET /instance — 获取（或启动）单例 ───────────────────────────────────────
+# ─── GET /instance — 启动/获取当前用户的独立实例 ──────────────────────────────
 
 @router.get("/instance")
 async def get_instance(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    info = await _ensure_singleton()
-
-    # 自动为当前用户建立 workdir → user_id 映射（用于统计）
-    user_workdir = os.path.join(tempfile.gettempdir(), f"ledesk_studio_user_{user.id}")
-    os.makedirs(user_workdir, exist_ok=True)
+    info = await _ensure_user_instance(user.id, display_name=user.display_name or "")
 
     from app.models.opencode import OpenCodeWorkspaceMapping
     mapping = db.query(OpenCodeWorkspaceMapping).filter(
@@ -501,6 +544,7 @@ async def get_instance(
         OpenCodeWorkspaceMapping.directory != None,
     ).first()
     if mapping is None:
+        user_workdir = os.path.join(tempfile.gettempdir(), f"ledesk_studio_user_{user.id}")
         mapping = OpenCodeWorkspaceMapping(
             user_id=user.id,
             directory=user_workdir,
@@ -512,13 +556,21 @@ async def get_instance(
     return {"url": info["url"], "port": info["port"], "status": "ready"}
 
 
-# ─── 兼容旧的 POST /sessions（不再创建多个，统一走单例）─────────────────────
+# ─── GET /user-port — Next.js 代理用：查询当前用户的 opencode 端口 ────────────
+
+@router.get("/user-port")
+async def get_user_port(user: User = Depends(get_current_user)):
+    """返回当前用户对应的 opencode 端口，供 Next.js 代理层做请求路由。"""
+    return {"port": _port_for_user(user.id), "user_id": user.id}
+
+
+# ─── POST /sessions（兼容旧接口，改为按用户隔离）─────────────────────────────
 
 @router.post("/sessions")
 async def create_session(user: User = Depends(get_current_user)):
-    info = await _ensure_singleton()
+    info = await _ensure_user_instance(user.id, display_name=user.display_name or "")
     return {
-        "session_id": "singleton",
+        "session_id": f"user_{user.id}",
         "url": info["url"],
         "port": info["port"],
     }

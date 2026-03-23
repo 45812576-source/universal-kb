@@ -52,6 +52,8 @@ def _skill_summary(s: Skill) -> dict:
         "created_at": s.created_at.isoformat(),
         "scope": s.scope or "personal",
         "created_by": s.created_by,
+        "source_type": s.source_type or "local",
+        "source_files": s.source_files or [],
     }
 
 
@@ -282,7 +284,7 @@ async def upload_skill_md(
     if not parsed["name"]:
         raise HTTPException(400, "文件缺少 frontmatter 中的 name 字段")
 
-    existing = db.query(Skill).filter(Skill.name == parsed["name"], Skill.created_by == user.id).first()
+    existing = db.query(Skill).filter(Skill.name == parsed["name"]).first()
 
     if existing:
         # Add a new version
@@ -388,7 +390,7 @@ async def batch_upload_skill_md(
             results.append({"filename": f.filename, "error": "缺少 name"})
             continue
 
-        existing = db.query(Skill).filter(Skill.name == parsed["name"], Skill.created_by == user.id).first()
+        existing = db.query(Skill).filter(Skill.name == parsed["name"]).first()
         if existing:
             latest = existing.versions[0] if existing.versions else None
             new_ver = (latest.version + 1) if latest else 1
@@ -432,6 +434,178 @@ async def batch_upload_skill_md(
 
     db.commit()
     return {"results": results, "total": len(results)}
+
+
+@router.post("/upload-zip")
+async def upload_skill_zip(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """上传 .zip 压缩包创建复杂 Skill（主 .md 文件 + 附属参考文件/脚本）。
+
+    zip 包结构：
+    - 必须包含一个 .md 文件（优先 index.md / README.md，否则取第一个 .md）
+    - 其余文件作为附属文件存储到 uploads/skills/<skill_id>/ 目录
+    """
+    import zipfile as _zipfile
+    import tempfile
+    import os as _os
+    import shutil
+    from pathlib import Path as _Path
+    from app.config import settings
+
+    if not file.filename or not file.filename.lower().endswith(".zip"):
+        raise HTTPException(400, "只支持 .zip 文件")
+
+    raw = await file.read()
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp.write(raw)
+        tmp_path = tmp.name
+
+    try:
+        with _zipfile.ZipFile(tmp_path, "r") as zf:
+            names = zf.namelist()
+    except _zipfile.BadZipFile:
+        _os.unlink(tmp_path)
+        raise HTTPException(400, "不是有效的 zip 文件")
+
+    # 找主 md 文件（忽略 __MACOSX 等系统目录）
+    md_files = [n for n in names if n.endswith(".md") and not n.startswith("__") and "/" not in n.lstrip("/")]
+    # 也允许一层子目录内的 md
+    if not md_files:
+        md_files = [n for n in names if n.endswith(".md") and not n.startswith("__")]
+    if not md_files:
+        _os.unlink(tmp_path)
+        raise HTTPException(400, "zip 包中未找到 .md 文件")
+
+    # 优先选 index.md / README.md
+    main_md = next(
+        (n for n in md_files if _Path(n).name.lower() in ("index.md", "readme.md", "skill.md")),
+        md_files[0],
+    )
+
+    with _zipfile.ZipFile(tmp_path, "r") as zf:
+        md_content = zf.read(main_md).decode("utf-8")
+        # 其他文件（排除系统文件和其他 .md 可选保留）
+        other_files = [
+            n for n in names
+            if n != main_md
+            and not n.endswith("/")
+            and not _Path(n).name.startswith(".")
+            and not n.startswith("__MACOSX")
+        ]
+
+    parsed = _parse_skill_md(md_content)
+    if not parsed["name"]:
+        _os.unlink(tmp_path)
+        raise HTTPException(400, "主 .md 文件缺少 frontmatter 中的 name 字段")
+
+    # 检查同名 skill
+    existing = db.query(Skill).filter(Skill.name == parsed["name"]).first()
+
+    if user.role == Role.SUPER_ADMIN:
+        new_status = SkillStatus.PUBLISHED
+        new_scope = "company"
+        initial_stage = None
+    else:
+        new_status = SkillStatus.REVIEWING
+        new_scope = "personal"
+        initial_stage = "super_pending" if user.role == Role.DEPT_ADMIN else "dept_pending"
+
+    if existing:
+        skill_id = existing.id
+        latest = existing.versions[0] if existing.versions else None
+        new_ver = (latest.version + 1) if latest else 1
+        v = SkillVersion(
+            skill_id=skill_id,
+            version=new_ver,
+            system_prompt=parsed["system_prompt"],
+            variables=parsed["variables"],
+            required_inputs=latest.required_inputs if latest else [],
+            model_config_id=latest.model_config_id if latest else None,
+            created_by=user.id,
+            change_note="从 zip 包上传更新",
+        )
+        db.add(v)
+        if parsed["description"]:
+            existing.description = parsed["description"]
+        action = "updated"
+        version = new_ver
+    else:
+        skill = Skill(
+            name=parsed["name"],
+            description=parsed["description"],
+            mode="hybrid",
+            status=new_status,
+            scope=new_scope,
+            auto_inject=True,
+            created_by=user.id,
+            source_type="local",
+        )
+        db.add(skill)
+        db.flush()
+        skill_id = skill.id
+        v = SkillVersion(
+            skill_id=skill_id,
+            version=1,
+            system_prompt=parsed["system_prompt"],
+            variables=parsed["variables"],
+            created_by=user.id,
+            change_note="从 zip 包上传创建",
+        )
+        db.add(v)
+        if initial_stage:
+            from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus as AStatus
+            approval = ApprovalRequest(
+                request_type=ApprovalRequestType.SKILL_PUBLISH,
+                target_id=skill_id,
+                target_type="skill",
+                requester_id=user.id,
+                status=AStatus.PENDING,
+                stage=initial_stage,
+            )
+            db.add(approval)
+        action = "created"
+        version = 1
+
+    # 提取附属文件到 uploads/skills/<skill_id>/
+    upload_base = _Path(settings.UPLOAD_DIR) / "skills" / str(skill_id)
+    upload_base.mkdir(parents=True, exist_ok=True)
+
+    saved_files = []
+    if other_files:
+        with _zipfile.ZipFile(tmp_path, "r") as zf:
+            for name in other_files:
+                safe_name = _Path(name).name  # 只取文件名，防止路径穿越
+                if not safe_name:
+                    continue
+                dest = upload_base / safe_name
+                data = zf.read(name)
+                dest.write_bytes(data)
+                saved_files.append({
+                    "filename": safe_name,
+                    "path": f"uploads/skills/{skill_id}/{safe_name}",
+                    "size": len(data),
+                })
+
+    # 更新 source_files
+    target_skill = db.get(Skill, skill_id)
+    if target_skill:
+        target_skill.source_files = saved_files
+
+    db.commit()
+    _os.unlink(tmp_path)
+
+    return {
+        "action": action,
+        "id": skill_id,
+        "name": parsed["name"],
+        "version": version,
+        "status": new_status.value if not existing else (existing.status.value),
+        "source_files": saved_files,
+        "stage": initial_stage,
+    }
 
 
 # ─── Skill ranking / hot list ─────────────────────────────────────────────────
@@ -579,13 +753,21 @@ def get_skill(
     if not skill:
         raise HTTPException(404, "Skill not found")
 
-    # employee: no versions at all
-    if user.role == Role.EMPLOYEE:
-        return _skill_summary(skill)
-
-    # dept_admin: show prompt only for own department's skills
+    is_external = skill.source_type in ("imported", "forked")
     is_own_dept = (user.role == Role.DEPT_ADMIN and skill.department_id == user.department_id)
     is_super = user.role == Role.SUPER_ADMIN
+
+    # employee: 外部引入的可看完整内容，内部 local 只看摘要
+    if user.role == Role.EMPLOYEE:
+        if not is_external:
+            return _skill_summary(skill)
+        # 外部引入：返回最新版 system_prompt（只读，不含版本历史）
+        latest = skill.versions[0] if skill.versions else None
+        return {
+            **_skill_summary(skill),
+            "source_type": skill.source_type,
+            "system_prompt": latest.system_prompt if latest else "",
+        }
 
     def _version_dict(v) -> dict:
         base = {
@@ -599,12 +781,13 @@ def get_skill(
             "created_by": v.created_by,
             "created_at": v.created_at.isoformat(),
         }
-        if is_super or is_own_dept:
+        if is_super or is_own_dept or is_external:
             base["system_prompt"] = v.system_prompt
         return base
 
     return {
         **_skill_summary(skill),
+        "source_type": skill.source_type,
         "versions": [_version_dict(v) for v in skill.versions],
     }
 
@@ -724,6 +907,35 @@ def update_status(
 
     db.commit()
     return {"id": skill_id, "status": status, "scope": skill.scope}
+
+
+class BatchPublishRequest(BaseModel):
+    skill_ids: list[int]
+    scope: str = "company"  # company / department / personal
+
+
+@router.post("/batch-publish")
+def batch_publish(
+    req: BatchPublishRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """超管批量发布 Skill，全部设为 published + 指定 scope。"""
+    if req.scope not in ("company", "department", "personal"):
+        raise HTTPException(400, "Invalid scope")
+    results = []
+    for skill_id in req.skill_ids:
+        skill = db.get(Skill, skill_id)
+        if not skill:
+            results.append({"id": skill_id, "ok": False, "reason": "not found"})
+            continue
+        skill.status = SkillStatus.PUBLISHED
+        skill.scope = req.scope
+        _ensure_skill_policy(skill_id, user, db)
+        results.append({"id": skill_id, "ok": True, "name": skill.name})
+    db.commit()
+    ok_count = sum(1 for r in results if r["ok"])
+    return {"published": ok_count, "total": len(req.skill_ids), "results": results}
 
 
 def _ensure_skill_policy(skill_id: int, user: User, db) -> None:
@@ -926,6 +1138,14 @@ def delete_skill(
     db.execute(text("DELETE FROM skill_versions WHERE skill_id = :sid"), {"sid": sid})
     # conversations 置空 skill_id（保留对话记录）
     db.execute(text("UPDATE conversations SET skill_id = NULL WHERE skill_id = :sid"), {"sid": sid})
+    # 清理附属文件目录（如果有）
+    from pathlib import Path as _Path
+    from app.config import settings
+    import shutil as _shutil
+    skill_files_dir = _Path(settings.UPLOAD_DIR) / "skills" / str(sid)
+    if skill_files_dir.exists():
+        _shutil.rmtree(skill_files_dir, ignore_errors=True)
+
     db.delete(skill)
     db.commit()
     return {"ok": True}
