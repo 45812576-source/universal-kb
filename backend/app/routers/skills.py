@@ -175,12 +175,8 @@ def create_skill(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    # 员工无权创建 Skill
-    if user.role == Role.EMPLOYEE:
-        raise HTTPException(403, "员工不能创建 Skill")
-
-    # DEPT_ADMIN 限额：最多 3 个未发布 Skill
-    if user.role == Role.DEPT_ADMIN:
+    # 员工/部门管理员：最多 3 个未发布的个人 Skill
+    if user.role in (Role.EMPLOYEE, Role.DEPT_ADMIN):
         unpublished_count = (
             db.query(Skill)
             .filter(
@@ -1117,10 +1113,11 @@ def delete_skill(
     # 级联删除关联记录（外键约束）
     from sqlalchemy import text
     sid = skill_id
+    # 子 skill 的 parent 引用置空（自引用外键）
+    db.execute(text("UPDATE skills SET parent_skill_id = NULL WHERE parent_skill_id = :sid"), {"sid": sid})
     # skill_policies 下的子表先删
     db.execute(text("DELETE FROM skill_mask_overrides WHERE skill_id = :sid"), {"sid": sid})
     db.execute(text("DELETE FROM role_policy_overrides WHERE skill_policy_id IN (SELECT id FROM skill_policies WHERE skill_id = :sid)"), {"sid": sid})
-    db.execute(text("DELETE FROM role_output_masks WHERE skill_policy_id IN (SELECT id FROM skill_policies WHERE skill_id = :sid)"), {"sid": sid})
     db.execute(text("DELETE FROM skill_output_schemas WHERE skill_id = :sid"), {"sid": sid})
     db.execute(text("DELETE FROM skill_agent_connections WHERE skill_policy_id IN (SELECT id FROM skill_policies WHERE skill_id = :sid) OR connected_skill_id = :sid"), {"sid": sid})
     db.execute(text("DELETE FROM handoff_executions WHERE upstream_skill_id = :sid OR downstream_skill_id = :sid"), {"sid": sid})
@@ -1128,6 +1125,7 @@ def delete_skill(
     db.execute(text("DELETE FROM handoff_templates WHERE upstream_skill_id = :sid OR downstream_skill_id = :sid"), {"sid": sid})
     db.execute(text("DELETE FROM skill_policies WHERE skill_id = :sid"), {"sid": sid})
     db.execute(text("DELETE FROM approval_requests WHERE target_id = :sid AND target_type = 'skill'"), {"sid": sid})
+    db.execute(text("DELETE FROM workspace_skills WHERE skill_id = :sid"), {"sid": sid})
     # skill 自身关联表
     db.execute(text("DELETE FROM skill_attributions WHERE skill_id = :sid"), {"sid": sid})
     db.execute(text("DELETE FROM skill_tools WHERE skill_id = :sid"), {"sid": sid})
@@ -1146,8 +1144,12 @@ def delete_skill(
     if skill_files_dir.exists():
         _shutil.rmtree(skill_files_dir, ignore_errors=True)
 
-    db.delete(skill)
-    db.commit()
+    try:
+        db.delete(skill)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"删除失败，数据库约束错误：{e}")
     return {"ok": True}
 
 

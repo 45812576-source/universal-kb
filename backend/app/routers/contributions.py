@@ -293,12 +293,87 @@ OPENCODE_DB_PATH = os.environ.get(
 )
 
 
+def _read_one_opencode_db(db_path: str) -> dict:
+    """从单个 OpenCode SQLite 读取汇总用量。返回单个用户的统计 dict。"""
+    import json as _json
+
+    result = {
+        "sessions": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "models": {},
+        "files_changed": 0,
+        "lines_added": 0,
+        "lines_deleted": 0,
+        "_file_set": set(),
+        "output_files": [],
+    }
+
+    if not os.path.exists(db_path):
+        return result
+
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        try:
+            session_rows = con.execute(
+                "SELECT id, title, summary_files, summary_additions, summary_deletions FROM session"
+            ).fetchall()
+            msg_rows = con.execute(
+                "SELECT m.data FROM message m "
+                "WHERE json_extract(m.data, '$.role') = 'assistant' "
+                "  AND json_extract(m.data, '$.error') IS NULL"
+            ).fetchall()
+            part_rows = con.execute(
+                "SELECT p.data, s.title FROM part p "
+                "JOIN session s ON s.id = p.session_id "
+                "WHERE json_extract(p.data, '$.type') = 'tool' "
+                "  AND json_extract(p.data, '$.tool') IN ('write', 'edit', 'patch')"
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception:
+        return result
+
+    for row in session_rows:
+        result["sessions"] += 1
+        result["files_changed"] += row["summary_files"] or 0
+        result["lines_added"] += row["summary_additions"] or 0
+        result["lines_deleted"] += row["summary_deletions"] or 0
+
+    for row in msg_rows:
+        try:
+            data = _json.loads(row["data"])
+        except Exception:
+            continue
+        tokens = data.get("tokens") or {}
+        cache = tokens.get("cache") or {}
+        result["input_tokens"] += tokens.get("input") or 0
+        result["output_tokens"] += tokens.get("output") or 0
+        result["cache_read_tokens"] += cache.get("read") or 0
+        model = data.get("modelID") or ""
+        if model:
+            result["models"][model] = result["models"].get(model, 0) + 1
+
+    for row in part_rows:
+        try:
+            data = _json.loads(row["data"])
+        except Exception:
+            continue
+        state = data.get("state") or {}
+        inp = state.get("input") or {}
+        file_path = inp.get("filePath") or inp.get("file_path") or ""
+        if file_path and file_path not in result["_file_set"]:
+            result["_file_set"].add(file_path)
+            result["output_files"].append({"path": file_path, "session_title": row["title"] or ""})
+
+    del result["_file_set"]
+    return result
+
+
 def _read_opencode_db() -> dict[str, dict]:
-    """从 OpenCode SQLite 读取按 directory 聚合的用量数据。
-    返回 {directory: {sessions, input_tokens, output_tokens, models,
-                      files_changed, lines_added, lines_deleted, output_files}}
-    output_files: [{path, session_title}, ...] 去重后列表
-    """
+    """兼容旧接口：读全局单一 SQLite，返回 {directory: stats}（仅供全局 DB 场景使用）。"""
     if not os.path.exists(OPENCODE_DB_PATH):
         return {}
 
@@ -307,24 +382,17 @@ def _read_opencode_db() -> dict[str, dict]:
     con = sqlite3.connect(f"file:{OPENCODE_DB_PATH}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     try:
-        # session 级别：代码产出 + 标题（用 directory 分组）
         session_rows = con.execute(
             "SELECT id, directory, title, summary_files, summary_additions, summary_deletions FROM session"
         ).fetchall()
-
-        # message 级别：token 用量（assistant 角色，无 error）
         msg_rows = con.execute(
-            "SELECT s.directory, m.data "
-            "FROM message m "
+            "SELECT s.directory, m.data FROM message m "
             "JOIN session s ON s.id = m.session_id "
             "WHERE json_extract(m.data, '$.role') = 'assistant' "
             "  AND json_extract(m.data, '$.error') IS NULL"
         ).fetchall()
-
-        # part 级别：write/edit 工具调用 → 提取 filePath
         part_rows = con.execute(
-            "SELECT p.data, s.directory, s.title "
-            "FROM part p "
+            "SELECT p.data, s.directory, s.title FROM part p "
             "JOIN session s ON s.id = p.session_id "
             "WHERE json_extract(p.data, '$.type') = 'tool' "
             "  AND json_extract(p.data, '$.tool') IN ('write', 'edit', 'patch')"
@@ -337,48 +405,38 @@ def _read_opencode_db() -> dict[str, dict]:
     def _ws(directory: str) -> dict:
         if directory not in result:
             result[directory] = {
-                "sessions": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cache_read_tokens": 0,
-                "models": {},
-                "files_changed": 0,
-                "lines_added": 0,
-                "lines_deleted": 0,
-                "_file_set": set(),
-                "output_files": [],
+                "sessions": 0, "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "models": {}, "files_changed": 0,
+                "lines_added": 0, "lines_deleted": 0, "_file_set": set(), "output_files": [],
             }
         return result[directory]
 
     for row in session_rows:
-        directory = row["directory"] or "__unknown__"
-        ws = _ws(directory)
+        d = row["directory"] or "__unknown__"
+        ws = _ws(d)
         ws["sessions"] += 1
         ws["files_changed"] += row["summary_files"] or 0
         ws["lines_added"] += row["summary_additions"] or 0
         ws["lines_deleted"] += row["summary_deletions"] or 0
 
     for row in msg_rows:
-        directory = row["directory"] or "__unknown__"
+        d = row["directory"] or "__unknown__"
         try:
             data = _json.loads(row["data"])
         except Exception:
             continue
         tokens = data.get("tokens") or {}
         cache = tokens.get("cache") or {}
-        inp = tokens.get("input") or 0
-        out = tokens.get("output") or 0
-        cr = cache.get("read") or 0
+        ws = _ws(d)
+        ws["input_tokens"] += tokens.get("input") or 0
+        ws["output_tokens"] += tokens.get("output") or 0
+        ws["cache_read_tokens"] += cache.get("read") or 0
         model = data.get("modelID") or ""
-        ws = _ws(directory)
-        ws["input_tokens"] += inp
-        ws["output_tokens"] += out
-        ws["cache_read_tokens"] += cr
         if model:
             ws["models"][model] = ws["models"].get(model, 0) + 1
 
     for row in part_rows:
-        directory = row["directory"] or "__unknown__"
+        d = row["directory"] or "__unknown__"
         try:
             data = _json.loads(row["data"])
         except Exception:
@@ -388,13 +446,10 @@ def _read_opencode_db() -> dict[str, dict]:
         file_path = inp.get("filePath") or inp.get("file_path") or ""
         if not file_path:
             continue
-        ws = _ws(directory)
+        ws = _ws(d)
         if file_path not in ws["_file_set"]:
             ws["_file_set"].add(file_path)
-            ws["output_files"].append({
-                "path": file_path,
-                "session_title": row["title"] or "",
-            })
+            ws["output_files"].append({"path": file_path, "session_title": row["title"] or ""})
 
     for ws in result.values():
         del ws["_file_set"]
@@ -408,6 +463,7 @@ class MappingCreate(BaseModel):
     opencode_workspace_id: str
     opencode_workspace_name: Optional[str] = None
     user_id: int
+    directory: Optional[str] = None
 
 
 class MappingUpdate(BaseModel):
@@ -446,6 +502,7 @@ def list_mappings(
             "opencode_workspace_name": m.opencode_workspace_name,
             "user_id": m.user_id,
             "display_name": m.user.display_name if m.user else None,
+            "directory": m.directory,
         }
         for m in mappings
     ]
@@ -462,10 +519,27 @@ def create_mapping(
     ).first()
     if existing:
         raise HTTPException(400, "该 workspace 已有映射，请先删除再重建")
+
+    # 自动从 OpenCode SQLite 查 worktree 路径作为 directory
+    directory = req.directory
+    if not directory and req.opencode_workspace_id and os.path.exists(OPENCODE_DB_PATH):
+        try:
+            con = sqlite3.connect(f"file:{OPENCODE_DB_PATH}?mode=ro", uri=True)
+            con.row_factory = sqlite3.Row
+            row = con.execute(
+                "SELECT worktree FROM project WHERE id = ?", (req.opencode_workspace_id,)
+            ).fetchone()
+            con.close()
+            if row:
+                directory = row["worktree"]
+        except Exception:
+            pass
+
     mapping = OpenCodeWorkspaceMapping(
         opencode_workspace_id=req.opencode_workspace_id,
         opencode_workspace_name=req.opencode_workspace_name,
         user_id=req.user_id,
+        directory=directory,
     )
     db.add(mapping)
     db.commit()
@@ -507,22 +581,34 @@ def delete_mapping(
 
 # ─── OpenCode 用量统计 ─────────────────────────────────────────────────────────
 
+def _resolve_user_db(mapping: "OpenCodeWorkspaceMapping") -> str:
+    """找到用户实际的 opencode.db 路径，优先用 mapping.directory，不行则按名字找 studio_workspaces。"""
+    from app.config import settings as _cfg
+    studio_root = os.path.abspath(os.path.expanduser(getattr(_cfg, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
+
+    candidates = []
+    if mapping.directory:
+        candidates.append(mapping.directory)
+    if mapping.opencode_workspace_name:
+        candidates.append(os.path.join(studio_root, mapping.opencode_workspace_name))
+
+    for wdir in candidates:
+        db_path = os.path.join(wdir, ".local", "share", "opencode", "opencode.db")
+        if os.path.exists(db_path):
+            return db_path
+    return ""
+
+
 def compute_and_store_opencode_usage(db: Session) -> None:
-    """读取 OpenCode SQLite，按用户聚合后写入缓存表。由定时任务和手动触发调用。"""
+    """读取各用户 OpenCode SQLite，按用户聚合后写入缓存表。由定时任务和手动触发调用。"""
     import datetime as dt
     from app.models.opencode import OpenCodeUsageCache
-    from app.models.skill import Skill, SkillStatus
+    from app.models.skill import Skill
     from app.models.tool import ToolRegistry
 
-    # 取有 directory 的映射（自动方案）；无 directory 的旧映射忽略
-    mappings = db.query(OpenCodeWorkspaceMapping).filter(
-        OpenCodeWorkspaceMapping.directory != None
-    ).all()
-    ws_data = _read_opencode_db()  # key = session.directory
+    mappings = db.query(OpenCodeWorkspaceMapping).all()
 
-    # 统计每个用户从 dev-studio 提交的 skill/tool 数量
-    # dev-studio 保存的 skill: source_type='local', created_by=user.id
-    # dev-studio 保存的 tool: created_by=user.id
+    # 统计每个用户提交的 skill/tool 数量
     skill_counts: dict[int, int] = {}
     for row in db.query(Skill.created_by, func.count(Skill.id)).filter(
         Skill.source_type == "local"
@@ -540,38 +626,36 @@ def compute_and_store_opencode_usage(db: Session) -> None:
     user_stats: dict[int, dict] = {}
     for m in mappings:
         uid = m.user_id
-        # 匹配所有 directory 以 m.directory 开头的 session（精确匹配或子目录）
+        if not m.directory and not m.opencode_workspace_name:
+            continue
+
+        user_db = _resolve_user_db(m)
+        if not user_db:
+            continue
+        ws = _read_one_opencode_db(user_db)
+
         if uid not in user_stats:
             user_stats[uid] = {
-                "sessions": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cache_read_tokens": 0,
-                "files_changed": 0,
-                "lines_added": 0,
-                "lines_deleted": 0,
-                "models": {},
-                "workspaces": [],
-                "output_files": [],
+                "sessions": 0, "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "files_changed": 0, "lines_added": 0,
+                "lines_deleted": 0, "models": {}, "workspaces": [], "output_files": [],
                 "_file_paths": set(),
             }
         s = user_stats[uid]
-        for dir_key, ws in ws_data.items():
-            if dir_key == m.directory or dir_key.startswith(m.directory + "/") or dir_key.startswith(m.directory + os.sep):
-                s["sessions"] += ws.get("sessions", 0)
-                s["input_tokens"] += ws.get("input_tokens", 0)
-                s["output_tokens"] += ws.get("output_tokens", 0)
-                s["cache_read_tokens"] += ws.get("cache_read_tokens", 0)
-                s["files_changed"] += ws.get("files_changed", 0)
-                s["lines_added"] += ws.get("lines_added", 0)
-                s["lines_deleted"] += ws.get("lines_deleted", 0)
-                for model, cnt in ws.get("models", {}).items():
-                    s["models"][model] = s["models"].get(model, 0) + cnt
-                for f in ws.get("output_files", []):
-                    if f["path"] not in s["_file_paths"]:
-                        s["_file_paths"].add(f["path"])
-                        s["output_files"].append(f)
-        s["workspaces"].append(m.opencode_workspace_name or m.directory or str(uid))
+        s["sessions"] += ws["sessions"]
+        s["input_tokens"] += ws["input_tokens"]
+        s["output_tokens"] += ws["output_tokens"]
+        s["cache_read_tokens"] += ws["cache_read_tokens"]
+        s["files_changed"] += ws["files_changed"]
+        s["lines_added"] += ws["lines_added"]
+        s["lines_deleted"] += ws["lines_deleted"]
+        for model, cnt in ws["models"].items():
+            s["models"][model] = s["models"].get(model, 0) + cnt
+        for f in ws["output_files"]:
+            if f["path"] not in s["_file_paths"]:
+                s["_file_paths"].add(f["path"])
+                s["output_files"].append(f)
+        s["workspaces"].append(m.opencode_workspace_name or os.path.basename(m.directory) or str(uid))
 
     now = dt.datetime.utcnow()
     for uid, s in user_stats.items():

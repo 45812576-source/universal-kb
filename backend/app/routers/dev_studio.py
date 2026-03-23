@@ -374,10 +374,6 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
     async with inst["lock"]:
         proc: Optional[asyncio.subprocess.Process] = inst["proc"]
 
-        # 已有进程且还活着，直接复用
-        if proc is not None and proc.returncode is None:
-            return {"port": inst["port"], "url": "/opencode"}
-
         opencode_bin = _find_opencode()
         if not opencode_bin:
             raise HTTPException(503, "opencode 未安装，请先运行: npm install -g opencode-ai")
@@ -407,7 +403,24 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
         lemondata_key = getattr(_settings, "LEMONDATA_API_KEY", "") or os.environ.get("LEMONDATA_API_KEY", "")
         use_ark_fallback = _runtime_fallback["use_ark"] or getattr(_settings, "BAILIAN_FALLBACK_TO_ARK", False)
 
+        # 先读取旧配置内容，用于检测是否需要重启
+        config_path = os.path.join(workdir, "opencode.json")
+        old_config = ""
+        if os.path.exists(config_path):
+            with open(config_path, encoding="utf-8") as _f:
+                old_config = _f.read()
+
         _write_opencode_config(workdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=use_ark_fallback, lemondata_key=lemondata_key)
+
+        # 已有进程且还活着：若配置无变化直接复用，否则重启使新配置生效
+        with open(config_path, encoding="utf-8") as _f:
+            new_config = _f.read()
+        if proc is not None and proc.returncode is None:
+            if old_config == new_config:
+                return {"port": inst["port"], "url": "/opencode"}
+            # 配置有变化，终止旧进程，下方代码负责重启
+            proc.terminate()
+            inst["proc"] = None
 
         # 每用户独立数据目录（持久化，session db 隔离）
         user_data_dir = os.path.join(workdir, ".local", "share")

@@ -269,6 +269,7 @@ def get_project(
             "shared_at": s.shared_at.isoformat() if s.shared_at else None,
         }
         for s in shares
+        if not (s.knowledge and s.knowledge.source_type == "project_chat_log")
     ]
     return _filter_project_fields(result, user, db)
 

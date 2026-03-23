@@ -171,14 +171,6 @@ async def upload_knowledge(
 
     entry = submit_knowledge(db, entry)
 
-    # 向量索引（后台，不阻塞响应）
-    try:
-        from app.services import vector_service
-        vector_service.index_knowledge(entry.id, content, created_by=user.id)
-    except Exception as _ve:
-        import logging
-        logging.getLogger(__name__).warning(f"Vector indexing failed for entry {entry.id}: {_ve}")
-
     return {
         "id": entry.id,
         "status": entry.status.value,
