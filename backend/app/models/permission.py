@@ -339,6 +339,7 @@ class HandoffSchemaCache(Base):
 class ApprovalRequestType(str, enum.Enum):
     SKILL_PUBLISH = "skill_publish"
     TOOL_PUBLISH = "tool_publish"
+    WEBAPP_PUBLISH = "webapp_publish"
     SCOPE_CHANGE = "scope_change"
     MASK_OVERRIDE = "mask_override"
     SCHEMA_APPROVAL = "schema_approval"

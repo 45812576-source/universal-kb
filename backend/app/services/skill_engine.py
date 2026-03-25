@@ -10,12 +10,45 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from fastapi import HTTPException
+
 from app.models.conversation import Conversation, Message, MessageRole
 from app.models.knowledge import KnowledgeEntry, KnowledgeStatus
 from app.models.skill import Skill, SkillMode, SkillStatus
 from app.models.user import User
 from app.services.llm_gateway import llm_gateway
 from app.services import prompt_compiler
+
+
+def _check_model_grant(db: Session, model_config: dict, user_id: int | None) -> None:
+    """如果该 model_id 在 user_model_grants 表中有授权记录，说明是受限模型，
+    检查当前用户是否在授权名单中。model_key 格式支持 'model_id' 或 'provider/model_id'。"""
+    from app.models.opencode import UserModelGrant
+    model_id = model_config.get("model_id", "")
+    # 查这个模型是否存在任何授权记录（即是否是受限模型）
+    any_grant = (
+        db.query(UserModelGrant)
+        .filter(
+            (UserModelGrant.model_key == model_id) |
+            UserModelGrant.model_key.like(f"%/{model_id}")
+        )
+        .first()
+    )
+    if any_grant is None:
+        return  # 不是受限模型，放行
+    if user_id is None:
+        raise HTTPException(403, f"模型 {model_id} 需要授权才能使用")
+    user_grant = (
+        db.query(UserModelGrant)
+        .filter(
+            UserModelGrant.user_id == user_id,
+            (UserModelGrant.model_key == model_id) |
+            UserModelGrant.model_key.like(f"%/{model_id}")
+        )
+        .first()
+    )
+    if user_grant is None:
+        raise HTTPException(403, f"您没有使用模型 {model_id} 的权限，请联系管理员申请授权")
 
 
 @dataclass
@@ -436,12 +469,16 @@ class SkillEngine:
         user_message: str,
         user_id: int | None = None,
         active_skill_ids: list[int] | None = None,
+        force_skill_id: int | None = None,
     ) -> PrepareResult:
         """Prepare everything needed for LLM call: skill matching, knowledge injection,
         prompt compilation, and message list assembly.
 
         If a short-circuit result is produced (rule engine / data query / input eval),
         it is stored in PrepareResult.early_return and the caller should return it directly.
+
+        force_skill_id: 沙盒测试模式，直接使用指定 skill（允许 draft，跳过匹配和权限检查，
+                        仅允许调用本人创建的 skill）。
         """
         default_config = llm_gateway.get_config(db)
 
@@ -465,6 +502,82 @@ class SkillEngine:
 
         # 1. Skill matching
         skill = None
+
+        # 沙盒模式：直接使用指定 skill，跳过所有匹配逻辑（允许 draft，仅限本人）
+        if force_skill_id is not None:
+            forced = db.get(Skill, force_skill_id)
+            if forced and (user_id is None or forced.created_by == user_id):
+                skill = forced
+                if conversation.skill_id != skill.id:
+                    conversation.skill_id = skill.id
+                    db.flush()
+                # 沙盒模式直接跳到后续准备阶段，不做 skill 切换/权限检查
+                skill_version = skill.versions[0] if skill and skill.versions else None
+                model_config_id = skill_version.model_config_id if skill_version else None
+                if not model_config_id and workspace and getattr(workspace, "model_config_id", None):
+                    model_config_id = workspace.model_config_id
+                model_config = llm_gateway.get_config(db, model_config_id)
+                _check_model_grant(db, model_config, user_id)
+
+                messages = (
+                    db.query(Message)
+                    .filter(Message.conversation_id == conversation.id)
+                    .order_by(Message.created_at)
+                    .all()
+                )
+
+                # 编译 prompt 并返回
+                if skill_version:
+                    base_prompt = self._inject_templates(skill_version.system_prompt or "")
+                    structured_ctx = self._get_latest_structured_output(messages)
+                    system_content = prompt_compiler.compile(
+                        system_prompt=base_prompt,
+                        output_schema=skill_version.output_schema,
+                        extracted_vars={},
+                        structured_context=structured_ctx,
+                    )
+                else:
+                    system_content = _DEFAULT_SYSTEM
+
+                knowledge_ctx = await self._inject_knowledge(
+                    user_message, skill, db=db, user_id=user_id,
+                )
+                if knowledge_ctx:
+                    system_content += f"\n\n## 参考知识\n\n{knowledge_ctx}"
+
+                # 构建消息列表（同主流程）
+                raw_pairs: list[tuple] = []
+                pending_user = None
+                for m in messages:
+                    if m.role == MessageRole.USER:
+                        if pending_user is not None:
+                            raw_pairs.append((pending_user, None))
+                        pending_user = m
+                    elif m.role == MessageRole.ASSISTANT:
+                        asst_content = (m.content or "").strip()
+                        if pending_user is not None and asst_content:
+                            raw_pairs.append((pending_user, m))
+                            pending_user = None
+
+                llm_messages = [{"role": "system", "content": system_content}]
+                for user_m, asst_m in raw_pairs:
+                    if asst_m is None:
+                        continue
+                    llm_messages.append({"role": "user", "content": user_m.content})
+                    llm_messages.append({"role": "assistant", "content": asst_m.content})
+                llm_messages.append({"role": "user", "content": user_message})
+
+                return PrepareResult(
+                    llm_messages=llm_messages,
+                    model_config=model_config,
+                    skill_name=skill.name,
+                    skill_id=skill.id,
+                    skill_version=skill_version,
+                    workspace=workspace,
+                    available_tools=[],
+                    tools_schema=[],
+                )
+
         current_skill = db.get(Skill, conversation.skill_id) if conversation.skill_id else None
 
         # active_skill_ids 限制：若当前 skill 不在激活列表内，视为无 current_skill
@@ -546,6 +659,7 @@ class SkillEngine:
         if not model_config_id and workspace and getattr(workspace, "model_config_id", None):
             model_config_id = workspace.model_config_id
         model_config = llm_gateway.get_config(db, model_config_id)
+        _check_model_grant(db, model_config, user_id)
 
         # Helper to build early PrepareResult
         def _early(result: tuple[str, dict]) -> PrepareResult:
@@ -910,8 +1024,9 @@ class SkillEngine:
         user_message: str,
         user_id: int | None = None,
         active_skill_ids: list[int] | None = None,
+        force_skill_id: int | None = None,
     ) -> tuple[str, dict]:
-        prep = await self.prepare(db, conversation, user_message, user_id, active_skill_ids)
+        prep = await self.prepare(db, conversation, user_message, user_id, active_skill_ids, force_skill_id=force_skill_id)
 
         # Short-circuit: prepare already produced a final result
         if prep.early_return is not None:

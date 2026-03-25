@@ -9,7 +9,7 @@ import tempfile
 from typing import Optional
 
 import aiohttp
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -23,9 +23,36 @@ router = APIRouter(prefix="/api/dev-studio", tags=["dev-studio"])
 
 # ─── 按用户隔离的实例池 ────────────────────────────────────────────────────────
 # 每个 user_id 对应独立的 opencode 进程 + workdir + 端口
-# 结构：{user_id: {"proc": Process, "port": int, "workdir": str, "lock": Lock}}
+# 结构：{user_id: {"proc": Process, "port": int, "workdir": str, "lock": Lock, "last_active": float}}
 _user_instances: dict = {}
 _instances_lock: object = None   # 全局 asyncio.Lock，保护 _user_instances 写入
+
+IDLE_TIMEOUT_SECONDS = 1800  # 30分钟无操作自动回收
+_REAPER_INTERVAL = 600       # 每10分钟检查一次
+_idle_reaper_task = None
+
+
+async def _idle_reaper() -> None:
+    """后台任务：每10分钟扫一遍，超过1小时没活动的 opencode 进程自动杀掉。"""
+    while True:
+        await asyncio.sleep(_REAPER_INTERVAL)
+        now = _time.time()
+        for uid, inst in list(_user_instances.items()):
+            proc = inst.get("proc")
+            if proc is None or proc.returncode is not None:
+                continue
+            last = inst.get("last_active", now)
+            if now - last > IDLE_TIMEOUT_SECONDS:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                inst["proc"] = None
+
+
+def _start_idle_reaper():
+    global _idle_reaper_task
+    _idle_reaper_task = asyncio.create_task(_idle_reaper())
 
 OPENCODE_BASE_PORT = 17171   # user_id=1 → 17172, user_id=2 → 17173, ...
 
@@ -311,6 +338,65 @@ def _write_opencode_config(
     config_path = os.path.join(workdir, "opencode.json")
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
+    # opencode 优先读 XDG_CONFIG_HOME/opencode/config.json，同步写一份确保生效
+    xdg_config_dir = os.path.join(workdir, ".config", "opencode")
+    os.makedirs(xdg_config_dir, exist_ok=True)
+    with open(os.path.join(xdg_config_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+
+def _sync_company_skills_to_workdir(workdir: str) -> None:
+    """把公司级 published skill 的 system_prompt 写到 workdir/.opencode/skills/*.md。
+
+    opencode 会自动发现该目录下的 .md 文件作为可加载的 skill。
+    每次启动时全量刷新，确保 skill 内容与数据库同步。
+    """
+    from app.database import SessionLocal
+    from app.models.skill import Skill, SkillStatus, SkillVersion
+
+    # 两个路径都写：.opencode/skills/（项目级）和 .config/opencode/skills/（XDG_CONFIG_HOME级）
+    skills_dir = os.path.join(workdir, ".opencode", "skills")
+    skills_dir_xdg = os.path.join(workdir, ".config", "opencode", "skills")
+    os.makedirs(skills_dir, exist_ok=True)
+    os.makedirs(skills_dir_xdg, exist_ok=True)
+
+    db = SessionLocal()
+    try:
+        skills = (
+            db.query(Skill)
+            .filter(Skill.status == SkillStatus.PUBLISHED, Skill.scope == "company")
+            .all()
+        )
+        written = set()
+        for skill in skills:
+            ver = (
+                db.query(SkillVersion)
+                .filter(SkillVersion.skill_id == skill.id)
+                .order_by(SkillVersion.version.desc())
+                .first()
+            )
+            if not ver or not ver.system_prompt:
+                continue
+            # 文件名用 skill.name，替换不安全字符
+            import re as _re
+            safe = _re.sub(r'[^\w\u4e00-\u9fff\-]', '_', skill.name).strip('_')
+            filename = f"{safe}.md"
+            filepath = os.path.join(skills_dir, filename)
+            content = f"---\ndescription: {skill.description or skill.name}\n---\n\n{ver.system_prompt}"
+            for d in (skills_dir, skills_dir_xdg):
+                with open(os.path.join(d, filename), "w", encoding="utf-8") as f:
+                    f.write(content)
+            written.add(filename)
+
+        # 清理已删除或不再是 published/company 的旧文件
+        for d in (skills_dir, skills_dir_xdg):
+            for existing in os.listdir(d):
+                if existing.endswith(".md") and existing not in written:
+                    os.remove(os.path.join(d, existing))
+    except Exception:
+        pass  # skill 同步失败不影响实例启动
+    finally:
+        db.close()
 
 
 def _find_opencode() -> Optional[str]:
@@ -368,6 +454,7 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
                 "port": _port_for_user(user_id),
                 "workdir": None,
                 "lock": asyncio.Lock(),
+                "last_active": _time.time(),
             }
 
     inst = _user_instances[user_id]
@@ -397,6 +484,29 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             with open(readme, "w", encoding="utf-8") as f:
                 f.write(f"# {display_name or folder_name} 的工作台\n\n这是你的专属开发工作台，文件会持久保存。\n")
 
+        # 始终写入 .gitignore，避免 opencode snapshot 把子仓库的 packfile 吸进来导致磁盘爆炸
+        # snapshot 仓库的 worktree 指向 workdir，会读这里的 .gitignore
+        _gitignore_path = os.path.join(workdir, ".gitignore")
+        _gitignore_content = (
+            "# 排除嵌套 git 仓库内容，防止 snapshot 把 packfile 反复快照\n"
+            ".git/\n"
+            "*.pack\n"
+            "*.idx\n"
+            "# 常见大目录\n"
+            "node_modules/\n"
+            ".venv/\n"
+            "venv/\n"
+            "__pycache__/\n"
+        )
+        with open(_gitignore_path, "w", encoding="utf-8") as _f:
+            _f.write(_gitignore_content)
+
+        # 双保险：同步写 snapshot 裸仓库的 info/exclude
+        _snapshot_info = os.path.join(workdir, ".local", "share", "opencode", "snapshot", "global", "info")
+        if os.path.isdir(_snapshot_info):
+            with open(os.path.join(_snapshot_info, "exclude"), "w", encoding="utf-8") as _f:
+                _f.write(_gitignore_content)
+
         from app.config import settings as _settings
         bailian_key = getattr(_settings, "BAILIAN_API_KEY", "") or os.environ.get("BAILIAN_API_KEY", "")
         ark_key = getattr(_settings, "ARK_API_KEY", "") or os.environ.get("ARK_API_KEY", "")
@@ -412,11 +522,15 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
 
         _write_opencode_config(workdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=use_ark_fallback, lemondata_key=lemondata_key)
 
+        # 将公司级 published skill 写入 .opencode/skills/，供 opencode 按需加载
+        _sync_company_skills_to_workdir(workdir)
+
         # 已有进程且还活着：若配置无变化直接复用，否则重启使新配置生效
         with open(config_path, encoding="utf-8") as _f:
             new_config = _f.read()
         if proc is not None and proc.returncode is None:
             if old_config == new_config:
+                inst["last_active"] = _time.time()
                 return {"port": inst["port"], "url": "/opencode"}
             # 配置有变化，终止旧进程，下方代码负责重启
             proc.terminate()
@@ -437,6 +551,19 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             proc_env["ARK_API_KEY"] = ark_key
         if lemondata_key:
             proc_env["LEMONDATA_API_KEY"] = lemondata_key
+        # 禁止 opencode web 自动在服务器本机打开浏览器标签。
+        # opencode 在 macOS 上通过调用系统 `open` 命令打开浏览器，
+        # 在 PATH 最前面注入一个假 `open` 脚本来拦截这个行为。
+        fake_open_dir = os.path.join(workdir, ".bin")
+        os.makedirs(fake_open_dir, exist_ok=True)
+        fake_open_path = os.path.join(fake_open_dir, "open")
+        if not os.path.exists(fake_open_path):
+            with open(fake_open_path, "w") as _f:
+                _f.write("#!/bin/sh\n# stub: suppress opencode auto-open browser\nexit 0\n")
+            os.chmod(fake_open_path, 0o755)
+        proc_env["PATH"] = fake_open_dir + ":" + proc_env.get("PATH", "")
+        # 限制每个 opencode 进程的 Node.js 堆内存，防止单进程无限膨胀
+        proc_env["NODE_OPTIONS"] = "--max-old-space-size=2048"
 
         frontend_origins = [
             o.strip()
@@ -467,10 +594,15 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
 
         inst["proc"] = new_proc
         inst["workdir"] = workdir
+        inst["last_active"] = _time.time()
 
         # 启动百炼用量监控（全局只跑一个）
         if _usage_counter["monitor_task"] is None or _usage_counter["monitor_task"].done():
             _usage_counter["monitor_task"] = asyncio.create_task(_bailian_usage_monitor())
+
+        # 启动空闲进程回收任务（全局只跑一个）
+        if _idle_reaper_task is None or _idle_reaper_task.done():
+            _start_idle_reaper()
 
         return {"port": port, "url": "/opencode"}
 
@@ -567,6 +699,21 @@ async def get_instance(
         db.commit()
 
     return {"url": info["url"], "port": info["port"], "status": "ready"}
+
+
+# ─── POST /restart — 强制重启当前用户的 opencode 实例 ─────────────────────────
+
+@router.post("/restart")
+async def restart_instance(user: User = Depends(get_current_user)):
+    """强制杀掉当前用户的 opencode 进程，下次 /instance 请求时重新启动。"""
+    inst = _user_instances.get(user.id)
+    if inst:
+        proc = inst.get("proc")
+        if proc is not None and proc.returncode is None:
+            proc.terminate()
+            inst["proc"] = None
+    info = await _ensure_user_instance(user.id, display_name=user.display_name or "")
+    return {"status": "restarted", "port": info["port"]}
 
 
 # ─── GET /user-port — Next.js 代理用：查询当前用户的 opencode 端口 ────────────
@@ -730,20 +877,14 @@ def save_skill(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    from app.models.user import Role
-
-    # 超管直接发布，其他人进审批流
-    is_super = user.role == Role.SUPER_ADMIN
-    initial_status = SkillStatus.PUBLISHED if is_super else SkillStatus.REVIEWING
-    initial_scope = "company" if is_super else "personal"
-
+    # 统一创建为草稿，由用户在 Skills & Tools 页面沙盒测试通过后手动提交发布
     skill = Skill(
         name=req.name,
         description=req.description,
-        scope=initial_scope,
+        scope="personal",
         mode="hybrid",
         created_by=user.id,
-        status=initial_status,
+        status=SkillStatus.DRAFT,
         auto_inject=True,
         source_type="local",
     )
@@ -759,29 +900,546 @@ def save_skill(
     )
     db.add(version)
 
-    approval_id = None
-    if not is_super:
-        from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus
-        from app.models.user import Role as R
-        # 部门管理员跳过部门审批，直接到超管
-        stage = "super_pending" if user.role == R.DEPT_ADMIN else "dept_pending"
-        approval = ApprovalRequest(
-            request_type=ApprovalRequestType.skill_publish,
-            target_id=skill.id,
-            target_type="skill",
-            requester_id=user.id,
-            status=ApprovalStatus.pending,
-            stage=stage,
-        )
-        db.add(approval)
-        db.flush()
-        approval_id = approval.id
-
     db.commit()
     db.refresh(skill)
     return {
         "id": skill.id,
         "name": skill.name,
-        "status": skill.status,
-        "approval_id": approval_id,
+        "status": skill.status.value,
+        "approval_id": None,
     }
+
+
+# ─── Transfer Table to Workdir ────────────────────────────────────────────────
+
+class TransferTableRequest(BaseModel):
+    table_name: str
+    format: str = "csv"   # "csv" | "json" | "sql"
+    filename: Optional[str] = None   # 留空则自动生成
+
+
+@router.post("/transfer-table")
+async def transfer_table(
+    req: TransferTableRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """将业务表全量数据导出并写入当前用户的 opencode workdir 根目录。"""
+    import csv
+    import io
+    import json as _json
+    import re
+    from sqlalchemy import text as _text
+    from app.models.business import BusinessTable
+    from app.config import settings as _cfg
+
+    # 1. 校验格式
+    fmt = req.format.lower()
+    if fmt not in ("csv", "json", "sql"):
+        raise HTTPException(400, "format 只支持 csv / json / sql")
+
+    # 2. 确认表已注册
+    bt = db.query(BusinessTable).filter(BusinessTable.table_name == req.table_name).first()
+    if not bt:
+        raise HTTPException(404, f"业务表 '{req.table_name}' 未注册")
+
+    # 3. 拉取全量数据（不分页）
+    rows_result = db.execute(_text(f"SELECT * FROM `{req.table_name}`"))
+    columns = list(rows_result.keys())
+    raw_rows = [dict(zip(columns, row)) for row in rows_result.fetchall()]
+
+    # 序列化
+    import datetime, decimal
+
+    def _ser(v):
+        if isinstance(v, (datetime.datetime, datetime.date)):
+            return v.isoformat()
+        if isinstance(v, decimal.Decimal):
+            return float(v)
+        if isinstance(v, bytes):
+            return v.decode("utf-8", errors="replace")
+        return v
+
+    rows = [{k: _ser(v) for k, v in r.items()} for r in raw_rows]
+
+    # 4. 生成文件内容
+    table_name = req.table_name
+    if fmt == "csv":
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+        content = buf.getvalue()
+        ext = "csv"
+    elif fmt == "json":
+        content = _json.dumps(rows, ensure_ascii=False, indent=2)
+        ext = "json"
+    else:  # sql
+        lines = [f"-- {bt.display_name or table_name} seed data\n"]
+        for row in rows:
+            col_str = ", ".join(f"`{c}`" for c in columns)
+            val_parts = []
+            for c in columns:
+                v = row[c]
+                if v is None:
+                    val_parts.append("NULL")
+                elif isinstance(v, (int, float)):
+                    val_parts.append(str(v))
+                else:
+                    val_parts.append("'" + str(v).replace("'", "''") + "'")
+            val_str = ", ".join(val_parts)
+            lines.append(f"INSERT INTO `{table_name}` ({col_str}) VALUES ({val_str});")
+        content = "\n".join(lines)
+        ext = "sql"
+
+    # 5. 确定用户 workdir
+    import re as _re
+    studio_root = os.path.abspath(os.path.expanduser(getattr(_cfg, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
+    safe_name = _re.sub(r'[^\w\u4e00-\u9fff\-]', '_', user.display_name).strip('_') if user.display_name else ""
+    folder_name = safe_name if safe_name else f"user_{user.id}"
+    workdir = os.path.join(studio_root, folder_name)
+    os.makedirs(workdir, exist_ok=True)
+
+    # 6. 写文件
+    if req.filename:
+        # 安全检查：不允许路径分隔符或 ..
+        safe_filename = os.path.basename(req.filename)
+    else:
+        safe_filename = f"{table_name}.{ext}"
+
+    dest = os.path.join(workdir, safe_filename)
+    with open(dest, "w", encoding="utf-8", newline="" if fmt == "csv" else "\n") as f:
+        f.write(content)
+
+    return {
+        "ok": True,
+        "filename": safe_filename,
+        "rows": len(rows),
+        "format": fmt,
+        "workdir": workdir,
+    }
+
+
+# ─── Upload File to Workdir ───────────────────────────────────────────────────
+
+@router.post("/upload-file")
+async def upload_file(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+):
+    """将用户上传的文件直接写入其 opencode workdir 根目录。"""
+    import re as _re
+    from app.config import settings as _cfg
+
+    # 确定用户 workdir（与 _ensure_user_instance 保持一致）
+    studio_root = os.path.abspath(os.path.expanduser(getattr(_cfg, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
+    safe_name = _re.sub(r'[^\w\u4e00-\u9fff\-]', '_', user.display_name).strip('_') if user.display_name else ""
+    folder_name = safe_name if safe_name else f"user_{user.id}"
+    workdir = os.path.join(studio_root, folder_name)
+    os.makedirs(workdir, exist_ok=True)
+
+    # 安全处理文件名：只取 basename，去掉路径分隔符
+    safe_filename = os.path.basename(file.filename or "upload")
+    if not safe_filename:
+        safe_filename = "upload"
+
+    dest = os.path.join(workdir, safe_filename)
+    content = await file.read()
+    with open(dest, "wb") as f:
+        f.write(content)
+
+    return {
+        "ok": True,
+        "filename": safe_filename,
+        "size": len(content),
+    }
+
+
+# ─── POST /analyze-project — 分析项目目录，生成可发布的 Web App HTML ──────────
+
+def _read_and_patch_html(project_path: str, skip_dirs: set, assigned_port: int, original_port) -> tuple[str, str]:
+    """找 index.html 并替换 localhost 路径，返回 (html_content, entry_path)。"""
+    import re as _re
+    html_files: list[str] = []
+    for root, dirs, files in os.walk(project_path):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for fname in files:
+            if fname.lower().endswith((".html", ".htm")):
+                html_files.append(os.path.join(root, fname))
+    if not html_files:
+        return "", ""
+    entry = next((f for f in html_files if os.path.basename(f).lower() == "index.html"), html_files[0])
+    try:
+        html = open(entry, encoding="utf-8", errors="replace").read()
+    except Exception:
+        return "", entry
+    # 替换原始端口
+    if original_port:
+        html = html.replace(f"http://localhost:{original_port}", f"/api/webapp-proxy/{assigned_port}")
+        html = html.replace(f"http://127.0.0.1:{original_port}", f"/api/webapp-proxy/{assigned_port}")
+    # 兜底替换所有剩余 localhost
+    html = _re.sub(
+        r'http://(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?(/[^"\'\s]*)',
+        lambda m: f"/api/webapp-proxy/{assigned_port}" + m.group(1),
+        html,
+    )
+    # 替换 API_BASE = '/api...' 模式（匹配 '/api'、'/api/proxy'、'/api/xxx' 等任意相对路径）
+    html = _re.sub(
+        r"""(const\s+API_BASE\s*=\s*['"])/api[^'"]*(['"])""",
+        rf"\g<1>/api/webapp-proxy/{assigned_port}\g<2>",
+        html,
+    )
+    return html, entry
+
+
+class AnalyzeProjectRequest(BaseModel):
+    project_path: str
+    name: str = ""
+    description: str = ""
+
+
+@router.post("/analyze-project")
+async def analyze_project(
+    req: AnalyzeProjectRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    分析项目目录，按类型自动选择发布策略：
+    - Next.js 全栈：生成 iframe 包装页，backend_cmd=npm start
+    - Node/Python 后端：读 index.html 替换路径，backend_cmd 指向启动文件
+    - 纯静态 HTML：读 index.html 替换路径，无 backend
+    """
+    import re as _re
+    import json as _json
+    from app.models.web_app import WebApp
+    from app.routers.web_apps import _user_port
+    import secrets as _secrets
+
+    # 1. 安全校验
+    project_path = os.path.abspath(os.path.expanduser(req.project_path))
+    if not os.path.isdir(project_path):
+        raise HTTPException(400, f"路径不存在或不是目录：{project_path}")
+
+    SKIP_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv", ".trae", ".bin", ".local", ".config", ".next", "dist", "build"}
+    assigned_port = _user_port(user.id)
+    app_name = req.name.strip() or os.path.basename(project_path) or "未命名应用"
+
+    # 2. 递归扫描目录树，收集特征文件（不限根目录）
+    # 记录：{ 'package.json': [路径,...], 'server.js': [...], ... }
+    found: dict[str, list[str]] = {}
+    for root, dirs, files in os.walk(project_path):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fname in files:
+            found.setdefault(fname, []).append(os.path.join(root, fname))
+
+    # 3. 按优先级判断类型
+    # 关键原则：同类特征文件有多个时，优先选层级最浅的（路径最短 = 最靠近项目根）
+    def _shallowest(paths: list[str]) -> list[str]:
+        """按路径深度升序排序，层级最浅的排最前。"""
+        return sorted(paths, key=lambda p: p.count(os.sep))
+
+    project_type = "static"
+    pkg = {}
+    backend_cwd: str | None = None
+    backend_cmd: str | None = None
+    original_port: int | None = None
+
+    # Node/Next.js：遍历所有 package.json，优先最浅层
+    for pkg_path in _shallowest(found.get("package.json", [])):
+        try:
+            p = _json.loads(open(pkg_path).read())
+        except Exception:
+            continue
+        deps = {**p.get("dependencies", {}), **p.get("devDependencies", {})}
+        pkg_dir = os.path.dirname(pkg_path)
+
+        # Next.js
+        if "next" in deps:
+            project_type = "nextjs"
+            pkg = p
+            backend_cwd = pkg_dir
+            break
+
+        # 纯前端框架（React/Vue/Vite/Angular）— 需要 build，无 Node 后端进程
+        SPA_MARKERS = {"react", "vue", "vite", "@angular/core", "svelte", "solid-js"}
+        if SPA_MARKERS & set(deps.keys()) and not any(
+            os.path.exists(os.path.join(pkg_dir, f)) for f in ["server.js", "app.js", "index.js"]
+        ):
+            project_type = "spa"
+            pkg = p
+            backend_cwd = pkg_dir
+            break
+
+        # Node 后端：package.json 同目录有启动文件
+        for js_entry in ["server.js", "app.js", "index.js"]:
+            candidate = os.path.join(pkg_dir, js_entry)
+            if os.path.exists(candidate):
+                project_type = "node"
+                pkg = p
+                backend_cwd = pkg_dir
+                js_src = open(candidate, encoding="utf-8", errors="replace").read()
+                # 检测是否已支持 PORT 环境变量
+                has_env_port = bool(_re.search(r'process\.env\.PORT', js_src))
+                m = _re.search(r'(?:const|let|var)\s+PORT\s*=\s*(\d{4,5})', js_src)
+                if m:
+                    original_port = int(m.group(1))
+                    if not has_env_port:
+                        # 自动修改源文件，加上环境变量读取
+                        js_src_fixed = js_src.replace(
+                            m.group(0),
+                            m.group(0).replace(m.group(1), f"process.env.PORT || {m.group(1)}")
+                        )
+                        with open(candidate, "w", encoding="utf-8") as _f:
+                            _f.write(js_src_fixed)
+                break
+        if project_type != "static":
+            break
+
+    # Python：遍历所有 requirements.txt，优先最浅层
+    if project_type == "static":
+        for req_path in _shallowest(found.get("requirements.txt", [])):
+            req_dir = os.path.dirname(req_path)
+            for py_entry in ["app.py", "main.py", "server.py", "run.py"]:
+                candidate = os.path.join(req_dir, py_entry)
+                if os.path.exists(candidate):
+                    project_type = "python"
+                    backend_cwd = req_dir
+                    py_src = open(candidate, encoding="utf-8", errors="replace").read()
+                    has_env_port = bool(_re.search(r'os\.environ|os\.getenv', py_src))
+                    m = _re.search(r'(port\s*=\s*)(\d{4,5})', py_src, _re.IGNORECASE)
+                    if m:
+                        original_port = int(m.group(2))
+                        if not has_env_port:
+                            # 自动修改源文件，加上环境变量读取
+                            py_src_fixed = py_src.replace(
+                                m.group(0),
+                                f"{m.group(1)}int(os.environ.get('PORT', {m.group(2)}))"
+                            )
+                            # 确保 import os 存在
+                            if "import os" not in py_src_fixed:
+                                py_src_fixed = "import os\n" + py_src_fixed
+                            with open(candidate, "w", encoding="utf-8") as _f:
+                                _f.write(py_src_fixed)
+                    break
+            if project_type != "static":
+                break
+
+    # 4A. Next.js
+    if project_type == "nextjs":
+        start_script = pkg.get("scripts", {}).get("start", "npm start")
+        backend_cmd = f"PORT={assigned_port} {start_script}"
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{app_name}</title>
+<style>*{{margin:0;padding:0;box-sizing:border-box}}html,body,iframe{{width:100%;height:100%;border:none}}</style>
+</head>
+<body>
+<iframe src="/api/webapp-proxy/{assigned_port}/" allow="same-origin"></iframe>
+</body>
+</html>"""
+
+    # 4B. SPA（React/Vue/Vite）：需要先 build，从 dist/build 目录找 HTML
+    elif project_type == "spa":
+        build_dir = None
+        for d in ["dist", "build", "out", ".next/static"]:
+            candidate = os.path.join(backend_cwd, d)
+            if os.path.isdir(candidate):
+                build_dir = candidate
+                break
+        if not build_dir:
+            raise HTTPException(400, f"SPA 项目尚未构建，请先在项目目录执行 npm run build，再发布")
+        html_content, _ = _read_and_patch_html(build_dir, SKIP_DIRS, assigned_port, None)
+        if not html_content:
+            raise HTTPException(400, "构建目录下没有找到 index.html")
+        # SPA 无需后端进程
+
+    # 4C. Node.js
+    elif project_type == "node":
+        for js_entry in ["server.js", "app.js", "index.js"]:
+            if os.path.exists(os.path.join(backend_cwd, js_entry)):
+                start_script = pkg.get("scripts", {}).get("start", "")
+                backend_cmd = start_script if start_script else f"node {js_entry}"
+                break
+        html_content, _ = _read_and_patch_html(project_path, SKIP_DIRS, assigned_port, original_port)
+
+    # 4D. Python
+    elif project_type == "python":
+        for py_entry in ["app.py", "main.py", "server.py", "run.py"]:
+            if os.path.exists(os.path.join(backend_cwd, py_entry)):
+                backend_cmd = f"python {py_entry}"
+                break
+        html_content, _ = _read_and_patch_html(project_path, SKIP_DIRS, assigned_port, original_port)
+        # Python 全栈无前端 HTML：生成 iframe 代理页
+        if not html_content and backend_cmd:
+            html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{app_name}</title>
+<style>*{{margin:0;padding:0;box-sizing:border-box}}html,body,iframe{{width:100%;height:100%;border:none}}</style>
+</head>
+<body>
+<iframe src="/api/webapp-proxy/{assigned_port}/" allow="same-origin"></iframe>
+</body>
+</html>"""
+
+    # 4E. 纯静态 HTML
+    else:
+        html_content, entry = _read_and_patch_html(project_path, SKIP_DIRS, assigned_port, None)
+        if not html_content:
+            raise HTTPException(400, "项目目录下没有找到 HTML 文件，请先用「完成开发，准备发布」Skill 生成 index.html")
+
+    # 4. 创建 WebApp 记录（先插入拿到 id，再算端口、更新 html）
+    from app.routers.web_apps import _app_port
+    share_token = _secrets.token_urlsafe(16)
+    web_app = WebApp(
+        name=app_name,
+        description=req.description.strip() or f"从 {project_path} 发布（{project_type}）",
+        html_content="",  # 先占位
+        created_by=user.id,
+        is_public=True,
+        share_token=share_token,
+        backend_cmd=backend_cmd,
+        backend_cwd=backend_cwd,
+        backend_port=None,
+    )
+    db.add(web_app)
+    db.flush()  # 拿到 auto-increment id，还未 commit
+
+    # 用 app_id 确定端口，替换 html 中的端口占位
+    final_port = _app_port(web_app.id) if backend_cmd else None
+    if final_port and backend_cmd:
+        # 替换 html 里之前用 assigned_port 占位的地址
+        html_content = html_content.replace(
+            f"/api/webapp-proxy/{assigned_port}",
+            f"/api/webapp-proxy/{final_port}",
+        )
+        web_app.backend_port = final_port
+        # Next.js 的 backend_cmd 里也有端口
+        if project_type == "nextjs":
+            web_app.backend_cmd = backend_cmd.replace(str(assigned_port), str(final_port))
+
+    web_app.html_content = html_content
+    db.commit()
+    db.refresh(web_app)
+
+    return {
+        "id": web_app.id,
+        "name": web_app.name,
+        "project_type": project_type,
+        "share_token": share_token,
+        "preview_url": f"/api/web-apps/{web_app.id}/preview",
+        "share_url": f"/share/{share_token}",
+        "backend_port": final_port,
+        "has_backend": bool(backend_cmd),
+    }
+
+
+# ─── Workdir File Manager ──────────────────────────────────────────────────────
+
+def _user_workdir(user: User) -> str:
+    """返回当前用户的 workdir 路径，不存在则创建。"""
+    import re as _re
+    from app.config import settings as _cfg
+    studio_root = os.path.abspath(os.path.expanduser(getattr(_cfg, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
+    safe_name = _re.sub(r'[^\w\u4e00-\u9fff\-]', '_', user.display_name).strip('_') if user.display_name else ""
+    folder_name = safe_name if safe_name else f"user_{user.id}"
+    workdir = os.path.join(studio_root, folder_name)
+    os.makedirs(workdir, exist_ok=True)
+    return workdir
+
+
+def _safe_path(workdir: str, rel: str) -> str:
+    """将相对路径解析为绝对路径，确保不超出 workdir（防路径穿越）。"""
+    abs_path = os.path.normpath(os.path.join(workdir, rel.lstrip("/")))
+    if not abs_path.startswith(workdir):
+        raise HTTPException(400, "路径不合法")
+    return abs_path
+
+
+_TREE_SKIP = {
+    ".git", ".bin", ".bun", ".cache", ".config", ".local",
+    "node_modules", "__pycache__", ".venv", "venv",
+    ".next", "dist", "build", ".trae",
+}
+
+def _tree(base: str, rel: str = "") -> list:
+    """递归列出目录树，返回节点列表（跳过隐藏/构建/依赖目录）。"""
+    abs_dir = os.path.join(base, rel) if rel else base
+    nodes = []
+    try:
+        entries = sorted(os.scandir(abs_dir), key=lambda e: (not e.is_dir(), e.name.lower()))
+    except PermissionError:
+        return nodes
+    for entry in entries:
+        # 跳过隐藏目录和已知大目录
+        if entry.is_dir() and (entry.name in _TREE_SKIP or entry.name.startswith(".")):
+            continue
+        node_rel = os.path.join(rel, entry.name) if rel else entry.name
+        if entry.is_dir():
+            nodes.append({"name": entry.name, "path": node_rel, "type": "dir", "children": _tree(base, node_rel)})
+        else:
+            stat = entry.stat()
+            nodes.append({"name": entry.name, "path": node_rel, "type": "file", "size": stat.st_size, "mtime": stat.st_mtime})
+    return nodes
+
+
+@router.get("/workdir/tree")
+def workdir_tree(user: User = Depends(get_current_user)):
+    """返回用户 workdir 的完整文件树。"""
+    workdir = _user_workdir(user)
+    return {"workdir": workdir, "tree": _tree(workdir)}
+
+
+class MkdirRequest(BaseModel):
+    path: str   # 相对路径，如 "seed_data/v2"
+
+
+@router.post("/workdir/mkdir")
+def workdir_mkdir(req: MkdirRequest, user: User = Depends(get_current_user)):
+    """在 workdir 内新建文件夹（含多级）。"""
+    workdir = _user_workdir(user)
+    target = _safe_path(workdir, req.path)
+    os.makedirs(target, exist_ok=True)
+    return {"ok": True, "path": req.path}
+
+
+class RenameRequest(BaseModel):
+    src: str   # 相对路径
+    dst: str   # 相对路径
+
+
+@router.post("/workdir/rename")
+def workdir_rename(req: RenameRequest, user: User = Depends(get_current_user)):
+    """重命名或移动文件/文件夹（src → dst，均为相对路径）。"""
+    workdir = _user_workdir(user)
+    src = _safe_path(workdir, req.src)
+    dst = _safe_path(workdir, req.dst)
+    if not os.path.exists(src):
+        raise HTTPException(404, "源路径不存在")
+    if os.path.exists(dst):
+        raise HTTPException(400, "目标路径已存在")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.move(src, dst)
+    return {"ok": True}
+
+
+class DeleteRequest(BaseModel):
+    path: str   # 相对路径
+
+
+@router.post("/workdir/delete")
+def workdir_delete(req: DeleteRequest, user: User = Depends(get_current_user)):
+    """删除 workdir 内的文件或文件夹。"""
+    workdir = _user_workdir(user)
+    target = _safe_path(workdir, req.path)
+    if not os.path.exists(target):
+        raise HTTPException(404, "路径不存在")
+    if os.path.isdir(target):
+        shutil.rmtree(target)
+    else:
+        os.remove(target)
+    return {"ok": True}

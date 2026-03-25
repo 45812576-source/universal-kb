@@ -171,15 +171,15 @@ class LLMGateway:
                         continue
 
     def get_lite_config(self) -> dict:
-        """DeepSeek config for lightweight calls (intent/input checks). No DB needed."""
-        api_key = os.getenv("DEEPSEEK_API_KEY", "")
+        """Lightweight LLM config for intent/input checks. No DB needed."""
+        api_key = os.getenv("ARK_API_KEY", "")
         if not api_key:
-            raise ValueError("DEEPSEEK_API_KEY not set")
+            raise ValueError("ARK_API_KEY not set")
         return {
-            "provider": "deepseek",
-            "model_id": "deepseek-chat",
-            "api_base": "https://api.deepseek.com/v1",
-            "api_key_env": "DEEPSEEK_API_KEY",
+            "provider": "ark",
+            "model_id": "doubao-seed-2.0-code",
+            "api_base": "https://ark.cn-beijing.volces.com/api/coding/v3",
+            "api_key_env": "ARK_API_KEY",
             "api_key": api_key,
             "max_tokens": 512,
             "temperature": "0.1",

@@ -86,13 +86,27 @@ def list_rows(
 ):
     bt = _get_registered_table(db, table_name)
     offset = (page - 1) * page_size
+    rules = bt.validation_rules or {}
 
-    # Check ownership / permission injection
-    ownership = db.query(DataOwnership).filter(DataOwnership.table_name == table_name).first()
     from app.models.user import Role
+    is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
+
+    # ── Row scope: check validation_rules["row_scope"] ──
+    row_scope = rules.get("row_scope", "all")
+    if not is_admin and row_scope == "private":
+        # Private: only admins can see
+        return {"total": 0, "page": page, "page_size": page_size, "columns": [], "rows": []}
+
     base_sql = f"SELECT * FROM `{table_name}`"
-    # For non-super-admins, inject row ownership filter at DB level
-    if ownership and user.role != Role.SUPER_ADMIN:
+
+    if not is_admin and row_scope == "department":
+        dept_ids = rules.get("row_department_ids") or []
+        if dept_ids and user.department_id not in dept_ids:
+            return {"total": 0, "page": page, "page_size": page_size, "columns": [], "rows": []}
+
+    # Legacy DataOwnership row-filter (owner/department field matching)
+    ownership = db.query(DataOwnership).filter(DataOwnership.table_name == table_name).first()
+    if ownership and not is_admin:
         conditions = []
         if ownership.owner_field:
             conditions.append(f"`{ownership.owner_field}` = {user.id}")
@@ -107,19 +121,38 @@ def list_rows(
         text(base_sql + " LIMIT :limit OFFSET :offset"),
         {"limit": page_size, "offset": offset},
     )
-    columns = list(rows_result.keys())
-    rows = [_serialize_row(dict(zip(columns, row))) for row in rows_result.fetchall()]
+    all_columns = list(rows_result.keys())
+    rows = [_serialize_row(dict(zip(all_columns, row))) for row in rows_result.fetchall()]
 
-    # Apply field-level visibility (desensitize)
+    # ── Column scope + hidden_fields ──
+    hidden_fields: list[str] = rules.get("hidden_fields") or []
+    col_scope = rules.get("column_scope", "all")
+    if not is_admin:
+        if col_scope == "private":
+            # No columns visible for non-admins
+            rows = [{} for _ in rows]
+            all_columns = []
+        elif col_scope == "department":
+            dept_ids = rules.get("column_department_ids") or []
+            if dept_ids and user.department_id not in dept_ids:
+                rows = [{} for _ in rows]
+                all_columns = []
+
+    # Remove hidden fields
+    if hidden_fields and all_columns:
+        all_columns = [c for c in all_columns if c not in hidden_fields]
+        rows = [{k: v for k, v in row.items() if k not in hidden_fields} for row in rows]
+
+    # Apply legacy field-level visibility (desensitize)
     if ownership:
-        desensitize_config = (bt.validation_rules or {}).get("desensitize_fields", {})
+        desensitize_config = rules.get("desensitize_fields", {})
         rows = data_visibility.apply_visibility(rows, user, ownership, desensitize_config)
 
     return {
         "total": count_result,
         "page": page,
         "page_size": page_size,
-        "columns": columns,
+        "columns": all_columns,
         "rows": rows,
     }
 

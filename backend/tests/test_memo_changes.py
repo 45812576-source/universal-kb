@@ -988,6 +988,53 @@ class TestApprovalToolTargetDetail:
         tool_resp = client.get(f"/api/tools/{tool.id}", headers=_auth(super_token))
         assert tool_resp.json()["status"] == "draft"
 
+    def test_super_admin_approves_dept_pending_tool_directly(self, client, db):
+        """员工提交后，超级管理员可直接批准，无需部门管理员先审批。"""
+        dept = _make_dept(db)
+        emp = _make_user(db, "dir_emp", Role.EMPLOYEE, dept.id)
+        super_adm = _make_user(db, "dir_super", Role.SUPER_ADMIN, dept.id)
+        db.commit()
+
+        emp_token = _login(client, "dir_emp")
+        super_token = _login(client, "dir_super")
+
+        from app.models.tool import ToolRegistry, ToolType
+        tool = ToolRegistry(
+            name="dir_tool", display_name="dir", description="dir",
+            tool_type=ToolType.BUILTIN, config={}, input_schema={},
+            output_format="json", created_by=emp.id,
+            is_active=False, scope="personal", status="draft",
+        )
+        db.add(tool)
+        db.commit()
+
+        submit_resp = client.patch(
+            f"/api/tools/{tool.id}/status",
+            headers=_auth(emp_token),
+            json={"status": "published", "scope": "company"},
+        )
+        assert submit_resp.status_code == 200
+        assert submit_resp.json()["stage"] == "dept_pending"
+
+        approvals = client.get("/api/approvals", headers=_auth(super_token)).json()
+        appr = next((a for a in approvals["items"] if a["target_id"] == tool.id), None)
+        assert appr is not None
+        assert appr["stage"] == "dept_pending"
+
+        act = client.post(
+            f"/api/approvals/{appr['id']}/actions",
+            headers=_auth(super_token),
+            json={"action": "approve"},
+        )
+        assert act.status_code == 200
+        assert act.json()["status"] == "approved"
+
+        approval_detail = client.get(f"/api/approvals/{appr['id']}", headers=_auth(super_token)).json()
+        assert approval_detail["status"] == "approved"
+
+        tool_resp = client.get(f"/api/tools/{tool.id}", headers=_auth(super_token))
+        assert tool_resp.json()["status"] == "published"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 9. ToolStatusUpdate PATCH 接口（deploy_info 字段）

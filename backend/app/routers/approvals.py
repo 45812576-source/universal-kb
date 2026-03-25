@@ -76,6 +76,16 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
                 "preconditions": manifest.get("preconditions", []),
                 "deploy_info": deploy_info,
             }
+    elif r.target_type == "webapp" and r.target_id:
+        from app.models.web_app import WebApp
+        webapp = db.get(WebApp, r.target_id)
+        if webapp:
+            target_detail = {
+                "name": webapp.name,
+                "description": webapp.description or "",
+                "is_public": webapp.is_public,
+                "preview_url": f"/api/web-apps/{webapp.id}/preview",
+            }
 
     return {
         "id": r.id,
@@ -271,6 +281,12 @@ async def act_on_approval(
     )
     db.add(a)
 
+    is_webapp_publish = (
+        r.request_type == ApprovalRequestType.WEBAPP_PUBLISH
+        and r.target_type == "webapp"
+        and r.target_id
+    )
+
     # 更新申请状态
     if req.action == "approve":
         is_skill_publish = (
@@ -286,10 +302,20 @@ async def act_on_approval(
         stage = getattr(r, "stage", "dept_pending") or "dept_pending"
 
         if is_skill_publish and stage == "dept_pending":
-            # 部门管理员通过第一步 → 进入超管审批阶段，skill 仍不发布
-            if user.role not in (Role.DEPT_ADMIN, Role.SUPER_ADMIN):
-                raise HTTPException(403, "仅部门管理员可执行第一阶段审批")
-            r.stage = "super_pending"
+            # 超管可在第一阶段直接终审通过；部门管理员则推进到超管审批阶段
+            if user.role == Role.SUPER_ADMIN:
+                r.status = ApprovalStatus.APPROVED
+                from app.models.skill import Skill, SkillStatus
+                skill = db.get(Skill, r.target_id)
+                if skill:
+                    skill.status = SkillStatus.PUBLISHED
+                    skill.scope = "company"
+                    from app.routers.skills import _ensure_skill_policy
+                    _ensure_skill_policy(r.target_id, user, db)
+            elif user.role == Role.DEPT_ADMIN:
+                r.stage = "super_pending"
+            else:
+                raise HTTPException(403, "仅部门管理员或超级管理员可执行审批")
         elif is_skill_publish and stage == "super_pending":
             # 超管通过第二步 → 正式发布
             if user.role != Role.SUPER_ADMIN:
@@ -303,10 +329,29 @@ async def act_on_approval(
                 from app.routers.skills import _ensure_skill_policy
                 _ensure_skill_policy(r.target_id, user, db)
         elif is_tool_publish and stage == "dept_pending":
-            # 部门管理员通过第一步 → 进入超管审批，tool 仍不发布
-            if user.role not in (Role.DEPT_ADMIN, Role.SUPER_ADMIN):
-                raise HTTPException(403, "仅部门管理员可执行第一阶段审批")
-            r.stage = "super_pending"
+            # 超管可在第一阶段直接终审通过；部门管理员则推进到超管审批阶段
+            if user.role == Role.SUPER_ADMIN:
+                r.status = ApprovalStatus.APPROVED
+                from app.models.tool import ToolRegistry, ToolType
+                tool = db.get(ToolRegistry, r.target_id)
+                if tool:
+                    tool.status = "published"
+                    import datetime as _dt
+                    tool.updated_at = _dt.datetime.utcnow()
+                    db.commit()
+                    # MCP 工具：自动安装依赖并启动服务
+                    if tool.tool_type == ToolType.MCP:
+                        from app.services.mcp_installer import install_and_start
+                        install_result = await install_and_start(db, tool)
+                        if not install_result["ok"]:
+                            a.comment = (a.comment or "") + f"\n[MCP 安装失败] {install_result['error']}"
+                            tool.is_active = False
+                    else:
+                        tool.is_active = True
+            elif user.role == Role.DEPT_ADMIN:
+                r.stage = "super_pending"
+            else:
+                raise HTTPException(403, "仅部门管理员或超级管理员可执行审批")
         elif is_tool_publish and stage == "super_pending":
             # 超管通过第二步 → 安装并启动 MCP 服务，正式发布
             if user.role != Role.SUPER_ADMIN:
@@ -328,6 +373,25 @@ async def act_on_approval(
                         tool.is_active = False
                 else:
                     tool.is_active = True
+        elif is_webapp_publish and stage == "dept_pending":
+            if user.role == Role.SUPER_ADMIN:
+                r.status = ApprovalStatus.APPROVED
+                from app.models.web_app import WebApp
+                webapp = db.get(WebApp, r.target_id)
+                if webapp:
+                    webapp.status = "published"
+            elif user.role == Role.DEPT_ADMIN:
+                r.stage = "super_pending"
+            else:
+                raise HTTPException(403, "仅部门管理员或超级管理员可执行审批")
+        elif is_webapp_publish and stage == "super_pending":
+            if user.role != Role.SUPER_ADMIN:
+                raise HTTPException(403, "仅超级管理员可执行最终审批")
+            r.status = ApprovalStatus.APPROVED
+            from app.models.web_app import WebApp
+            webapp = db.get(WebApp, r.target_id)
+            if webapp:
+                webapp.status = "published"
         else:
             # 其他审批类型，保持原逻辑
             r.status = ApprovalStatus.APPROVED
@@ -357,7 +421,7 @@ async def act_on_approval(
                         tool.is_active = True
     elif req.action == "reject":
         r.status = ApprovalStatus.REJECTED
-        # 驳回时把 skill/tool 状态回退到 draft
+        # 驳回时把 skill/tool/webapp 状态回退到 draft
         if r.target_type == "skill" and r.target_id:
             from app.models.skill import Skill, SkillStatus
             skill = db.get(Skill, r.target_id)
@@ -371,6 +435,11 @@ async def act_on_approval(
                 tool.is_active = False
                 import datetime as _dt
                 tool.updated_at = _dt.datetime.utcnow()
+        elif r.target_type == "webapp" and r.target_id:
+            from app.models.web_app import WebApp
+            webapp = db.get(WebApp, r.target_id)
+            if webapp and webapp.status == "reviewing":
+                webapp.status = "draft"
     elif req.action == "add_conditions":
         r.status = ApprovalStatus.CONDITIONS
         if req.conditions:

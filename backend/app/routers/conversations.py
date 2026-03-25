@@ -41,6 +41,7 @@ def _classify_error(e: Exception) -> str:
 class SendMessage(BaseModel):
     content: str
     active_skill_ids: list[int] | None = None
+    force_skill_id: int | None = None  # 沙盒测试模式：强制指定 skill（允许 draft，仅限本人创建）
 
     @field_validator("content")
     @classmethod
@@ -61,10 +62,27 @@ def create_conversation(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    # opencode workspace：每人只能有一个对话，若已存在则直接返回
+    # opencode / sandbox workspace：每人只能有一个对话，若已存在则直接返回
     if req.workspace_id:
         from app.models.workspace import Workspace as WsModel
         ws = db.get(WsModel, req.workspace_id)
+        if ws and ws.workspace_type == "sandbox":
+            existing = (
+                db.query(Conversation)
+                .filter(
+                    Conversation.user_id == user.id,
+                    Conversation.workspace_id == req.workspace_id,
+                    Conversation.is_active == True,
+                )
+                .first()
+            )
+            if existing:
+                return {"id": existing.id, "title": existing.title, "workspace_id": existing.workspace_id}
+            conv = Conversation(user_id=user.id, workspace_id=req.workspace_id, title="沙盒测试")
+            db.add(conv)
+            db.commit()
+            db.refresh(conv)
+            return {"id": conv.id, "title": conv.title, "workspace_id": conv.workspace_id}
         if ws and ws.workspace_type == "opencode":
             existing = (
                 db.query(Conversation)
@@ -204,6 +222,10 @@ async def send_message(
     if conv.workspace_id:
         from app.models.workspace import Workspace as WsModel
         _ws = db.get(WsModel, conv.workspace_id)
+        if _ws and _ws.workspace_type == "sandbox":
+            # 沙盒工作台：必须携带 force_skill_id，拒绝一切无关请求
+            if not req.force_skill_id:
+                raise HTTPException(400, "沙盒测试工作台仅用于测试指定 Skill，请从技能列表发起测试")
         if _ws and _ws.workspace_type == "opencode":
             _is_opencode_conv = True
 
@@ -218,7 +240,7 @@ async def send_message(
 
     # Execute skill engine
     try:
-        result = await skill_engine.execute(db, conv, req.content, user_id=user.id, active_skill_ids=req.active_skill_ids)
+        result = await skill_engine.execute(db, conv, req.content, user_id=user.id, active_skill_ids=req.active_skill_ids, force_skill_id=req.force_skill_id)
     except ValueError as e:
         raise HTTPException(503, str(e))
     except Exception as e:
@@ -282,6 +304,13 @@ async def stream_message(
     conv = db.get(Conversation, conv_id)
     if not conv or conv.user_id != user.id:
         raise HTTPException(404, "Conversation not found")
+
+    # 沙盒工作台 guard：在 commit user message 之前检查，避免无关消息入库
+    if conv.workspace_id:
+        from app.models.workspace import Workspace as WsModel
+        _ws_pre = db.get(WsModel, conv.workspace_id)
+        if _ws_pre and _ws_pre.workspace_type == "sandbox" and not req.force_skill_id:
+            raise HTTPException(400, "沙盒测试工作台仅用于测试指定 Skill，请从技能列表发起测试")
 
     # Persist user message — commit immediately so it survives if SSE is dropped mid-stream
     user_msg = Message(
@@ -362,6 +391,7 @@ async def stream_message(
                 db, conv, req.content,
                 user_id=current_user_id,
                 active_skill_ids=req.active_skill_ids,
+                force_skill_id=req.force_skill_id,
             )
 
             # Resolve skill name for metadata
@@ -622,9 +652,11 @@ async def upload_and_chat(
     with open(saved_path, "wb") as f:
         f.write(content_bytes)
 
-    # 提取文本
+    # 提取文本（放入线程池，避免阻塞事件循环；kimi vision 等同步 IO 耗时较长）
     try:
-        file_text = extract_text(saved_path)
+        file_text = await asyncio.get_event_loop().run_in_executor(
+            None, extract_text, saved_path
+        )
     except ValueError as e:
         os.unlink(saved_path)
         raise HTTPException(400, str(e))

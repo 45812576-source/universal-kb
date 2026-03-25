@@ -281,12 +281,15 @@ def apply_schema(
             schema_generator.apply_schema(req.ddl_sql, db)
 
         # Register in business_tables
+        rules = dict(req.validation_rules or {})
+        rules.setdefault("row_scope", "private")
+        rules.setdefault("column_scope", "private")
         bt = schema_generator.register_table(
             table_name=req.table_name,
             display_name=req.display_name,
             description=req.description,
             ddl_sql=req.ddl_sql,
-            validation_rules=req.validation_rules,
+            validation_rules=rules,
             workflow=req.workflow,
             owner_id=user.id,
             db=db,
@@ -401,7 +404,7 @@ class ProbeTableRequest(BaseModel):
 @router.post("/resolve-wiki")
 async def resolve_wiki(
     req: ResolveWikiRequest,
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Resolve a Feishu Wiki node token → bitable app_token + table list."""
     from app.services.lark_client import lark_client
@@ -456,7 +459,7 @@ async def resolve_wiki(
 @router.post("/probe-bitable")
 async def probe_bitable(
     req: ProbeBitableRequest,
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Preview a Feishu Bitable table: fetch fields + first 20 records. Does NOT persist."""
     from app.services.lark_client import lark_client
@@ -545,7 +548,7 @@ _BITABLE_TYPE_MAP = {
 async def sync_bitable(
     req: SyncBitableRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Full sync: fetch ALL records from Feishu Bitable → create/replace local MySQL table → register."""
     from app.services.lark_client import lark_client
@@ -669,7 +672,13 @@ async def sync_bitable(
             display_name=display,
             description=f"飞书多维表格同步 | app_token={req.app_token} | table_id={req.table_id}",
             ddl_sql=ddl,
-            validation_rules={"bitable_app_token": req.app_token, "bitable_table_id": req.table_id, "last_synced_at": int(time.time())},
+            validation_rules={
+                "bitable_app_token": req.app_token,
+                "bitable_table_id": req.table_id,
+                "last_synced_at": int(time.time()),
+                "row_scope": "private",
+                "column_scope": "private",
+            },
             owner_id=user.id,
         )
         db.add(bt)

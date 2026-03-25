@@ -280,7 +280,19 @@ async def upload_skill_md(
     if not parsed["name"]:
         raise HTTPException(400, "文件缺少 frontmatter 中的 name 字段")
 
-    existing = db.query(Skill).filter(Skill.name == parsed["name"]).first()
+    # 先查自己名下的同名 Skill；超管可以更新任意同名 Skill
+    if user.role == Role.SUPER_ADMIN:
+        existing = db.query(Skill).filter(Skill.name == parsed["name"]).first()
+    else:
+        existing = db.query(Skill).filter(
+            Skill.name == parsed["name"],
+            Skill.created_by == user.id,
+        ).first()
+        # 名字被别人占用时给出明确提示
+        if not existing:
+            name_taken = db.query(Skill).filter(Skill.name == parsed["name"]).first()
+            if name_taken:
+                raise HTTPException(400, f"Skill 名称「{parsed['name']}」已被占用，请修改 md 文件中的 name 字段后重新上传")
 
     if existing:
         # Add a new version
@@ -308,13 +320,13 @@ async def upload_skill_md(
             "version": new_ver,
         }
     else:
-        # 超管直接发布；部门管理员和员工走双重审批
+        # 超管直接发布；其他角色先存为草稿，由用户自行决定何时提交审批
         if user.role == Role.SUPER_ADMIN:
             new_status = SkillStatus.PUBLISHED
             new_scope = "company"
         else:
-            new_status = SkillStatus.REVIEWING
-            new_scope = "personal"  # 审批通过前仅本人可见
+            new_status = SkillStatus.DRAFT
+            new_scope = "personal"
         skill = Skill(
             name=parsed["name"],
             description=parsed["description"],
@@ -335,22 +347,6 @@ async def upload_skill_md(
             change_note="从 md 文件上传创建",
         )
         db.add(v)
-        if new_status == SkillStatus.REVIEWING:
-            from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus as AStatus
-            # 部门管理员上传，跳过 dept 阶段，直接等超管审批
-            if user.role == Role.DEPT_ADMIN:
-                initial_stage = "super_pending"
-            else:
-                initial_stage = "dept_pending"
-            approval = ApprovalRequest(
-                request_type=ApprovalRequestType.SKILL_PUBLISH,
-                target_id=skill.id,
-                target_type="skill",
-                requester_id=user.id,
-                status=AStatus.PENDING,
-                stage=initial_stage,
-            )
-            db.add(approval)
         db.commit()
         db.refresh(skill)
         return {
@@ -359,7 +355,6 @@ async def upload_skill_md(
             "name": skill.name,
             "version": 1,
             "status": new_status.value,
-            "stage": initial_stage if new_status == SkillStatus.REVIEWING else None,
         }
 
 
@@ -739,6 +734,36 @@ def get_skill_usage(
     }
 
 
+def _get_rejection_comment(skill_id: int, db: Session) -> str | None:
+    """返回该 Skill 最近一次被驳回时审批人写的意见（供提交人看）。"""
+    try:
+        from app.models.permission import ApprovalRequest, ApprovalAction, ApprovalStatus, ApprovalActionType
+        req = (
+            db.query(ApprovalRequest)
+            .filter(
+                ApprovalRequest.target_id == skill_id,
+                ApprovalRequest.target_type == "skill",
+                ApprovalRequest.status == ApprovalStatus.REJECTED,
+            )
+            .order_by(ApprovalRequest.created_at.desc())
+            .first()
+        )
+        if not req:
+            return None
+        action = (
+            db.query(ApprovalAction)
+            .filter(
+                ApprovalAction.request_id == req.id,
+                ApprovalAction.action == ApprovalActionType.REJECT,
+            )
+            .order_by(ApprovalAction.created_at.desc())
+            .first()
+        )
+        return action.comment if action and action.comment else None
+    except Exception:
+        return None
+
+
 @router.get("/{skill_id}")
 def get_skill(
     skill_id: int,
@@ -785,6 +810,7 @@ def get_skill(
         **_skill_summary(skill),
         "source_type": skill.source_type,
         "versions": [_version_dict(v) for v in skill.versions],
+        "rejection_comment": _get_rejection_comment(skill.id, db),
     }
 
 
@@ -1124,6 +1150,7 @@ def delete_skill(
     db.execute(text("DELETE FROM handoff_schema_caches WHERE upstream_skill_id = :sid OR downstream_skill_id = :sid"), {"sid": sid})
     db.execute(text("DELETE FROM handoff_templates WHERE upstream_skill_id = :sid OR downstream_skill_id = :sid"), {"sid": sid})
     db.execute(text("DELETE FROM skill_policies WHERE skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM approval_actions WHERE request_id IN (SELECT id FROM approval_requests WHERE target_id = :sid AND target_type = 'skill')"), {"sid": sid})
     db.execute(text("DELETE FROM approval_requests WHERE target_id = :sid AND target_type = 'skill'"), {"sid": sid})
     db.execute(text("DELETE FROM workspace_skills WHERE skill_id = :sid"), {"sid": sid})
     # skill 自身关联表

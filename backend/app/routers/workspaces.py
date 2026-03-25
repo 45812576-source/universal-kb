@@ -22,6 +22,7 @@ from app.models.workspace import (
 router = APIRouter(prefix="/api/workspaces", tags=["workspaces"])
 
 MAX_EMPLOYEE_DRAFT = 3
+MAX_DEPT_ADMIN_WORKSPACES = 3
 
 
 # ─── Serialisation ────────────────────────────────────────────────────────────
@@ -106,7 +107,7 @@ class WorkspaceCreate(BaseModel):
     model_config_id: Optional[int] = None
     department_id: Optional[int] = None
     sort_order: int = 0
-    workspace_type: str = "chat"  # chat | opencode
+    workspace_type: str = "chat"  # chat | opencode | sandbox
 
 
 class WorkspaceUpdate(BaseModel):
@@ -121,7 +122,7 @@ class WorkspaceUpdate(BaseModel):
     model_config_id: Optional[int] = None
     department_id: Optional[int] = None
     sort_order: Optional[int] = None
-    workspace_type: Optional[str] = None  # chat | opencode，仅 super_admin
+    workspace_type: Optional[str] = None  # chat | opencode | sandbox，仅 super_admin
 
 
 class ReviewRequest(BaseModel):
@@ -190,13 +191,30 @@ def create_workspace(
                 f"最多只能创建 {MAX_EMPLOYEE_DRAFT} 个草稿工作台，请先提交审核或删除已有草稿"
             )
 
-    # Determine initial status
+    # DEPT_ADMIN total workspace quota check
+    if user.role == Role.DEPT_ADMIN:
+        total = (
+            db.query(Workspace)
+            .filter(Workspace.created_by == user.id, Workspace.is_active == True)
+            .count()
+        )
+        if total >= MAX_DEPT_ADMIN_WORKSPACES:
+            raise HTTPException(
+                400,
+                f"部门管理员最多只能创建 {MAX_DEPT_ADMIN_WORKSPACES} 个工作台"
+            )
+
+    # Determine initial status and visibility
+    # Only super_admin can publish globally (visibility=all); dept_admin is limited to department scope
     if user.role == Role.SUPER_ADMIN:
         status = WorkspaceStatus.PUBLISHED
+        visibility = req.visibility
     elif user.role == Role.DEPT_ADMIN:
         status = WorkspaceStatus.PUBLISHED
+        visibility = "department"  # dept_admin 只能建部门内可见的工作台
     else:
         status = WorkspaceStatus.DRAFT
+        visibility = "department"
 
     # Only super_admin can set system_context and workspace_type
     system_context = req.system_context if user.role == Role.SUPER_ADMIN else None
@@ -212,7 +230,7 @@ def create_workspace(
         icon=req.icon,
         color=req.color,
         category=req.category,
-        visibility=req.visibility,
+        visibility=visibility,
         welcome_message=req.welcome_message,
         system_context=system_context,
         model_config_id=req.model_config_id,
@@ -265,8 +283,8 @@ def update_workspace(
             raise HTTPException(403, "只能编辑自己的草稿工作台")
 
     for field, value in req.model_dump(exclude_none=True).items():
-        # Only super_admin can edit system_context, model_config_id, workspace_type
-        if field in ("system_context", "model_config_id", "workspace_type") and not is_super:
+        # Only super_admin can edit system_context, model_config_id, workspace_type, visibility
+        if field in ("system_context", "model_config_id", "workspace_type", "visibility") and not is_super:
             continue
         if field == "model_config_id" and value and not db.get(ModelConfig, value):
             raise HTTPException(400, "指定的模型配置不存在")
