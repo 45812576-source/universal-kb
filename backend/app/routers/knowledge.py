@@ -725,7 +725,7 @@ async def upload_image(
 
 
 @router.get("/images/{filename}")
-def serve_image(filename: str):
+def serve_image(filename: str, user: User = Depends(get_current_user)):
     """Serve an uploaded inline image."""
     from fastapi.responses import FileResponse
     if "/" in filename or "\\" in filename or ".." in filename:

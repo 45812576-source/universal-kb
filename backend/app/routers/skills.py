@@ -362,7 +362,7 @@ async def upload_skill_md(
 async def batch_upload_skill_md(
     files: list[UploadFile] = File(...),
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
 ):
     """Upload multiple .md files at once."""
     results = []
@@ -597,6 +597,155 @@ async def upload_skill_zip(
         "source_files": saved_files,
         "stage": initial_stage,
     }
+
+
+# ─── Skill file CRUD ──────────────────────────────────────────────────────────
+
+TEXT_EXTENSIONS = {".md", ".txt", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".sh", ".toml", ".xml", ".csv"}
+
+
+def _check_skill_write_access(skill: Skill, user: User):
+    if user.role != Role.SUPER_ADMIN and skill.created_by != user.id:
+        raise HTTPException(403, "无权操作此 Skill 的文件")
+
+
+def _safe_skill_dir(skill_id: int) -> "Path":
+    from pathlib import Path
+    from app.config import settings
+    return Path(settings.UPLOAD_DIR) / "skills" / str(skill_id)
+
+
+def _safe_file_path(skill_id: int, filename: str) -> "Path":
+    from pathlib import Path
+    base = _safe_skill_dir(skill_id)
+    # 防止路径穿越：只取文件名部分
+    safe = Path(filename).name
+    if not safe or safe.startswith("."):
+        raise HTTPException(400, "无效文件名")
+    return base / safe
+
+
+@router.get("/{skill_id}/files/{filename}")
+def get_skill_file(
+    skill_id: int,
+    filename: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """读取 skill 附属文件内容（文本）。"""
+    from pathlib import Path
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+    _check_skill_write_access(skill, user)
+
+    path = _safe_file_path(skill_id, filename)
+    if not path.exists():
+        raise HTTPException(404, "文件不存在")
+
+    ext = Path(filename).suffix.lower()
+    if ext not in TEXT_EXTENSIONS:
+        raise HTTPException(400, "该文件类型不支持文本预览")
+
+    return {"content": path.read_text(encoding="utf-8", errors="replace")}
+
+
+class SkillFileUpdate(BaseModel):
+    content: str
+
+
+@router.put("/{skill_id}/files/{filename}")
+def update_skill_file(
+    skill_id: int,
+    filename: str,
+    req: SkillFileUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """保存 skill 附属文件内容。若文件不存在则创建并追加到 source_files。"""
+    from pathlib import Path
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+    _check_skill_write_access(skill, user)
+
+    path = _safe_file_path(skill_id, filename)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(req.content, encoding="utf-8")
+
+    size = len(req.content.encode("utf-8"))
+    rel_path = f"uploads/skills/{skill_id}/{path.name}"
+    files = list(skill.source_files or [])
+    for f in files:
+        if f.get("filename") == path.name:
+            f["size"] = size
+            break
+    else:
+        files.append({"filename": path.name, "path": rel_path, "size": size})
+    skill.source_files = files
+    db.commit()
+    return {"ok": True, "filename": path.name, "size": size}
+
+
+@router.post("/{skill_id}/files")
+async def upload_skill_file(
+    skill_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """上传新 asset 文件到 skill 目录。"""
+    from pathlib import Path
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+    _check_skill_write_access(skill, user)
+
+    if not file.filename:
+        raise HTTPException(400, "文件名不能为空")
+    safe_name = Path(file.filename).name
+    if not safe_name or safe_name.startswith("."):
+        raise HTTPException(400, "无效文件名")
+
+    dest = _safe_skill_dir(skill_id) / safe_name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    data = await file.read()
+    dest.write_bytes(data)
+
+    files = list(skill.source_files or [])
+    rel_path = f"uploads/skills/{skill_id}/{safe_name}"
+    for f in files:
+        if f.get("filename") == safe_name:
+            f["size"] = len(data)
+            break
+    else:
+        files.append({"filename": safe_name, "path": rel_path, "size": len(data)})
+    skill.source_files = files
+    db.commit()
+    return {"ok": True, "filename": safe_name, "size": len(data), "source_files": files}
+
+
+@router.delete("/{skill_id}/files/{filename}")
+def delete_skill_file(
+    skill_id: int,
+    filename: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """删除 skill 附属文件（磁盘 + source_files 列表）。"""
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+    _check_skill_write_access(skill, user)
+
+    path = _safe_file_path(skill_id, filename)
+    if path.exists():
+        path.unlink()
+
+    files = [f for f in (skill.source_files or []) if f.get("filename") != path.name]
+    skill.source_files = files
+    db.commit()
+    return {"ok": True, "source_files": files}
 
 
 # ─── Skill ranking / hot list ─────────────────────────────────────────────────

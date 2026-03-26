@@ -75,7 +75,30 @@ async def get_engine():
 
 
 @router.websocket("/asr")
-async def asr_endpoint(websocket: WebSocket):
+async def asr_endpoint(websocket: WebSocket, token: str = None):
+    # 握手阶段校验 JWT token（通过 query param 传入）
+    from app.services.auth_service import decode_token
+    from app.database import SessionLocal
+    from app.models.user import User as _User
+
+    if not token:
+        await websocket.close(code=4401, reason="Missing token")
+        return
+
+    payload = decode_token(token)
+    if not payload:
+        await websocket.close(code=4401, reason="Invalid or expired token")
+        return
+
+    db = SessionLocal()
+    try:
+        user = db.get(_User, int(payload.get("sub", 0)))
+        if not user or not user.is_active:
+            await websocket.close(code=4403, reason="User not found or inactive")
+            return
+    finally:
+        db.close()
+
     await websocket.accept()
 
     # 等引擎加载完毕，最多等 120 秒

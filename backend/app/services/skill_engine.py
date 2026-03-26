@@ -834,9 +834,15 @@ class SkillEngine:
                 structured_context=structured_ctx,
             )
         else:
-            system_content = _DEFAULT_SYSTEM
+            # If workspace has system_context and no skill selected, use system_context as the
+            # primary system prompt (replacing _DEFAULT_SYSTEM) so it's not overridden.
+            if workspace and workspace.system_context:
+                system_content = workspace.system_context
+            else:
+                system_content = _DEFAULT_SYSTEM
 
-        if workspace and workspace.system_context:
+        if skill_version and workspace and workspace.system_context:
+            # Skill selected: append workspace rules after skill's own prompt
             system_content += f"\n\n## 工作台附加指令\n\n{workspace.system_context}"
 
         if workspace and getattr(workspace, "project_id", None):

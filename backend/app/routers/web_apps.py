@@ -12,8 +12,16 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.web_app import WebApp
-from app.models.user import User
+from app.models.user import User, Role
 from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus
+
+
+def _require_app_access(app: WebApp, user: User):
+    """owner 或管理员可访问；已发布 app 所有登录用户可读（按 publish_scope 过滤由 market 端点处理）。"""
+    is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
+    if app.created_by == user.id or is_admin:
+        return
+    raise HTTPException(status_code=403, detail="无权访问此 Web App")
 
 router = APIRouter(tags=["web-apps"])
 
@@ -176,6 +184,7 @@ def get_web_app(
     app = db.get(WebApp, app_id)
     if not app:
         raise HTTPException(status_code=404, detail="Web app not found")
+    _require_app_access(app, user)
     return _app_dict(app, include_html=True)
 
 
@@ -268,6 +277,7 @@ def start_backend(
     app = db.get(WebApp, app_id)
     if not app:
         raise HTTPException(status_code=404, detail="Web app not found")
+    _require_app_access(app, user)
     if not app.backend_cmd or not app.backend_cwd:
         return {"ok": True, "message": "无后端服务"}
 
@@ -306,6 +316,7 @@ def preview_web_app(
     app = db.get(WebApp, app_id)
     if not app:
         raise HTTPException(status_code=404, detail="Web app not found")
+    _require_app_access(app, user)
 
     # 有后端配置则自动启动
     if app.backend_cmd and app.backend_cwd:

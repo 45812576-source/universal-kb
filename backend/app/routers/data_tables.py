@@ -10,8 +10,42 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.business import AuditLog, BusinessTable, DataOwnership
-from app.models.user import User
+from app.models.user import User, Role
 from app.services.data_visibility import data_visibility
+
+
+def _check_write_permission(bt: BusinessTable, user: User):
+    """写操作行级权限校验：non-admin 只能向 row_scope=all/department(自身部门) 的表写入。"""
+    is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
+    if is_admin:
+        return
+    rules = bt.validation_rules or {}
+    row_scope = rules.get("row_scope", "private")
+    if row_scope == "private":
+        raise HTTPException(403, "该表为私有表，无写入权限")
+    if row_scope == "department":
+        dept_ids = rules.get("row_department_ids") or []
+        if dept_ids and user.department_id not in dept_ids:
+            raise HTTPException(403, "您不在该表的授权部门内，无写入权限")
+
+
+def _check_row_owner(bt: BusinessTable, row_values: dict, user: User):
+    """更新/删除时校验行所有权：若配置了 owner_field，非管理员只能修改自己的行。"""
+    is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
+    if is_admin:
+        return
+    rules = bt.validation_rules or {}
+    row_scope = rules.get("row_scope", "private")
+    if row_scope != "all":
+        # private 已在 _check_write_permission 拦截；department 级别仍需校验行所有权
+        owner_field = None
+        from app.models.business import DataOwnership as DO
+        # row_values 是从 DB 读出的字典，key 是列名
+        # 尝试从 validation_rules 或 DataOwnership 找 owner_field
+        if "owner_field" in rules:
+            owner_field = rules["owner_field"]
+        if owner_field and str(row_values.get(owner_field, "")) != str(user.id):
+            raise HTTPException(403, "无权修改他人数据")
 
 router = APIRouter(prefix="/api/data", tags=["data-tables"])
 
@@ -92,7 +126,7 @@ def list_rows(
     is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
 
     # ── Row scope: check validation_rules["row_scope"] ──
-    row_scope = rules.get("row_scope", "all")
+    row_scope = rules.get("row_scope", "private")
     if not is_admin and row_scope == "private":
         # Private: only admins can see
         return {"total": 0, "page": page, "page_size": page_size, "columns": [], "rows": []}
@@ -173,6 +207,7 @@ def create_row(
     user: User = Depends(get_current_user),
 ):
     bt = _get_registered_table(db, table_name)
+    _check_write_permission(bt, user)
 
     # Validate against validation_rules
     validation_rules = bt.validation_rules or {}
@@ -223,6 +258,7 @@ def update_row(
     user: User = Depends(get_current_user),
 ):
     bt = _get_registered_table(db, table_name)
+    _check_write_permission(bt, user)
 
     # Get old values for audit
     old_row = db.execute(
@@ -238,6 +274,7 @@ def update_row(
     )
     col_names = list(old_cols.keys())
     old_values = dict(zip(col_names, old_row))
+    _check_row_owner(bt, old_values, user)
 
     # Validate
     validation_rules = bt.validation_rules or {}
@@ -286,7 +323,8 @@ def delete_row(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    _get_registered_table(db, table_name)
+    bt = _get_registered_table(db, table_name)
+    _check_write_permission(bt, user)
 
     old_row = db.execute(
         text(f"SELECT * FROM `{table_name}` WHERE id = :id"),
@@ -294,6 +332,14 @@ def delete_row(
     ).fetchone()
     if not old_row:
         raise HTTPException(404, "Row not found")
+
+    old_cols = db.execute(
+        text(f"SELECT * FROM `{table_name}` WHERE id = :id"),
+        {"id": row_id},
+    )
+    col_names = list(old_cols.keys())
+    old_values = dict(zip(col_names, old_row))
+    _check_row_owner(bt, old_values, user)
 
     try:
         db.execute(text(f"DELETE FROM `{table_name}` WHERE id = :id"), {"id": row_id})

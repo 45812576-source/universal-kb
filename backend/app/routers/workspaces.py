@@ -306,7 +306,7 @@ def delete_workspace(
     if not ws:
         raise HTTPException(404, "Workspace not found")
 
-    if ws.workspace_type == "opencode":
+    if ws.workspace_type in ("opencode", "sandbox", "skill_studio"):
         raise HTTPException(403, "系统工作台不可删除")
 
     is_super = user.role == Role.SUPER_ADMIN

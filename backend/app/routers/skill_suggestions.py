@@ -148,8 +148,10 @@ def react_to_message(
     if msg.role.value != "assistant":
         raise HTTPException(400, "Can only react to assistant messages")
 
-    # Find the skill_id from the conversation
+    # Find the skill_id from the conversation; verify ownership
     conv = db.get(Conversation, msg.conversation_id)
+    if not conv or conv.user_id != user.id:
+        raise HTTPException(403, "无权对该消息进行操作")
     skill_id = conv.skill_id if conv else None
     if not skill_id:
         # Try metadata

@@ -25,6 +25,35 @@ from app.utils.file_parser import extract_text
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
+# ── SSE Keepalive ─────────────────────────────────────────────────────────────
+_SSE_KEEPALIVE = ": ping\n\n"  # SSE comment — ignored by browser but keeps proxy alive
+_KEEPALIVE_INTERVAL = 15  # seconds of silence before emitting a ping
+
+
+async def _stream_with_keepalive(agen):
+    """Wrap an async generator: yield items as they arrive;
+    if no item arrives within _KEEPALIVE_INTERVAL seconds, yield a keepalive ping.
+    Prevents nginx / Next.js proxy from closing idle SSE connections during
+    long LLM thinking phases."""
+    it = agen.__aiter__()
+    pending = asyncio.ensure_future(it.__anext__())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(asyncio.shield(pending), timeout=_KEEPALIVE_INTERVAL)
+                pending = asyncio.ensure_future(it.__anext__())
+                yield item
+            except asyncio.TimeoutError:
+                yield _SSE_KEEPALIVE  # keepalive ping, loop continues
+            except StopAsyncIteration:
+                break
+    finally:
+        pending.cancel()
+        try:
+            await pending
+        except (asyncio.CancelledError, StopAsyncIteration):
+            pass
+
 
 def _classify_error(e: Exception) -> str:
     """Classify exception into error type for frontend."""
@@ -345,12 +374,20 @@ async def stream_message(
                     _is_opencode_conv = True
 
             # --- PEV 升级判断（复杂多步场景） ---
+            # skill_studio workspace 是交互式对话，不走 PEV
+            _skip_pev = False
+            if conv.workspace_id:
+                from app.models.workspace import Workspace as WsModel2
+                _ws_pev = db.get(WsModel2, conv.workspace_id)
+                if _ws_pev and _ws_pev.workspace_type in ("skill_studio", "sandbox", "opencode"):
+                    _skip_pev = True
+
             from app.models.skill import Skill as SkillModel
             from app.services.pev import pev_orchestrator
             from app.models.pev_job import PEVJob
 
             _skill_for_pev = db.get(SkillModel, conv.skill_id) if conv.skill_id else None
-            pev_scenario = await pev_orchestrator.should_upgrade(req.content, _skill_for_pev, conv, db)
+            pev_scenario = None if _skip_pev else await pev_orchestrator.should_upgrade(req.content, _skill_for_pev, conv, db)
             if pev_scenario:
                 pev_job = PEVJob(
                     scenario=pev_scenario,
@@ -383,6 +420,54 @@ async def stream_message(
                 db.commit()
                 yield _sse("done", {"message_id": pev_msg.id, "metadata": {"pev_job_id": pev_job.id}})
                 return
+
+            # --- skill_studio 快速路径：跳过 prepare，直接用 system_context 对话 ---
+            if _skip_pev and conv.workspace_id:
+                from app.models.workspace import Workspace as WsModel3
+                _ws_fast = db.get(WsModel3, conv.workspace_id)
+                if _ws_fast and _ws_fast.workspace_type == "skill_studio" and _ws_fast.system_context:
+                    logger.info(f"[skill_studio fast path] conv={conv_id} system_context_len={len(_ws_fast.system_context)}")
+                    # 直接构建 messages，不做 skill matching / knowledge / variable extraction
+                    _history_msgs = (
+                        db.query(Message)
+                        .filter(Message.conversation_id == conv_id)
+                        .order_by(Message.created_at)
+                        .all()
+                    )
+                    _llm_msgs = [{"role": "system", "content": _ws_fast.system_context}]
+                    for _m in _history_msgs:
+                        _role = "user" if _m.role == MessageRole.USER else "assistant"
+                        _llm_msgs.append({"role": _role, "content": _m.content or ""})
+
+                    _fast_model = llm_gateway.get_config(db, getattr(_ws_fast, "model_config_id", None))
+                    yield _sse("status", {"stage": "generating"})
+
+                    _fast_full = ""
+                    async for _item in _stream_with_keepalive(llm_gateway.chat_stream_typed(
+                        model_config=_fast_model, messages=_llm_msgs, tools=None
+                    )):
+                        if isinstance(_item, str):
+                            yield _item
+                            continue
+                        _ctype, _cdata = _item
+                        if _ctype == "content":
+                            _fast_full += _cdata
+                            yield _sse("content_block_delta", {"index": 0, "delta": {"text": _cdata}})
+                            yield _sse("delta", {"text": _cdata})
+
+                    _fast_msg = Message(
+                        conversation_id=conv_id,
+                        role=MessageRole.ASSISTANT,
+                        content=_fast_full,
+                        metadata_={},
+                    )
+                    db.add(_fast_msg)
+                    _msg_count = db.query(Message).filter(Message.conversation_id == conv_id).count()
+                    if _msg_count <= 2:
+                        conv.title = req.content[:60]
+                    db.commit()
+                    yield _sse("done", {"message_id": _fast_msg.id, "metadata": {}})
+                    return
 
             # --- Prepare phase (skill matching, knowledge, prompt) ---
             yield _sse("status", {"stage": "preparing"})
@@ -437,11 +522,17 @@ async def stream_message(
             current_block_type = None  # "text" | "thinking" | None
             native_tool_calls: list[dict] = []
 
-            async for chunk_type, chunk_data in llm_gateway.chat_stream_typed(
+            _llm_stream = llm_gateway.chat_stream_typed(
                 model_config=prep.model_config,
                 messages=prep.llm_messages,
                 tools=prep.tools_schema or None,
-            ):
+            )
+            async for item in _stream_with_keepalive(_llm_stream):
+                if isinstance(item, str):
+                    # keepalive ping — pass raw bytes to keep connection alive
+                    yield item
+                    continue
+                chunk_type, chunk_data = item
                 if chunk_type == "thinking":
                     full_thinking += chunk_data
                     if current_block_type != "thinking":
@@ -756,7 +847,9 @@ async def upload_and_chat(
     db.commit()
 
     # 并行执行 KB 存储和 skill_engine（current_message="" 避免重复评估）
-    kb_task = _asyncio.create_task(_save_to_kb())
+    # .md 文件（Skill 文件）不存入知识库
+    _is_skill_file = (file.filename or "").lower().endswith(".md")
+    kb_task = _asyncio.create_task(_save_to_kb()) if not _is_skill_file else None
     try:
         parsed_skill_ids = None
         if active_skill_ids:
@@ -768,7 +861,7 @@ async def upload_and_chat(
         result = await skill_engine.execute(db, conv, user_text, user_id=user.id, active_skill_ids=parsed_skill_ids)
     except ValueError as e:
         raise HTTPException(503, str(e))
-    kb_entry_id = await kb_task
+    kb_entry_id = (await kb_task) if kb_task else None
 
     response, guide_meta = result
 
@@ -965,10 +1058,11 @@ async def upload_stream_message(
             db.add(user_msg)
             db.commit()
 
-            # KB save in background
+            # KB save in background — 跳过 .md 文件（Skill 文件不入知识库）
             _user_id = user.id
             _dept_id = user.department_id
             _foe_summary = foe_summary
+            _is_skill_file = file_filename.lower().endswith(".md")
 
             async def _save_to_kb():
                 from app.database import SessionLocal as _SessionLocal
@@ -995,7 +1089,7 @@ async def upload_stream_message(
                 finally:
                     kb_db.close()
 
-            kb_task = asyncio.create_task(_save_to_kb())
+            kb_task = asyncio.create_task(_save_to_kb()) if not _is_skill_file else None
 
             # 3. Prepare + stream LLM
             yield _sse("status", {"stage": "preparing"})
@@ -1039,7 +1133,8 @@ async def upload_stream_message(
                     conv.title = f"[文件] {_title_label}"[:60]
                     db.add(conv)
                 db.commit()
-                await kb_task
+                if kb_task:
+                    await kb_task
                 yield _sse("delta", {"text": response_text})
                 yield _sse("done", {"message_id": assistant_msg.id, "metadata": msg_metadata})
                 return
@@ -1053,11 +1148,16 @@ async def upload_stream_message(
             current_block_type = None
             native_tool_calls: list[dict] = []
 
-            async for chunk_type, chunk_data in llm_gateway.chat_stream_typed(
+            _llm_stream2 = llm_gateway.chat_stream_typed(
                 model_config=prep.model_config,
                 messages=prep.llm_messages,
                 tools=prep.tools_schema or None,
-            ):
+            )
+            async for item in _stream_with_keepalive(_llm_stream2):
+                if isinstance(item, str):
+                    yield item
+                    continue
+                chunk_type, chunk_data = item
                 if chunk_type == "thinking":
                     full_thinking += chunk_data
                     if current_block_type != "thinking":
@@ -1105,7 +1205,7 @@ async def upload_stream_message(
                         yield _sse(item["event"], item["data"])
                 yield _sse("replace", {"text": response})
 
-            kb_entry_id = await kb_task
+            kb_entry_id = (await kb_task) if kb_task else None
 
             msg_metadata = {
                 "skill_id": conv.skill_id,

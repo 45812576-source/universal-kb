@@ -121,7 +121,7 @@ def delete_model(
 @router.get("/departments")
 def list_departments(
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     return [
         {
@@ -463,3 +463,51 @@ def revoke_model(
     db.delete(grant)
     db.commit()
     return {"ok": True}
+
+
+_DEFAULT_FEATURE_FLAGS = {
+    "dev_studio": True,
+    "asr": True,
+    "webapp_publish": True,
+    "batch_upload_skill": False,
+    "feishu_sync": False,
+}
+
+
+class FeatureFlagsUpdate(BaseModel):
+    feature_flags: dict
+
+
+@router.get("/users/{uid}/features")
+def get_user_features(
+    uid: int,
+    db: Session = Depends(get_db),
+    current: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """获取指定用户的功能开关。"""
+    user = db.get(User, uid)
+    if not user:
+        raise HTTPException(404, "用户不存在")
+    flags = {**_DEFAULT_FEATURE_FLAGS, **(user.feature_flags or {})}
+    return {"feature_flags": flags}
+
+
+@router.put("/users/{uid}/features")
+def update_user_features(
+    uid: int,
+    body: FeatureFlagsUpdate,
+    db: Session = Depends(get_db),
+    current: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """更新指定用户的功能开关（仅超管）。"""
+    user = db.get(User, uid)
+    if not user:
+        raise HTTPException(404, "用户不存在")
+    # 只允许已知 key
+    allowed_keys = set(_DEFAULT_FEATURE_FLAGS.keys())
+    filtered = {k: bool(v) for k, v in body.feature_flags.items() if k in allowed_keys}
+    user.feature_flags = {**(user.feature_flags or {}), **filtered}
+    db.commit()
+    db.refresh(user)
+    flags = {**_DEFAULT_FEATURE_FLAGS, **(user.feature_flags or {})}
+    return {"ok": True, "feature_flags": flags}

@@ -1,5 +1,6 @@
 """Business tables management API."""
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -151,10 +152,18 @@ def _table_detail(bt: BusinessTable, columns: list[dict] = None) -> dict:
 
 @router.get("")
 def list_business_tables(
+    owner_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    tables = db.query(BusinessTable).order_by(BusinessTable.created_at.desc()).all()
+    q = db.query(BusinessTable)
+    if owner_id is not None:
+        # 仅超管可按 owner_id 过滤其他用户的表
+        is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
+        if not is_admin and owner_id != user.id:
+            return []
+        q = q.filter(BusinessTable.owner_id == owner_id)
+    tables = q.order_by(BusinessTable.created_at.desc()).all()
     if not tables:
         return []
 
@@ -195,8 +204,23 @@ def list_business_tables(
     for tname, sname in sdq_rows:
         skill_map[tname].append(sname)
 
+    is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
+
     result = []
     for t in tables:
+        rules = t.validation_rules or {}
+        row_scope = rules.get("row_scope", "private")
+
+        if not is_admin:
+            if row_scope == "private":
+                # 仅自己能看到
+                if t.owner_id != user.id:
+                    continue
+            elif row_scope == "department":
+                dept_ids = rules.get("row_department_ids") or []
+                if dept_ids and user.department_id not in dept_ids:
+                    continue
+
         d = _table_detail(t)
         d["owner_name"] = owner_map.get(t.owner_id) if t.owner_id else None
         d["department_name"] = dept_map.get(t.department_id) if t.department_id else None
@@ -404,7 +428,7 @@ class ProbeTableRequest(BaseModel):
 @router.post("/resolve-wiki")
 async def resolve_wiki(
     req: ResolveWikiRequest,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
 ):
     """Resolve a Feishu Wiki node token → bitable app_token + table list."""
     from app.services.lark_client import lark_client
@@ -459,7 +483,7 @@ async def resolve_wiki(
 @router.post("/probe-bitable")
 async def probe_bitable(
     req: ProbeBitableRequest,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
 ):
     """Preview a Feishu Bitable table: fetch fields + first 20 records. Does NOT persist."""
     from app.services.lark_client import lark_client
@@ -548,7 +572,7 @@ _BITABLE_TYPE_MAP = {
 async def sync_bitable(
     req: SyncBitableRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
 ):
     """Full sync: fetch ALL records from Feishu Bitable → create/replace local MySQL table → register."""
     from app.services.lark_client import lark_client
@@ -662,8 +686,13 @@ async def sync_bitable(
     if existing:
         existing.display_name = display
         existing.description = f"飞书多维表格同步 | app_token={req.app_token} | table_id={req.table_id}"
+        existing.owner_id = user.id
         rules = dict(existing.validation_rules or {})
         rules.update({"bitable_app_token": req.app_token, "bitable_table_id": req.table_id, "last_synced_at": int(time.time())})
+        rules.setdefault("row_scope", "private")
+        rules.setdefault("column_scope", "private")
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(existing, "validation_rules")
         existing.validation_rules = rules
         bt = existing
     else:
@@ -743,7 +772,7 @@ def patch_business_table(
     table_id: int,
     req: PatchTableRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
 ):
     """Partial update: rename display_name, hide fields, set folder/sort/scope metadata."""
     bt = db.get(BusinessTable, table_id)

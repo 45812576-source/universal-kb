@@ -14,10 +14,10 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.dependencies import get_current_user
+from app.dependencies import get_current_user, require_role
 from app.models.skill import Skill, SkillStatus, SkillVersion
 from app.models.tool import ToolRegistry, ToolType
-from app.models.user import User
+from app.models.user import User, Role
 
 router = APIRouter(prefix="/api/dev-studio", tags=["dev-studio"])
 
@@ -382,7 +382,7 @@ def _sync_company_skills_to_workdir(workdir: str) -> None:
             safe = _re.sub(r'[^\w\u4e00-\u9fff\-]', '_', skill.name).strip('_')
             filename = f"{safe}.md"
             filepath = os.path.join(skills_dir, filename)
-            content = f"---\ndescription: {skill.description or skill.name}\n---\n\n{ver.system_prompt}"
+            content = f"---\nname: {skill.name}\ndescription: {skill.description or skill.name}\n---\n\n{ver.system_prompt}"
             for d in (skills_dir, skills_dir_xdg):
                 with open(os.path.join(d, filename), "w", encoding="utf-8") as f:
                     f.write(content)
@@ -510,8 +510,28 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
         from app.config import settings as _settings
         bailian_key = getattr(_settings, "BAILIAN_API_KEY", "") or os.environ.get("BAILIAN_API_KEY", "")
         ark_key = getattr(_settings, "ARK_API_KEY", "") or os.environ.get("ARK_API_KEY", "")
-        lemondata_key = getattr(_settings, "LEMONDATA_API_KEY", "") or os.environ.get("LEMONDATA_API_KEY", "")
         use_ark_fallback = _runtime_fallback["use_ark"] or getattr(_settings, "BAILIAN_FALLBACK_TO_ARK", False)
+
+        # 仅向已授权 lemondata/gpt-5.4 的用户暴露 LEMONDATA_API_KEY
+        _lemondata_raw = getattr(_settings, "LEMONDATA_API_KEY", "") or os.environ.get("LEMONDATA_API_KEY", "")
+        lemondata_key = ""
+        if _lemondata_raw:
+            from app.database import SessionLocal as _SL
+            from app.models.opencode import UserModelGrant as _UMG
+            _db = _SL()
+            try:
+                _grant = (
+                    _db.query(_UMG)
+                    .filter(
+                        _UMG.user_id == user_id,
+                        _UMG.model_key.like("%gpt%") | _UMG.model_key.like("lemondata/%"),
+                    )
+                    .first()
+                )
+                if _grant:
+                    lemondata_key = _lemondata_raw
+            finally:
+                _db.close()
 
         # 先读取旧配置内容，用于检测是否需要重启
         config_path = os.path.join(workdir, "opencode.json")
@@ -551,6 +571,9 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             proc_env["ARK_API_KEY"] = ark_key
         if lemondata_key:
             proc_env["LEMONDATA_API_KEY"] = lemondata_key
+        else:
+            # 无授权时显式清除，防止从系统 env 继承后绕过授权
+            proc_env.pop("LEMONDATA_API_KEY", None)
         # 禁止 opencode web 自动在服务器本机打开浏览器标签。
         # opencode 在 macOS 上通过调用系统 `open` 命令打开浏览器，
         # 在 PATH 最前面注入一个假 `open` 脚本来拦截这个行为。
@@ -613,7 +636,7 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
 async def set_provider_fallback(
     enable: bool,
     reset_counter: bool = False,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
 ):
     """手动触发/关闭百炼→ARK fallback，刷新 opencode.json 并重启 opencode 进程。
     reset_counter=true 可重置估算计数器（月初清零时用）。
@@ -625,15 +648,34 @@ async def set_provider_fallback(
         _usage_counter["trigger_reason"] = ""
 
     from app.config import settings as _settings
+    from app.database import SessionLocal as _SL
+    from app.models.opencode import UserModelGrant as _UMG
     bailian_key = getattr(_settings, "BAILIAN_API_KEY", "") or os.environ.get("BAILIAN_API_KEY", "")
     ark_key = getattr(_settings, "ARK_API_KEY", "") or os.environ.get("ARK_API_KEY", "")
-    lemondata_key = getattr(_settings, "LEMONDATA_API_KEY", "") or os.environ.get("LEMONDATA_API_KEY", "")
+    _lemondata_raw = getattr(_settings, "LEMONDATA_API_KEY", "") or os.environ.get("LEMONDATA_API_KEY", "")
 
     # 更新所有已启动用户实例的配置，并逐一重启
     for uid, inst in list(_user_instances.items()):
         wdir = inst.get("workdir") or os.path.join(tempfile.gettempdir(), f"ledesk_studio_user_{uid}")
         os.makedirs(wdir, exist_ok=True)
-        _write_opencode_config(wdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=enable, lemondata_key=lemondata_key)
+        # 按用户授权决定是否传入 lemondata key
+        _uid_lemondata_key = ""
+        if _lemondata_raw:
+            _db = _SL()
+            try:
+                _grant = (
+                    _db.query(_UMG)
+                    .filter(
+                        _UMG.user_id == uid,
+                        _UMG.model_key.like("%gpt%") | _UMG.model_key.like("lemondata/%"),
+                    )
+                    .first()
+                )
+                if _grant:
+                    _uid_lemondata_key = _lemondata_raw
+            finally:
+                _db.close()
+        _write_opencode_config(wdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=enable, lemondata_key=_uid_lemondata_key)
         proc = inst.get("proc")
         if proc is not None and proc.returncode is None:
             proc.terminate()
