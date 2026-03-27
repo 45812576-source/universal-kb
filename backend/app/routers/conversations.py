@@ -281,10 +281,14 @@ async def send_message(
             _is_opencode_conv = True
 
     # Persist user message immediately so it survives any downstream failure
+    _user_msg_meta: dict = {}
+    if req.selected_skill_id is not None:
+        _user_msg_meta["skill_id"] = req.selected_skill_id
     user_msg = Message(
         conversation_id=conv_id,
         role=MessageRole.USER,
         content=req.content,
+        metadata_=_user_msg_meta if _user_msg_meta else {},
     )
     db.add(user_msg)
     db.commit()
