@@ -37,10 +37,15 @@ WORKSPACE_MAX_GB = 2
 _db_cleaner_task = None
 
 
+_DIR_SIZE_SKIP = {"node_modules", ".bun", ".cache", "__pycache__", ".venv", "venv", ".next", "dist", "build"}
+
+
 def _dir_size_bytes(path: str) -> int:
-    """递归计算目录下所有文件的总字节数（含隐藏目录）。"""
+    """递归计算目录下所有文件的总字节数（跳过包管理器缓存等大目录）。"""
     total = 0
-    for dirpath, _dirnames, filenames in os.walk(path):
+    for dirpath, dirnames, filenames in os.walk(path):
+        # 原地修改 dirnames 跳过无关目录，避免递归进缓存目录
+        dirnames[:] = [d for d in dirnames if d not in _DIR_SIZE_SKIP]
         for fname in filenames:
             fpath = os.path.join(dirpath, fname)
             try:
@@ -570,7 +575,11 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
                 f.write(f"# {display_name or folder_name} 的工作台\n\n这是你的专属开发工作台，文件会持久保存。\n")
 
         # 启动前检查 workspace 大小，超过上限先清理再继续
-        _cleanup_workspace_if_needed(workdir, WORKSPACE_MAX_GB * 1024 ** 3)
+        # 注意：_cleanup_workspace_if_needed 是同步 IO，用 executor 跑防止阻塞 event loop
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, _cleanup_workspace_if_needed, workdir, WORKSPACE_MAX_GB * 1024 ** 3
+        )
 
         # 始终写入 .gitignore，避免 opencode snapshot 把子仓库的 packfile 吸进来导致磁盘爆炸
         # snapshot 仓库的 worktree 指向 workdir，会读这里的 .gitignore
@@ -621,7 +630,7 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
         _write_opencode_config(workdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=use_ark_fallback, lemondata_key=lemondata_key)
 
         # 将公司级 published skill 写入 .opencode/skills/，供 opencode 按需加载
-        _sync_company_skills_to_workdir(workdir)
+        await loop.run_in_executor(None, _sync_company_skills_to_workdir, workdir)
 
         # 已有进程且还活着：若配置无变化直接复用，否则重启使新配置生效
         new_config = ""
