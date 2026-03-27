@@ -594,10 +594,38 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             raise HTTPException(503, "opencode 未安装，请先运行: npm install -g opencode-ai")
 
         # 后端重启后 _user_instances 内存清空，但 opencode 进程可能仍在跑。
-        # 若 proc 为 None 但固定端口已有进程在监听，直接复用，不重新启动。
+        # 若 proc 为 None 但固定端口已有进程在监听，检查 cwd 是否正确再决定复用或重启。
         if proc is None and _port_open(inst["port"]):
-            inst["last_active"] = _time.time()
-            return {"port": inst["port"], "url": "/opencode"}
+            from app.config import settings as _cfg_chk
+            import re as _re_chk
+            _studio_root_chk = os.path.abspath(os.path.expanduser(getattr(_cfg_chk, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
+            _safe_chk = _re_chk.sub(r'[^\w\u4e00-\u9fff\-]', '_', display_name).strip('_') if display_name else ""
+            _expected_cwd = os.path.join(_studio_root_chk, _safe_chk if _safe_chk else f"user_{user_id}")
+            # 通过端口找到占用该端口的进程，检查其 cwd
+            _cwd_ok = False
+            try:
+                import subprocess as _sp
+                _lsof = _sp.run(["lsof", "-ti", f":{inst['port']}"], capture_output=True, text=True, timeout=5)
+                for _pid_str in _lsof.stdout.strip().split('\n'):
+                    if _pid_str.strip().isdigit():
+                        _actual_cwd = os.readlink(f"/proc/{_pid_str.strip()}/cwd")
+                        if _actual_cwd == _expected_cwd:
+                            _cwd_ok = True
+                            break
+            except Exception:
+                _cwd_ok = True  # 检查失败时保守复用，不影响已有逻辑
+            if _cwd_ok:
+                inst["last_active"] = _time.time()
+                return {"port": inst["port"], "url": "/opencode"}
+            # cwd 不对，杀掉旧进程，下方代码会重新启动
+            try:
+                for _pid_str in _lsof.stdout.strip().split('\n'):
+                    if _pid_str.strip().isdigit():
+                        os.kill(int(_pid_str.strip()), 9)
+            except Exception:
+                pass
+            import asyncio as _aio
+            await _aio.sleep(1)  # 等端口释放
 
         # 每用户独立持久化 workdir，用姓名命名（重启后保留文件和 session 历史）
         from app.config import settings as _cfg
