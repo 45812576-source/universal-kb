@@ -535,6 +535,7 @@ async def stream_message(
                         ]
 
                     _fast_model = llm_gateway.get_config(db, getattr(_ws_fast, "model_config_id", None))
+                    yield _sse("status", {"stage": "preparing"})
                     yield _sse("status", {"stage": "generating"})
 
                     _final_content = ""
