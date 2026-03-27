@@ -404,6 +404,7 @@ async def stream_message(
         conversation_id=conv_id,
         role=MessageRole.USER,
         content=req.content,
+        metadata_={"skill_id": req.selected_skill_id} if req.selected_skill_id else {},
     )
     db.add(user_msg)
     db.commit()
@@ -490,17 +491,48 @@ async def stream_message(
                         f"dirty={req.editor_is_dirty}"
                     )
 
-                    # 构建历史消息（不含 system）
-                    _history_msgs = (
-                        db.query(Message)
-                        .filter(Message.conversation_id == conv_id)
-                        .order_by(Message.created_at)
-                        .all()
-                    )
-                    _llm_history: list[dict] = []
-                    for _m in _history_msgs:
-                        _role = "user" if _m.role == MessageRole.USER else "assistant"
-                        _llm_history.append({"role": _role, "content": _m.content or ""})
+                    # 构建历史消息（按 selected_skill_id 隔离，每个 skill 最多 30 轮 = 60 条）
+                    _STUDIO_HISTORY_ROUNDS = 30
+                    _sid = req.selected_skill_id
+                    if _sid:
+                        # 取该 skill 下最近 60 条（user 消息 metadata_.skill_id 匹配，assistant 消息紧跟其后）
+                        # 简化方案：取 conv 内所有消息，过滤出属于该 skill 的对话对
+                        _all_msgs = (
+                            db.query(Message)
+                            .filter(Message.conversation_id == conv_id)
+                            .order_by(Message.created_at)
+                            .all()
+                        )
+                        # 按 user message 的 skill_id 标记筛选对话对
+                        _skill_pairs: list[dict] = []
+                        _pending_user: dict | None = None
+                        for _m in _all_msgs:
+                            if _m.role == MessageRole.USER:
+                                _meta = _m.metadata_ or {}
+                                if _meta.get("skill_id") == _sid:
+                                    _pending_user = {"role": "user", "content": _m.content or ""}
+                                else:
+                                    _pending_user = None
+                            elif _m.role == MessageRole.ASSISTANT and _pending_user is not None:
+                                _skill_pairs.append(_pending_user)
+                                _skill_pairs.append({"role": "assistant", "content": _m.content or ""})
+                                _pending_user = None
+                        # 最多保留最近 30 轮
+                        _llm_history = _skill_pairs[-(_STUDIO_HISTORY_ROUNDS * 2):]
+                    else:
+                        # 没有选中 skill 时，取全局最近 30 轮（无 skill_id 过滤）
+                        _all_msgs = (
+                            db.query(Message)
+                            .filter(Message.conversation_id == conv_id)
+                            .order_by(Message.created_at.desc())
+                            .limit(_STUDIO_HISTORY_ROUNDS * 2)
+                            .all()
+                        )
+                        _llm_history = [
+                            {"role": "user" if _m.role == MessageRole.USER else "assistant",
+                             "content": _m.content or ""}
+                            for _m in reversed(_all_msgs)
+                        ]
 
                     _fast_model = llm_gateway.get_config(db, getattr(_ws_fast, "model_config_id", None))
                     yield _sse("status", {"stage": "generating"})
@@ -533,7 +565,7 @@ async def stream_message(
                         conversation_id=conv_id,
                         role=MessageRole.ASSISTANT,
                         content=_final_content,
-                        metadata_={},
+                        metadata_={"skill_id": req.selected_skill_id} if req.selected_skill_id else {},
                     )
                     db.add(_fast_msg)
                     _msg_count = db.query(Message).filter(Message.conversation_id == conv_id).count()
