@@ -561,6 +561,12 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
         if not opencode_bin:
             raise HTTPException(503, "opencode 未安装，请先运行: npm install -g opencode-ai")
 
+        # 后端重启后 _user_instances 内存清空，但 opencode 进程可能仍在跑。
+        # 若 proc 为 None 但固定端口已有进程在监听，直接复用，不重新启动。
+        if proc is None and _port_open(inst["port"]):
+            inst["last_active"] = _time.time()
+            return {"port": inst["port"], "url": "/opencode"}
+
         # 每用户独立持久化 workdir，用姓名命名（重启后保留文件和 session 历史）
         from app.config import settings as _cfg
         import re
