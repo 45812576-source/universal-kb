@@ -121,8 +121,28 @@ async def _db_cleaner() -> None:
             logging.getLogger(__name__).warning(f"[DbCleaner] 扫描失败: {e}")
 
 
+MAX_RSS_MB = 800  # 单实例内存硬上限（含 Go 主进程 + Node 启动器），超过则强制重启
+
+
+def _get_proc_tree_rss_mb(pid: int) -> int:
+    """获取进程及其所有子进程的 RSS 总和（MB）。"""
+    try:
+        # 用 ps 取该 pid 及所有后代进程的 RSS
+        import subprocess
+        result = subprocess.run(
+            ["ps", "-o", "rss=", "--pid", str(pid), "--ppid", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+        total_kb = sum(int(line.strip()) for line in result.stdout.strip().split('\n') if line.strip().isdigit())
+        return total_kb // 1024
+    except Exception:
+        return 0
+
+
 async def _idle_reaper() -> None:
-    """后台任务：每10分钟扫一遍，超过1小时没活动的 opencode 进程自动杀掉。"""
+    """后台任务：每2分钟扫一遍，回收空闲实例 + 杀掉内存超限实例。"""
+    import logging
+    logger = logging.getLogger(__name__)
     while True:
         await asyncio.sleep(_REAPER_INTERVAL)
         now = _time.time()
@@ -130,10 +150,22 @@ async def _idle_reaper() -> None:
             proc = inst.get("proc")
             if proc is None or proc.returncode is not None:
                 continue
+            # 空闲超时回收
             last = inst.get("last_active", now)
             if now - last > IDLE_TIMEOUT_SECONDS:
+                logger.info(f"[Reaper] user={uid} 空闲超时，终止进程")
                 try:
                     proc.terminate()
+                except Exception:
+                    pass
+                inst["proc"] = None
+                continue
+            # 内存超限强杀
+            rss = _get_proc_tree_rss_mb(proc.pid)
+            if rss > MAX_RSS_MB:
+                logger.warning(f"[Reaper] user={uid} RSS={rss}MB 超过 {MAX_RSS_MB}MB 限制，强制终止")
+                try:
+                    proc.kill()
                 except Exception:
                     pass
                 inst["proc"] = None
