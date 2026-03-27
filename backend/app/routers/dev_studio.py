@@ -27,13 +27,13 @@ router = APIRouter(prefix="/api/dev-studio", tags=["dev-studio"])
 _user_instances: dict = {}
 _instances_lock: object = None   # 全局 asyncio.Lock，保护 _user_instances 写入
 
-IDLE_TIMEOUT_SECONDS = 1800  # 30分钟无操作自动回收
-_REAPER_INTERVAL = 600       # 每10分钟检查一次
+IDLE_TIMEOUT_SECONDS = 600   # 10分钟无操作自动回收（降低内存压力）
+_REAPER_INTERVAL = 120       # 每2分钟检查一次空闲实例
 _idle_reaper_task = None
-MAX_ACTIVE_INSTANCES = 20    # 最多同时运行 20 个 opencode 进程
+MAX_ACTIVE_INSTANCES = 12    # 最多同时运行 12 个 opencode 进程
 
 # 每个用户 workspace 目录总大小上限（包含 .local 等隐藏目录，超出后删最老 session + VACUUM）
-WORKSPACE_MAX_GB = 2
+WORKSPACE_MAX_GB = 1
 _db_cleaner_task = None
 
 
@@ -102,12 +102,12 @@ def _cleanup_workspace_if_needed(workdir: str, max_bytes: int) -> None:
 
 
 async def _db_cleaner() -> None:
-    """每20分钟扫一遍所有用户 workspace，总大小超过 WORKSPACE_MAX_GB 则清理。"""
+    """每5分钟扫一遍所有用户 workspace，总大小超过 WORKSPACE_MAX_GB 则清理。"""
     import logging
     max_bytes = WORKSPACE_MAX_GB * 1024 ** 3
 
     while True:
-        await asyncio.sleep(1200)
+        await asyncio.sleep(300)
         try:
             from app.config import settings as _cfg
             studio_root = os.path.abspath(os.path.expanduser(
@@ -706,7 +706,7 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             os.chmod(fake_open_path, 0o755)
         proc_env["PATH"] = fake_open_dir + ":" + proc_env.get("PATH", "")
         # 限制每个 opencode 进程的 Node.js 堆内存，防止单进程无限膨胀
-        proc_env["NODE_OPTIONS"] = "--max-old-space-size=1024"
+        proc_env["NODE_OPTIONS"] = "--max-old-space-size=384"
 
         frontend_origins = [
             o.strip()
