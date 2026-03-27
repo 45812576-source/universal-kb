@@ -1634,3 +1634,21 @@ def workdir_delete(req: DeleteRequest, user: User = Depends(get_current_user)):
     else:
         os.remove(target)
     return {"ok": True}
+
+
+@router.get("/workdir/download")
+def workdir_download(path: str, user: User = Depends(get_current_user)):
+    """下载 workdir 内的单个文件到本地。"""
+    from fastapi.responses import FileResponse
+    workdir = _user_workdir(user)
+    target = _safe_path(workdir, path)
+    if not os.path.exists(target):
+        raise HTTPException(404, "文件不存在")
+    if os.path.isdir(target):
+        raise HTTPException(400, "不支持下载文件夹，请先打包")
+    filename = os.path.basename(target)
+    return FileResponse(
+        path=target,
+        media_type="application/octet-stream",
+        filename=filename,
+    )
