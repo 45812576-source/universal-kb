@@ -71,6 +71,10 @@ class SendMessage(BaseModel):
     content: str
     active_skill_ids: list[int] | None = None
     force_skill_id: int | None = None  # 沙盒测试模式：强制指定 skill（允许 draft，仅限本人创建）
+    # Studio Agent 编辑上下文（仅 skill_studio workspace 使用）
+    selected_skill_id: int | None = None
+    editor_prompt: str | None = None
+    editor_is_dirty: bool = False
 
     @field_validator("content")
     @classmethod
@@ -475,61 +479,60 @@ async def stream_message(
                 yield _sse("done", {"message_id": pev_msg.id, "metadata": {"pev_job_id": pev_job.id}})
                 return
 
-            # --- skill_studio 快速路径：跳过 prepare，直接用 system_context 对话 ---
+            # --- skill_studio 路径：调用 studio_agent orchestrator ---
             if _skip_pev and conv.workspace_id:
                 from app.models.workspace import Workspace as WsModel3
                 _ws_fast = db.get(WsModel3, conv.workspace_id)
-                if _ws_fast and _ws_fast.workspace_type == "skill_studio" and _ws_fast.system_context:
-                    logger.info(f"[skill_studio fast path] conv={conv_id} system_context_len={len(_ws_fast.system_context)}")
-                    # 直接构建 messages，不做 skill matching / knowledge / variable extraction
+                if _ws_fast and _ws_fast.workspace_type == "skill_studio":
+                    from app.services.studio_agent import run_stream as _studio_run_stream
+                    logger.info(
+                        f"[studio_agent] conv={conv_id} skill={req.selected_skill_id} "
+                        f"dirty={req.editor_is_dirty}"
+                    )
+
+                    # 构建历史消息（不含 system）
                     _history_msgs = (
                         db.query(Message)
                         .filter(Message.conversation_id == conv_id)
                         .order_by(Message.created_at)
                         .all()
                     )
-                    _llm_msgs = [{"role": "system", "content": _ws_fast.system_context}]
+                    _llm_history: list[dict] = []
                     for _m in _history_msgs:
                         _role = "user" if _m.role == MessageRole.USER else "assistant"
-                        _llm_msgs.append({"role": _role, "content": _m.content or ""})
+                        _llm_history.append({"role": _role, "content": _m.content or ""})
 
                     _fast_model = llm_gateway.get_config(db, getattr(_ws_fast, "model_config_id", None))
                     yield _sse("status", {"stage": "generating"})
 
-                    _fast_full = ""
-                    async for _item in _stream_with_keepalive(llm_gateway.chat_stream_typed(
-                        model_config=_fast_model, messages=_llm_msgs, tools=None
-                    )):
+                    _final_content = ""
+                    async for _item in _stream_with_keepalive(
+                        _studio_run_stream(
+                            db=db,
+                            conv_id=conv_id,
+                            workspace_system_context=_ws_fast.system_context or "",
+                            history_messages=_llm_history,
+                            user_message=req.content,
+                            model_config=_fast_model,
+                            selected_skill_id=req.selected_skill_id,
+                            editor_prompt=req.editor_prompt,
+                            editor_is_dirty=req.editor_is_dirty,
+                        )
+                    ):
                         if isinstance(_item, str):
+                            # keepalive ping
                             yield _item
                             continue
-                        _ctype, _cdata = _item
-                        if _ctype == "content":
-                            _fast_full += _cdata
-                            yield _sse("content_block_delta", {"index": 0, "delta": {"text": _cdata}})
-                            yield _sse("delta", {"text": _cdata})
-
-                    # Extract structured studio_draft / studio_diff blocks from response
-                    import re as _re
-                    _clean_full = _fast_full
-                    for _evt_name in ("studio_draft", "studio_diff", "studio_test_result"):
-                        _pat = _re.compile(
-                            r"```" + _evt_name + r"\s*\n([\s\S]*?)\n```",
-                            _re.IGNORECASE,
-                        )
-                        for _m_obj in _pat.finditer(_fast_full):
-                            try:
-                                _payload = json.loads(_m_obj.group(1))
-                                yield _sse(_evt_name, _payload)
-                            except Exception:
-                                pass
-                        # Strip the block from the display text
-                        _clean_full = _pat.sub("", _clean_full).strip()
+                        _evt, _data = _item
+                        if _evt == "__full_content__":
+                            _final_content = _data.get("text", "")
+                        else:
+                            yield _sse(_evt, _data)
 
                     _fast_msg = Message(
                         conversation_id=conv_id,
                         role=MessageRole.ASSISTANT,
-                        content=_clean_full or _fast_full,
+                        content=_final_content,
                         metadata_={},
                     )
                     db.add(_fast_msg)
