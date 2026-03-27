@@ -35,13 +35,14 @@ async def startup_event():
         import logging
         logging.getLogger(__name__).warning(f"Intel scheduler startup failed: {e}")
 
-    # 后台预热 ASR 模型，避免首次语音输入等待
-    try:
-        from app.routers.asr import preload_engine
-        asyncio.create_task(preload_engine())
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"ASR preload failed: {e}")
+    # 后台预热 ASR 模型，避免首次语音输入等待（DISABLE_ASR_PRELOAD=1 可跳过，用于无 GPU/无网络环境）
+    if not os.getenv("DISABLE_ASR_PRELOAD"):
+        try:
+            from app.routers.asr import preload_engine
+            asyncio.create_task(preload_engine())
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"ASR preload failed: {e}")
 
     try:
         from apscheduler.schedulers.background import BackgroundScheduler

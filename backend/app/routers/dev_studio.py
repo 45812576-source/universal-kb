@@ -30,6 +30,84 @@ _instances_lock: object = None   # 全局 asyncio.Lock，保护 _user_instances 
 IDLE_TIMEOUT_SECONDS = 1800  # 30分钟无操作自动回收
 _REAPER_INTERVAL = 600       # 每10分钟检查一次
 _idle_reaper_task = None
+MAX_ACTIVE_INSTANCES = 20    # 最多同时运行 20 个 opencode 进程
+
+# 每个用户 workspace 目录总大小上限（包含 .local 等隐藏目录，超出后删最老 session + VACUUM）
+WORKSPACE_MAX_GB = 2
+_db_cleaner_task = None
+
+
+def _dir_size_bytes(path: str) -> int:
+    """递归计算目录下所有文件的总字节数（含隐藏目录）。"""
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for fname in filenames:
+            fpath = os.path.join(dirpath, fname)
+            try:
+                total += os.path.getsize(fpath)
+            except OSError:
+                pass
+    return total
+
+
+def _cleanup_workspace_if_needed(workdir: str, max_bytes: int) -> None:
+    """若 workdir 总大小超过 max_bytes，删最老 session 直到达标。同步函数，可在启动前直接调用。"""
+    import sqlite3 as _sqlite3
+    import logging
+    logger = logging.getLogger(__name__)
+
+    ws_bytes = _dir_size_bytes(workdir)
+    if ws_bytes <= max_bytes:
+        return
+    db_path = os.path.join(workdir, ".local", "share", "opencode", "opencode.db")
+    if not os.path.exists(db_path):
+        return
+    try:
+        con = _sqlite3.connect(db_path)
+        deleted = 0
+        while ws_bytes > max_bytes:
+            row = con.execute(
+                "SELECT id FROM session ORDER BY time_updated ASC LIMIT 1"
+            ).fetchone()
+            if not row:
+                break
+            sid = row[0]
+            con.execute("DELETE FROM part WHERE session_id = ?", (sid,))
+            con.execute("DELETE FROM message WHERE session_id = ?", (sid,))
+            con.execute("DELETE FROM session WHERE id = ?", (sid,))
+            con.commit()
+            deleted += 1
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            con.execute("VACUUM")
+            ws_bytes = _dir_size_bytes(workdir)
+        con.close()
+        name = os.path.basename(workdir)
+        logger.info(
+            f"[DbCleaner] {name}: 删除 {deleted} 个旧 session，"
+            f"workspace 现在 {ws_bytes / 1024**3:.2f}GB"
+        )
+    except Exception as e:
+        logger.warning(f"[DbCleaner] {os.path.basename(workdir)} 清理失败: {e}")
+
+
+async def _db_cleaner() -> None:
+    """每20分钟扫一遍所有用户 workspace，总大小超过 WORKSPACE_MAX_GB 则清理。"""
+    import logging
+    max_bytes = WORKSPACE_MAX_GB * 1024 ** 3
+
+    while True:
+        await asyncio.sleep(1200)
+        try:
+            from app.config import settings as _cfg
+            studio_root = os.path.abspath(os.path.expanduser(
+                getattr(_cfg, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")
+            ))
+            for user_dir in os.scandir(studio_root):
+                if not user_dir.is_dir():
+                    continue
+                _cleanup_workspace_if_needed(user_dir.path, max_bytes)
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"[DbCleaner] 扫描失败: {e}")
 
 
 async def _idle_reaper() -> None:
@@ -217,6 +295,7 @@ def _write_opencode_config(
     config: dict = {
         "$schema": "https://opencode.ai/config.schema.json",
         "model": default_model,
+        "snapshot": False,
         "provider": {
             "bailian-coding-plan": {
                 "npm": "@ai-sdk/anthropic",
@@ -336,8 +415,14 @@ def _write_opencode_config(
         },
     }
     config_path = os.path.join(workdir, "opencode.json")
+    new_content = json.dumps(config, ensure_ascii=False, indent=2)
+    # 内容没变则跳过写入，避免 mtime 更新触发 opencode file watcher 重启
+    if os.path.exists(config_path):
+        with open(config_path, encoding="utf-8") as _f:
+            if _f.read() == new_content:
+                return
     with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
+        f.write(new_content)
     # opencode 优先读 XDG_CONFIG_HOME/opencode/config.json，同步写一份确保生效
     xdg_config_dir = os.path.join(workdir, ".config", "opencode")
     os.makedirs(xdg_config_dir, exist_ok=True)
@@ -484,15 +569,13 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             with open(readme, "w", encoding="utf-8") as f:
                 f.write(f"# {display_name or folder_name} 的工作台\n\n这是你的专属开发工作台，文件会持久保存。\n")
 
+        # 启动前检查 workspace 大小，超过上限先清理再继续
+        _cleanup_workspace_if_needed(workdir, WORKSPACE_MAX_GB * 1024 ** 3)
+
         # 始终写入 .gitignore，避免 opencode snapshot 把子仓库的 packfile 吸进来导致磁盘爆炸
         # snapshot 仓库的 worktree 指向 workdir，会读这里的 .gitignore
         _gitignore_path = os.path.join(workdir, ".gitignore")
         _gitignore_content = (
-            "# 排除嵌套 git 仓库内容，防止 snapshot 把 packfile 反复快照\n"
-            ".git/\n"
-            "*.pack\n"
-            "*.idx\n"
-            "# 常见大目录\n"
             "node_modules/\n"
             ".venv/\n"
             "venv/\n"
@@ -500,12 +583,6 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
         )
         with open(_gitignore_path, "w", encoding="utf-8") as _f:
             _f.write(_gitignore_content)
-
-        # 双保险：同步写 snapshot 裸仓库的 info/exclude
-        _snapshot_info = os.path.join(workdir, ".local", "share", "opencode", "snapshot", "global", "info")
-        if os.path.isdir(_snapshot_info):
-            with open(os.path.join(_snapshot_info, "exclude"), "w", encoding="utf-8") as _f:
-                _f.write(_gitignore_content)
 
         from app.config import settings as _settings
         bailian_key = getattr(_settings, "BAILIAN_API_KEY", "") or os.environ.get("BAILIAN_API_KEY", "")
@@ -533,21 +610,24 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             finally:
                 _db.close()
 
-        # 先读取旧配置内容，用于检测是否需要重启
+        # 读取旧配置内容，用于检测是否需要重启
         config_path = os.path.join(workdir, "opencode.json")
         old_config = ""
         if os.path.exists(config_path):
             with open(config_path, encoding="utf-8") as _f:
                 old_config = _f.read()
 
+        # 内容无变化时 _write_opencode_config 会跳过写文件（不更新 mtime）
         _write_opencode_config(workdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=use_ark_fallback, lemondata_key=lemondata_key)
 
         # 将公司级 published skill 写入 .opencode/skills/，供 opencode 按需加载
         _sync_company_skills_to_workdir(workdir)
 
         # 已有进程且还活着：若配置无变化直接复用，否则重启使新配置生效
-        with open(config_path, encoding="utf-8") as _f:
-            new_config = _f.read()
+        new_config = ""
+        if os.path.exists(config_path):
+            with open(config_path, encoding="utf-8") as _f:
+                new_config = _f.read()
         if proc is not None and proc.returncode is None:
             if old_config == new_config:
                 inst["last_active"] = _time.time()
@@ -555,6 +635,14 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             # 配置有变化，终止旧进程，下方代码负责重启
             proc.terminate()
             inst["proc"] = None
+
+        # 活跃进程数上限检查（已有进程的用户不受限，仅限新启动）
+        active_count = sum(
+            1 for uid, i in _user_instances.items()
+            if uid != user_id and i.get("proc") is not None and i["proc"].returncode is None
+        )
+        if active_count >= MAX_ACTIVE_INSTANCES:
+            raise HTTPException(503, f"当前并发实例已达上限（{MAX_ACTIVE_INSTANCES}），请稍后再试")
 
         # 每用户独立数据目录（持久化，session db 隔离）
         user_data_dir = os.path.join(workdir, ".local", "share")
@@ -586,7 +674,7 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             os.chmod(fake_open_path, 0o755)
         proc_env["PATH"] = fake_open_dir + ":" + proc_env.get("PATH", "")
         # 限制每个 opencode 进程的 Node.js 堆内存，防止单进程无限膨胀
-        proc_env["NODE_OPTIONS"] = "--max-old-space-size=2048"
+        proc_env["NODE_OPTIONS"] = "--max-old-space-size=1024"
 
         frontend_origins = [
             o.strip()
@@ -626,6 +714,11 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
         # 启动空闲进程回收任务（全局只跑一个）
         if _idle_reaper_task is None or _idle_reaper_task.done():
             _start_idle_reaper()
+
+        # 启动 db 大小清理任务（全局只跑一个）
+        global _db_cleaner_task
+        if _db_cleaner_task is None or _db_cleaner_task.done():
+            _db_cleaner_task = asyncio.create_task(_db_cleaner())
 
         return {"port": port, "url": "/opencode"}
 

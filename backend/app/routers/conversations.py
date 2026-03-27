@@ -509,10 +509,27 @@ async def stream_message(
                             yield _sse("content_block_delta", {"index": 0, "delta": {"text": _cdata}})
                             yield _sse("delta", {"text": _cdata})
 
+                    # Extract structured studio_draft / studio_diff blocks from response
+                    import re as _re
+                    _clean_full = _fast_full
+                    for _evt_name in ("studio_draft", "studio_diff", "studio_test_result"):
+                        _pat = _re.compile(
+                            r"```" + _evt_name + r"\s*\n([\s\S]*?)\n```",
+                            _re.IGNORECASE,
+                        )
+                        for _m_obj in _pat.finditer(_fast_full):
+                            try:
+                                _payload = json.loads(_m_obj.group(1))
+                                yield _sse(_evt_name, _payload)
+                            except Exception:
+                                pass
+                        # Strip the block from the display text
+                        _clean_full = _pat.sub("", _clean_full).strip()
+
                     _fast_msg = Message(
                         conversation_id=conv_id,
                         role=MessageRole.ASSISTANT,
-                        content=_fast_full,
+                        content=_clean_full or _fast_full,
                         metadata_={},
                     )
                     db.add(_fast_msg)
