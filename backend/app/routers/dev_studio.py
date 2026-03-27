@@ -75,6 +75,12 @@ def _cleanup_workspace_if_needed(workdir: str, max_bytes: int) -> None:
                 "SELECT id FROM session ORDER BY time_updated ASC LIMIT 1"
             ).fetchone()
             if not row:
+                # session 已删完但仍超限，说明存在大文件，不能继续清理
+                logger.warning(
+                    f"[DbCleaner] {os.path.basename(workdir)}: session 已删完但 workspace 仍超限 "
+                    f"({ws_bytes / 1024**3:.2f}GB > {max_bytes / 1024**3:.2f}GB)，"
+                    f"可能存在用户上传的大文件"
+                )
                 break
             sid = row[0]
             con.execute("DELETE FROM part WHERE session_id = ?", (sid,))
@@ -1177,6 +1183,9 @@ async def transfer_table(
 
 # ─── Upload File to Workdir ───────────────────────────────────────────────────
 
+_MAX_UPLOAD_FILE_BYTES = 200 * 1024 * 1024  # 单文件上限 200MB
+
+
 @router.post("/upload-file")
 async def upload_file(
     file: UploadFile = File(...),
@@ -1193,13 +1202,40 @@ async def upload_file(
     workdir = os.path.join(studio_root, folder_name)
     os.makedirs(workdir, exist_ok=True)
 
+    max_bytes = WORKSPACE_MAX_GB * 1024 ** 3
+
+    # 若 Content-Length 已知，提前拒绝超大文件（避免读入内存再报错）
+    declared_size = file.size  # FastAPI 从 Content-Length 头解析，可能为 None
+    if declared_size is not None and declared_size > _MAX_UPLOAD_FILE_BYTES:
+        raise HTTPException(400, f"单文件不能超过 {_MAX_UPLOAD_FILE_BYTES // 1024 // 1024}MB")
+
+    # 检查上传后是否会超出用户 workspace 配额
+    ws_bytes = _dir_size_bytes(workdir)
+    if declared_size is not None and ws_bytes + declared_size > max_bytes:
+        raise HTTPException(
+            400,
+            f"Workspace 已使用 {ws_bytes / 1024**3:.2f}GB，"
+            f"上传此文件将超过 {WORKSPACE_MAX_GB}GB 上限"
+        )
+
+    content = await file.read()
+
+    # 读取后二次校验（防止 declared_size 为 None 或客户端伪造）
+    if len(content) > _MAX_UPLOAD_FILE_BYTES:
+        raise HTTPException(400, f"单文件不能超过 {_MAX_UPLOAD_FILE_BYTES // 1024 // 1024}MB")
+    if ws_bytes + len(content) > max_bytes:
+        raise HTTPException(
+            400,
+            f"Workspace 已使用 {ws_bytes / 1024**3:.2f}GB，"
+            f"上传此文件将超过 {WORKSPACE_MAX_GB}GB 上限"
+        )
+
     # 安全处理文件名：只取 basename，去掉路径分隔符
     safe_filename = os.path.basename(file.filename or "upload")
     if not safe_filename:
         safe_filename = "upload"
 
     dest = os.path.join(workdir, safe_filename)
-    content = await file.read()
     with open(dest, "wb") as f:
         f.write(content)
 
