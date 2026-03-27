@@ -585,10 +585,21 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
         # snapshot 仓库的 worktree 指向 workdir，会读这里的 .gitignore
         _gitignore_path = os.path.join(workdir, ".gitignore")
         _gitignore_content = (
+            "# 依赖/缓存/构建目录 — 禁止 opencode snapshot 写入\n"
             "node_modules/\n"
+            ".bun/\n"
+            ".npm/\n"
+            ".pnpm-store/\n"
             ".venv/\n"
             "venv/\n"
             "__pycache__/\n"
+            "*.pyc\n"
+            ".next/\n"
+            "dist/\n"
+            "build/\n"
+            ".cache/\n"
+            "*.log\n"
+            "*.tmp\n"
         )
         with open(_gitignore_path, "w", encoding="utf-8") as _f:
             _f.write(_gitignore_content)
