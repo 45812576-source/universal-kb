@@ -130,6 +130,23 @@ def create_conversation(
             db.commit()
             db.refresh(conv)
             return {"id": conv.id, "title": conv.title, "workspace_id": conv.workspace_id}
+        if ws and ws.workspace_type == "skill_studio":
+            existing = (
+                db.query(Conversation)
+                .filter(
+                    Conversation.user_id == user.id,
+                    Conversation.workspace_id == req.workspace_id,
+                    Conversation.is_active == True,
+                )
+                .first()
+            )
+            if existing:
+                return {"id": existing.id, "title": existing.title, "workspace_id": existing.workspace_id}
+            conv = Conversation(user_id=user.id, workspace_id=req.workspace_id, title=ws.name)
+            db.add(conv)
+            db.commit()
+            db.refresh(conv)
+            return {"id": conv.id, "title": conv.title, "workspace_id": conv.workspace_id}
 
     # project 对话：每人只维护一个（类似 opencode 逻辑）
     if req.project_id and not req.workspace_id:
@@ -248,14 +265,15 @@ async def send_message(
 
     # opencode 工作台对话标题锁定，不随消息内容变更
     _is_opencode_conv = False
+    _ws_obj = None
     if conv.workspace_id:
         from app.models.workspace import Workspace as WsModel
-        _ws = db.get(WsModel, conv.workspace_id)
-        if _ws and _ws.workspace_type == "sandbox":
+        _ws_obj = db.get(WsModel, conv.workspace_id)
+        if _ws_obj and _ws_obj.workspace_type == "sandbox":
             # 沙盒工作台：必须携带 force_skill_id，拒绝一切无关请求
             if not req.force_skill_id:
                 raise HTTPException(400, "沙盒测试工作台仅用于测试指定 Skill，请从技能列表发起测试")
-        if _ws and _ws.workspace_type == "opencode":
+        if _ws_obj and _ws_obj.workspace_type == "opencode":
             _is_opencode_conv = True
 
     # Persist user message immediately so it survives any downstream failure
@@ -266,6 +284,42 @@ async def send_message(
     )
     db.add(user_msg)
     db.commit()
+
+    # skill_studio 快速路径：用 system_context 直接对话，跳过 skill_engine
+    if _ws_obj and _ws_obj.workspace_type == "skill_studio" and _ws_obj.system_context:
+        _history = (
+            db.query(Message)
+            .filter(Message.conversation_id == conv_id)
+            .order_by(Message.created_at)
+            .all()
+        )
+        _llm_msgs = [{"role": "system", "content": _ws_obj.system_context}]
+        for _m in _history:
+            _llm_msgs.append({"role": "user" if _m.role == MessageRole.USER else "assistant", "content": _m.content or ""})
+        _model_cfg = llm_gateway.get_config(db, getattr(_ws_obj, "model_config_id", None))
+        try:
+            _resp_text, _ = await llm_gateway.chat(_model_cfg, _llm_msgs)
+        except Exception as e:
+            raise HTTPException(503, f"AI 服务暂时不可用，请稍后重试")
+        _assistant_msg = Message(
+            conversation_id=conv_id,
+            role=MessageRole.ASSISTANT,
+            content=_resp_text,
+            metadata_={},
+        )
+        db.add(_assistant_msg)
+        msg_count = db.query(Message).filter(Message.conversation_id == conv_id).count()
+        if msg_count <= 2:
+            conv.title = req.content[:60]
+        db.commit()
+        return {
+            "id": _assistant_msg.id,
+            "role": "assistant",
+            "content": _resp_text,
+            "skill_id": None,
+            "skill_name": None,
+            "metadata": {},
+        }
 
     # Execute skill engine
     try:
