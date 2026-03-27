@@ -2,6 +2,14 @@ import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
+# Load .env so ASR_BACKEND is available at engine-load time
+try:
+    from dotenv import load_dotenv
+    from pathlib import Path
+    load_dotenv(Path(__file__).parent.parent.parent / ".env", override=False)
+except ImportError:
+    pass
+
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from whisperlivekit import TranscriptionEngine, AudioProcessor
 import whisperlivekit.core
@@ -20,7 +28,6 @@ _ENGINE_KWARGS = dict(
     lan="zh",
     pcm_input=True,
     backend_policy="localagreement",
-    backend="mlx-whisper",
     buffer_trimming="segment",
     buffer_trimming_sec=60,
     no_vac=True,
@@ -35,7 +42,8 @@ def _load_engine():
     # 重置单例，确保每次创建新引擎
     whisperlivekit.core.TranscriptionEngine._instance = None
     whisperlivekit.core.TranscriptionEngine._initialized = False
-    engine = TranscriptionEngine(**_ENGINE_KWARGS)
+    kwargs = {**_ENGINE_KWARGS, "backend": os.environ.get("ASR_BACKEND", "faster-whisper")}
+    engine = TranscriptionEngine(**kwargs)
     # 包装 transcribe，自动注入简体中文引导 prompt
     _orig_transcribe = engine.asr.transcribe
 

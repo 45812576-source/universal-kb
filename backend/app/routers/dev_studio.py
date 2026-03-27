@@ -30,6 +30,63 @@ _instances_lock: object = None   # 全局 asyncio.Lock，保护 _user_instances 
 IDLE_TIMEOUT_SECONDS = 1800  # 30分钟无操作自动回收
 _REAPER_INTERVAL = 600       # 每10分钟检查一次
 _idle_reaper_task = None
+MAX_ACTIVE_INSTANCES = 20    # 最多同时运行 20 个 opencode 进程
+
+# 每个用户 opencode.db 的大小上限（超出后删最老 session 直到降下来）
+DB_MAX_MB = 200
+_db_cleaner_task = None
+
+
+async def _db_cleaner() -> None:
+    """每小时扫一遍所有用户 opencode.db，超过 DB_MAX_MB 则删最老 session 直到达标，然后 VACUUM。"""
+    import sqlite3 as _sqlite3
+    import logging
+    logger = logging.getLogger(__name__)
+
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            from app.config import settings as _cfg
+            studio_root = os.path.abspath(os.path.expanduser(
+                getattr(_cfg, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")
+            ))
+            for user_dir in os.scandir(studio_root):
+                if not user_dir.is_dir():
+                    continue
+                db_path = os.path.join(user_dir.path, ".local", "share", "opencode", "opencode.db")
+                if not os.path.exists(db_path):
+                    continue
+                size_mb = os.path.getsize(db_path) / 1024 / 1024
+                if size_mb <= DB_MAX_MB:
+                    continue
+                try:
+                    con = _sqlite3.connect(db_path)
+                    # 反复删最老 session（含其 part/message）直到低于阈值
+                    deleted = 0
+                    while size_mb > DB_MAX_MB:
+                        row = con.execute(
+                            "SELECT id FROM session ORDER BY time_updated ASC LIMIT 1"
+                        ).fetchone()
+                        if not row:
+                            break
+                        sid = row[0]
+                        con.execute("DELETE FROM part WHERE session_id = ?", (sid,))
+                        con.execute("DELETE FROM message WHERE session_id = ?", (sid,))
+                        con.execute("DELETE FROM session WHERE id = ?", (sid,))
+                        con.commit()
+                        deleted += 1
+                        size_mb = os.path.getsize(db_path) / 1024 / 1024
+                    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    con.execute("VACUUM")
+                    con.close()
+                    logger.info(
+                        f"[DbCleaner] {user_dir.name}: 删除 {deleted} 个旧 session，"
+                        f"现在 {size_mb:.0f}MB"
+                    )
+                except Exception as e:
+                    logger.warning(f"[DbCleaner] {user_dir.name} 清理失败: {e}")
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"[DbCleaner] 扫描失败: {e}")
 
 
 async def _idle_reaper() -> None:
@@ -217,6 +274,7 @@ def _write_opencode_config(
     config: dict = {
         "$schema": "https://opencode.ai/config.schema.json",
         "model": default_model,
+        "snapshot": False,
         "provider": {
             "bailian-coding-plan": {
                 "npm": "@ai-sdk/anthropic",
@@ -488,11 +546,6 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
         # snapshot 仓库的 worktree 指向 workdir，会读这里的 .gitignore
         _gitignore_path = os.path.join(workdir, ".gitignore")
         _gitignore_content = (
-            "# 排除嵌套 git 仓库内容，防止 snapshot 把 packfile 反复快照\n"
-            ".git/\n"
-            "*.pack\n"
-            "*.idx\n"
-            "# 常见大目录\n"
             "node_modules/\n"
             ".venv/\n"
             "venv/\n"
@@ -500,12 +553,6 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
         )
         with open(_gitignore_path, "w", encoding="utf-8") as _f:
             _f.write(_gitignore_content)
-
-        # 双保险：同步写 snapshot 裸仓库的 info/exclude
-        _snapshot_info = os.path.join(workdir, ".local", "share", "opencode", "snapshot", "global", "info")
-        if os.path.isdir(_snapshot_info):
-            with open(os.path.join(_snapshot_info, "exclude"), "w", encoding="utf-8") as _f:
-                _f.write(_gitignore_content)
 
         from app.config import settings as _settings
         bailian_key = getattr(_settings, "BAILIAN_API_KEY", "") or os.environ.get("BAILIAN_API_KEY", "")
@@ -556,6 +603,14 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             proc.terminate()
             inst["proc"] = None
 
+        # 活跃进程数上限检查（已有进程的用户不受限，仅限新启动）
+        active_count = sum(
+            1 for uid, i in _user_instances.items()
+            if uid != user_id and i.get("proc") is not None and i["proc"].returncode is None
+        )
+        if active_count >= MAX_ACTIVE_INSTANCES:
+            raise HTTPException(503, f"当前并发实例已达上限（{MAX_ACTIVE_INSTANCES}），请稍后再试")
+
         # 每用户独立数据目录（持久化，session db 隔离）
         user_data_dir = os.path.join(workdir, ".local", "share")
         os.makedirs(user_data_dir, exist_ok=True)
@@ -586,7 +641,7 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             os.chmod(fake_open_path, 0o755)
         proc_env["PATH"] = fake_open_dir + ":" + proc_env.get("PATH", "")
         # 限制每个 opencode 进程的 Node.js 堆内存，防止单进程无限膨胀
-        proc_env["NODE_OPTIONS"] = "--max-old-space-size=2048"
+        proc_env["NODE_OPTIONS"] = "--max-old-space-size=1024"
 
         frontend_origins = [
             o.strip()
@@ -626,6 +681,11 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
         # 启动空闲进程回收任务（全局只跑一个）
         if _idle_reaper_task is None or _idle_reaper_task.done():
             _start_idle_reaper()
+
+        # 启动 db 大小清理任务（全局只跑一个）
+        global _db_cleaner_task
+        if _db_cleaner_task is None or _db_cleaner_task.done():
+            _db_cleaner_task = asyncio.create_task(_db_cleaner())
 
         return {"port": port, "url": "/opencode"}
 
@@ -1485,3 +1545,38 @@ def workdir_delete(req: DeleteRequest, user: User = Depends(get_current_user)):
     else:
         os.remove(target)
     return {"ok": True}
+
+
+# ─── GET /sse-proxy — FastAPI 持久化 SSE 代理，绕过 Next.js 30s 超时 ──────────
+
+@router.get("/sse-proxy")
+async def sse_proxy(path: str = "global/event", user: User = Depends(get_current_user)):
+    """把当前用户的 opencode SSE 流转发给浏览器，FastAPI StreamingResponse 无超时限制。"""
+    import aiohttp as _aiohttp
+    from fastapi.responses import StreamingResponse as _StreamingResponse
+
+    port = _port_for_user(user.id)
+    url = f"http://127.0.0.1:{port}/{path}"
+
+    async def event_stream():
+        while True:
+            try:
+                async with _aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=_aiohttp.ClientTimeout(total=None, connect=5)) as resp:
+                        async for chunk in resp.content.iter_any():
+                            yield chunk
+            except Exception:
+                pass
+            # 断线后发一个注释行保持浏览器连接，然后重连
+            yield b": reconnecting\n\n"
+            await asyncio.sleep(1)
+
+    return _StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
