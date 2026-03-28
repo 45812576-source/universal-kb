@@ -1044,6 +1044,31 @@ class SkillEngine:
             except Exception as e:
                 logger.warning(f"Data scope injection failed: {e}")
 
+        # ── 数据表上下文注入（当 Skill 绑定了 data_queries 时）──
+        if skill and skill.data_queries:
+            try:
+                from app.models.business import BusinessTable as BT
+                from app.services.data_engine import data_engine as _de
+                table_names = list({q.get("table_name") for q in skill.data_queries if q.get("table_name")})
+                if table_names:
+                    bts = db.query(BT).filter(BT.table_name.in_(table_names)).all()
+                    if bts:
+                        tables_for_ctx = []
+                        for bt in bts:
+                            cols = _de._get_columns(db, bt.table_name)
+                            tables_for_ctx.append({
+                                "table_name": bt.table_name,
+                                "display_name": bt.display_name,
+                                "description": bt.description or "",
+                                "columns": cols,
+                                "validation_rules": bt.validation_rules or {},
+                                "workflow": bt.workflow or {},
+                            })
+                        table_ctx = _de._build_table_context(tables_for_ctx)
+                        system_content += f"\n\n## 可用数据表\n\n{table_ctx}"
+            except Exception as e:
+                logger.warning(f"Data table context injection failed: {e}")
+
         # 追加通用行为约束（仅当 system_content 中没有自带约束时）
         if "回复规范" not in system_content and "禁止行为" not in system_content:
             system_content += (

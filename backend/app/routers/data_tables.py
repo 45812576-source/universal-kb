@@ -110,11 +110,69 @@ def get_table_schema(
     }
 
 
+_OP_MAP = {
+    "eq": "=", "ne": "!=", "gt": ">", "gte": ">=", "lt": "<", "lte": "<=",
+    "contains": "LIKE", "starts": "LIKE", "ends": "LIKE",
+}
+
+
+def _apply_view_config(base_sql: str, config: dict) -> tuple[str, str]:
+    """Apply view filters and sorts to a base SELECT SQL.
+    Returns (filtered_sql, sorted_sql)."""
+    import re
+
+    filters = config.get("filters") or []
+    sorts = config.get("sorts") or []
+
+    where_parts = []
+    for f in filters:
+        field = f.get("field", "").strip()
+        op = f.get("op", "eq")
+        val = f.get("value", "")
+        if not field or op not in _OP_MAP:
+            continue
+        # Sanitize field name
+        if not re.match(r'^[\w\u4e00-\u9fff]+$', field):
+            continue
+        sql_op = _OP_MAP[op]
+        if op == "contains":
+            where_parts.append(f"`{field}` LIKE '%{val}%'")
+        elif op == "starts":
+            where_parts.append(f"`{field}` LIKE '{val}%'")
+        elif op == "ends":
+            where_parts.append(f"`{field}` LIKE '%{val}'")
+        else:
+            if isinstance(val, str):
+                val_escaped = val.replace("'", "''")
+                where_parts.append(f"`{field}` {sql_op} '{val_escaped}'")
+            else:
+                where_parts.append(f"`{field}` {sql_op} {val}")
+
+    if where_parts:
+        if "WHERE" in base_sql.upper():
+            base_sql += " AND (" + " AND ".join(where_parts) + ")"
+        else:
+            base_sql += " WHERE " + " AND ".join(where_parts)
+
+    if sorts:
+        order_parts = []
+        for s in sorts:
+            field = s.get("field", "").strip()
+            direction = "DESC" if s.get("dir", "asc").lower() == "desc" else "ASC"
+            if field and re.match(r'^[\w\u4e00-\u9fff]+$', field):
+                order_parts.append(f"`{field}` {direction}")
+        if order_parts:
+            base_sql += " ORDER BY " + ", ".join(order_parts)
+
+    return base_sql
+
+
 @router.get("/{table_name}/rows")
 def list_rows(
     table_name: str,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    view_id: int = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -148,6 +206,13 @@ def list_rows(
             conditions.append(f"`{ownership.department_field}` = {user.department_id}")
         if conditions:
             base_sql += " WHERE (" + " OR ".join(conditions) + ")"
+
+    # ── Apply view config (filters + sorts) if view_id provided ──
+    if view_id:
+        from app.models.business import TableView
+        view = db.get(TableView, view_id)
+        if view and view.table_id == bt.id:
+            base_sql = _apply_view_config(base_sql, view.config or {})
 
     count_result = db.execute(text(f"SELECT COUNT(*) FROM ({base_sql}) AS _t")).scalar()
 

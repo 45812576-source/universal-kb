@@ -76,3 +76,19 @@ class SkillDataQuery(Base):
     template_sql = Column(Text)
 
     skill = relationship("Skill", foreign_keys=[skill_id])
+
+
+class TableView(Base):
+    """User-defined views for a business table: saved filter/sort/group/column config."""
+    __tablename__ = "table_views"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    table_id = Column(Integer, ForeignKey("business_tables.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(100), nullable=False)
+    view_type = Column(String(20), default="grid")   # "grid" | "kanban" | "gallery"
+    config = Column(JSON, default=dict)              # {filters, sorts, group_by, hidden_columns, column_widths}
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    table = relationship("BusinessTable", foreign_keys=[table_id])

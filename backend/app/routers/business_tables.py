@@ -754,6 +754,259 @@ def probe_external_table(
         raise HTTPException(400, f"连接或查询失败: {e}")
 
 
+# ─── field_type → MySQL type mapping ─────────────────────────────────────────
+_FIELD_TYPE_MAP = {
+    "text":         "TEXT",
+    "number":       "DOUBLE",
+    "select":       "VARCHAR(100)",
+    "multi_select": "TEXT",
+    "date":         "DATETIME",
+    "person":       "INT",
+    "url":          "TEXT",
+    "checkbox":     "TINYINT(1)",
+    "email":        "VARCHAR(255)",
+    "phone":        "VARCHAR(50)",
+}
+
+
+class FieldDef(BaseModel):
+    name: str
+    field_type: str = "text"        # see _FIELD_TYPE_MAP
+    options: list[str] = []         # for select / multi_select
+    nullable: bool = True
+    comment: str = ""
+
+
+class CreateBlankTableRequest(BaseModel):
+    display_name: str
+    description: str = ""
+    fields: list[FieldDef] = []     # extra user-defined fields (id/created_at/updated_at auto-added)
+    row_scope: str = "private"      # "all" | "department" | "private"
+    column_scope: str = "private"
+
+
+@router.post("/create-blank")
+def create_blank_table(
+    req: CreateBlankTableRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """Create a new blank table with user-defined fields."""
+    import re, time
+
+    if not req.display_name.strip():
+        raise HTTPException(400, "display_name 不能为空")
+
+    # Auto-generate a unique table name from display_name
+    base = re.sub(r"[^a-z0-9\u4e00-\u9fff]", "_", req.display_name.strip().lower())
+    base = re.sub(r"_+", "_", base).strip("_")[:30] or "table"
+    table_name = f"usr_{base}_{int(time.time()) % 100000}"
+
+    # Validate field types
+    for f in req.fields:
+        if f.field_type not in _FIELD_TYPE_MAP:
+            raise HTTPException(400, f"不支持的字段类型 '{f.field_type}'，可选：{list(_FIELD_TYPE_MAP.keys())}")
+        if not re.match(r'^[a-zA-Z_\u4e00-\u9fff][a-zA-Z0-9_\u4e00-\u9fff]*$', f.name):
+            raise HTTPException(400, f"字段名 '{f.name}' 格式不合法")
+
+    # Build DDL
+    col_defs = [
+        "  `id` INT AUTO_INCREMENT PRIMARY KEY",
+        "  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP",
+        "  `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    ]
+    field_meta = []
+    for f in req.fields:
+        mysql_type = _FIELD_TYPE_MAP[f.field_type]
+        null_clause = "NULL" if f.nullable else "NOT NULL"
+        comment_clause = f" COMMENT '{f.comment}'" if f.comment else ""
+        col_defs.append(f"  `{f.name}` {mysql_type} {null_clause}{comment_clause}")
+        field_meta.append({
+            "name": f.name,
+            "field_type": f.field_type,
+            "options": f.options,
+            "nullable": f.nullable,
+            "comment": f.comment,
+        })
+
+    ddl = (
+        f"CREATE TABLE IF NOT EXISTS `{table_name}` (\n"
+        + ",\n".join(col_defs)
+        + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+    # Execute DDL
+    try:
+        db.execute(text(ddl))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"建表失败: {e}")
+
+    # Register
+    rules = {
+        "row_scope": req.row_scope,
+        "column_scope": req.column_scope,
+        "field_meta": field_meta,
+    }
+    bt = BusinessTable(
+        table_name=table_name,
+        display_name=req.display_name.strip(),
+        description=req.description,
+        ddl_sql=ddl,
+        validation_rules=rules,
+        owner_id=user.id,
+    )
+    db.add(bt)
+    db.commit()
+    db.refresh(bt)
+    return {"id": bt.id, "table_name": bt.table_name, "display_name": bt.display_name}
+
+
+# ─── Column management APIs ───────────────────────────────────────────────────
+
+class AddColumnRequest(BaseModel):
+    name: str
+    field_type: str = "text"
+    options: list[str] = []
+    nullable: bool = True
+    comment: str = ""
+
+
+class RenameColumnRequest(BaseModel):
+    new_name: str
+    comment: str = None
+
+
+@router.post("/{table_id}/columns")
+def add_column(
+    table_id: int,
+    req: AddColumnRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """Add a new column to an existing business table."""
+    import re
+    bt = db.get(BusinessTable, table_id)
+    if not bt:
+        raise HTTPException(404, "Business table not found")
+    if req.field_type not in _FIELD_TYPE_MAP:
+        raise HTTPException(400, f"不支持的字段类型 '{req.field_type}'")
+    if not re.match(r'^[a-zA-Z_\u4e00-\u9fff][a-zA-Z0-9_\u4e00-\u9fff]*$', req.name):
+        raise HTTPException(400, f"字段名 '{req.name}' 格式不合法")
+
+    mysql_type = _FIELD_TYPE_MAP[req.field_type]
+    null_clause = "NULL" if req.nullable else "NOT NULL"
+    comment_clause = f" COMMENT '{req.comment}'" if req.comment else ""
+    alter_sql = f"ALTER TABLE `{bt.table_name}` ADD COLUMN `{req.name}` {mysql_type} {null_clause}{comment_clause}"
+
+    try:
+        db.execute(text(alter_sql))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"新增列失败: {e}")
+
+    # Update field_meta in validation_rules
+    rules = dict(bt.validation_rules or {})
+    meta = list(rules.get("field_meta") or [])
+    meta.append({"name": req.name, "field_type": req.field_type, "options": req.options,
+                  "nullable": req.nullable, "comment": req.comment})
+    rules["field_meta"] = meta
+    bt.validation_rules = rules
+    db.commit()
+    return {"ok": True, "column": req.name}
+
+
+@router.patch("/{table_id}/columns/{col_name}")
+def rename_column(
+    table_id: int,
+    col_name: str,
+    req: RenameColumnRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """Rename a column (or update its comment)."""
+    import re
+    bt = db.get(BusinessTable, table_id)
+    if not bt:
+        raise HTTPException(404, "Business table not found")
+
+    # Get current column info
+    col_rows = db.execute(
+        text("SELECT DATA_TYPE, IS_NULLABLE, COLUMN_COMMENT FROM INFORMATION_SCHEMA.COLUMNS "
+             "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t AND COLUMN_NAME = :c"),
+        {"t": bt.table_name, "c": col_name},
+    ).fetchone()
+    if not col_rows:
+        raise HTTPException(404, f"列 '{col_name}' 不存在")
+
+    new_name = req.new_name.strip()
+    if not re.match(r'^[a-zA-Z_\u4e00-\u9fff][a-zA-Z0-9_\u4e00-\u9fff]*$', new_name):
+        raise HTTPException(400, f"新列名 '{new_name}' 格式不合法")
+
+    data_type = col_rows[0].upper()
+    null_clause = "NULL" if col_rows[1] == "YES" else "NOT NULL"
+    comment = req.comment if req.comment is not None else (col_rows[2] or "")
+    comment_clause = f" COMMENT '{comment}'" if comment else ""
+
+    alter_sql = (
+        f"ALTER TABLE `{bt.table_name}` "
+        f"CHANGE COLUMN `{col_name}` `{new_name}` {data_type} {null_clause}{comment_clause}"
+    )
+    try:
+        db.execute(text(alter_sql))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"重命名列失败: {e}")
+
+    # Update field_meta
+    rules = dict(bt.validation_rules or {})
+    meta = list(rules.get("field_meta") or [])
+    for m in meta:
+        if m["name"] == col_name:
+            m["name"] = new_name
+            if req.comment is not None:
+                m["comment"] = req.comment
+            break
+    rules["field_meta"] = meta
+    bt.validation_rules = rules
+    db.commit()
+    return {"ok": True, "old_name": col_name, "new_name": new_name}
+
+
+@router.delete("/{table_id}/columns/{col_name}")
+def drop_column(
+    table_id: int,
+    col_name: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """Drop a column from a business table. Protected columns (id, created_at, updated_at) cannot be dropped."""
+    PROTECTED = {"id", "created_at", "updated_at", "_record_id", "_synced_at"}
+    bt = db.get(BusinessTable, table_id)
+    if not bt:
+        raise HTTPException(404, "Business table not found")
+    if col_name in PROTECTED:
+        raise HTTPException(400, f"列 '{col_name}' 是系统保留列，不允许删除")
+
+    try:
+        db.execute(text(f"ALTER TABLE `{bt.table_name}` DROP COLUMN `{col_name}`"))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"删除列失败: {e}")
+
+    # Update field_meta
+    rules = dict(bt.validation_rules or {})
+    meta = [m for m in (rules.get("field_meta") or []) if m["name"] != col_name]
+    rules["field_meta"] = meta
+    bt.validation_rules = rules
+    db.commit()
+    return {"ok": True, "dropped": col_name}
+
+
 class PatchTableRequest(BaseModel):
     display_name: str = None
     hidden_fields: list[str] = None       # stored in validation_rules["hidden_fields"]
