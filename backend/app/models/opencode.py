@@ -29,6 +29,7 @@ class OpenCodeUsageCache(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True)
     sessions = Column(Integer, default=0)
+    ai_calls = Column(Integer, default=0)          # step-finish 条数，即 LLM API 调用次数
     input_tokens = Column(Integer, default=0)
     output_tokens = Column(Integer, default=0)
     cache_read_tokens = Column(Integer, default=0)

@@ -299,6 +299,7 @@ def _read_one_opencode_db(db_path: str) -> dict:
 
     result = {
         "sessions": 0,
+        "ai_calls": 0,
         "input_tokens": 0,
         "output_tokens": 0,
         "cache_read_tokens": 0,
@@ -320,6 +321,11 @@ def _read_one_opencode_db(db_path: str) -> dict:
             session_rows = con.execute(
                 "SELECT id, title, summary_files, summary_additions, summary_deletions FROM session"
             ).fetchall()
+            ai_calls_row = con.execute(
+                "SELECT COUNT(*) FROM part "
+                "WHERE json_extract(data, '$.type') = 'step-finish'"
+            ).fetchone()
+            result["ai_calls"] = int(ai_calls_row[0]) if ai_calls_row else 0
             msg_rows = con.execute(
                 "SELECT m.data FROM message m "
                 "WHERE json_extract(m.data, '$.role') = 'assistant' "
@@ -636,13 +642,14 @@ def compute_and_store_opencode_usage(db: Session) -> None:
 
         if uid not in user_stats:
             user_stats[uid] = {
-                "sessions": 0, "input_tokens": 0, "output_tokens": 0,
+                "sessions": 0, "ai_calls": 0, "input_tokens": 0, "output_tokens": 0,
                 "cache_read_tokens": 0, "files_changed": 0, "lines_added": 0,
                 "lines_deleted": 0, "models": {}, "workspaces": [], "output_files": [],
                 "_file_paths": set(),
             }
         s = user_stats[uid]
         s["sessions"] += ws["sessions"]
+        s["ai_calls"] += ws["ai_calls"]
         s["input_tokens"] += ws["input_tokens"]
         s["output_tokens"] += ws["output_tokens"]
         s["cache_read_tokens"] += ws["cache_read_tokens"]
@@ -665,6 +672,7 @@ def compute_and_store_opencode_usage(db: Session) -> None:
             row = OpenCodeUsageCache(user_id=uid)
             db.add(row)
         row.sessions = s["sessions"]
+        row.ai_calls = s["ai_calls"]
         row.input_tokens = s["input_tokens"]
         row.output_tokens = s["output_tokens"]
         row.cache_read_tokens = s["cache_read_tokens"]
@@ -698,6 +706,7 @@ def opencode_usage(
             "user_id": row.user_id,
             "display_name": row.user.display_name if row.user else str(row.user_id),
             "sessions": row.sessions,
+            "ai_calls": row.ai_calls or 0,
             "input_tokens": row.input_tokens,
             "output_tokens": row.output_tokens,
             "cache_read_tokens": row.cache_read_tokens,
