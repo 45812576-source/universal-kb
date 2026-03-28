@@ -182,6 +182,22 @@ class UserSavedSkill(Base):
     skill = relationship("Skill", foreign_keys=[skill_id])
 
 
+class SkillPreflightResult(Base):
+    """Skill 预检结果持久化 — 支持增量检测（content_hash 比对跳过未变维度）。"""
+    __tablename__ = "skill_preflight_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skill_id = Column(Integer, ForeignKey("skills.id"), nullable=False)
+    gate_name = Column(String(50), nullable=False)  # structure / knowledge / tools / quality
+    passed = Column(Boolean, nullable=False)
+    score = Column(Integer, nullable=True)  # NULL for gates, 0-100 for quality
+    detail = Column(JSON, nullable=True)
+    content_hash = Column(String(64), nullable=True)  # 内容变更检测
+    checked_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    skill = relationship("Skill", foreign_keys=[skill_id])
+
+
 class SkillAttribution(Base):
     __tablename__ = "skill_attributions"
 

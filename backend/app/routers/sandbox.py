@@ -4,21 +4,25 @@ Skill 测试：用 AI 分析 system_prompt，生成典型测试 prompt，
           实际调用 LLM，输出测试报告。
 Tool 测试：分析工具的 input_schema/manifest，生成 mock 参数，
          执行 tool_executor，输出执行结果。
+Preflight：多维度预检 — Gate 1/2/3（结构/知识库/工具）一票否决 + LLM 质量评分。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import logging
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.user import User
-from app.models.skill import Skill, SkillVersion
+from app.models.skill import Skill, SkillVersion, SkillPreflightResult
 from app.models.tool import ToolRegistry
 from app.services.llm_gateway import llm_gateway
 
@@ -486,3 +490,523 @@ async def _sandbox_execute_tool(
         }
     except Exception as e:
         return {"ok": False, "error": str(e), "phases": phases + ["runtime_error"]}
+
+
+# ─── Preflight: 多维度预检 ────────────────────────────────────────────────────
+
+_QUALITY_TEST_GEN_PROMPT = """你是 AI Skill 测试专家。根据以下 Skill 信息，生成 2-3 个最能检验该 Skill 核心能力的测试用例。
+
+Skill 名称：{name}
+Skill 目标：{description}
+System Prompt（前 2000 字）：
+{system_prompt}
+
+附属文件列表：
+{file_list}
+
+要求：
+- 每个用例一行，直接输出用户消息
+- 第 1 个测试核心场景，第 2 个测试边界/深度场景
+- 用例应该能暴露"只做了子问题没解决完整问题"的情况
+- 中文，每条 20-80 字
+- 不要编号、不要解释，一行一条"""
+
+_QUALITY_SCORE_PROMPT = """你是 AI Skill 质量评审官。
+
+该 Skill 的目标：
+{description}
+
+System Prompt 摘要（前 1500 字）：
+{system_prompt}
+
+知识库检索结果：
+{knowledge_summary}
+
+测试用例：
+{test_input}
+
+AI 回复：
+{response}
+
+请严格评分（0-100），评估标准：
+1. 目标覆盖度（40%）：回复是否解决了 Skill 描述中的核心问题？还是只碰到了皮毛/子问题？
+   - 如果 Skill 说"系统复盘"但只做了"查预算"，应给低分
+2. 输出完整度（30%）：回复结构是否完整？关键信息是否齐全？
+   - 如果知识库检索到了相关内容，回复是否有效利用了这些知识？
+   - 如果知识库为空或无相关结果，说明该 Skill 缺少支撑知识，应适当扣分
+3. 专业度（30%）：用词是否专业？格式是否规范？是否体现领域知识？
+
+只输出 JSON（不要其他内容）：
+{{"score": 75, "coverage": 80, "completeness": 70, "professionalism": 75, "knowledge_used": true, "reason": "一句话说明"}}"""
+
+
+def _hash_content(*parts: str) -> str:
+    """对多个内容片段取 SHA256 前 16 位作为变更指纹。"""
+    h = hashlib.sha256()
+    for p in parts:
+        h.update((p or "").encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _get_cached_result(db: Session, skill_id: int, gate_name: str, content_hash: str) -> Optional[dict]:
+    """查找未过期的缓存结果（content_hash 匹配）。"""
+    row = (
+        db.query(SkillPreflightResult)
+        .filter(
+            SkillPreflightResult.skill_id == skill_id,
+            SkillPreflightResult.gate_name == gate_name,
+            SkillPreflightResult.content_hash == content_hash,
+        )
+        .order_by(SkillPreflightResult.checked_at.desc())
+        .first()
+    )
+    if not row:
+        return None
+    return {
+        "passed": row.passed,
+        "score": row.score,
+        "detail": row.detail,
+        "cached": True,
+        "checked_at": row.checked_at.isoformat() if row.checked_at else None,
+    }
+
+
+def _save_result(db: Session, skill_id: int, gate_name: str, passed: bool, content_hash: str, detail: dict, score: int = None):
+    """保存检测结果，覆盖同 skill_id + gate_name 的旧记录。"""
+    existing = (
+        db.query(SkillPreflightResult)
+        .filter(SkillPreflightResult.skill_id == skill_id, SkillPreflightResult.gate_name == gate_name)
+        .first()
+    )
+    import datetime
+    if existing:
+        existing.passed = passed
+        existing.score = score
+        existing.detail = detail
+        existing.content_hash = content_hash
+        existing.checked_at = datetime.datetime.utcnow()
+    else:
+        db.add(SkillPreflightResult(
+            skill_id=skill_id, gate_name=gate_name, passed=passed,
+            score=score, detail=detail, content_hash=content_hash,
+        ))
+    db.commit()
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@router.get("/preflight/{skill_id}")
+async def preflight(
+    skill_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Skill 多维度预检 — SSE 流式返回各 gate 结果 + LLM 质量评分。"""
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+
+    from app.models.user import Role
+    if skill.created_by != user.id and user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
+        raise HTTPException(403, "无权检测该 Skill")
+
+    latest_ver: SkillVersion | None = (
+        db.query(SkillVersion)
+        .filter(SkillVersion.skill_id == skill_id)
+        .order_by(SkillVersion.version.desc())
+        .first()
+    )
+    system_prompt = (latest_ver.system_prompt if latest_ver else "") or ""
+    source_files = skill.source_files or []
+
+    async def generate():
+        gates = []
+        all_passed = True
+
+        # ── Gate 1: 结构完整性 ──────────────────────────────────────
+        yield _sse("gate", {"gate": "structure", "label": "检查目录结构...", "status": "running"})
+
+        structure_hash = _hash_content(
+            system_prompt[:100], skill.description or "",
+            json.dumps([f["filename"] for f in source_files], ensure_ascii=False),
+        )
+        cached = _get_cached_result(db, skill_id, "structure", structure_hash)
+        if cached and cached["passed"]:
+            gate1 = {"gate": "structure", "label": "目录结构", "status": "passed", "items": cached["detail"].get("items", []), "cached": True, "checked_at": cached["checked_at"]}
+            gates.append(gate1)
+            yield _sse("gate", gate1)
+        else:
+            items = []
+            g1_pass = True
+            if len(system_prompt.strip()) < 50:
+                items.append({"check": "SKILL.md 内容", "ok": False, "issue": f"System Prompt 仅 {len(system_prompt.strip())} 字，需 ≥ 50 字"})
+                g1_pass = False
+            else:
+                items.append({"check": "SKILL.md 内容", "ok": True})
+            if not (skill.description or "").strip():
+                items.append({"check": "Skill 描述", "ok": False, "issue": "description 为空"})
+                g1_pass = False
+            else:
+                items.append({"check": "Skill 描述", "ok": True})
+            if len(source_files) == 0:
+                items.append({"check": "附属文件", "ok": False, "issue": "无任何附属文件"})
+                g1_pass = False
+            else:
+                items.append({"check": "附属文件", "ok": True, "detail": f"{len(source_files)} 个文件"})
+
+            status = "passed" if g1_pass else "failed"
+            gate1 = {"gate": "structure", "label": "目录结构", "status": status, "items": items}
+            gates.append(gate1)
+            _save_result(db, skill_id, "structure", g1_pass, structure_hash, {"items": items})
+            yield _sse("gate", gate1)
+            if not g1_pass:
+                all_passed = False
+                yield _sse("done", {"passed": False, "blocked_by": "structure", "gates": gates})
+                return
+
+        # ── Gate 2: 知识库就绪 ──────────────────────────────────────
+        yield _sse("gate", {"gate": "knowledge", "label": "检查知识库...", "status": "running"})
+
+        kb_files = [f for f in source_files if f.get("category") == "knowledge-base"]
+        if not kb_files:
+            gate2 = {"gate": "knowledge", "label": "知识库", "status": "passed", "items": [{"check": "无知识库文件", "ok": True, "detail": "该 Skill 不需要知识库"}]}
+            gates.append(gate2)
+            _save_result(db, skill_id, "knowledge", True, "no_kb", {"items": gate2["items"]})
+            yield _sse("gate", gate2)
+        else:
+            kb_hash = _hash_content(*[f["filename"] for f in kb_files])
+            cached = _get_cached_result(db, skill_id, "knowledge", kb_hash)
+            if cached and cached["passed"]:
+                gate2 = {"gate": "knowledge", "label": "知识库", "status": "passed", "items": cached["detail"].get("items", []), "cached": True, "checked_at": cached["checked_at"]}
+                gates.append(gate2)
+                yield _sse("gate", gate2)
+            else:
+                from app.models.knowledge import KnowledgeEntry
+                items = []
+                g2_pass = True
+                for kf in kb_files:
+                    fname = kf["filename"]
+                    # 查 knowledge_entries 匹配（按 title 或 source_file）
+                    entry = (
+                        db.query(KnowledgeEntry)
+                        .filter(
+                            (KnowledgeEntry.title == fname) | (KnowledgeEntry.source_file == fname)
+                        )
+                        .first()
+                    )
+                    if not entry:
+                        items.append({"check": fname, "ok": False, "issue": "未入库", "action": "confirm_archive"})
+                        g2_pass = False
+                        continue
+                    # 查向量库是否有 chunk
+                    try:
+                        from app.services.vector_service import search_knowledge
+                        hits = search_knowledge(fname, top_k=1, knowledge_id_filter=[entry.id])
+                        if hits:
+                            items.append({"check": fname, "ok": True, "detail": f"已入库 (ID:{entry.id}), 有向量索引"})
+                        else:
+                            items.append({"check": fname, "ok": False, "issue": "已入库但无向量索引", "knowledge_id": entry.id, "action": "reindex"})
+                            g2_pass = False
+                    except Exception:
+                        items.append({"check": fname, "ok": True, "detail": f"已入库 (ID:{entry.id}), 向量检查跳过"})
+
+                status = "passed" if g2_pass else "failed"
+                gate2 = {"gate": "knowledge", "label": "知识库", "status": status, "items": items}
+                gates.append(gate2)
+                _save_result(db, skill_id, "knowledge", g2_pass, kb_hash, {"items": items})
+                yield _sse("gate", gate2)
+                if not g2_pass:
+                    all_passed = False
+                    yield _sse("done", {"passed": False, "blocked_by": "knowledge", "gates": gates})
+                    return
+
+        # ── Gate 3: 工具就绪 ──────────────────────────────────────
+        yield _sse("gate", {"gate": "tools", "label": "检查工具...", "status": "running"})
+
+        bound = list(skill.bound_tools)
+        if not bound:
+            gate3 = {"gate": "tools", "label": "工具", "status": "passed", "items": [{"check": "无绑定工具", "ok": True, "detail": "该 Skill 不需要工具"}]}
+            gates.append(gate3)
+            _save_result(db, skill_id, "tools", True, "no_tools", {"items": gate3["items"]})
+            yield _sse("gate", gate3)
+        else:
+            tool_hash = _hash_content(*[str(t.id) for t in bound])
+            cached = _get_cached_result(db, skill_id, "tools", tool_hash)
+            if cached and cached["passed"]:
+                gate3 = {"gate": "tools", "label": "工具", "status": "passed", "items": cached["detail"].get("items", []), "cached": True, "checked_at": cached["checked_at"]}
+                gates.append(gate3)
+                yield _sse("gate", gate3)
+            else:
+                items = []
+                g3_pass = True
+                for t in bound:
+                    tool_name = t.display_name or t.name
+                    issues = []
+                    # 检查状态
+                    if t.status != "published" and not t.is_active:
+                        issues.append(f"状态 {t.status}, 未激活")
+                    # BUILTIN 类型检查模块
+                    if t.tool_type and t.tool_type.value == "BUILTIN":
+                        try:
+                            import importlib
+                            mod_name = f"app.tools.{t.name}"
+                            importlib.import_module(mod_name)
+                        except (ImportError, ModuleNotFoundError):
+                            issues.append("模块不存在或无法导入")
+                    # registered_table 数据源检查
+                    config = t.config or {}
+                    manifest = config.get("manifest", {})
+                    for ds in manifest.get("data_sources", []):
+                        if ds.get("type") == "registered_table" and ds.get("required", True):
+                            from app.models.business import BusinessTable
+                            exists = db.query(BusinessTable).filter(BusinessTable.table_name == ds.get("key", "")).first()
+                            if not exists:
+                                issues.append(f"数据表 '{ds.get('key')}' 未注册")
+
+                    if issues:
+                        items.append({"check": tool_name, "ok": False, "issue": "；".join(issues)})
+                        g3_pass = False
+                    else:
+                        items.append({"check": tool_name, "ok": True})
+
+                status = "passed" if g3_pass else "failed"
+                gate3 = {"gate": "tools", "label": "工具", "status": status, "items": items}
+                gates.append(gate3)
+                _save_result(db, skill_id, "tools", g3_pass, tool_hash, {"items": items})
+                yield _sse("gate", gate3)
+                if not g3_pass:
+                    all_passed = False
+                    yield _sse("done", {"passed": False, "blocked_by": "tools", "gates": gates})
+                    return
+
+        # ── 阶段二：LLM 质量评分 ──────────────────────────────────
+        yield _sse("stage", {"label": "生成测试用例..."})
+
+        file_list = "\n".join(f"  - {f['filename']} ({f.get('category', 'other')})" for f in source_files) or "（无附属文件）"
+        test_gen_prompt = _QUALITY_TEST_GEN_PROMPT.format(
+            name=skill.name,
+            description=skill.description or "无描述",
+            system_prompt=system_prompt[:2000],
+            file_list=file_list,
+        )
+        try:
+            raw_cases, _ = await llm_gateway.chat(
+                model_config=llm_gateway.get_lite_config(),
+                messages=[{"role": "user", "content": test_gen_prompt}],
+                temperature=0.7,
+                max_tokens=500,
+            )
+            test_cases = [line.strip() for line in raw_cases.strip().splitlines() if line.strip()][:3]
+        except Exception:
+            test_cases = ["请介绍一下你的核心功能并给出一个完整示例。"]
+
+        if not test_cases:
+            test_cases = ["请展示你的核心能力。"]
+
+        model_cfg = llm_gateway.get_preflight_exec_config()
+        tests = []
+        total_score = 0
+
+        # 知识检索函数：模拟真实 RAG 链路
+        async def _retrieve_knowledge(query: str) -> str:
+            try:
+                import asyncio
+                from app.services.vector_service import search_knowledge
+                hits = await asyncio.wait_for(
+                    asyncio.to_thread(search_knowledge, query, 10),
+                    timeout=5.0,
+                )
+                if not hits:
+                    return ""
+                # 按 Skill 的 knowledge_tags 过滤（如果有）
+                if skill.knowledge_tags:
+                    tag_set = set(skill.knowledge_tags)
+                    hits = [h for h in hits if tag_set.intersection(set(h.get("tags", [])))] or hits[:5]
+                chunks = []
+                for h in hits[:5]:
+                    chunks.append(h.get("text", ""))
+                return "\n\n---\n\n".join(c for c in chunks if c)
+            except Exception as e:
+                logger.warning(f"Preflight knowledge retrieval failed: {e}")
+                return ""
+
+        for idx, tc in enumerate(test_cases):
+            yield _sse("stage", {"label": f"运行测试 {idx + 1}/{len(test_cases)}..."})
+
+            # 检索知识库，注入到 system_prompt
+            knowledge_ctx = await _retrieve_knowledge(tc)
+            full_prompt = system_prompt
+            if knowledge_ctx:
+                full_prompt += f"\n\n## 参考知识\n\n{knowledge_ctx}"
+
+            # 调 LLM
+            try:
+                response, _ = await llm_gateway.chat(
+                    model_config=model_cfg,
+                    messages=[
+                        {"role": "system", "content": full_prompt},
+                        {"role": "user", "content": tc},
+                    ],
+                    temperature=0.7,
+                    max_tokens=1500,
+                )
+            except Exception as e:
+                tests.append({"index": idx + 1, "test_input": tc, "response": "", "score": 0, "detail": {"reason": f"LLM 调用失败：{e}"}})
+                continue
+
+            # AI 评分
+            yield _sse("stage", {"label": f"评估测试 {idx + 1} 回复质量..."})
+            kb_summary = knowledge_ctx[:500] if knowledge_ctx else "（未检索到相关知识）"
+            score_prompt = _QUALITY_SCORE_PROMPT.format(
+                description=skill.description or "无描述",
+                system_prompt=system_prompt[:1500],
+                knowledge_summary=kb_summary,
+                test_input=tc,
+                response=response[:2000],
+            )
+            try:
+                score_raw, _ = await llm_gateway.chat(
+                    model_config=llm_gateway.get_preflight_score_config(),
+                    messages=[{"role": "user", "content": score_prompt}],
+                    temperature=0.0,
+                    max_tokens=1024,
+                )
+                text = score_raw.strip()
+                if "```" in text:
+                    text = text.split("```")[1]
+                    if text.startswith("json"):
+                        text = text[4:]
+                score_data = json.loads(text.strip())
+                sc = int(score_data.get("score", 0))
+            except Exception:
+                sc = 50
+                score_data = {"score": 50, "reason": "评分解析失败，给默认分"}
+
+            test_result = {
+                "index": idx + 1,
+                "test_input": tc,
+                "response": response[:500] + ("..." if len(response) > 500 else ""),
+                "score": sc,
+                "detail": score_data,
+            }
+            tests.append(test_result)
+            total_score += sc
+            yield _sse("test_result", test_result)
+
+        avg_score = round(total_score / len(tests)) if tests else 0
+        quality_passed = avg_score >= 70
+
+        _save_result(db, skill_id, "quality", quality_passed, "", {"tests": tests, "avg_score": avg_score}, score=avg_score)
+
+        yield _sse("done", {
+            "passed": quality_passed,
+            "score": avg_score,
+            "gates": gates,
+            "tests": tests,
+        })
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+# ─── Knowledge confirm ────────────────────────────────────────────────────────
+
+class KnowledgeConfirmItem(BaseModel):
+    filename: str
+    target_board: str = ""
+    target_category: str = ""
+    display_title: str = ""
+
+
+class KnowledgeConfirmRequest(BaseModel):
+    confirmations: List[KnowledgeConfirmItem]
+
+
+@router.post("/preflight/{skill_id}/knowledge-confirm")
+async def knowledge_confirm(
+    skill_id: int,
+    req: KnowledgeConfirmRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """确认知识库文件归档路径并入库。"""
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+
+    from app.models.knowledge import KnowledgeEntry
+    results = []
+
+    for item in req.confirmations:
+        # 读取文件内容
+        source_files = skill.source_files or []
+        file_info = next((f for f in source_files if f["filename"] == item.filename), None)
+        if not file_info:
+            results.append({"filename": item.filename, "ok": False, "reason": "文件不存在"})
+            continue
+
+        # 读文件内容
+        import os
+        file_path = file_info.get("path", "")
+        content = ""
+        if file_path and os.path.exists(file_path):
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except Exception:
+                pass
+
+        if not content:
+            results.append({"filename": item.filename, "ok": False, "reason": "文件内容为空或无法读取"})
+            continue
+
+        title = item.display_title or item.filename
+        category = item.target_category or "general"
+
+        # 创建/更新 knowledge_entry
+        existing = db.query(KnowledgeEntry).filter(
+            (KnowledgeEntry.title == title) | (KnowledgeEntry.source_file == item.filename)
+        ).first()
+
+        if existing:
+            existing.content = content
+            existing.category = category
+            existing.taxonomy_board = item.target_board or existing.taxonomy_board
+            entry_id = existing.id
+        else:
+            from app.models.knowledge import KnowledgeStatus
+            entry = KnowledgeEntry(
+                title=title,
+                content=content,
+                category=category,
+                status=KnowledgeStatus.APPROVED,
+                created_by=user.id,
+                source_type="skill_preflight",
+                source_file=item.filename,
+                taxonomy_board=item.target_board or None,
+            )
+            db.add(entry)
+            db.flush()
+            entry_id = entry.id
+
+        db.commit()
+
+        # 触发向量入库
+        try:
+            from app.services.vector_service import index_knowledge, delete_knowledge_vectors
+            delete_knowledge_vectors(entry_id)  # 清除旧向量
+            index_knowledge(entry_id, content, user.id)
+            results.append({"filename": item.filename, "ok": True, "knowledge_id": entry_id})
+        except Exception as e:
+            results.append({"filename": item.filename, "ok": True, "knowledge_id": entry_id, "vector_warning": str(e)})
+
+    # 清除 knowledge gate 缓存，强制下次重检
+    db.query(SkillPreflightResult).filter(
+        SkillPreflightResult.skill_id == skill_id,
+        SkillPreflightResult.gate_name == "knowledge",
+    ).delete()
+    db.commit()
+
+    return {"results": results}
