@@ -13,6 +13,16 @@ class Settings(BaseSettings):
     # 每用户 opencode 工作目录根路径（持久化，重启不丢失）
     STUDIO_WORKSPACE_ROOT: str = "~/studio_workspaces"
 
+    # ── 阿里云 OSS 存储 ──────────────────────────────────────────────────────
+    OSS_ENDPOINT: str = "oss-cn-guangzhou.aliyuncs.com"
+    OSS_BUCKET: str = "le-desk"
+    OSS_ACCESS_KEY_ID: str = ""
+    OSS_ACCESS_KEY_SECRET: str = ""
+
+    # OnlyOffice Document Server
+    ONLYOFFICE_URL: str = "http://localhost:8443"
+    ONLYOFFICE_JWT_SECRET: str = "change-me-onlyoffice"
+
     # Feishu (Lark) integration
     LARK_APP_ID: str = ""
     LARK_APP_SECRET: str = ""

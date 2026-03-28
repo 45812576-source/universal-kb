@@ -67,9 +67,14 @@ def get_collection() -> Collection:
             FieldSchema(name="created_by", dtype=DataType.INT64),
             FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=8000),
             FieldSchema(name="desensitized_text", dtype=DataType.VARCHAR, max_length=8000),
+            # 分类 metadata（用于过滤检索）
+            FieldSchema(name="taxonomy_board", dtype=DataType.VARCHAR, max_length=10, default_value=""),
+            FieldSchema(name="taxonomy_code", dtype=DataType.VARCHAR, max_length=20, default_value=""),
+            FieldSchema(name="file_type", dtype=DataType.VARCHAR, max_length=50, default_value=""),
+            FieldSchema(name="quality_score", dtype=DataType.FLOAT, default_value=0.5),
             FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=DIM),
         ]
-        schema = CollectionSchema(fields, description="Knowledge chunks with ownership & desensitized text")
+        schema = CollectionSchema(fields, description="Knowledge chunks with metadata for filtered RAG retrieval")
         col = Collection(COLLECTION_NAME, schema)
         col.create_index(
             "embedding",
@@ -178,24 +183,33 @@ def index_knowledge(
     knowledge_id: int,
     text: str,
     created_by: int = 0,
+    taxonomy_board: str = "",
+    taxonomy_code: str = "",
+    file_type: str = "",
+    quality_score: float = 0.5,
 ) -> list[int]:
-    """Chunk text, embed, desensitize, and insert into Milvus."""
+    """Chunk text, embed, desensitize, and insert into Milvus with metadata."""
     col = get_collection()
     chunks = chunk_text(text)
     if not chunks:
         return []
 
+    n = len(chunks)
     embeddings = embed_texts(chunks)
 
     # Generate desensitized versions
     desensitized = _desensitize_chunks_llm(chunks)
 
     result = col.insert([
-        [knowledge_id] * len(chunks),    # knowledge_id
-        list(range(len(chunks))),         # chunk_index
-        [created_by] * len(chunks),       # created_by
+        [knowledge_id] * n,              # knowledge_id
+        list(range(n)),                   # chunk_index
+        [created_by] * n,                # created_by
         chunks,                           # text
         desensitized,                     # desensitized_text
+        [taxonomy_board or ""] * n,       # taxonomy_board
+        [taxonomy_code or ""] * n,        # taxonomy_code
+        [file_type or ""] * n,            # file_type
+        [quality_score] * n,              # quality_score
         embeddings,                       # embedding
     ])
     col.flush()
@@ -206,16 +220,36 @@ def search_knowledge(
     query: str,
     top_k: int = 8,
     knowledge_id_filter: list[int] = None,
+    taxonomy_board: str = None,
+    file_type: str = None,
+    min_quality: float = None,
 ) -> list[dict]:
-    """Semantic search. Returns list of {knowledge_id, chunk_index, text,
-    desensitized_text, created_by, score}."""
+    """Semantic search with optional metadata filtering.
+
+    Returns list of {knowledge_id, chunk_index, text, desensitized_text,
+    created_by, taxonomy_board, taxonomy_code, quality_score, score}.
+    """
     col = get_collection()
     q_embedding = embed_query(query)
 
-    expr = None
+    # 构建过滤表达式
+    exprs = []
     if knowledge_id_filter:
         ids_str = ", ".join(str(i) for i in knowledge_id_filter)
-        expr = f"knowledge_id in [{ids_str}]"
+        exprs.append(f"knowledge_id in [{ids_str}]")
+    if taxonomy_board:
+        exprs.append(f'taxonomy_board == "{taxonomy_board}"')
+    if file_type:
+        exprs.append(f'file_type == "{file_type}"')
+    if min_quality is not None:
+        exprs.append(f"quality_score >= {min_quality}")
+
+    expr = " and ".join(exprs) if exprs else None
+
+    output_fields = [
+        "knowledge_id", "chunk_index", "text", "desensitized_text",
+        "created_by", "taxonomy_board", "taxonomy_code", "quality_score",
+    ]
 
     results = col.search(
         data=[q_embedding],
@@ -223,19 +257,31 @@ def search_knowledge(
         param={"metric_type": "COSINE", "params": {"ef": 128}},
         limit=top_k,
         expr=expr,
-        output_fields=["knowledge_id", "chunk_index", "text", "desensitized_text", "created_by"],
+        output_fields=output_fields,
     )
 
     hits = []
     for hit in results[0]:
+        quality = float(hit.entity.get("quality_score", 0.5))
+        cosine_score = float(hit.score)
+        # 质量加权最终分数：cosine_sim * 0.8 + quality_score * 0.2
+        final_score = cosine_score * 0.8 + quality * 0.2
+
         hits.append({
             "knowledge_id": hit.entity.get("knowledge_id"),
             "chunk_index": hit.entity.get("chunk_index"),
             "text": hit.entity.get("text"),
             "desensitized_text": hit.entity.get("desensitized_text", ""),
             "created_by": hit.entity.get("created_by", 0),
-            "score": round(float(hit.score), 4),
+            "taxonomy_board": hit.entity.get("taxonomy_board", ""),
+            "taxonomy_code": hit.entity.get("taxonomy_code", ""),
+            "quality_score": quality,
+            "score": round(final_score, 4),
+            "cosine_score": round(cosine_score, 4),
         })
+
+    # 按加权分数重排序
+    hits.sort(key=lambda x: x["score"], reverse=True)
     return hits
 
 

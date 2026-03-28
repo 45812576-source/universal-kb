@@ -82,6 +82,16 @@ def _entry_dict(e: KnowledgeEntry) -> dict:
         "taxonomy_board": e.taxonomy_board,
         "taxonomy_code": e.taxonomy_code,
         "taxonomy_path": e.taxonomy_path or [],
+        # OSS 文件信息
+        "oss_key": e.oss_key,
+        "file_type": e.file_type,
+        "file_ext": e.file_ext,
+        "file_size": e.file_size,
+        # AI 命名
+        "ai_title": e.ai_title,
+        "ai_summary": e.ai_summary,
+        "ai_tags": e.ai_tags,
+        "quality_score": e.quality_score,
         "created_at": e.created_at.isoformat(),
     }
 
@@ -121,18 +131,42 @@ async def upload_knowledge(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    import mimetypes
+
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    ext = os.path.splitext(file.filename or "")[1]
-    saved_path = os.path.join(settings.UPLOAD_DIR, f"{uuid.uuid4()}{ext}")
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    local_filename = f"{uuid.uuid4()}{ext}"
+    saved_path = os.path.join(settings.UPLOAD_DIR, local_filename)
 
+    file_data = await file.read()
     with open(saved_path, "wb") as f:
-        f.write(await file.read())
+        f.write(file_data)
 
+    # 提取文本内容
     try:
         content = extract_text(saved_path)
     except ValueError as e:
         os.unlink(saved_path)
         raise HTTPException(400, str(e))
+
+    # 上传原件到 OSS
+    oss_key = None
+    file_size = len(file_data)
+    file_type = mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
+    try:
+        from app.services.oss_service import generate_oss_key, upload_file as oss_upload
+        oss_key = generate_oss_key(ext)
+        oss_upload(saved_path, oss_key)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"OSS upload failed, file kept locally: {e}")
+
+    # 清理本地临时文件（OSS 上传成功后）
+    if oss_key:
+        try:
+            os.unlink(saved_path)
+        except OSError:
+            pass
 
     # 检测敏感词决定 capture_mode
     from app.services.review_policy import review_policy
@@ -155,9 +189,33 @@ async def upload_knowledge(
         source_type="upload",
         source_file=file.filename,
         capture_mode=capture_mode,
+        # OSS 文件信息
+        oss_key=oss_key,
+        file_type=file_type,
+        file_ext=ext,
+        file_size=file_size,
     )
     db.add(entry)
     db.flush()
+
+    # AI 智能命名（异步，不阻塞入库）
+    from app.services.knowledge_namer import auto_name
+    try:
+        naming_result = await auto_name(content, file.filename or "", file_type)
+        entry.ai_title = naming_result["title"]
+        entry.ai_summary = naming_result["summary"]
+        entry.ai_tags = naming_result["tags"]
+        entry.quality_score = naming_result["quality_score"]
+        # AI 生成的标签也同步到筛选用标签字段
+        if naming_result["tags"].get("industry"):
+            entry.industry_tags = naming_result["tags"]["industry"]
+        if naming_result["tags"].get("platform"):
+            entry.platform_tags = naming_result["tags"]["platform"]
+        if naming_result["tags"].get("topic"):
+            entry.topic_tags = naming_result["tags"]["topic"]
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"AI naming failed: {e}")
 
     # 自动分类（异步，不阻塞入库）
     from app.services.knowledge_classifier import classify, apply_classification_to_entry
@@ -180,6 +238,8 @@ async def upload_knowledge(
         "taxonomy_code": entry.taxonomy_code,
         "taxonomy_board": entry.taxonomy_board,
         "classification_confidence": entry.classification_confidence,
+        "oss_key": entry.oss_key,
+        "file_type": entry.file_type,
     }
 
 
@@ -388,6 +448,58 @@ def get_knowledge_chunks(
         "source_file": entry.source_file,
         "chunks": chunks,
     }
+
+
+# ─── 文件下载/预览 URL ────────────────────────────────────────────────────────
+
+@router.get("/{kid}/file-url")
+def get_file_url(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """返回 OSS 签名下载 URL（1小时有效）。"""
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    if user.role != Role.SUPER_ADMIN:
+        if entry.created_by != user.id and entry.status != KnowledgeStatus.APPROVED:
+            raise HTTPException(403, "Access denied")
+    if not entry.oss_key:
+        raise HTTPException(404, "此知识条目没有关联的原始文件")
+
+    from app.services.oss_service import generate_signed_url
+    url = generate_signed_url(entry.oss_key, expires=3600)
+    return {
+        "url": url,
+        "filename": entry.source_file,
+        "file_type": entry.file_type,
+        "file_ext": entry.file_ext,
+        "file_size": entry.file_size,
+    }
+
+
+@router.get("/{kid}/download")
+def download_file(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """重定向到 OSS 签名下载 URL。"""
+    from fastapi.responses import RedirectResponse
+
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    if user.role != Role.SUPER_ADMIN:
+        if entry.created_by != user.id and entry.status != KnowledgeStatus.APPROVED:
+            raise HTTPException(403, "Access denied")
+    if not entry.oss_key:
+        raise HTTPException(404, "此知识条目没有关联的原始文件")
+
+    from app.services.oss_service import generate_signed_url
+    url = generate_signed_url(entry.oss_key, expires=3600)
+    return RedirectResponse(url=url)
 
 
 # ─── Folder CRUD ──────────────────────────────────────────────────────────────
@@ -636,6 +748,16 @@ def delete_knowledge(
         raise HTTPException(403, "Cannot delete others' entries")
     if user.role == Role.DEPT_ADMIN and entry.created_by != user.id and entry.department_id != user.department_id:
         raise HTTPException(403, "只能删除本部门的知识条目")
+
+    # 清理 OSS 文件
+    if entry.oss_key:
+        try:
+            from app.services.oss_service import delete_file as oss_delete
+            oss_delete(entry.oss_key)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Failed to delete OSS file {entry.oss_key}: {e}")
+
     db.delete(entry)
     db.commit()
     return {"ok": True}

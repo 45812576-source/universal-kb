@@ -11,12 +11,16 @@ logger = logging.getLogger(__name__)
 
 
 def _do_vectorize(db: Session, entry: KnowledgeEntry) -> None:
-    """向量化并写入 Milvus（失败不阻塞）。"""
+    """向量化并写入 Milvus（带分类 metadata，失败不阻塞）。"""
     try:
         milvus_ids = index_knowledge(
             entry.id,
             entry.content,
             created_by=entry.created_by or 0,
+            taxonomy_board=entry.taxonomy_board or "",
+            taxonomy_code=entry.taxonomy_code or "",
+            file_type=entry.file_type or "",
+            quality_score=entry.quality_score or 0.5,
         )
         entry.milvus_ids = milvus_ids
     except Exception as e:

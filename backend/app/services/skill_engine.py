@@ -333,10 +333,20 @@ class SkillEngine:
         """
         try:
             from app.services.vector_service import search_knowledge
+            # 构建检索参数：如果有匹配的 Skill，用其 serving_skill_codes 对应的 taxonomy_board 做预过滤
+            search_kwargs = {"query": query, "top_k": 20}
+
+            # Skill 关联的 taxonomy_board 预过滤（减少跨领域噪音）
+            if skill and hasattr(skill, "taxonomy_board") and skill.taxonomy_board:
+                search_kwargs["taxonomy_board"] = skill.taxonomy_board
+
+            # 过滤低质量知识
+            search_kwargs["min_quality"] = 0.3
+
             # search_knowledge 是同步阻塞调用（pymilvus），Milvus 不可用时会阻塞 ~10s
             # 用 asyncio.wait_for + to_thread 包裹，超时立即返回空，不阻塞事件循环
             hits = await asyncio.wait_for(
-                asyncio.to_thread(search_knowledge, query, 20),
+                asyncio.to_thread(lambda: search_knowledge(**search_kwargs)),
                 timeout=3.0,
             )
         except asyncio.TimeoutError:

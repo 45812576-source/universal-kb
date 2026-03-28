@@ -65,9 +65,23 @@ services:
     volumes:
       - redis_data:/data
 
+  onlyoffice:
+    image: onlyoffice/documentserver:latest
+    ports:
+      - "8443:80"
+    environment:
+      - JWT_ENABLED=true
+      - JWT_SECRET=${ONLYOFFICE_JWT_SECRET:-change-me-onlyoffice}
+    volumes:
+      - onlyoffice_data:/var/www/onlyoffice/Data
+      - onlyoffice_log:/var/log/onlyoffice
+    restart: unless-stopped
+
 volumes:
   mysql_data:
   etcd_data:
   minio_data:
   milvus_data:
   redis_data:
+  onlyoffice_data:
+  onlyoffice_log:

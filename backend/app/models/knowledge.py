@@ -1,7 +1,7 @@
 import datetime
 import enum
 
-from sqlalchemy import Column, DateTime, Enum, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import BigInteger, Column, DateTime, Enum, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import relationship
 
@@ -66,6 +66,18 @@ class KnowledgeEntry(Base):
     # Source info
     source_type = Column(String(50), default="manual")  # manual / upload / auto_collected
     source_file = Column(String(255), nullable=True)
+
+    # ── OSS 文件存储 ─────────────────────────────────────────────────────────
+    oss_key = Column(String(500), nullable=True)       # OSS 对象路径
+    file_type = Column(String(50), nullable=True)      # MIME 类型 (application/pdf 等)
+    file_ext = Column(String(20), nullable=True)       # 文件扩展名 (.pdf, .docx 等)
+    file_size = Column(BigInteger, nullable=True)      # 文件大小 (bytes)
+
+    # ── AI 智能命名 ──────────────────────────────────────────────────────────
+    ai_title = Column(String(500), nullable=True)      # AI 生成的标题
+    ai_summary = Column(Text, nullable=True)           # AI 生成的摘要
+    ai_tags = Column(JSON, nullable=True)              # AI 生成的标签 {"industry":[], "platform":[], "topic":[]}
+    quality_score = Column(Float, nullable=True)        # AI 内容质量评分 0-1
 
     # Milvus chunk IDs
     milvus_ids = Column(JSON, default=list)

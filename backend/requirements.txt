@@ -29,6 +29,8 @@ matplotlib>=3.8
 funasr
 Pillow
 openai
+oss2>=2.18.0
+pyjwt>=2.8.0
 
 langchain-openai>=0.3.0
 langchain-text-splitters>=0.3.0
