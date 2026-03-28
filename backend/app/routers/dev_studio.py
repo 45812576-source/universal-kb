@@ -1043,6 +1043,50 @@ def get_latest_output(
     return result
 
 
+# ─── Tool Task (from Skill Studio) ────────────────────────────────────────────
+
+class ToolTaskRequest(BaseModel):
+    skill_id: int
+    skill_name: str
+    tool_description: str
+    expected_schema: dict = {}
+
+
+@router.post("/tool-task")
+def create_tool_task(
+    req: ToolTaskRequest,
+    user: User = Depends(get_current_user),
+):
+    """从 Skill Studio 发起工具开发任务，在用户 workdir 写入 TOOL_REQUEST.md。"""
+    workdir = _user_workdir(user)
+
+    schema_text = ""
+    if req.expected_schema:
+        import json as _json
+        schema_text = f"\n```json\n{_json.dumps(req.expected_schema, ensure_ascii=False, indent=2)}\n```"
+
+    content = f"""# 工具开发需求
+
+来源 Skill: {req.skill_name} (ID: {req.skill_id})
+
+## 需求描述
+
+{req.tool_description}
+
+## 期望接口
+{schema_text if schema_text else "（待定义）"}
+
+## 完成后
+
+保存为 Tool，回到 Skill Studio 绑定到源 Skill。
+"""
+    dest = os.path.join(workdir, "TOOL_REQUEST.md")
+    with open(dest, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    return {"ok": True, "skill_id": req.skill_id, "file": "TOOL_REQUEST.md"}
+
+
 # ─── Save as Tool ─────────────────────────────────────────────────────────────
 
 class SaveToolRequest(BaseModel):
@@ -1711,6 +1755,21 @@ def workdir_delete(req: DeleteRequest, user: User = Depends(get_current_user)):
     else:
         os.remove(target)
     return {"ok": True}
+
+
+@router.get("/read-file")
+def read_file(path: str, user: User = Depends(get_current_user)):
+    """读取 workdir 内的文本文件内容（用于前端展示 TOOL_REQUEST.md 等）。"""
+    workdir = _user_workdir(user)
+    target = _safe_path(workdir, path)
+    if not os.path.exists(target) or os.path.isdir(target):
+        raise HTTPException(404, "文件不存在")
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            content = f.read(64 * 1024)  # 最多读 64KB
+    except Exception:
+        raise HTTPException(400, "无法读取文件")
+    return {"content": content}
 
 
 @router.get("/workdir/download")

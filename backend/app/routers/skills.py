@@ -578,6 +578,7 @@ async def upload_skill_zip(
                     "filename": safe_name,
                     "path": f"uploads/skills/{skill_id}/{safe_name}",
                     "size": len(data),
+                    "category": _infer_category(safe_name),
                 })
 
     # 更新 source_files
@@ -602,6 +603,23 @@ async def upload_skill_zip(
 # ─── Skill file CRUD ──────────────────────────────────────────────────────────
 
 TEXT_EXTENSIONS = {".md", ".txt", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".sh", ".toml", ".xml", ".csv"}
+
+
+def _infer_category(filename: str) -> str:
+    """根据文件名/扩展名推断资产文件角色。"""
+    name_lower = filename.lower()
+    base = name_lower.rsplit("/", 1)[-1]
+    if base.endswith((".js", ".py", ".sh", ".ts")):
+        return "tool"
+    if "template" in base or base.startswith("_"):
+        return "template"
+    if base.startswith("example") or "example" in base or "/examples/" in name_lower:
+        return "example"
+    if "-kb." in base or "knowledge" in base:
+        return "knowledge-base"
+    if "reference" in base or base.endswith((".dot", ".xml")):
+        return "reference"
+    return "other"
 
 
 def _check_skill_write_access(skill: Skill, user: User):
@@ -681,7 +699,7 @@ def update_skill_file(
             f["size"] = size
             break
     else:
-        files.append({"filename": path.name, "path": rel_path, "size": size})
+        files.append({"filename": path.name, "path": rel_path, "size": size, "category": _infer_category(path.name)})
     skill.source_files = files
     db.commit()
     return {"ok": True, "filename": path.name, "size": size}
@@ -719,7 +737,7 @@ async def upload_skill_file(
             f["size"] = len(data)
             break
     else:
-        files.append({"filename": safe_name, "path": rel_path, "size": len(data)})
+        files.append({"filename": safe_name, "path": rel_path, "size": len(data), "category": _infer_category(safe_name)})
     skill.source_files = files
     db.commit()
     return {"ok": True, "filename": safe_name, "size": len(data), "source_files": files}
@@ -746,6 +764,209 @@ def delete_skill_file(
     skill.source_files = files
     db.commit()
     return {"ok": True, "source_files": files}
+
+
+@router.patch("/{skill_id}/files/{filename}/category")
+def update_file_category(
+    skill_id: int,
+    filename: str,
+    req: dict,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """手动修改资产文件的 category（覆盖自动推断）。"""
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+    _check_skill_write_access(skill, user)
+
+    category = req.get("category", "other")
+    valid = {"knowledge-base", "reference", "example", "tool", "template", "other"}
+    if category not in valid:
+        raise HTTPException(400, f"无效 category，可选值：{', '.join(sorted(valid))}")
+
+    from pathlib import Path as _P
+    safe = _P(filename).name
+    files = list(skill.source_files or [])
+    found = False
+    for f in files:
+        if f.get("filename") == safe:
+            f["category"] = category
+            found = True
+            break
+    if not found:
+        raise HTTPException(404, "文件不存在")
+    skill.source_files = files
+    db.commit()
+    return {"ok": True, "filename": safe, "category": category}
+
+
+@router.get("/{skill_id}/export-zip")
+def export_skill_zip(
+    skill_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """将 Skill 打包为 zip 下载（SKILL.md + 所有 source_files）。"""
+    import io as _io
+    import zipfile as _zf
+    from starlette.responses import StreamingResponse
+
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+
+    # 获取最新 system_prompt
+    latest_ver = (
+        db.query(SkillVersion)
+        .filter(SkillVersion.skill_id == skill_id)
+        .order_by(SkillVersion.version.desc())
+        .first()
+    )
+    system_prompt = latest_ver.system_prompt if latest_ver else ""
+
+    buf = _io.BytesIO()
+    with _zf.ZipFile(buf, "w", _zf.ZIP_DEFLATED) as zf:
+        # 写入主文件 SKILL.md（带 frontmatter）
+        frontmatter = f"---\nname: {skill.name}\ndescription: {skill.description or ''}\n---\n\n"
+        zf.writestr("SKILL.md", frontmatter + (system_prompt or ""))
+
+        # 写入附属文件
+        for f in (skill.source_files or []):
+            file_path = _safe_file_path(skill_id, f["filename"])
+            if file_path.exists():
+                zf.write(file_path, f["filename"])
+
+    buf.seek(0)
+    safe_name = skill.name.replace(" ", "-").replace("/", "-")
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}.zip"'},
+    )
+
+
+# ─── Tool binding ─────────────────────────────────────────────────────────────
+
+@router.get("/{skill_id}/bound-tools")
+def get_bound_tools(
+    skill_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """查询 Skill 已绑定的 ToolRegistry 工具列表。"""
+    from app.models.tool import ToolRegistry, SkillTool
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+    tools = (
+        db.query(ToolRegistry)
+        .join(SkillTool, SkillTool.tool_id == ToolRegistry.id)
+        .filter(SkillTool.skill_id == skill_id)
+        .all()
+    )
+    return [
+        {
+            "id": t.id,
+            "name": t.name,
+            "display_name": t.display_name,
+            "tool_type": t.tool_type.value if hasattr(t.tool_type, "value") else str(t.tool_type),
+            "description": t.description or "",
+            "status": t.status.value if hasattr(t.status, "value") else str(t.status),
+        }
+        for t in tools
+    ]
+
+
+@router.post("/{skill_id}/upload-tool")
+async def upload_and_bind_tool(
+    skill_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """上传 .py 文件，自动注册为 Tool 并绑定到当前 Skill。"""
+    from app.models.tool import ToolRegistry, ToolType, SkillTool
+    import ast
+    import importlib
+    import inspect
+    from pathlib import Path as _P
+
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+    _check_skill_write_access(skill, user)
+
+    if not file.filename or not file.filename.endswith(".py"):
+        raise HTTPException(400, "仅支持 .py 文件")
+
+    data = await file.read()
+    source = data.decode("utf-8")
+
+    # 解析 Python 模块，提取函数签名
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        raise HTTPException(400, f"Python 语法错误：{e}")
+
+    # 找到 execute 函数或第一个公开函数
+    func_name = None
+    func_doc = ""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and not node.name.startswith("_"):
+            if func_name is None or node.name == "execute":
+                func_name = node.name
+                func_doc = ast.get_docstring(node) or ""
+                if node.name == "execute":
+                    break
+
+    if not func_name:
+        raise HTTPException(400, "未找到任何公开函数（需要至少一个不以 _ 开头的函数）")
+
+    # 从文件名生成 tool name
+    safe_name = _P(file.filename).stem
+    tool_name = f"skill_{skill_id}_{safe_name}"
+
+    # 写入 app/tools/ 目录
+    tools_dir = _P(__file__).parent.parent / "tools"
+    tools_dir.mkdir(exist_ok=True)
+    dest = tools_dir / f"{tool_name}.py"
+    dest.write_text(source, encoding="utf-8")
+
+    # 检查是否已存在同名 tool
+    existing = db.query(ToolRegistry).filter(ToolRegistry.name == tool_name).first()
+    if existing:
+        # 更新源码，保留绑定
+        existing.config = {"module": tool_name, "function": func_name, "source": f"tools/{tool_name}.py"}
+        existing.description = func_doc[:500] if func_doc else f"来自 Skill {skill.name} 的工具"
+        db.flush()
+        tool_id = existing.id
+    else:
+        tool = ToolRegistry(
+            name=tool_name,
+            display_name=safe_name,
+            description=func_doc[:500] if func_doc else f"来自 Skill {skill.name} 的工具",
+            tool_type=ToolType.BUILTIN,
+            config={"module": tool_name, "function": func_name, "source": f"tools/{tool_name}.py"},
+            input_schema={},
+            scope="personal",
+            created_by=user.id,
+        )
+        db.add(tool)
+        db.flush()
+        tool_id = tool.id
+
+    # 绑定到 Skill（如果尚未绑定）
+    exists_binding = (
+        db.query(SkillTool)
+        .filter(SkillTool.skill_id == skill_id, SkillTool.tool_id == tool_id)
+        .first()
+    )
+    if not exists_binding:
+        db.add(SkillTool(skill_id=skill_id, tool_id=tool_id))
+
+    db.commit()
+    return {"ok": True, "tool_id": tool_id, "tool_name": tool_name, "bound": True}
 
 
 # ─── Skill ranking / hot list ─────────────────────────────────────────────────

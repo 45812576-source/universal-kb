@@ -98,7 +98,8 @@ class Skill(Base):
     auto_save_output = Column(Boolean, default=False)
 
     # 复杂 Skill 的附属文件（zip 包上传时提取的非 .md 文件）
-    # 每项格式: {"filename": "ref.py", "path": "uploads/skills/42/ref.py", "size": 1234}
+    # 每项格式: {"filename": "ref.py", "path": "uploads/skills/42/ref.py", "size": 1234, "category": "tool"}
+    # category: knowledge-base | reference | example | tool | template | other
     source_files = Column(JSON, default=list, nullable=True)
 
     # Upstream tracking fields

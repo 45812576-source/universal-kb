@@ -540,6 +540,23 @@ async def stream_message(
 
                     _fast_model = llm_gateway.get_config(db, getattr(_ws_fast, "model_config_id", None))
                     yield _sse("status", {"stage": "preparing"})
+
+                    # 查询可用工具列表，供 AI 推荐绑定
+                    from app.models.tool import ToolRegistry, ToolType
+                    _pub_tools = (
+                        db.query(ToolRegistry)
+                        .filter(ToolRegistry.status == "published")
+                        .limit(50)
+                        .all()
+                    )
+                    if _pub_tools:
+                        _tools_text = "\n".join(
+                            f"  - [{t.id}] {t.display_name or t.name}（{t.tool_type.value}）：{t.description or '无描述'}"
+                            for t in _pub_tools
+                        )
+                    else:
+                        _tools_text = "（暂无已注册工具）"
+
                     yield _sse("status", {"stage": "generating"})
 
                     _final_content = ""
@@ -554,6 +571,7 @@ async def stream_message(
                             selected_skill_id=req.selected_skill_id,
                             editor_prompt=req.editor_prompt,
                             editor_is_dirty=req.editor_is_dirty,
+                            available_tools=_tools_text,
                         )
                     ):
                         if isinstance(_item, str):
@@ -581,14 +599,34 @@ async def stream_message(
                     return
 
             # --- Prepare phase (skill matching, knowledge, prompt) ---
-            yield _sse("status", {"stage": "preparing"})
+            # 用 asyncio.Queue + keepalive 循环保护 prepare 阶段：
+            # prepare 内部每完成一个子阶段就 put 一个 status，主循环取出来 yield 给前端；
+            # 超过 10s 没有进展则发送 keepalive ping，防止 nginx 等代理超时断连。
+            _status_queue: asyncio.Queue = asyncio.Queue()
 
-            prep = await skill_engine.prepare(
+            async def _on_status(stage: str):
+                await _status_queue.put(("status", stage))
+
+            _prep_task = asyncio.ensure_future(skill_engine.prepare(
                 db, conv, req.content,
                 user_id=current_user_id,
                 active_skill_ids=req.active_skill_ids,
                 force_skill_id=req.force_skill_id,
-            )
+                on_status=_on_status,
+            ))
+
+            # drain queue：持续取 status 事件并 yield，直到 prepare 完成
+            while not _prep_task.done():
+                try:
+                    _evt_type, _evt_stage = await asyncio.wait_for(
+                        _status_queue.get(), timeout=10
+                    )
+                    yield _sse("status", {"stage": _evt_stage})
+                except asyncio.TimeoutError:
+                    yield _SSE_KEEPALIVE  # ": ping\n\n" — 防止代理超时
+
+            # 取出 prepare 结果（若有异常则抛出）
+            prep = _prep_task.result()
 
             # Resolve skill name for metadata
             skill_name = prep.skill_name
@@ -1212,11 +1250,24 @@ async def upload_stream_message(
                 except Exception:
                     pass
 
-            prep = await skill_engine.prepare(
+            _status_queue2: asyncio.Queue = asyncio.Queue()
+
+            async def _on_status2(stage: str):
+                await _status_queue2.put(stage)
+
+            _prep_task2 = asyncio.ensure_future(skill_engine.prepare(
                 db, conv, user_text,
                 user_id=current_user_id,
                 active_skill_ids=parsed_skill_ids,
-            )
+                on_status=_on_status2,
+            ))
+            while not _prep_task2.done():
+                try:
+                    _s = await asyncio.wait_for(_status_queue2.get(), timeout=10)
+                    yield _sse("status", {"stage": _s})
+                except asyncio.TimeoutError:
+                    yield _SSE_KEEPALIVE
+            prep = _prep_task2.result()
 
             skill_name = prep.skill_name
 
