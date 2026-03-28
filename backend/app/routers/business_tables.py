@@ -1051,3 +1051,54 @@ def patch_business_table(
     bt.validation_rules = rules
     db.commit()
     return {"ok": True}
+
+
+# ── 飞书多维表格同步管理 ─────────────────────────────────────────────────────
+
+
+class SyncConfigRequest(BaseModel):
+    sync_interval: int = 0         # 同步间隔（分钟），0=关闭定时同步
+    sync_mode: str = "incremental"  # "full" | "incremental"
+
+
+@router.patch("/{table_id}/sync-config")
+def set_sync_config(
+    table_id: int,
+    req: SyncConfigRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """设置飞书多维表格定时同步配置。"""
+    bt = db.get(BusinessTable, table_id)
+    if not bt:
+        raise HTTPException(404, "Business table not found")
+    rules = dict(bt.validation_rules or {})
+    if not rules.get("bitable_app_token"):
+        raise HTTPException(400, "该表未关联飞书多维表格，无法配置同步")
+
+    rules["sync_interval"] = req.sync_interval
+    rules["sync_mode"] = req.sync_mode
+    bt.validation_rules = rules
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(bt, "validation_rules")
+    db.commit()
+    return {"ok": True, "sync_interval": req.sync_interval, "sync_mode": req.sync_mode}
+
+
+@router.post("/{table_id}/sync-now")
+async def sync_now(
+    table_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """手动触发飞书多维表格增量同步。"""
+    bt = db.get(BusinessTable, table_id)
+    if not bt:
+        raise HTTPException(404, "Business table not found")
+
+    from app.services.bitable_sync import bitable_sync
+    try:
+        result = await bitable_sync.incremental_sync(db, bt)
+        return {"ok": True, **result}
+    except Exception as e:
+        raise HTTPException(500, f"同步失败: {e}")

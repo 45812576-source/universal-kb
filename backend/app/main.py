@@ -92,8 +92,39 @@ async def startup_event():
             finally:
                 db.close()
 
+        def _run_bitable_sync():
+            """定时同步飞书多维表格：扫描所有配置了 sync_interval 的表。"""
+            import asyncio as _asyncio
+            db = SessionLocal()
+            try:
+                from app.models.business import BusinessTable as BT
+                from app.services.bitable_sync import bitable_sync
+                tables = db.query(BT).all()
+                now_ts = int(time.time()) if "time" in dir() else __import__("time").time()
+                for bt in tables:
+                    rules = bt.validation_rules or {}
+                    interval = rules.get("sync_interval", 0)
+                    if not interval or not rules.get("bitable_app_token"):
+                        continue
+                    last = rules.get("last_synced_at", 0)
+                    if now_ts - last < interval * 60:
+                        continue  # 未到同步时间
+                    try:
+                        _asyncio.run(bitable_sync.incremental_sync(db, bt))
+                        logging.getLogger(__name__).info(
+                            f"Bitable sync done: {bt.table_name}"
+                        )
+                    except Exception as ex:
+                        logging.getLogger(__name__).warning(
+                            f"Bitable sync failed for {bt.table_name}: {ex}"
+                        )
+            finally:
+                db.close()
+
         upstream_scheduler = BackgroundScheduler()
         upstream_scheduler.add_job(check_all_imported_skills, "cron", hour=3, minute=0)
+        # 每 10 分钟扫描一次需要同步的飞书表
+        upstream_scheduler.add_job(_run_bitable_sync, "interval", minutes=10)
         # 每 12 小时统计一次 OpenCode 用量（0点 和 12点）
         upstream_scheduler.add_job(_run_opencode_usage_job, "cron", hour="0,12", minute=5)
         upstream_scheduler.add_job(_run_daily_project_summary, "cron", hour=23, minute=0)
