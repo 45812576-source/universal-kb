@@ -1,6 +1,9 @@
+import logging
 import re
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+
+logger = logging.getLogger(__name__)
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
@@ -546,6 +549,7 @@ async def upload_skill_zip(
             change_note="从 zip 包上传创建",
         )
         db.add(v)
+        _zip_approval_id = None
         if initial_stage:
             from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus as AStatus
             approval = ApprovalRequest(
@@ -557,6 +561,8 @@ async def upload_skill_zip(
                 stage=initial_stage,
             )
             db.add(approval)
+            db.flush()
+            _zip_approval_id = approval.id
         action = "created"
         version = 1
 
@@ -588,6 +594,28 @@ async def upload_skill_zip(
 
     db.commit()
     _os.unlink(tmp_path)
+
+    # 异步触发安全扫描（zip 包上传且创建了审批单时）
+    if _zip_approval_id:
+        import asyncio
+        from app.database import SessionLocal
+        from app.models.permission import ApprovalRequest as _AR
+        from app.services.skill_security_scanner import skill_security_scanner
+
+        async def _run_zip_scan(aid: int, sid: int):
+            scan_db = SessionLocal()
+            try:
+                result = await skill_security_scanner.scan(sid, scan_db)
+                req = scan_db.get(_AR, aid)
+                if req:
+                    req.security_scan_result = result
+                    scan_db.commit()
+            except Exception as e:
+                logger.error(f"安全扫描（zip）后台任务失败 approval={aid}: {e}")
+            finally:
+                scan_db.close()
+
+        asyncio.create_task(_run_zip_scan(_zip_approval_id, skill_id))
 
     return {
         "action": action,
@@ -1284,7 +1312,30 @@ def update_status(
                 status=ApprovalStatus.PENDING,
             )
             db.add(approval)
+            db.flush()
+            approval_id = approval.id
+        else:
+            approval_id = existing_approval.id
         db.commit()
+        # 异步触发安全扫描（不阻塞提交流程）
+        import asyncio
+        from app.database import SessionLocal
+        from app.services.skill_security_scanner import skill_security_scanner
+
+        async def _run_scan(aid: int, sid: int):
+            scan_db = SessionLocal()
+            try:
+                result = await skill_security_scanner.scan(sid, scan_db)
+                req = scan_db.get(ApprovalRequest, aid)
+                if req:
+                    req.security_scan_result = result
+                    scan_db.commit()
+            except Exception as e:
+                logger.error(f"安全扫描后台任务失败 approval={aid}: {e}")
+            finally:
+                scan_db.close()
+
+        asyncio.create_task(_run_scan(approval_id, skill_id))
         return {"id": skill_id, "status": SkillStatus.REVIEWING.value, "scope": skill.scope}
 
     skill.status = status
@@ -1659,6 +1710,47 @@ def upstream_sync(
         return {"ok": True, "action": "overwrite", "new_version": v.version}
 
     raise HTTPException(400, f"Unknown action: {req.action}")
+
+
+# ─── 安全扫描 ────────────────────────────────────────────────────────────────
+
+@router.post("/{skill_id}/security-scan")
+async def trigger_security_scan(
+    skill_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """手动触发 Skill 安全扫描，将结果写入最近一条审批单。"""
+    from app.models.permission import ApprovalRequest
+    from app.services.skill_security_scanner import skill_security_scanner
+
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+
+    # 找最近一条审批单
+    approval = (
+        db.query(ApprovalRequest)
+        .filter(
+            ApprovalRequest.target_id == skill_id,
+            ApprovalRequest.target_type == "skill",
+        )
+        .order_by(ApprovalRequest.created_at.desc())
+        .first()
+    )
+
+    result = await skill_security_scanner.scan(skill_id, db)
+
+    if approval:
+        approval.security_scan_result = result
+        db.commit()
+
+    return {
+        "ok": True,
+        "skill_id": skill_id,
+        "approval_id": approval.id if approval else None,
+        "scan_result": result,
+    }
 
 
 # ─── Usage stats (super_admin only) ──────────────────────────────────────────

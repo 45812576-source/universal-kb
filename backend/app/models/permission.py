@@ -371,6 +371,8 @@ class ApprovalRequest(Base):
     )
     conditions = Column(JSON, default=list)   # 附条件时的条件列表
     stage = Column(String(20), default="dept_pending", nullable=False)  # dept_pending / super_pending
+    security_scan_result = Column(JSON, default=None, nullable=True)   # 安全扫描结果（含风险报告 + Policy 草案）
+    dept_approved_policy = Column(JSON, default=None, nullable=True)   # dept_admin 已确认的 Policy 分量（scope/overrides/masks 均在自己权限内）
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     requester = relationship("User", foreign_keys=[requester_id])
