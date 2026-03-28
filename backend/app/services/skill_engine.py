@@ -152,7 +152,7 @@ class SkillEngine:
             return current_skill
 
         skill_list = "\n".join(
-            f"- {s.name}: {s.description or '无描述'}" for s in candidates
+            f"- {s.name}: {(s.description or '无描述')[:30]}" for s in candidates
         )
         prompt = (
             f"当前技能：{current_skill.name}（{current_skill.description or '无描述'}）\n"
@@ -165,11 +165,14 @@ class SkillEngine:
             "只返回一个词。"
         )
         try:
-            result, _ = await llm_gateway.chat(
-                model_config=llm_gateway.get_lite_config(),
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=50,
+            result, _ = await asyncio.wait_for(
+                llm_gateway.chat(
+                    model_config=llm_gateway.get_lite_config(),
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=50,
+                ),
+                timeout=12.0,
             )
             answer = result.strip().splitlines()[0].strip().strip('"').strip("'")
             if answer.lower() == "keep":
@@ -177,6 +180,9 @@ class SkillEngine:
             for s in candidates:
                 if s.name == answer:
                     return s
+            return current_skill
+        except asyncio.TimeoutError:
+            logger.warning(f"Skill match_or_keep timed out after 12s, keeping current")
             return current_skill
         except Exception as e:
             logger.warning(f"Skill match_or_keep failed: {e}, keeping current")
@@ -196,28 +202,61 @@ class SkillEngine:
         if not skills:
             return None
 
+        # 只有一个候选时直接返回，无需 LLM
+        if len(skills) == 1:
+            return skills[0]
+
+        # 超过 15 个候选时，先用关键词粗筛，把候选压缩到 ≤15 个，减少 prompt 长度
+        if len(skills) > 15:
+            msg_lower = user_message.lower()
+            msg_words = [w for w in msg_lower.split() if len(w) > 1]
+            def _kw_score(s: Skill) -> int:
+                text = f"{s.name} {s.description or ''}".lower()
+                return sum(1 for w in msg_words if w in text)
+            scored = sorted(((s, _kw_score(s)) for s in skills), key=lambda x: x[1], reverse=True)
+            top = [s for s, sc in scored[:15] if sc > 0]
+            skills = top if top else [s for s, _ in scored[:15]]
+
+        # description 截断到 30 字，避免 prompt 过长导致模型不遵循指令
         skill_list = "\n".join(
-            f"- {s.name}: {s.description or '无描述'}" for s in skills
+            f"- {s.name}: {(s.description or '无描述')[:30]}" for s in skills
         )
         prompt = _SKILL_MATCH_PROMPT.format(
             skill_list=skill_list, user_message=user_message
         )
-        # Always use DeepSeek for intent matching — it follows "return only the name" strictly
+        import time as _time
         try:
             match_config = llm_gateway.get_lite_config()
         except Exception:
             match_config = model_config
-        result, _ = await llm_gateway.chat(
-            model_config=match_config,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=50,
-        )
+        _t0 = _time.monotonic()
+        logger.debug(f"[_match_skill] calling {match_config.get('model_id')} with {len(skills)} skills, prompt len={len(prompt)}")
+        try:
+            result, _ = await asyncio.wait_for(
+                llm_gateway.chat(
+                    model_config=match_config,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=50,
+                ),
+                timeout=12.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[_match_skill] LLM timed out after 12s, returning None")
+            return None
+        logger.debug(f"[_match_skill] LLM done in {_time.monotonic()-_t0:.2f}s, raw='{result[:80]}'")
+
+        # 先取第一行，再在全文中扫描 skill name（应对模型返回解释性文字的情况）
         first_line = result.strip().splitlines()[0].strip().strip('"').strip("'")
         if first_line.lower() == "none":
             return None
         for s in skills:
             if s.name == first_line:
+                return s
+        # fallback: 扫描全文找第一个匹配的 skill name
+        result_lower = result.lower()
+        for s in skills:
+            if s.name.lower() in result_lower:
                 return s
         return db.query(Skill).filter(Skill.name == first_line).first()
 
@@ -294,7 +333,15 @@ class SkillEngine:
         """
         try:
             from app.services.vector_service import search_knowledge
-            hits = search_knowledge(query, top_k=20)
+            # search_knowledge 是同步阻塞调用（pymilvus），Milvus 不可用时会阻塞 ~10s
+            # 用 asyncio.wait_for + to_thread 包裹，超时立即返回空，不阻塞事件循环
+            hits = await asyncio.wait_for(
+                asyncio.to_thread(search_knowledge, query, 20),
+                timeout=3.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Knowledge search timed out after 3s, skipping")
+            return ""
         except Exception as e:
             logger.warning(f"Knowledge search failed: {e}")
             return ""
@@ -470,6 +517,7 @@ class SkillEngine:
         user_id: int | None = None,
         active_skill_ids: list[int] | None = None,
         force_skill_id: int | None = None,
+        on_status=None,  # Optional[Callable[[str], Awaitable[None]]]
     ) -> PrepareResult:
         """Prepare everything needed for LLM call: skill matching, knowledge injection,
         prompt compilation, and message list assembly.
@@ -479,7 +527,12 @@ class SkillEngine:
 
         force_skill_id: 沙盒测试模式，直接使用指定 skill（允许 draft，跳过匹配和权限检查，
                         仅允许调用本人创建的 skill）。
+        on_status: 可选回调，每个子阶段完成时被调用，传入阶段名字符串。
         """
+
+        async def _emit(stage: str):
+            if on_status:
+                await on_status(stage)
         default_config = llm_gateway.get_config(db)
 
         # Load workspace if present
@@ -501,6 +554,9 @@ class SkillEngine:
                 logger.warning(f"Workspace load failed: {e}")
 
         # 1. Skill matching
+        import time as _time
+        _phase_t0 = _time.monotonic()
+        await _emit("matching_skill")
         skill = None
 
         # 沙盒模式：直接使用指定 skill，跳过所有匹配逻辑（允许 draft，仅限本人）
@@ -641,6 +697,9 @@ class SkillEngine:
             except Exception as e:
                 logger.warning(f"Callable check failed: {e}")
 
+        logger.info(f"[prepare] Phase A (skill matching) done in {_time.monotonic()-_phase_t0:.2f}s → skill={skill.name if skill else None}")
+        _phase_t0 = _time.monotonic()
+
         if skill and conversation.skill_id != skill.id:
             conversation.skill_id = skill.id
             db.flush()
@@ -671,7 +730,7 @@ class SkillEngine:
                 early_return=result,
             )
 
-        # 4a. Structured mode: try rule engine first
+        # 4a. Structured mode: try rule engine first（同步逻辑，不阻塞，保持原位）
         if skill and skill.mode == SkillMode.STRUCTURED:
             try:
                 from app.services.rule_engine import rule_engine
@@ -683,46 +742,11 @@ class SkillEngine:
             except Exception as e:
                 logger.warning(f"Rule engine failed, falling through to LLM: {e}")
 
-        # 4b. Data queries（规则前置 → LLM fallback）
-        if skill and skill.data_queries:
-            try:
-                from app.services.data_engine import data_engine
-                # 先走规则快速判定
-                intent = data_engine.classify_intent_fast(user_message)
-                if intent is None:
-                    # 规则无法判定时才调 LLM
-                    intent = await data_engine.classify_intent(user_message, default_config)
-                intent_type = intent.get("type", "ai_generate")
-                if intent_type in ("data_query", "data_mutation"):
-                    result = await self._handle_data_operation(
-                        db, skill, user_message, model_config, user_id, intent_type
-                    )
-                    return _early(result)
-            except Exception as e:
-                logger.warning(f"Intent classification failed, falling through to LLM: {e}")
+        # Phase B: 并行化 — data_intent / input_eval / knowledge / vars / tool_chain
+        # 这五个任务都只依赖 skill（来自 Phase A），彼此无依赖，可以全部并行。
+        await _emit("checking_context")
 
-        # 4c. InputEvaluator
-        if skill_version and skill_version.required_inputs:
-            # Guard: if conversation already has enough back-and-forth, skip evaluation
-            # 每个字段最多问 1 轮（user+assistant=2条消息），超出后强制放行，避免无限追问
-            n_required = len(skill_version.required_inputs)
-            max_clarify_msgs = n_required * 2
-            if len(messages) <= max_clarify_msgs:
-                from app.services.input_evaluator import input_evaluator
-                # current_message is already in `messages` (flushed/committed in the caller),
-                # so do NOT pass it again to avoid duplicate evaluation
-                eval_result = await input_evaluator.evaluate(
-                    purpose=skill.description or skill.name,
-                    required_inputs=skill_version.required_inputs,
-                    history_messages=messages,
-                    current_message="",
-                )
-                if not eval_result["pass"]:
-                    questions = eval_result.get("missing_questions", [])
-                    text = questions[0] if questions else "请提供更多信息。"
-                    return _early((text, {}))
-
-        # 4d. Tool chain: detect tool intent and auto-consume structured output
+        # 加载工具列表（同步，无 LLM，先取出来供 tool_chain 并行任务使用）
         available_tools = []
         try:
             from app.services.tool_executor import tool_executor
@@ -738,33 +762,168 @@ class SkillEngine:
         except Exception as e:
             logger.warning(f"Tool loading for chain detection failed: {e}")
 
-        if available_tools:
-            # native FC 模型 + 工具数不多时，跳过 lite LLM 意图检测，让主模型自己决定
+        # ---------- 并行任务定义 ----------
+
+        async def _task_data_intent():
+            """4b. Data queries: 规则前置 → LLM 意图分类"""
+            if not (skill and skill.data_queries):
+                return None
+            _t = _time.monotonic()
+            try:
+                from app.services.data_engine import data_engine
+                intent = data_engine.classify_intent_fast(user_message)
+                if intent is None:
+                    intent = await data_engine.classify_intent(user_message, default_config)
+                return intent
+            except Exception as e:
+                logger.warning(f"Intent classification failed: {e}")
+                return None
+            finally:
+                logger.debug(f"[prepare] _task_data_intent done in {_time.monotonic()-_t:.2f}s")
+
+        async def _task_input_eval():
+            """4c. InputEvaluator: 检查用户输入是否足够"""
+            if not (skill_version and skill_version.required_inputs):
+                return None
+            _t = _time.monotonic()
+            n_required = len(skill_version.required_inputs)
+            max_clarify_msgs = n_required * 2
+            if len(messages) > max_clarify_msgs:
+                return None  # 超出轮次上限，强制放行
+            try:
+                from app.services.input_evaluator import input_evaluator
+                return await input_evaluator.evaluate(
+                    purpose=skill.description or skill.name,
+                    required_inputs=skill_version.required_inputs,
+                    history_messages=messages,
+                    current_message="",
+                )
+            except Exception as e:
+                logger.warning(f"InputEvaluator failed: {e}")
+                return None
+            finally:
+                logger.debug(f"[prepare] _task_input_eval done in {_time.monotonic()-_t:.2f}s")
+
+        async def _task_knowledge():
+            """知识检索 + 精排"""
+            _t = _time.monotonic()
+            need_knowledge = not skill or (skill and skill.auto_inject)
+            if not need_knowledge:
+                return ""
+            _project_id = getattr(conversation, "project_id", None)
+            try:
+                return await self._inject_knowledge(
+                    user_message, skill, db=db, user_id=user_id, project_id=_project_id
+                )
+            finally:
+                logger.debug(f"[prepare] _task_knowledge done in {_time.monotonic()-_t:.2f}s")
+
+        async def _task_vars():
+            """变量提取"""
+            if not (skill_version and skill_version.variables):
+                return {}
+            _t = _time.monotonic()
+            history_text = "\n".join(
+                f"{m.role.value}: {m.content}" for m in messages
+            )
+            history_text += f"\nuser: {user_message}"
+            try:
+                return await self._extract_variables(
+                    skill_version.variables, history_text, default_config
+                )
+            finally:
+                logger.debug(f"[prepare] _task_vars done in {_time.monotonic()-_t:.2f}s")
+
+        async def _task_tool_chain():
+            """4d. 非 FC 模型：工具精选 + 意图检测（FC 模型直接跳过）"""
+            if not available_tools:
+                return None
+            _t = _time.monotonic()
             _model_supports_fc = llm_gateway.supports_function_calling(model_config)
             if _model_supports_fc and len(available_tools) <= 15:
-                # 跳过 _select_tools_for_message 和 _detect_tool_intent
-                pass
-            else:
-                # 非 FC 模型或工具过多：保留原有 lite LLM 精选 + 意图检测逻辑
+                return None  # 让主模型自己决定，跳过 lite LLM 检测
+            try:
                 selected_tools = await self._select_tools_for_message(
                     user_message, available_tools, default_config
                 )
                 tool_intent = await self._detect_tool_intent(user_message, selected_tools, default_config)
-                if tool_intent:
-                    structured_ctx = self._get_latest_structured_output(messages)
-                    if structured_ctx:
-                        try:
-                            tool_params = await self._map_output_to_tool_input(
-                                structured_ctx, tool_intent, default_config
-                            )
-                            result = await tool_executor.execute_tool(
-                                db, tool_intent.name, tool_params, user_id
-                            )
-                            return _early(self._format_tool_result(result, tool_intent))
-                        except Exception as e:
-                            logger.warning(f"Tool chain mapping failed, falling through to LLM: {e}")
+                return tool_intent
+            except Exception as e:
+                logger.warning(f"Tool chain detection failed: {e}")
+                return None
+            finally:
+                logger.debug(f"[prepare] _task_tool_chain done in {_time.monotonic()-_t:.2f}s")
 
-        # 5. Inject available tools
+        # ---------- 并行执行 ----------
+        (
+            _data_intent_result,
+            _input_eval_result,
+            knowledge_context,
+            extracted_vars,
+            _tool_intent,
+        ) = await asyncio.gather(
+            _task_data_intent(),
+            _task_input_eval(),
+            _task_knowledge(),
+            _task_vars(),
+            _task_tool_chain(),
+            return_exceptions=True,
+        )
+
+        # 安全取值（gather 可能返回 Exception）
+        if isinstance(knowledge_context, Exception):
+            logger.warning(f"knowledge failed: {knowledge_context}")
+            knowledge_context = ""
+        if isinstance(extracted_vars, Exception):
+            logger.warning(f"vars failed: {extracted_vars}")
+            extracted_vars = {}
+        if isinstance(_data_intent_result, Exception):
+            logger.warning(f"data_intent failed: {_data_intent_result}")
+            _data_intent_result = None
+        if isinstance(_input_eval_result, Exception):
+            logger.warning(f"input_eval failed: {_input_eval_result}")
+            _input_eval_result = None
+        if isinstance(_tool_intent, Exception):
+            logger.warning(f"tool_chain failed: {_tool_intent}")
+            _tool_intent = None
+
+        # ---------- 处理并行任务的 early_return ----------
+
+        # 4b 结果：data intent
+        if _data_intent_result is not None and skill and skill.data_queries:
+            intent_type = _data_intent_result.get("type", "ai_generate")
+            if intent_type in ("data_query", "data_mutation"):
+                try:
+                    result = await self._handle_data_operation(
+                        db, skill, user_message, model_config, user_id, intent_type
+                    )
+                    return _early(result)
+                except Exception as e:
+                    logger.warning(f"Data operation failed, falling through to LLM: {e}")
+
+        # 4c 结果：input eval
+        if _input_eval_result is not None and not _input_eval_result.get("pass", True):
+            questions = _input_eval_result.get("missing_questions", [])
+            text = questions[0] if questions else "请提供更多信息。"
+            return _early((text, {}))
+
+        # 4d 结果：tool chain（非 FC 模型）
+        if _tool_intent and available_tools:
+            structured_ctx = self._get_latest_structured_output(messages)
+            if structured_ctx:
+                try:
+                    from app.services.tool_executor import tool_executor
+                    tool_params = await self._map_output_to_tool_input(
+                        structured_ctx, _tool_intent, default_config
+                    )
+                    result = await tool_executor.execute_tool(
+                        db, _tool_intent.name, tool_params, user_id
+                    )
+                    return _early(self._format_tool_result(result, _tool_intent))
+                except Exception as e:
+                    logger.warning(f"Tool chain mapping failed, falling through to LLM: {e}")
+
+        # 5. Inject available tools prompt（同步，无 LLM）
         tool_prompt = ""
         try:
             from app.services.tool_executor import tool_executor
@@ -785,41 +944,10 @@ class SkillEngine:
         except Exception as e:
             logger.warning(f"Tool loading failed: {e}")
 
-        # 6+7. 知识检索与变量提取并行化（两者无数据依赖）
-        knowledge_context = ""
-        extracted_vars = {}
+        logger.info(f"[prepare] Phase B (parallel context) done in {_time.monotonic()-_phase_t0:.2f}s")
 
-        # 准备并行任务
-        _parallel_tasks = []
-
-        need_knowledge = not skill or (skill and skill.auto_inject)
-        _project_id = getattr(conversation, "project_id", None)
-        if need_knowledge:
-            _parallel_tasks.append(("knowledge", self._inject_knowledge(
-                user_message, skill, db=db, user_id=user_id, project_id=_project_id
-            )))
-
-        need_vars = bool(skill_version and skill_version.variables)
-        if need_vars:
-            history_text = "\n".join(
-                f"{m.role.value}: {m.content}" for m in messages
-            )
-            history_text += f"\nuser: {user_message}"
-            _parallel_tasks.append(("vars", self._extract_variables(
-                skill_version.variables, history_text, default_config
-            )))
-
-        if _parallel_tasks:
-            labels = [t[0] for t in _parallel_tasks]
-            coros = [t[1] for t in _parallel_tasks]
-            results = await asyncio.gather(*coros, return_exceptions=True)
-            for label, result in zip(labels, results):
-                if isinstance(result, Exception):
-                    logger.warning(f"{label} failed: {result}")
-                elif label == "knowledge":
-                    knowledge_context = result
-                elif label == "vars":
-                    extracted_vars = result
+        # Phase C: 组装 prompt
+        await _emit("compiling_prompt")
 
         # Build system prompt
         if skill_version:
