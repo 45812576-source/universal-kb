@@ -469,7 +469,10 @@ def get_file_url(
         raise HTTPException(404, "此知识条目没有关联的原始文件")
 
     from app.services.oss_service import generate_signed_url
-    url = generate_signed_url(entry.oss_key, expires=3600)
+    # 图片/PDF/音视频等浏览器可内联预览的格式用 inline，其余用 attachment
+    INLINE_EXTS = {".pdf", ".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".bmp", ".mp4", ".webm", ".mp3", ".wav", ".m4a"}
+    file_ext = (entry.file_ext or "").lower()
+    url = generate_signed_url(entry.oss_key, expires=3600, inline=file_ext in INLINE_EXTS)
     return {
         "url": url,
         "filename": entry.source_file,

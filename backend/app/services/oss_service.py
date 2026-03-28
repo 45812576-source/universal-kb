@@ -52,10 +52,13 @@ def upload_bytes(data: bytes, oss_key: str, content_type: str = None) -> str:
     return oss_key
 
 
-def generate_signed_url(oss_key: str, expires: int = 3600) -> str:
-    """生成 OSS 签名下载 URL（默认1小时有效）。"""
+def generate_signed_url(oss_key: str, expires: int = 3600, inline: bool = False) -> str:
+    """生成 OSS 签名下载 URL（默认1小时有效）。inline=True 时浏览器内联预览而非下载。"""
     bucket = _get_bucket()
-    return bucket.sign_url("GET", oss_key, expires)
+    params = {}
+    if inline:
+        params["response-content-disposition"] = "inline"
+    return bucket.sign_url("GET", oss_key, expires, params=params if params else None)
 
 
 def generate_signed_upload_url(oss_key: str, expires: int = 600) -> str:
