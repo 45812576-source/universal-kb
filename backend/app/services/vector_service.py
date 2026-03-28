@@ -25,7 +25,7 @@ _embed_model = None
 
 # ─── Embedding ────────────────────────────────────────────────────────────────
 
-_BGE_M3_PATH = "/Users/xia/.cache/huggingface/hub/models--BAAI--bge-m3/snapshots/5617a9f61b028005a4858fdac845db406aefb181"
+_BGE_M3_PATH = "/home/mo/.cache/modelscope/BAAI/bge-m3"
 
 
 def _get_embed_model():
