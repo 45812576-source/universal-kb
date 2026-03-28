@@ -129,6 +129,13 @@ class KnowledgeEntry(Base):
     # classification_confidence: AI 分类置信度 0-1
     classification_confidence = Column(Float, nullable=True)
 
+    # ── 飞书文档同步 ──────────────────────────────────────────────────────────
+    lark_doc_token = Column(String(200), nullable=True)       # 飞书文档 token
+    lark_doc_type = Column(String(50), nullable=True)         # docx / wiki / sheet / file
+    lark_doc_url = Column(String(500), nullable=True)         # 原始飞书链接
+    lark_sync_interval = Column(Integer, default=0)           # 同步间隔（分钟），0=不同步
+    lark_last_synced_at = Column(Integer, default=0)          # 上次同步时间戳
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(
         DateTime,

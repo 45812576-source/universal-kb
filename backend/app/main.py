@@ -121,10 +121,40 @@ async def startup_event():
             finally:
                 db.close()
 
+        def _run_lark_doc_sync():
+            """定时同步飞书文档：扫描所有配置了 lark_sync_interval 的知识条目。"""
+            import asyncio as _asyncio
+            import time as _time
+            db = SessionLocal()
+            try:
+                from app.models.knowledge import KnowledgeEntry
+                from app.services.lark_doc_importer import lark_doc_importer
+                entries = db.query(KnowledgeEntry).filter(
+                    KnowledgeEntry.lark_sync_interval > 0,
+                    KnowledgeEntry.lark_doc_token.isnot(None),
+                ).all()
+                now_ts = int(_time.time())
+                for entry in entries:
+                    if now_ts - (entry.lark_last_synced_at or 0) < entry.lark_sync_interval * 60:
+                        continue
+                    try:
+                        result = _asyncio.run(lark_doc_importer.sync_doc(db, entry))
+                        logging.getLogger(__name__).info(
+                            f"Lark doc sync done: entry {entry.id}, changed={result.get('content_changed')}"
+                        )
+                    except Exception as ex:
+                        logging.getLogger(__name__).warning(
+                            f"Lark doc sync failed for entry {entry.id}: {ex}"
+                        )
+            finally:
+                db.close()
+
         upstream_scheduler = BackgroundScheduler()
         upstream_scheduler.add_job(check_all_imported_skills, "cron", hour=3, minute=0)
         # 每 10 分钟扫描一次需要同步的飞书表
         upstream_scheduler.add_job(_run_bitable_sync, "interval", minutes=10)
+        # 每 10 分钟扫描一次需要同步的飞书文档
+        upstream_scheduler.add_job(_run_lark_doc_sync, "interval", minutes=10)
         # 每 12 小时统计一次 OpenCode 用量（0点 和 12点）
         upstream_scheduler.add_job(_run_opencode_usage_job, "cron", hour="0,12", minute=5)
         upstream_scheduler.add_job(_run_daily_project_summary, "cron", hour=23, minute=0)

@@ -823,6 +823,97 @@ def move_entry_to_folder(
     return {"ok": True, "folder_id": folder_id}
 
 
+# ── 飞书文档导入 ──────────────────────────────────────────────────────
+
+
+class LarkImportRequest(BaseModel):
+    url: str
+    title: Optional[str] = None
+    folder_id: Optional[int] = None
+    sync_interval: int = 0
+    category: str = "experience"
+
+
+class LarkBatchImportRequest(BaseModel):
+    urls: list[str]
+    folder_id: Optional[int] = None
+    sync_interval: int = 0
+    category: str = "experience"
+
+
+@router.post("/import-from-lark")
+async def import_from_lark(
+    req: LarkImportRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """从飞书文档链接导入为知识库云文档。"""
+    from app.services.lark_doc_importer import lark_doc_importer
+
+    try:
+        entry = await lark_doc_importer.import_doc(
+            db=db,
+            user=user,
+            url=req.url,
+            title=req.title,
+            folder_id=req.folder_id,
+            category=req.category,
+            sync_interval=req.sync_interval,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(502, f"飞书 API 调用失败: {e}")
+
+    return {
+        "id": entry.id,
+        "title": entry.title,
+        "ai_title": entry.ai_title,
+        "ai_summary": entry.ai_summary,
+        "status": entry.status.value if entry.status else "pending",
+        "oss_key": entry.oss_key,
+        "lark_doc_token": entry.lark_doc_token,
+        "sync_interval": entry.lark_sync_interval,
+        "source_type": entry.source_type,
+    }
+
+
+@router.post("/import-from-lark/batch")
+async def batch_import_from_lark(
+    req: LarkBatchImportRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """批量从飞书文档链接导入。逐个导入，返回每个的结果。"""
+    from app.services.lark_doc_importer import lark_doc_importer
+
+    results = []
+    for url in req.urls:
+        try:
+            entry = await lark_doc_importer.import_doc(
+                db=db,
+                user=user,
+                url=url,
+                folder_id=req.folder_id,
+                category=req.category,
+                sync_interval=req.sync_interval,
+            )
+            results.append({
+                "url": url,
+                "ok": True,
+                "id": entry.id,
+                "title": entry.title,
+            })
+        except Exception as e:
+            results.append({
+                "url": url,
+                "ok": False,
+                "error": str(e),
+            })
+
+    return {"total": len(req.urls), "results": results}
+
+
 @router.post("/image-upload")
 async def upload_image(
     file: UploadFile = File(...),

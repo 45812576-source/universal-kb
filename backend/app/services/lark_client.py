@@ -198,6 +198,88 @@ class LarkClient:
                 for it in items
             ]
 
+    # ── 文档导出 API ────────────────────────────────────────────────────
+
+    async def get_wiki_node(self, token: str) -> dict:
+        """解析 wiki token 为实际文档 obj_token + obj_type。"""
+        access_token = await self.get_tenant_access_token()
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{_LARK_API_BASE}/wiki/v2/spaces/get_node",
+                params={"token": token},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            data = resp.json()
+            if data.get("code") != 0:
+                raise RuntimeError(f"解析 wiki 节点失败: {data.get('msg')}")
+            node = data["data"]["node"]
+            return {
+                "obj_token": node["obj_token"],
+                "obj_type": node["obj_type"],
+                "title": node.get("title", ""),
+            }
+
+    async def create_export_task(
+        self, token: str, doc_type: str, file_extension: str = "docx"
+    ) -> str:
+        """创建文档导出任务，返回 ticket。"""
+        access_token = await self.get_tenant_access_token()
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{_LARK_API_BASE}/drive/v1/export_tasks",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "token": token,
+                    "type": doc_type,
+                    "file_extension": file_extension,
+                },
+            )
+            data = resp.json()
+            if data.get("code") != 0:
+                raise RuntimeError(f"创建导出任务失败: {data.get('msg')} (code={data.get('code')})")
+            return data["data"]["ticket"]
+
+    async def poll_and_download_export(self, ticket: str, max_wait: int = 60) -> bytes:
+        """轮询导出任务直到完成，然后下载文件内容。"""
+        import asyncio
+        access_token = await self.get_tenant_access_token()
+
+        file_token = None
+        for _ in range(max_wait // 2):
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"{_LARK_API_BASE}/drive/v1/export_tasks/{ticket}",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                data = resp.json()
+                if data.get("code") != 0:
+                    raise RuntimeError(f"查询导出任务失败: {data.get('msg')}")
+                result = data.get("data", {}).get("result", {})
+                job_status = result.get("job_status", -1)
+                if job_status == 0:  # 完成
+                    file_token = result.get("file_token")
+                    break
+                elif job_status == 1 or job_status == 2:  # 处理中
+                    await asyncio.sleep(2)
+                else:
+                    raise RuntimeError(f"导出任务失败, job_status={job_status}")
+
+        if not file_token:
+            raise RuntimeError(f"导出任务超时 (waited {max_wait}s)")
+
+        # 下载文件
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"{_LARK_API_BASE}/drive/v1/export_tasks/file/{file_token}/download",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"下载导出文件失败: HTTP {resp.status_code}")
+            return resp.content
+
     async def get_user_info(self, open_id: str) -> Optional[dict]:
         """Get Lark user info by open_id."""
         try:
