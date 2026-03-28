@@ -111,6 +111,7 @@ from app.models import opencode  # noqa: F401
 
 from app.routers import auth, admin, skills, knowledge, conversations  # noqa: E402
 from app.routers import business_tables, data_tables, audit, skill_suggestions, contributions  # noqa: E402
+from app.routers import table_views  # noqa: E402
 from app.routers import tools, files, intel, lark  # noqa: E402
 from app.routers import web_apps, workspaces  # noqa: E402
 from app.routers import skill_market  # noqa: E402
@@ -130,6 +131,7 @@ app.include_router(skills.router)
 app.include_router(knowledge.router)
 app.include_router(conversations.router)
 app.include_router(business_tables.router)
+app.include_router(table_views.router)
 app.include_router(data_tables.router)
 app.include_router(audit.router)
 app.include_router(skill_suggestions.router)
