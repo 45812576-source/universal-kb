@@ -1233,6 +1233,39 @@ def update_skill(
     return {"id": skill.id}
 
 
+@router.patch("/{skill_id}/data-queries")
+def update_data_queries(
+    skill_id: int,
+    body: dict,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Replace the data_queries bindings for a skill."""
+    from app.models.business import SkillDataQuery
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill not found")
+    # Only owner or admin may edit
+    is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
+    if not is_admin and skill.created_by != user.id:
+        raise HTTPException(403, "无权限")
+    queries = body.get("data_queries") or []
+    db.query(SkillDataQuery).filter(SkillDataQuery.skill_id == skill_id).delete()
+    for q in queries:
+        table_name = q.get("table_name", "").strip()
+        if not table_name:
+            continue
+        db.add(SkillDataQuery(
+            skill_id=skill_id,
+            query_name=q.get("query_name") or f"read_{table_name}",
+            query_type=q.get("query_type") or "read",
+            table_name=table_name,
+            description=q.get("description") or "",
+        ))
+    db.commit()
+    return {"ok": True}
+
+
 @router.post("/{skill_id}/versions")
 def add_version(
     skill_id: int,

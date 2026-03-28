@@ -300,6 +300,40 @@ def _seed_tools(db):
             "output_format": "json",
         },
         {
+            "name": "data_table_reader",
+            "display_name": "业务表读取",
+            "description": "从已注册的业务表中读取数据，支持字段过滤和条件筛选",
+            "tool_type": ToolType.BUILTIN,
+            "config": {"module": "app.tools.data_table_reader", "function": "execute"},
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "table_name": {"type": "string", "description": "目标业务表名（需在business_tables注册）"},
+                    "filters": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "field": {"type": "string"},
+                                "op": {"type": "string", "enum": ["eq", "ne", "gt", "gte", "lt", "lte", "contains", "starts", "ends"]},
+                                "value": {},
+                            },
+                            "required": ["field", "op", "value"],
+                        },
+                        "description": "筛选条件列表",
+                    },
+                    "columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "要返回的列名，不填则返回所有可见列",
+                    },
+                    "limit": {"type": "integer", "description": "最多返回行数，默认50，最大500"},
+                },
+                "required": ["table_name"],
+            },
+            "output_format": "json",
+        },
+        {
             "name": "data_table_writer",
             "display_name": "业务表写入",
             "description": "将Skill结构化输出写入已注册的业务表，带安全校验和审计日志",
