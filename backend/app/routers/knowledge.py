@@ -142,12 +142,19 @@ async def upload_knowledge(
     with open(saved_path, "wb") as f:
         f.write(file_data)
 
-    # 提取文本内容
+    # 提取文本内容（供 AI/向量化）
     try:
         content = extract_text(saved_path)
     except ValueError as e:
         os.unlink(saved_path)
         raise HTTPException(400, str(e))
+
+    # 提取 HTML 内容（供前端云文档编辑器）
+    try:
+        from app.utils.file_parser import extract_html
+        content_html = extract_html(saved_path)
+    except Exception:
+        content_html = None
 
     # 上传原件到 OSS
     oss_key = None
@@ -180,6 +187,7 @@ async def upload_knowledge(
     entry = KnowledgeEntry(
         title=title,
         content=content,
+        content_html=content_html,
         category=category,
         industry_tags=json.loads(industry_tags),
         platform_tags=json.loads(platform_tags),
@@ -644,6 +652,7 @@ def get_knowledge(
             raise HTTPException(403, "Access denied")
     result = _entry_dict(entry)
     result["content"] = entry.content  # full content for detail view
+    result["content_html"] = entry.content_html  # HTML for cloud doc editor
     return result
 
 
@@ -714,6 +723,7 @@ def super_review_knowledge(
 class EntryUpdate(BaseModel):
     title: Optional[str] = None
     content: Optional[str] = None
+    content_html: Optional[str] = None
 
 
 @router.patch("/{kid}")
@@ -734,6 +744,8 @@ def update_knowledge(
         entry.title = req.title
     if req.content is not None:
         entry.content = req.content
+    if req.content_html is not None:
+        entry.content_html = req.content_html
     db.commit()
     return _entry_dict(entry)
 

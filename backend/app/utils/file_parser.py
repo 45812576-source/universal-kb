@@ -154,6 +154,91 @@ def foe_summarize(raw_text: str, llm_cfg: dict) -> str:
     return final.content
 
 
+def extract_html(file_path: str) -> str:
+    """从文件提取 HTML 格式内容，保留富文本格式（标题/加粗/列表/表格等）。
+    用于前端云文档编辑器渲染。不支持的格式回退到 extract_text() 包装。"""
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext in (".docx",):
+        import mammoth
+        with open(file_path, "rb") as f:
+            result = mammoth.convert_to_html(f, style_map=[
+                "p[style-name='Heading 1'] => h1:fresh",
+                "p[style-name='Heading 2'] => h2:fresh",
+                "p[style-name='Heading 3'] => h3:fresh",
+                "p[style-name='标题 1'] => h1:fresh",
+                "p[style-name='标题 2'] => h2:fresh",
+                "p[style-name='标题 3'] => h3:fresh",
+            ])
+            return result.value
+
+    elif ext in (".md",):
+        import markdown as md_lib
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        return md_lib.markdown(text, extensions=["tables", "fenced_code", "nl2br", "sane_lists"])
+
+    elif ext in (".pptx",):
+        # PPTX: wrap each slide as a section with headings
+        from pptx import Presentation
+        prs = Presentation(file_path)
+        html_parts = []
+        for i, slide in enumerate(prs.slides, 1):
+            slide_texts = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    t = shape.text.strip()
+                    if t:
+                        slide_texts.append(t)
+            if slide_texts:
+                title = slide_texts[0]
+                body = slide_texts[1:] if len(slide_texts) > 1 else []
+                html_parts.append(f"<h2>{title}</h2>")
+                for line in body:
+                    html_parts.append(f"<p>{line}</p>")
+        return "\n".join(html_parts)
+
+    elif ext in (".xlsx", ".xls", ".csv"):
+        # Tabular data → HTML table
+        plain = extract_text(file_path)
+        lines = plain.strip().split("\n")
+        html_parts = []
+        in_table = False
+        for line in lines:
+            if line.startswith("[Sheet:"):
+                if in_table:
+                    html_parts.append("</tbody></table>")
+                    in_table = False
+                html_parts.append(f"<h3>{line.strip('[]')}</h3>")
+            elif "\t" in line:
+                if not in_table:
+                    html_parts.append("<table><tbody>")
+                    in_table = True
+                cells = line.split("\t")
+                html_parts.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+            elif line.strip():
+                if in_table:
+                    html_parts.append("</tbody></table>")
+                    in_table = False
+                html_parts.append(f"<p>{line}</p>")
+        if in_table:
+            html_parts.append("</tbody></table>")
+        return "\n".join(html_parts)
+
+    elif ext in (".txt",):
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        return "\n".join(f"<p>{line or '<br>'}</p>" for line in text.split("\n"))
+
+    else:
+        # 其他格式（PDF/图片/音频等）：纯文本包装为 <p>
+        try:
+            plain = extract_text(file_path)
+            return "\n".join(f"<p>{line or '<br>'}</p>" for line in plain.split("\n"))
+        except ValueError:
+            return ""
+
+
 def extract_text(file_path: str) -> str:
     ext = os.path.splitext(file_path)[1].lower()
 

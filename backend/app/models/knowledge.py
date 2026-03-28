@@ -50,6 +50,7 @@ class KnowledgeEntry(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     title = Column(String(200), nullable=False)
     content = Column(Text, nullable=False)
+    content_html = Column(Text, nullable=True)    # 富文本 HTML（供前端云文档编辑器）
     category = Column(String(50), default="experience")  # experience / external_intel
     status = Column(Enum(KnowledgeStatus), default=KnowledgeStatus.PENDING)
     department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
