@@ -6,3 +6,4 @@ __pycache__/
 uploads/
 build/
 .react-router/
+backend/studio_workspaces/
