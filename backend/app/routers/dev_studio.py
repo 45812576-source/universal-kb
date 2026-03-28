@@ -236,8 +236,9 @@ def _all_opencode_db_paths() -> list[str]:
 
 
 def _count_ai_calls(since_ms: int) -> int:
-    """统计所有用户 opencode.db 中 since_ms（毫秒时间戳）之后的 assistant 消息条数。
-    每条 assistant message = 1 次 AI 调用（模型推理请求）。
+    """统计所有用户 opencode.db 中 since_ms（毫秒时间戳）之后的 LLM 调用次数。
+    以 part 表中 type='step-finish' 的条数计算：
+    每条 step-finish = 1 次实际 API 调用（含 tool-calls 中间轮和最终 stop 轮）。
     """
     import sqlite3 as _sqlite3
     total = 0
@@ -247,8 +248,8 @@ def _count_ai_calls(since_ms: int) -> int:
         try:
             con = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             row = con.execute(
-                "SELECT COUNT(*) FROM message "
-                "WHERE json_extract(data, '$.role') = 'assistant' "
+                "SELECT COUNT(*) FROM part "
+                "WHERE json_extract(data, '$.type') = 'step-finish' "
                 "  AND time_created >= ?",
                 (since_ms,),
             ).fetchone()
