@@ -298,17 +298,14 @@ async def _bailian_usage_monitor() -> None:
 
                 bailian_key = os.environ.get("BAILIAN_API_KEY", "")
                 ark_key = os.environ.get("ARK_API_KEY", "")
-                # 更新所有已启动用户实例的 opencode.json，并重启进程
+                # 只更新配置文件，不主动杀进程（避免中断用户当前操作）。
+                # 下次用户调用 /instance 时，_ensure_user_instance 检测到配置变化会自动重启。
                 for uid, inst in list(_user_instances.items()):
                     from app.config import settings as _cfg2
                     _studio_root = os.path.abspath(os.path.expanduser(getattr(_cfg2, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
                     wdir = inst.get("workdir") or os.path.join(_studio_root, f"user_{uid}")
                     os.makedirs(wdir, exist_ok=True)
                     _write_opencode_config(wdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=True)
-                    proc = inst.get("proc")
-                    if proc is not None and proc.returncode is None:
-                        proc.terminate()
-                        inst["proc"] = None
         except Exception as e:
             logging.getLogger(__name__).warning(f"[BailianMonitor] 采样失败: {e}")
 
