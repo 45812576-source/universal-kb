@@ -197,9 +197,6 @@ import collections as _collections
 import time as _time
 
 _usage_counter: dict = {
-    # deque of (unix_timestamp, estimated_calls_delta)
-    "events": _collections.deque(),
-    "last_files_total": 0,
     "monitor_task": None,
     # 触发 fallback 的原因，便于查询
     "trigger_reason": "",
@@ -211,42 +208,50 @@ _WINDOW_7D  = 7  * 86400
 _WINDOW_30D = 30 * 86400
 
 
-def _window_sum(seconds: int) -> int:
-    """统计最近 seconds 内的估算调用总量。"""
-    cutoff = _time.time() - seconds
-    return sum(calls for ts, calls in _usage_counter["events"] if ts >= cutoff)
+def _all_opencode_db_paths() -> list[str]:
+    """收集所有用户的 opencode.db 路径（含全局兜底路径）。"""
+    from app.config import settings as _cfg3
+    _studio_root = os.path.abspath(os.path.expanduser(getattr(_cfg3, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
+    paths: list[str] = []
+    # 各用户独立目录（内存中已知实例）
+    seen = set()
+    for uid, inst in list(_user_instances.items()):
+        wdir = inst.get("workdir") or os.path.join(_studio_root, f"user_{uid}")
+        p = os.path.join(wdir, ".local", "share", "opencode", "opencode.db")
+        if p not in seen:
+            seen.add(p)
+            paths.append(p)
+    # 扫描 studio_root 下所有用户目录（兼容重启后 _user_instances 为空的情况）
+    if os.path.isdir(_studio_root):
+        for name in os.listdir(_studio_root):
+            p = os.path.join(_studio_root, name, ".local", "share", "opencode", "opencode.db")
+            if p not in seen:
+                seen.add(p)
+                paths.append(p)
+    # 全局路径兜底
+    global_db = os.environ.get("OPENCODE_DB_PATH", os.path.expanduser("~/.local/share/opencode/opencode.db"))
+    if global_db not in seen:
+        paths.append(global_db)
+    return paths
 
 
-def _prune_events() -> None:
-    """删除 30 天前的旧事件，防内存无限增长。"""
-    cutoff = _time.time() - _WINDOW_30D
-    while _usage_counter["events"] and _usage_counter["events"][0][0] < cutoff:
-        _usage_counter["events"].popleft()
-
-
-def _read_files_total() -> int:
-    """从所有用户的 OpenCode SQLite 汇总 summary_files 总量。"""
+def _count_ai_calls(since_ms: int) -> int:
+    """统计所有用户 opencode.db 中 since_ms（毫秒时间戳）之后的 assistant 消息条数。
+    每条 assistant message = 1 次 AI 调用（模型推理请求）。
+    """
     import sqlite3 as _sqlite3
     total = 0
-    db_paths = []
-
-    # 各用户独立目录
-    for uid, inst in list(_user_instances.items()):
-        from app.config import settings as _cfg3
-        _studio_root = os.path.abspath(os.path.expanduser(getattr(_cfg3, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
-        wdir = inst.get("workdir") or os.path.join(_studio_root, f"user_{uid}")
-        db_paths.append(os.path.join(wdir, ".local", "share", "opencode", "opencode.db"))
-
-    # 兜底：全局路径（向后兼容）
-    global_db = os.environ.get("OPENCODE_DB_PATH", os.path.expanduser("~/.local/share/opencode/opencode.db"))
-    db_paths.append(global_db)
-
-    for db_path in db_paths:
+    for db_path in _all_opencode_db_paths():
         if not os.path.exists(db_path):
             continue
         try:
             con = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            row = con.execute("SELECT COALESCE(SUM(summary_files), 0) FROM session").fetchone()
+            row = con.execute(
+                "SELECT COUNT(*) FROM message "
+                "WHERE json_extract(data, '$.role') = 'assistant' "
+                "  AND time_created >= ?",
+                (since_ms,),
+            ).fetchone()
             con.close()
             total += int(row[0]) if row else 0
         except Exception:
@@ -255,7 +260,8 @@ def _read_files_total() -> int:
 
 
 async def _bailian_usage_monitor() -> None:
-    """每 5 分钟采样一次文件变更量，估算百炼调用次数，任一窗口超 90% 自动切换 ARK。"""
+    """每 5 分钟直接统计 opencode message 表中 assistant 消息条数，
+    任一窗口超 90% 自动切换 ARK。"""
     import logging
     logger = logging.getLogger(__name__)
 
@@ -267,29 +273,20 @@ async def _bailian_usage_monitor() -> None:
             q7d  = getattr(_settings, "BAILIAN_QUOTA_7D",  45000)
             q30d = getattr(_settings, "BAILIAN_QUOTA_30D", 90000)
 
-            # 采样增量
-            current_total = _read_files_total()
-            delta = max(0, current_total - _usage_counter["last_files_total"])
-            _usage_counter["last_files_total"] = current_total
-            if delta > 0:
-                _usage_counter["events"].append((_time.time(), delta * 2))
-            _prune_events()
-
-            # 三窗口求和
-            s5h  = _window_sum(_WINDOW_5H)
-            s7d  = _window_sum(_WINDOW_7D)
-            s30d = _window_sum(_WINDOW_30D)
+            now_ms = int(_time.time() * 1000)
+            s5h  = _count_ai_calls(now_ms - _WINDOW_5H  * 1000)
+            s7d  = _count_ai_calls(now_ms - _WINDOW_7D  * 1000)
+            s30d = _count_ai_calls(now_ms - _WINDOW_30D * 1000)
 
             logger.info(
-                f"[BailianMonitor] delta={delta} "
-                f"5h={s5h}/{q5h} 7d={s7d}/{q7d} 30d={s30d}/{q30d}"
+                f"[BailianMonitor] 5h={s5h}/{q5h} 7d={s7d}/{q7d} 30d={s30d}/{q30d}"
             )
 
             # 任一窗口超 90% 触发 fallback
             reason = ""
-            if s5h  >= q5h  * 0.9: reason = f"5h用量 {s5h}/{q5h}"
-            elif s7d  >= q7d  * 0.9: reason = f"7d用量 {s7d}/{q7d}"
-            elif s30d >= q30d * 0.9: reason = f"30d用量 {s30d}/{q30d}"
+            if s5h  >= q5h  * 0.9: reason = f"5h调用 {s5h}/{q5h}"
+            elif s7d  >= q7d  * 0.9: reason = f"7d调用 {s7d}/{q7d}"
+            elif s30d >= q30d * 0.9: reason = f"30d调用 {s30d}/{q30d}"
 
             if reason and not _runtime_fallback["use_ark"]:
                 logger.warning(f"[BailianMonitor] {reason} 已达90%，自动切换 ARK")
@@ -833,8 +830,6 @@ async def set_provider_fallback(
     """
     _runtime_fallback["use_ark"] = enable
     if reset_counter:
-        _usage_counter["events"].clear()
-        _usage_counter["last_files_total"] = _read_files_total()
         _usage_counter["trigger_reason"] = ""
 
     from app.config import settings as _settings
@@ -882,16 +877,16 @@ async def set_provider_fallback(
 async def get_provider_status(
     user: User = Depends(get_current_user),
 ):
-    """查询百炼三窗口估算用量及当前 provider 配置。"""
+    """查询百炼三窗口实际调用次数及当前 provider 配置。"""
     from app.config import settings as _settings
     q5h  = getattr(_settings, "BAILIAN_QUOTA_5H",  6000)
     q7d  = getattr(_settings, "BAILIAN_QUOTA_7D",  45000)
     q30d = getattr(_settings, "BAILIAN_QUOTA_30D", 90000)
 
-    _prune_events()
-    s5h  = _window_sum(_WINDOW_5H)
-    s7d  = _window_sum(_WINDOW_7D)
-    s30d = _window_sum(_WINDOW_30D)
+    now_ms = int(_time.time() * 1000)
+    s5h  = _count_ai_calls(now_ms - _WINDOW_5H  * 1000)
+    s7d  = _count_ai_calls(now_ms - _WINDOW_7D  * 1000)
+    s30d = _count_ai_calls(now_ms - _WINDOW_30D * 1000)
 
     return {
         "fallback_active": _runtime_fallback["use_ark"],
@@ -899,9 +894,9 @@ async def get_provider_status(
         "active_provider": "ark" if _runtime_fallback["use_ark"] else "bailian-coding-plan",
         "default_model": _resolve_default_model(_runtime_fallback["use_ark"]),
         "windows": {
-            "5h":  {"estimated": s5h,  "quota": q5h,  "pct": round(s5h  / q5h  * 100, 1)},
-            "7d":  {"estimated": s7d,  "quota": q7d,  "pct": round(s7d  / q7d  * 100, 1)},
-            "30d": {"estimated": s30d, "quota": q30d, "pct": round(s30d / q30d * 100, 1)},
+            "5h":  {"calls": s5h,  "quota": q5h,  "pct": round(s5h  / q5h  * 100, 1)},
+            "7d":  {"calls": s7d,  "quota": q7d,  "pct": round(s7d  / q7d  * 100, 1)},
+            "30d": {"calls": s30d, "quota": q30d, "pct": round(s30d / q30d * 100, 1)},
         },
     }
 
