@@ -1255,9 +1255,10 @@ _MAX_UPLOAD_FILE_BYTES = 200 * 1024 * 1024  # 单文件上限 200MB
 @router.post("/upload-file")
 async def upload_file(
     file: UploadFile = File(...),
+    target_path: str = Form(default=""),
     user: User = Depends(get_current_user),
 ):
-    """将用户上传的文件直接写入其 opencode workdir 根目录。"""
+    """将用户上传的文件写入其 opencode workdir，支持指定子目录。"""
     import re as _re
     from app.config import settings as _cfg
 
@@ -1301,13 +1302,23 @@ async def upload_file(
     if not safe_filename:
         safe_filename = "upload"
 
-    dest = os.path.join(workdir, safe_filename)
+    # 处理目标子目录：防路径穿越，确保在 workdir 内
+    if target_path and target_path.strip():
+        dest_dir = _safe_path(workdir, target_path.strip())
+        os.makedirs(dest_dir, exist_ok=True)
+    else:
+        dest_dir = workdir
+
+    dest = os.path.join(dest_dir, safe_filename)
     with open(dest, "wb") as f:
         f.write(content)
 
+    # 返回相对于 workdir 的路径，便于前端显示
+    rel_dest = os.path.relpath(dest, workdir)
     return {
         "ok": True,
         "filename": safe_filename,
+        "path": rel_dest,
         "size": len(content),
     }
 
