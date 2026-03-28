@@ -319,6 +319,50 @@ def _seed_tools(db):
             },
             "output_format": "json",
         },
+        {
+            "name": "lark_approval",
+            "display_name": "飞书审批",
+            "description": "发起飞书审批流程（请假、报销、采购等），审批人在飞书端操作，结果自动回调",
+            "tool_type": ToolType.BUILTIN,
+            "config": {
+                "module": "app.tools.lark_approval",
+                "function": "execute",
+                "usage_hint": "当用户需要发起请假、报销、采购等审批流程时调用此工具",
+            },
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "approval_code": {
+                        "type": "string",
+                        "description": "飞书审批定义 code（审批模板标识，从审批管理获取）",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "审批标题，如「张三请假申请」",
+                    },
+                    "form_data": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "description": "表单控件 ID"},
+                                "type": {"type": "string", "description": "控件类型，如 input / textarea / date / number"},
+                                "value": {"type": "string", "description": "控件值"},
+                            },
+                            "required": ["id", "type", "value"],
+                        },
+                        "description": "飞书审批表单数据",
+                    },
+                    "urgency": {
+                        "type": "string",
+                        "enum": ["normal", "urgent"],
+                        "description": "紧急程度（可选，默认 normal）",
+                    },
+                },
+                "required": ["approval_code", "title", "form_data"],
+            },
+            "output_format": "json",
+        },
     ]
 
     for tool_data in builtin_tools:

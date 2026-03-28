@@ -57,6 +57,8 @@ class LarkBot:
 
         if event_type == "im.message.receive_v1":
             await self._handle_message(db, event)
+        elif event_type in ("approval_instance", "approval"):
+            await self._handle_approval_event(db, event)
 
         return {"ok": True}
 
@@ -112,6 +114,53 @@ class LarkBot:
         # Save messages to conversation
         self._save_message(db, conversation.id, "user", user_text)
         self._save_message(db, conversation.id, "assistant", response_text)
+
+    async def _handle_approval_event(self, db: Session, event: dict) -> None:
+        """处理飞书审批状态变更事件。"""
+        from app.models.lark_approval import LarkApprovalInstance
+        from app.services.lark_client import lark_client
+
+        instance_code = event.get("instance_code", "")
+        status = event.get("status", "")  # APPROVED / REJECTED / CANCELED / DELETED
+
+        if not instance_code or not status:
+            logger.warning(f"Approval event missing fields: {event}")
+            return
+
+        # 更新本地记录
+        record = (
+            db.query(LarkApprovalInstance)
+            .filter(LarkApprovalInstance.instance_code == instance_code)
+            .first()
+        )
+        if not record:
+            logger.info(f"Approval instance {instance_code} not tracked locally, skipping")
+            return
+
+        record.status = status
+        record.result_data = event
+        db.commit()
+
+        # 通知发起人
+        status_map = {
+            "APPROVED": "✅ 已通过",
+            "REJECTED": "❌ 已拒绝",
+            "CANCELED": "🚫 已撤回",
+            "DELETED": "🗑 已删除",
+        }
+        status_text = status_map.get(status, status)
+        msg = f"审批通知：「{record.title}」{status_text}"
+
+        user = self._get_or_create_user(db, "")
+        if record.user_id:
+            from app.models.user import User
+            user = db.get(User, record.user_id)
+            if user and user.lark_user_id:
+                await lark_client.send_message(user.lark_user_id, msg)
+
+        # 在关联对话中插入系统消息
+        if record.conversation_id:
+            self._save_message(db, record.conversation_id, "assistant", msg)
 
     def _get_or_create_user(self, db: Session, lark_user_id: str):
         """Find user by lark_user_id."""

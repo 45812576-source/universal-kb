@@ -119,6 +119,85 @@ class LarkClient:
             receive_id, card_content, receive_id_type, msg_type="interactive"
         )
 
+    # ── 审批 API ─────────────────────────────────────────────────────────
+
+    async def create_approval_instance(
+        self,
+        approval_code: str,
+        open_id: str,
+        form: list[dict],
+        node_approver_open_ids: list[str] | None = None,
+        urgency: str = "normal",
+    ) -> dict:
+        """创建飞书审批实例。返回 {"instance_code": "..."}。
+
+        注意：飞书 API 要求 form 是 JSON 字符串，不是 object。
+        """
+        import json
+        token = await self.get_tenant_access_token()
+
+        body: dict = {
+            "approval_code": approval_code,
+            "open_id": open_id,
+            "form": json.dumps(form, ensure_ascii=False),
+        }
+        if node_approver_open_ids:
+            body["node_approver_open_id_list"] = [
+                {"key": "default", "value": node_approver_open_ids}
+            ]
+        if urgency == "urgent":
+            body["urgency"] = "urgent"
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{_LARK_API_BASE}/approval/v4/instances",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+            )
+            data = resp.json()
+            if data.get("code") != 0:
+                raise RuntimeError(f"创建审批失败: {data.get('msg')} (code={data.get('code')})")
+            return {"instance_code": data["data"]["instance_code"]}
+
+    async def get_approval_instance(self, instance_code: str) -> dict:
+        """查询飞书审批实例详情。"""
+        token = await self.get_tenant_access_token()
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{_LARK_API_BASE}/approval/v4/instances/{instance_code}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            data = resp.json()
+            if data.get("code") != 0:
+                raise RuntimeError(f"查询审批失败: {data.get('msg')}")
+            return data.get("data", {})
+
+    async def list_approval_definitions(self) -> list[dict]:
+        """获取企业可用的审批定义列表。"""
+        token = await self.get_tenant_access_token()
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{_LARK_API_BASE}/approval/v4/approvals",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"page_size": 100},
+            )
+            data = resp.json()
+            if data.get("code") != 0:
+                logger.warning(f"List approval definitions failed: {data.get('msg')}")
+                return []
+            items = data.get("data", {}).get("items", [])
+            return [
+                {
+                    "approval_code": it.get("approval_code", ""),
+                    "approval_name": it.get("approval_name", ""),
+                    "status": it.get("status", ""),
+                }
+                for it in items
+            ]
+
     async def get_user_info(self, open_id: str) -> Optional[dict]:
         """Get Lark user info by open_id."""
         try:
