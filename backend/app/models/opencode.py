@@ -15,6 +15,8 @@ class OpenCodeWorkspaceMapping(Base):
     opencode_workspace_name = Column(String(255), nullable=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     directory = Column(String(1024), nullable=True)  # 用户 opencode workdir，按此匹配 session
+    oss_prefix = Column(String(500), nullable=True)  # OSS 路径前缀，如 studio_workspaces/胡瑞
+    kb_folder_id = Column(Integer, nullable=True)    # 对应知识库"开发工地"文件夹 ID
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     user = relationship("User", foreign_keys=[user_id])

@@ -159,6 +159,20 @@ async def startup_event():
         upstream_scheduler.add_job(_run_opencode_usage_job, "cron", hour="0,12", minute=5)
         upstream_scheduler.add_job(_run_daily_project_summary, "cron", hour=23, minute=0)
         upstream_scheduler.add_job(_run_todo_reminder, "cron", hour=9, minute=0)
+
+        def _run_workdir_kb_sync():
+            """每 30 分钟扫描用户 workdir，把新产出文档沉淀到知识库开发工地文件夹。"""
+            db = SessionLocal()
+            try:
+                from app.services.workdir_kb_sync import run_workdir_kb_sync
+                run_workdir_kb_sync(db)
+            except Exception as ex:
+                import logging
+                logging.getLogger(__name__).warning(f"WorkdirKbSync job failed: {ex}")
+            finally:
+                db.close()
+
+        upstream_scheduler.add_job(_run_workdir_kb_sync, "interval", minutes=30)
         upstream_scheduler.start()
     except Exception as e:
         import logging
