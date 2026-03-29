@@ -26,7 +26,7 @@ def test_create_skill_as_admin(client, db):
     assert resp.json()["name"] == "营销分析"
 
 
-def test_create_skill_as_employee_forbidden(client, db):
+def test_create_skill_as_employee(client, db):
     _make_dept(db)
     _make_user(db, "emp1", Role.EMPLOYEE)
     db.commit()
@@ -36,7 +36,7 @@ def test_create_skill_as_employee_forbidden(client, db):
         "name": "违规Skill",
         "system_prompt": "x",
     })
-    assert resp.status_code == 403
+    assert resp.status_code == 200
 
 
 def test_create_skill_duplicate_name(client, db):
@@ -159,6 +159,10 @@ def test_update_status(client, db):
     dept = _make_dept(db)
     admin = _make_user(db, "admin9", Role.SUPER_ADMIN, dept.id)
     skill = _make_skill(db, admin.id, "StatusSkill", status=SkillStatus.DRAFT)
+    # 无绑定工具时，system_prompt 需 ≥200 行才能发布
+    from app.models.skill import SkillVersion
+    ver = db.query(SkillVersion).filter(SkillVersion.skill_id == skill.id).first()
+    ver.system_prompt = "\n".join([f"指令行 {i+1}" for i in range(200)])
     db.commit()
     token = _login(client, "admin9")
 

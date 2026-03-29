@@ -424,7 +424,7 @@ async def import_convert_skill(
     try:
         prompt = _IMPORT_CONVERT_PROMPT.format(raw_content=raw_content[:8000])
         ai_result, _ = await llm_gateway.chat(
-            model_config=llm_gateway.get_lite_config(),
+            model_config=llm_gateway.resolve_config(db, "skill.classify"),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             max_tokens=4000,
@@ -1824,7 +1824,7 @@ async def edit_with_ai(
 ):
     """Generate AI-powered edit preview from natural language instruction."""
     from app.services.skill_editor import skill_editor
-    model_config = llm_gateway.get_config(db, req.model_config_id)
+    model_config = llm_gateway.resolve_config(db, "skill.run_in_router", req.model_config_id)
     skill = db.get(Skill, skill_id)
     if not skill:
         raise HTTPException(404, "Skill not found")
@@ -1874,7 +1874,7 @@ async def iterate_from_suggestions(
 ):
     """Generate AI-powered diff based on adopted suggestions."""
     from app.services.skill_editor import skill_editor
-    model_config = llm_gateway.get_config(db, req.model_config_id)
+    model_config = llm_gateway.resolve_config(db, "skill.run_in_router", req.model_config_id)
     skill = db.get(Skill, skill_id)
     if not skill:
         raise HTTPException(404, "Skill not found")
@@ -1908,7 +1908,7 @@ def apply_iterate(
         # Fire-and-forget attribution (non-blocking)
         import asyncio
         try:
-            model_config = llm_gateway.get_config(db)
+            model_config = llm_gateway.resolve_config(db, "skill.run_in_router")
             asyncio.create_task(
                 attribution_service.generate_attributions(
                     skill_id=skill_id,
