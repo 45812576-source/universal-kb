@@ -343,6 +343,7 @@ class ApprovalRequestType(str, enum.Enum):
     SCOPE_CHANGE = "scope_change"
     MASK_OVERRIDE = "mask_override"
     SCHEMA_APPROVAL = "schema_approval"
+    KNOWLEDGE_EDIT = "knowledge_edit"
 
 
 class ApprovalStatus(str, enum.Enum):

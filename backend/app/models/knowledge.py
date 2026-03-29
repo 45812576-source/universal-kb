@@ -1,7 +1,7 @@
 import datetime
 import enum
 
-from sqlalchemy import BigInteger, Column, DateTime, Enum, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import BigInteger, Column, DateTime, Enum, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import relationship
 
@@ -166,3 +166,22 @@ class KnowledgeRevision(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     knowledge = relationship("KnowledgeEntry", back_populates="revisions")
+
+
+class KnowledgeEditGrant(Base):
+    """文档编辑权限授权记录。创建者以外的用户需要申请才能编辑。"""
+    __tablename__ = "knowledge_edit_grants"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    entry_id = Column(Integer, ForeignKey("knowledge_entries.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    granted_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    entry = relationship("KnowledgeEntry")
+    user = relationship("User", foreign_keys=[user_id])
+    grantor = relationship("User", foreign_keys=[granted_by])
+
+    __table_args__ = (
+        UniqueConstraint("entry_id", "user_id", name="uq_edit_grant"),
+    )

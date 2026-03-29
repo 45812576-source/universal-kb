@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.dependencies import get_current_user, require_role
-from app.models.knowledge import KnowledgeEntry, KnowledgeFolder, KnowledgeStatus, ReviewStage
+from app.models.knowledge import KnowledgeEntry, KnowledgeEditGrant, KnowledgeFolder, KnowledgeStatus, ReviewStage
 from app.models.user import Role, User
 from app.services.knowledge_service import (
     approve_knowledge,
@@ -720,6 +720,18 @@ def super_review_knowledge(
     return _entry_dict(entry)
 
 
+def can_edit_entry(entry: KnowledgeEntry, user: User, db: Session) -> bool:
+    """检查用户是否有编辑权限：创建者/super_admin/被授权者。"""
+    if entry.created_by == user.id:
+        return True
+    if user.role == Role.SUPER_ADMIN:
+        return True
+    grant = db.query(KnowledgeEditGrant).filter_by(
+        entry_id=entry.id, user_id=user.id
+    ).first()
+    return grant is not None
+
+
 class EntryUpdate(BaseModel):
     title: Optional[str] = None
     content: Optional[str] = None
@@ -736,10 +748,8 @@ def update_knowledge(
     entry = db.get(KnowledgeEntry, kid)
     if not entry:
         raise HTTPException(404, "Knowledge entry not found")
-    if user.role == Role.EMPLOYEE and entry.created_by != user.id:
-        raise HTTPException(403, "Cannot edit others' entries")
-    if user.role == Role.DEPT_ADMIN and entry.created_by != user.id and entry.department_id != user.department_id:
-        raise HTTPException(403, "只能编辑本部门的知识条目")
+    if not can_edit_entry(entry, user, db):
+        raise HTTPException(403, "无编辑权限，请先向文档创建者申请")
     if req.title is not None:
         entry.title = req.title
     if req.content is not None:
@@ -927,6 +937,140 @@ async def batch_import_from_lark(
             })
 
     return {"total": len(req.urls), "results": results}
+
+
+# ── 文档编辑权限 ──────────────────────────────────────────────────────
+
+
+@router.get("/{kid}/edit-permission")
+def check_edit_permission(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """检查当前用户是否有编辑权限，以及是否已有待审批的申请。"""
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+
+    has_permission = can_edit_entry(entry, user, db)
+
+    # 检查是否有 pending 的编辑权限申请
+    pending_request = None
+    if not has_permission:
+        from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus
+        pending = (
+            db.query(ApprovalRequest)
+            .filter(
+                ApprovalRequest.request_type == ApprovalRequestType.KNOWLEDGE_EDIT,
+                ApprovalRequest.target_id == kid,
+                ApprovalRequest.target_type == "knowledge",
+                ApprovalRequest.requester_id == user.id,
+                ApprovalRequest.status == ApprovalStatus.PENDING,
+            )
+            .first()
+        )
+        if pending:
+            pending_request = {"id": pending.id, "created_at": pending.created_at.isoformat() if pending.created_at else None}
+
+    return {
+        "can_edit": has_permission,
+        "is_owner": entry.created_by == user.id,
+        "pending_request": pending_request,
+    }
+
+
+@router.post("/{kid}/request-edit")
+def request_edit_permission(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """申请某文档的编辑权限。"""
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+
+    if can_edit_entry(entry, user, db):
+        raise HTTPException(400, "您已有编辑权限")
+
+    # 检查是否已有 pending 申请
+    from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus
+    existing = (
+        db.query(ApprovalRequest)
+        .filter(
+            ApprovalRequest.request_type == ApprovalRequestType.KNOWLEDGE_EDIT,
+            ApprovalRequest.target_id == kid,
+            ApprovalRequest.target_type == "knowledge",
+            ApprovalRequest.requester_id == user.id,
+            ApprovalRequest.status == ApprovalStatus.PENDING,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(400, "已有待审批的申请")
+
+    r = ApprovalRequest(
+        request_type=ApprovalRequestType.KNOWLEDGE_EDIT,
+        target_id=kid,
+        target_type="knowledge",
+        requester_id=user.id,
+        status=ApprovalStatus.PENDING,
+        stage="owner_pending",
+    )
+    db.add(r)
+    db.commit()
+    db.refresh(r)
+    return {"id": r.id, "status": "pending"}
+
+
+@router.get("/{kid}/edit-grants")
+def list_edit_grants(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """列出文档的所有编辑权限授权。只有创建者和 super_admin 可查看。"""
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    if entry.created_by != user.id and user.role != Role.SUPER_ADMIN:
+        raise HTTPException(403, "只有文档创建者可以管理编辑权限")
+
+    grants = db.query(KnowledgeEditGrant).filter_by(entry_id=kid).all()
+    return [
+        {
+            "id": g.id,
+            "user_id": g.user_id,
+            "user_name": g.user.display_name if g.user else None,
+            "granted_by": g.granted_by,
+            "created_at": g.created_at.isoformat() if g.created_at else None,
+        }
+        for g in grants
+    ]
+
+
+@router.delete("/{kid}/edit-grants/{uid}")
+def revoke_edit_grant(
+    kid: int,
+    uid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """撤销某用户的编辑权限。只有创建者和 super_admin 可操作。"""
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    if entry.created_by != user.id and user.role != Role.SUPER_ADMIN:
+        raise HTTPException(403, "只有文档创建者可以撤销编辑权限")
+
+    grant = db.query(KnowledgeEditGrant).filter_by(entry_id=kid, user_id=uid).first()
+    if not grant:
+        raise HTTPException(404, "该用户没有编辑权限")
+
+    db.delete(grant)
+    db.commit()
+    return {"ok": True}
 
 
 @router.post("/image-upload")

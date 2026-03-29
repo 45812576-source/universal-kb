@@ -264,6 +264,18 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
                 "is_public": webapp.is_public,
                 "preview_url": f"/api/web-apps/{webapp.id}/preview",
             }
+    elif r.target_type == "knowledge" and r.target_id:
+        from app.models.knowledge import KnowledgeEntry
+        entry = db.get(KnowledgeEntry, r.target_id)
+        if entry:
+            target_detail = {
+                "name": entry.ai_title or entry.title,
+                "title": entry.title,
+                "file_ext": entry.file_ext,
+                "source_file": entry.source_file,
+                "created_by": entry.created_by,
+                "creator_name": entry.creator.display_name if entry.creator else None,
+            }
 
     return {
         "id": r.id,
@@ -352,32 +364,54 @@ def pending_count(
     user: User = Depends(get_current_user),
 ):
     """返回当前用户需要处理的待审批数量（用于侧边栏红标）。"""
-    if user.role == Role.SUPER_ADMIN:
-        # 超管：stage=super_pending 的所有待审批
-        count = (
+    from sqlalchemy import or_
+    from app.models.knowledge import KnowledgeEntry
+
+    # 知识编辑权限：所有用户都可能收到（作为文档创建者）
+    my_entry_ids = [
+        e.id for e in db.query(KnowledgeEntry.id).filter(KnowledgeEntry.created_by == user.id).all()
+    ]
+    ke_count = 0
+    if my_entry_ids:
+        ke_count = (
             db.query(ApprovalRequest)
-            .filter(ApprovalRequest.status == ApprovalStatus.PENDING, ApprovalRequest.stage == "super_pending")
+            .filter(
+                ApprovalRequest.status == ApprovalStatus.PENDING,
+                ApprovalRequest.request_type == ApprovalRequestType.KNOWLEDGE_EDIT,
+                ApprovalRequest.target_id.in_(my_entry_ids),
+            )
+            .count()
+        )
+
+    # 其他审批类型的 count（原逻辑）
+    other_count = 0
+    if user.role == Role.SUPER_ADMIN:
+        other_count = (
+            db.query(ApprovalRequest)
+            .filter(
+                ApprovalRequest.status == ApprovalStatus.PENDING,
+                ApprovalRequest.stage == "super_pending",
+                ApprovalRequest.request_type != ApprovalRequestType.KNOWLEDGE_EDIT,
+            )
             .count()
         )
     elif user.role == Role.DEPT_ADMIN:
-        # 部门管理员：stage=dept_pending 且 requester 在本部门的
         from app.models.user import User as UserModel
-        from sqlalchemy import or_
         dept_user_ids = [
             u.id for u in db.query(UserModel).filter(UserModel.department_id == user.department_id).all()
         ]
-        count = (
+        other_count = (
             db.query(ApprovalRequest)
             .filter(
                 ApprovalRequest.status == ApprovalStatus.PENDING,
                 ApprovalRequest.stage == "dept_pending",
+                ApprovalRequest.request_type != ApprovalRequestType.KNOWLEDGE_EDIT,
                 ApprovalRequest.requester_id.in_(dept_user_ids),
             )
             .count()
         )
-    else:
-        count = 0
-    return {"count": count}
+
+    return {"count": ke_count + other_count}
 
 
 @router.get("/my")
@@ -389,6 +423,56 @@ def my_approvals(
     items = (
         db.query(ApprovalRequest)
         .filter(ApprovalRequest.requester_id == user.id)
+        .order_by(ApprovalRequest.created_at.desc())
+        .all()
+    )
+    return [_req(r, db) for r in items]
+
+
+@router.get("/incoming")
+def incoming_approvals(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """需要我审批的请求（包括知识编辑权限申请——我是文档创建者的那些）。"""
+    from sqlalchemy import or_
+
+    # 知识编辑权限：文档创建者审批
+    from app.models.knowledge import KnowledgeEntry
+    my_entry_ids = [
+        e.id for e in db.query(KnowledgeEntry.id).filter(KnowledgeEntry.created_by == user.id).all()
+    ]
+
+    conditions = []
+    # 知识编辑权限：我创建的文档的申请
+    if my_entry_ids:
+        conditions.append(
+            (ApprovalRequest.request_type == ApprovalRequestType.KNOWLEDGE_EDIT)
+            & (ApprovalRequest.target_id.in_(my_entry_ids))
+        )
+    # 管理员还能看其他类型的审批
+    if user.role == Role.SUPER_ADMIN:
+        conditions.append(
+            (ApprovalRequest.request_type != ApprovalRequestType.KNOWLEDGE_EDIT)
+        )
+    elif user.role == Role.DEPT_ADMIN:
+        from app.models.user import User as UserModel
+        dept_user_ids = [
+            u.id for u in db.query(UserModel).filter(UserModel.department_id == user.department_id).all()
+        ]
+        conditions.append(
+            (ApprovalRequest.request_type != ApprovalRequestType.KNOWLEDGE_EDIT)
+            & (ApprovalRequest.stage == "dept_pending")
+            & (ApprovalRequest.requester_id.in_(dept_user_ids))
+        )
+
+    if not conditions:
+        return []
+
+    items = (
+        db.query(ApprovalRequest)
+        .filter(ApprovalRequest.status == ApprovalStatus.PENDING)
+        .filter(or_(*conditions))
         .order_by(ApprovalRequest.created_at.desc())
         .all()
     )
@@ -435,7 +519,7 @@ async def act_on_approval(
     request_id: int,
     req: ApprovalActionCreate,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """审批动作：approve / reject / add_conditions"""
     r = db.get(ApprovalRequest, request_id)
@@ -443,6 +527,18 @@ async def act_on_approval(
         raise HTTPException(404, "审批申请不存在")
     if r.status != ApprovalStatus.PENDING:
         raise HTTPException(400, f"审批已完结（状态：{r.status}），不可重复操作")
+
+    # 权限检查：knowledge_edit 由文档创建者或 super_admin 审批，其他类型由 admin 角色审批
+    is_knowledge_edit = r.request_type == ApprovalRequestType.KNOWLEDGE_EDIT and r.target_type == "knowledge"
+    if is_knowledge_edit:
+        from app.models.knowledge import KnowledgeEntry
+        entry = db.get(KnowledgeEntry, r.target_id) if r.target_id else None
+        if not entry:
+            raise HTTPException(404, "关联文档不存在")
+        if entry.created_by != user.id and user.role != Role.SUPER_ADMIN:
+            raise HTTPException(403, "只有文档创建者或超级管理员可以审批编辑权限")
+    elif user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
+        raise HTTPException(403, "仅管理员可执行审批")
 
     action_map = {
         "approve": ApprovalActionType.APPROVE,
@@ -578,6 +674,19 @@ async def act_on_approval(
             webapp = db.get(WebApp, r.target_id)
             if webapp:
                 webapp.status = "published"
+        elif is_knowledge_edit:
+            # 知识编辑权限审批：通过 → 写入 KnowledgeEditGrant
+            r.status = ApprovalStatus.APPROVED
+            from app.models.knowledge import KnowledgeEditGrant
+            existing_grant = db.query(KnowledgeEditGrant).filter_by(
+                entry_id=r.target_id, user_id=r.requester_id
+            ).first()
+            if not existing_grant:
+                db.add(KnowledgeEditGrant(
+                    entry_id=r.target_id,
+                    user_id=r.requester_id,
+                    granted_by=user.id,
+                ))
         else:
             # 其他审批类型，保持原逻辑
             r.status = ApprovalStatus.APPROVED
