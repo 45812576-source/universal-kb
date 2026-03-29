@@ -233,6 +233,7 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
                 "mode": skill.mode,
                 "system_prompt": latest_ver.system_prompt if latest_ver else "",
                 "change_note": latest_ver.change_note if latest_ver else "",
+                "source_files": skill.source_files or [],
             }
     elif r.target_type == "tool" and r.target_id:
         from app.models.tool import ToolRegistry

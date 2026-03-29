@@ -214,6 +214,11 @@ async def test_skill(
         raise HTTPException(400, "Skill 尚无可用版本或 System Prompt 为空，无法测试")
 
     system_prompt = latest_ver.system_prompt
+    # 注入附属文件内容（与 skill_engine 运行时一致）
+    from app.services.skill_engine import _read_source_files
+    _file_ctx = _read_source_files(skill_id, skill.source_files or [])
+    if _file_ctx:
+        system_prompt += _file_ctx
     steps = []
 
     # Step 1: 生成测试输入

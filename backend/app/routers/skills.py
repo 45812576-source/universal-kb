@@ -655,6 +655,17 @@ def _check_skill_write_access(skill: Skill, user: User):
         raise HTTPException(403, "无权操作此 Skill 的文件")
 
 
+def _check_skill_read_access(skill: Skill, user: User):
+    """读取权限：创建者 / 超管 / 同部门的部门管理员。"""
+    if user.role == Role.SUPER_ADMIN:
+        return
+    if skill.created_by == user.id:
+        return
+    if user.role == Role.DEPT_ADMIN and skill.department_id == user.department_id:
+        return
+    raise HTTPException(403, "无权查看此 Skill 的文件")
+
+
 def _safe_skill_dir(skill_id: int) -> "Path":
     from pathlib import Path
     from app.config import settings
@@ -683,7 +694,7 @@ def get_skill_file(
     skill = db.get(Skill, skill_id)
     if not skill:
         raise HTTPException(404, "Skill 不存在")
-    _check_skill_write_access(skill, user)
+    _check_skill_read_access(skill, user)
 
     path = _safe_file_path(skill_id, filename)
     if not path.exists():
