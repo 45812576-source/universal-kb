@@ -45,9 +45,9 @@ class PlanAgent:
         db: Session,
     ) -> dict:
         """生成执行计划，返回 plan dict（含 steps 列表）。"""
-        lite_config = llm_gateway.get_lite_config()
+        plan_config = llm_gateway.resolve_config(db, "pev.plan")
         # PlanAgent 允许更长的输出
-        lite_config = {**lite_config, "max_tokens": 2048}
+        plan_config = {**plan_config, "max_tokens": 2048}
 
         messages = [
             {"role": "system", "content": PLAN_SYSTEM},
@@ -62,7 +62,7 @@ class PlanAgent:
         ]
 
         raw, _ = await llm_gateway.chat(
-            model_config=lite_config,
+            model_config=plan_config,
             messages=messages,
             temperature=0.2,
         )
@@ -87,8 +87,8 @@ class PlanAgent:
         db: Session,
     ) -> dict:
         """在某步骤验证失败且重试耗尽后，生成调整后的计划。"""
-        lite_config = llm_gateway.get_lite_config()
-        lite_config = {**lite_config, "max_tokens": 2048}
+        plan_config = llm_gateway.resolve_config(db, "pev.plan")
+        plan_config = {**plan_config, "max_tokens": 2048}
 
         original_steps = original_plan.get("steps") or []
         messages = [
@@ -108,7 +108,7 @@ class PlanAgent:
         ]
 
         raw, _ = await llm_gateway.chat(
-            model_config=lite_config,
+            model_config=plan_config,
             messages=messages,
             temperature=0.2,
         )

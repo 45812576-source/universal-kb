@@ -304,7 +304,7 @@ async def send_message(
         _llm_msgs = [{"role": "system", "content": _ws_obj.system_context}]
         for _m in _history:
             _llm_msgs.append({"role": "user" if _m.role == MessageRole.USER else "assistant", "content": _m.content or ""})
-        _model_cfg = llm_gateway.get_config(db, getattr(_ws_obj, "model_config_id", None))
+        _model_cfg = llm_gateway.resolve_config(db, "conversation.main", getattr(_ws_obj, "model_config_id", None))
         try:
             _resp_text, _ = await llm_gateway.chat(_model_cfg, _llm_msgs)
         except Exception as e:
@@ -538,7 +538,7 @@ async def stream_message(
                             for _m in reversed(_all_msgs)
                         ]
 
-                    _fast_model = llm_gateway.get_config(db, getattr(_ws_fast, "model_config_id", None))
+                    _fast_model = llm_gateway.resolve_config(db, "conversation.main", getattr(_ws_fast, "model_config_id", None))
                     yield _sse("status", {"stage": "preparing"})
 
                     # 查询可用工具列表，供 AI 推荐绑定
@@ -927,7 +927,7 @@ async def upload_and_chat(
         try:
             from app.services.llm_gateway import llm_gateway
             from app.utils.file_parser import foe_summarize
-            _cfg = llm_gateway.get_lite_config()
+            _cfg = llm_gateway.resolve_config(db, "conversation.title")
             foe_summary = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: foe_summarize(raw_text=file_text, llm_cfg=_cfg),
@@ -1157,7 +1157,7 @@ async def upload_stream_message(
                     yield _sse("status", {"stage": "summarizing"})
                     try:
                         from app.utils.file_parser import foe_summarize
-                        _cfg = llm_gateway.get_lite_config()
+                        _cfg = llm_gateway.resolve_config(db, "conversation.title")
                         _foe = await asyncio.get_event_loop().run_in_executor(
                             None,
                             lambda r=_raw: foe_summarize(raw_text=r, llm_cfg=_cfg),

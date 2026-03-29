@@ -267,7 +267,7 @@ async def generate_from_description(
 ):
     """Direction A: natural language → DDL + Skill preview."""
     from app.services.schema_generator import schema_generator
-    model_config = llm_gateway.get_config(db, req.model_config_id)
+    model_config = llm_gateway.resolve_config(db, "business_table.generate", req.model_config_id)
     try:
         preview = await schema_generator.generate_from_description(req.description, model_config)
         return preview
@@ -283,7 +283,7 @@ async def generate_from_existing(
 ):
     """Direction B: existing table → Skill preview."""
     from app.services.schema_generator import schema_generator
-    model_config = llm_gateway.get_config(db, req.model_config_id)
+    model_config = llm_gateway.resolve_config(db, "business_table.generate", req.model_config_id)
     try:
         preview = await schema_generator.generate_from_table(req.table_name, model_config, db)
         return preview

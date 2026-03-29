@@ -78,10 +78,10 @@ _CHECKLIST_ITEM = "- [{key}] {label}：{desc}{example}"
 
 
 async def execute(params: dict, db=None) -> dict:
-    return await _execute_async(params)
+    return await _execute_async(params, db=db)
 
 
-async def _execute_async(params: dict) -> dict:
+async def _execute_async(params: dict, db=None) -> dict:
     topic = params.get("topic", "")
     context_so_far = params.get("context_so_far", "").strip()
     required_context = params.get("required_context", [])
@@ -120,7 +120,7 @@ async def _execute_async(params: dict) -> dict:
 
     try:
         from app.services.llm_gateway import llm_gateway
-        lite_config = llm_gateway.get_lite_config()
+        lite_config = llm_gateway.resolve_config(db, "tool.brainstorming")
         raw, _ = await llm_gateway.chat(
             model_config=lite_config,
             messages=[{"role": "user", "content": prompt}],

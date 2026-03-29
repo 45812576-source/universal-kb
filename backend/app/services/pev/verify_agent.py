@@ -67,8 +67,8 @@ class VerifyAgent:
         if not verify_criteria:
             return {"pass": True, "score": 100, "issues": [], "suggestion": ""}
 
-        lite_config = llm_gateway.get_lite_config()
-        lite_config = {**lite_config, "max_tokens": 600}
+        verify_config = llm_gateway.resolve_config(db, "pev.verify")
+        verify_config = {**verify_config, "max_tokens": 600}
 
         messages = [
             {"role": "system", "content": VERIFY_STEP_SYSTEM},
@@ -84,7 +84,7 @@ class VerifyAgent:
 
         try:
             raw, _ = await llm_gateway.chat(
-                model_config=lite_config,
+                model_config=verify_config,
                 messages=messages,
                 temperature=0.1,
             )
@@ -149,8 +149,8 @@ class VerifyAgent:
         db: Session,
     ) -> dict:
         """全局交叉验证。返回：{"pass": bool, "score": int, "issues": [], "summary": str}。"""
-        lite_config = llm_gateway.get_lite_config()
-        lite_config = {**lite_config, "max_tokens": 800}
+        verify_config = llm_gateway.resolve_config(db, "pev.verify")
+        verify_config = {**verify_config, "max_tokens": 800}
 
         # 构建步骤摘要
         steps_parts = []
@@ -175,7 +175,7 @@ class VerifyAgent:
 
         try:
             raw, _ = await llm_gateway.chat(
-                model_config=lite_config,
+                model_config=verify_config,
                 messages=messages,
                 temperature=0.1,
             )

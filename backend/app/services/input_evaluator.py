@@ -82,6 +82,7 @@ class InputEvaluator:
         history_messages: list,
         threshold: int = 60,
         current_message: str = "",
+        db=None,
     ) -> dict:
         """
         返回:
@@ -106,7 +107,7 @@ class InputEvaluator:
         )
 
         try:
-            lite_config = llm_gateway.get_lite_config()
+            lite_config = llm_gateway.resolve_config(db, "input.evaluate")
             raw, _ = await llm_gateway.chat(
                 model_config=lite_config,
                 messages=[{"role": "user", "content": prompt}],

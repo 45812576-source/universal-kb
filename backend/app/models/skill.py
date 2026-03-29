@@ -45,6 +45,18 @@ class ModelConfig(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
+class ModelAssignment(Base):
+    """调用点 → 模型配置 绑定表。slot_key 对应 SLOT_REGISTRY 中的 key。"""
+    __tablename__ = "model_assignments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    slot_key = Column(String(100), unique=True, nullable=False)
+    model_config_id = Column(Integer, ForeignKey("model_configs.id"), nullable=False)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    model_config = relationship("ModelConfig")
+
+
 class Skill(Base):
     __tablename__ = "skills"
 

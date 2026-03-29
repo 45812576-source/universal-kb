@@ -127,7 +127,7 @@ class ProjectEngine:
             project_description=project_description,
             members_info=members_info,
         )
-        model_config = llm_gateway.get_config(db)
+        model_config = llm_gateway.resolve_config(db, "project.engine")
         response, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[{"role": "user", "content": prompt}],
@@ -224,7 +224,7 @@ class ProjectEngine:
         from app.models.project import ProjectMember, ProjectContext
         from app.models.conversation import Conversation, Message
 
-        model_config = llm_gateway.get_config(db)
+        model_config = llm_gateway.resolve_config(db, "project.engine")
 
         for member in project.members:
             if not member.workspace_id:
@@ -328,7 +328,7 @@ class ProjectEngine:
             conversation_text=conversation_text,
         )
 
-        model_config = llm_gateway.get_config(db)
+        model_config = llm_gateway.resolve_config(db, "project.engine")
         response, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[{"role": "user", "content": prompt}],
@@ -497,7 +497,7 @@ class ProjectEngine:
             contexts_text=contexts_text or "暂无成员工作进展。",
         )
 
-        model_config = llm_gateway.get_config(db)
+        model_config = llm_gateway.resolve_config(db, "project.engine")
         content, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[{"role": "user", "content": prompt}],
@@ -579,7 +579,7 @@ class ProjectEngine:
             tasks_text=tasks_text,
         )
 
-        model_config = llm_gateway.get_config(db)
+        model_config = llm_gateway.resolve_config(db, "project.engine")
         summary_text, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[{"role": "user", "content": prompt}],
@@ -696,7 +696,7 @@ class ProjectEngine:
             summary_text=summary_text[:1000],
         )
 
-        model_config = llm_gateway.get_config(db)
+        model_config = llm_gateway.resolve_config(db, "project.engine")
         reminder_text, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[{"role": "user", "content": prompt}],

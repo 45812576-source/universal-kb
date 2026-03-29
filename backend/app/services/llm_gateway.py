@@ -8,9 +8,69 @@ from pathlib import Path
 import httpx
 from sqlalchemy.orm import Session
 
-from app.models.skill import ModelConfig
+from app.models.skill import ModelConfig, ModelAssignment
 
 logger = logging.getLogger(__name__)
+
+# ── 调用点注册表 ──────────────────────────────────────────────────────────────
+# 每个 slot 对应系统中一个独立的 AI 调用场景，可在 admin 前端绑定不同模型。
+# fallback: 未绑定时的默认策略 ("default"=DB默认模型, "lite"=轻量模型, "preflight_exec", "preflight_score")
+SLOT_REGISTRY: dict[str, dict] = {
+    # ── 对话 ──
+    "conversation.main":          {"name": "主对话", "category": "对话", "desc": "用户发消息后的主 LLM 回复（流式），Workspace 模式下直接对话", "fallback": "default"},
+    "conversation.title":         {"name": "对话标题生成", "category": "对话", "desc": "超长文件上传后用 LLM 生成摘要作为对话上下文", "fallback": "lite"},
+    # ── Skill ──
+    "skill.match":                {"name": "Skill 匹配", "category": "Skill", "desc": "根据用户消息从候选 Skill 列表中选出最匹配的一个", "fallback": "lite"},
+    "skill.switch_detect":        {"name": "Skill 切换检测", "category": "Skill", "desc": "判断用户是否想切换到另一个 Skill", "fallback": "lite"},
+    "skill.extract_params":       {"name": "Skill 参数提取", "category": "Skill", "desc": "从对话中提取 Skill 所需的变量值", "fallback": "default"},
+    "skill.rerank":               {"name": "知识片段重排序", "category": "Skill", "desc": "从向量搜索返回的候选 chunks 中筛选最相关的 top_k 条", "fallback": "lite"},
+    "skill.execute":              {"name": "Skill 执行", "category": "Skill", "desc": "编译完 prompt 后调用 LLM 生成最终回复（含流式多轮工具调用）", "fallback": "default"},
+    "skill.compress_history":     {"name": "历史压缩", "category": "Skill", "desc": "对话轮数过多时用 LLM 压缩历史上下文保留关键信息", "fallback": "lite"},
+    "skill.tool_match":           {"name": "工具匹配", "category": "Skill", "desc": "判断用户消息是否想调用某个工具", "fallback": "lite"},
+    "skill.tool_param_extract":   {"name": "工具参数提取", "category": "Skill", "desc": "从对话中提取调用工具所需的参数 JSON", "fallback": "lite"},
+    "skill.tool_select":          {"name": "工具候选筛选", "category": "Skill", "desc": "从所有可用工具中选出与用户消息最相关的 3-5 个", "fallback": "lite"},
+    "skill.tool_output_map":      {"name": "工具输出映射", "category": "Skill", "desc": "将 Skill 的 structured_output 映射为工具的 input_schema", "fallback": "lite"},
+    "skill.edit":                 {"name": "Skill 编辑辅助", "category": "Skill", "desc": "AI 辅助生成/优化 Skill 的 system_prompt", "fallback": "default"},
+    "skill.security_scan":        {"name": "Skill 安全扫描", "category": "Skill", "desc": "扫描 Skill prompt 是否有注入/越权等安全风险", "fallback": "default"},
+    "skill.classify":             {"name": "Skill 分类", "category": "Skill", "desc": "对 Skill 进行智能分类", "fallback": "lite"},
+    "skill.run_in_router":        {"name": "Skill 路由执行", "category": "Skill", "desc": "skills router 中直接调用 LLM 执行 Skill", "fallback": "default"},
+    # ── 知识 ──
+    "knowledge.classify":         {"name": "知识分类", "category": "知识", "desc": "上传知识后用 LLM 自动分类到知识体系", "fallback": "default"},
+    "knowledge.name":             {"name": "知识命名", "category": "知识", "desc": "自动为上传的知识文档生成标题", "fallback": "lite"},
+    "knowledge.search":           {"name": "知识搜索增强", "category": "知识", "desc": "在知识搜索中用 LLM 增强查询", "fallback": "lite"},
+    # ── 项目 ──
+    "project.engine":             {"name": "项目引擎", "category": "项目", "desc": "项目中的 AI 调用：生成项目计划/总结/提醒/分析等", "fallback": "default"},
+    # ── PEV ──
+    "pev.plan":                   {"name": "PEV 规划", "category": "PEV", "desc": "Plan-Execute-Verify 规划阶段：拆解任务步骤", "fallback": "lite"},
+    "pev.execute":                {"name": "PEV 执行", "category": "PEV", "desc": "PEV 执行阶段：按步骤逐一执行", "fallback": "default"},
+    "pev.verify":                 {"name": "PEV 验证", "category": "PEV", "desc": "PEV 验证阶段：检查执行结果质量", "fallback": "lite"},
+    "pev.orchestrate":            {"name": "PEV 编排", "category": "PEV", "desc": "PEV 编排器：判断用户意图是否需要走 PEV 流程", "fallback": "lite"},
+    # ── 沙箱 ──
+    "sandbox.mock_input":         {"name": "沙箱测试输入生成", "category": "沙箱", "desc": "根据 Skill 的 system_prompt 自动生成模拟测试输入", "fallback": "lite"},
+    "sandbox.tool_mock":          {"name": "沙箱工具模拟", "category": "沙箱", "desc": "为 Skill 关联的工具生成模拟输入数据", "fallback": "lite"},
+    "sandbox.evaluate":           {"name": "沙箱结果评估", "category": "沙箱", "desc": "评估 Skill 回复质量（通过/不通过 + 评语）", "fallback": "lite"},
+    "sandbox.execute":            {"name": "沙箱 Skill 执行", "category": "沙箱", "desc": "在沙箱中实际调用 LLM 执行 Skill", "fallback": "default"},
+    "sandbox.fe_detect":          {"name": "沙箱前端检测", "category": "沙箱", "desc": "判断 Skill 的 prompt 是否要求生成前端 UI 代码", "fallback": "lite"},
+    "sandbox.preflight_gen":      {"name": "Preflight 用例生成", "category": "沙箱", "desc": "为 Preflight 测试自动生成测试用例", "fallback": "lite"},
+    "sandbox.preflight_exec":     {"name": "Preflight 执行", "category": "沙箱", "desc": "Preflight 测试中实际执行 Skill 的 LLM 调用", "fallback": "preflight_exec"},
+    "sandbox.preflight_score":    {"name": "Preflight 评分", "category": "沙箱", "desc": "Preflight 测试中对每条回复进行质量评分", "fallback": "preflight_score"},
+    # ── 其他 ──
+    "input.evaluate":             {"name": "输入评估", "category": "其他", "desc": "评估用户输入是否有效/是否需要澄清", "fallback": "lite"},
+    "input.process":              {"name": "输入处理", "category": "其他", "desc": "预处理用户输入（意图识别、实体提取等）", "fallback": "default"},
+    "schema.generate":            {"name": "Schema 生成", "category": "其他", "desc": "根据 Skill 描述自动生成 output_schema JSON", "fallback": "default"},
+    "attribution":                {"name": "归因分析", "category": "其他", "desc": "分析 AI 回复中哪些内容来自哪些知识源", "fallback": "default"},
+    "intel.collect":              {"name": "情报收集", "category": "其他", "desc": "收集和分析竞品/市场情报", "fallback": "default"},
+    "rule.engine":                {"name": "规则引擎", "category": "其他", "desc": "用 LLM 执行自然语言规则判断", "fallback": "default"},
+    "studio.agent":               {"name": "Studio Agent", "category": "其他", "desc": "DevStudio 中的 AI 对话（流式+非流式）", "fallback": "default"},
+    "task.engine":                {"name": "任务引擎", "category": "其他", "desc": "项目任务中的 AI 辅助（总结/分解任务等）", "fallback": "default"},
+    "business_table.generate":    {"name": "业务表格生成", "category": "其他", "desc": "用 LLM 解析业务数据生成结构化表格", "fallback": "default"},
+    "output_schema.gen":          {"name": "输出模式生成", "category": "其他", "desc": "根据描述自动生成结构化输出 Schema", "fallback": "default"},
+    "file.parse":                 {"name": "文件解析", "category": "其他", "desc": "解析上传文件内容时用 LLM 辅助理解", "fallback": "lite"},
+    "tool.web_builder":           {"name": "网页生成", "category": "工具", "desc": "根据用户描述生成 HTML 网页代码", "fallback": "default"},
+    "tool.brainstorming":         {"name": "头脑风暴", "category": "工具", "desc": "AI 辅助头脑风暴，生成创意发散", "fallback": "lite"},
+    "tool.data_engine":           {"name": "数据引擎", "category": "工具", "desc": "用 LLM 解析和转换数据", "fallback": "default"},
+    "tool.input_evaluator":       {"name": "工具输入评估", "category": "工具", "desc": "评估工具调用的输入参数是否合理", "fallback": "lite"},
+}
 
 # Load .env from backend root (in case env vars not injected by process)
 try:
@@ -256,6 +316,32 @@ class LLMGateway:
             "max_tokens": mc.max_tokens,
             "temperature": mc.temperature,
         }
+
+    def resolve_config(self, db: Session, slot_key: str, model_config_id: int = None) -> dict:
+        """按调用点解析模型配置。
+
+        优先级：
+        1. 调用方显式传入的 model_config_id（如 Skill 绑定的模型）
+        2. model_assignments 表中的绑定
+        3. SLOT_REGISTRY 中的 fallback 策略
+        """
+        if model_config_id:
+            return self.get_config(db, model_config_id)
+
+        assignment = db.query(ModelAssignment).filter_by(slot_key=slot_key).first()
+        if assignment:
+            return self.get_config(db, assignment.model_config_id)
+
+        slot = SLOT_REGISTRY.get(slot_key, {})
+        fb = slot.get("fallback", "default")
+        if fb == "lite":
+            return self.get_lite_config()
+        elif fb == "preflight_exec":
+            return self.get_preflight_exec_config()
+        elif fb == "preflight_score":
+            return self.get_preflight_score_config()
+        else:
+            return self.get_config(db)
 
 
 llm_gateway = LLMGateway()

@@ -321,7 +321,7 @@ class SkillSecurityScanner:
         from app.services.llm_gateway import llm_gateway
 
         try:
-            model_config = llm_gateway.get_config(db)
+            model_config = llm_gateway.resolve_config(db, "skill.security_scan")
         except Exception as e:
             return {"error": f"无法获取模型配置: {e}", "fallback": True}
 

@@ -486,6 +486,7 @@ class McpConfigRequest(BaseModel):
 @router.post("/generate-mcp-config")
 async def generate_mcp_config(
     body: McpConfigRequest,
+    db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """用自然语言描述生成 MCP 工具的 manifest 配置。"""
@@ -516,7 +517,7 @@ async def generate_mcp_config(
 - 如无特殊前提条件或权限，对应字段返回空数组或空字符串"""
 
     try:
-        model_config = llm_gateway.get_lite_config()
+        model_config = llm_gateway.resolve_config(db, "tool.input_evaluator")
         # 生成配置需要更多 token
         model_config = {**model_config, "max_tokens": 1024}
         content, _ = await llm_gateway.chat(

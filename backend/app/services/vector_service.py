@@ -113,14 +113,14 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str
 
 # ─── Desensitisation ─────────────────────────────────────────────────────────
 
-def _desensitize_chunks_llm(chunks: list[str]) -> list[str]:
+def _desensitize_chunks_llm(chunks: list[str], db=None) -> list[str]:
     """Batch-desensitize chunks via DeepSeek (lite model).
     Falls back to rule-based desensitization on failure.
     """
     from app.services.llm_gateway import llm_gateway
 
     try:
-        config = llm_gateway.get_lite_config()
+        config = llm_gateway.resolve_config(db, "knowledge.search")
     except Exception:
         return [_desensitize_rule(c) for c in chunks]
 
@@ -187,6 +187,7 @@ def index_knowledge(
     taxonomy_code: str = "",
     file_type: str = "",
     quality_score: float = 0.5,
+    db=None,
 ) -> list[int]:
     """Chunk text, embed, desensitize, and insert into Milvus with metadata."""
     col = get_collection()
@@ -198,7 +199,7 @@ def index_knowledge(
     embeddings = embed_texts(chunks)
 
     # Generate desensitized versions
-    desensitized = _desensitize_chunks_llm(chunks)
+    desensitized = _desensitize_chunks_llm(chunks, db=db)
 
     result = col.insert([
         [knowledge_id] * n,              # knowledge_id

@@ -64,10 +64,7 @@ class ExecuteAgent:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        try:
-            model_config = llm_gateway.get_config(db)
-        except ValueError:
-            model_config = llm_gateway.get_lite_config()
+        model_config = llm_gateway.resolve_config(db, "pev.execute")
 
         content, usage = await llm_gateway.chat(
             model_config=model_config,

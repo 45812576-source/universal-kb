@@ -313,7 +313,7 @@ class PEVOrchestrator:
         # （此处只做第一层过滤，最终由 LLM 判断）
 
         try:
-            lite_config = llm_gateway.get_lite_config()
+            orch_config = llm_gateway.resolve_config(db, "pev.orchestrate")
             skill_name = skill.name if skill else "（无）"
             # 安全获取 history_count，避免 lazy load 问题
             try:
@@ -337,7 +337,7 @@ class PEVOrchestrator:
             ]
 
             raw, _ = await llm_gateway.chat(
-                model_config=lite_config,
+                model_config=orch_config,
                 messages=messages,
                 temperature=0.0,
                 max_tokens=10,

@@ -89,6 +89,7 @@ async def auto_name(
     content: str,
     filename: str = "",
     file_type: str = "",
+    db=None,
 ) -> dict:
     """AI 自动命名：生成标题、摘要、标签和质量评分。
 
@@ -118,7 +119,7 @@ async def auto_name(
     )
 
     try:
-        config = llm_gateway.get_lite_config()
+        config = llm_gateway.resolve_config(db, "knowledge.name")
         # 命名需要更多 token
         config["max_tokens"] = 1000
 

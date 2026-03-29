@@ -405,7 +405,7 @@ class IntelCollector:
             if count > 0:
                 try:
                     from app.services.llm_gateway import llm_gateway
-                    model_config = llm_gateway.get_config(db)
+                    model_config = llm_gateway.resolve_config(db, "intel.collect")
                     new_entries = (
                         db.query(IntelEntry)
                         .filter(

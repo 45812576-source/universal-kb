@@ -118,7 +118,7 @@ def foe_summarize(raw_text: str, llm_cfg: dict) -> str:
     返回 FOE 结构化摘要字符串（用于聊天上下文）。
     原始文本由调用方单独保存到知识库，数据不丢失。
 
-    llm_cfg: llm_gateway.get_lite_config() 返回的 dict，
+    llm_cfg: llm_gateway.resolve_config(db, slot_key) 返回的 dict，
              包含 api_base / api_key / model_id 等字段。
     """
     from langchain_text_splitters import RecursiveCharacterTextSplitter

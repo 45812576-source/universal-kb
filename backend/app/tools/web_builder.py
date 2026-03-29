@@ -48,7 +48,7 @@ async def execute(params: dict) -> dict:
     # We need a model config — use the default
     db = SessionLocal()
     try:
-        model_config = llm_gateway.get_config(db)
+        model_config = llm_gateway.resolve_config(db, "tool.web_builder")
         html_content, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[

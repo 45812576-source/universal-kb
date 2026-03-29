@@ -916,7 +916,7 @@ async def extract_project_tasks(
     import json
     try:
         result, _ = await llm_gateway.chat(
-            model_config=llm_gateway.get_config(db),
+            model_config=llm_gateway.resolve_config(db, "project.engine"),
             messages=[{"role": "user", "content": extract_prompt}],
             temperature=0.2,
             max_tokens=1000,

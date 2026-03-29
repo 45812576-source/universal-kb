@@ -79,7 +79,7 @@ async def generate_schema(
         try:
             from app.services.llm_gateway import llm_gateway
             from app.services.schema_generator import schema_generator
-            model_config = llm_gateway.get_config(db, model_config_id)
+            model_config = llm_gateway.resolve_config(db, "output_schema.gen", model_config_id)
             existing_schema = await schema_generator.generate_output_schema(
                 system_prompt=latest_version.system_prompt,
                 model_config=model_config,

@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from app.database import get_db
 from app.dependencies import require_role, get_current_user
 from app.models.user import Department, Role, User
-from app.models.skill import ModelConfig
+from app.models.skill import ModelConfig, ModelAssignment
 from app.services.auth_service import hash_password
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -100,6 +100,75 @@ def update_model(
     db.commit()
     db.refresh(mc)
     return {"id": mc.id, "name": mc.name}
+
+
+# ─── Model Assignments (调用点 → 模型绑定) ──────────────────────────────────
+
+@router.get("/model-assignments")
+def list_model_assignments(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """返回全量调用点列表，合并 SLOT_REGISTRY 定义 + DB 中的实际绑定。"""
+    from app.services.llm_gateway import SLOT_REGISTRY
+    assignments = {a.slot_key: a for a in db.query(ModelAssignment).all()}
+    result = []
+    for key, slot in SLOT_REGISTRY.items():
+        a = assignments.get(key)
+        mc = a.model_config if a else None
+        result.append({
+            "slot_key": key,
+            "name": slot["name"],
+            "category": slot["category"],
+            "desc": slot.get("desc", ""),
+            "fallback": slot["fallback"],
+            "model_config_id": a.model_config_id if a else None,
+            "model_name": mc.name if mc else None,
+        })
+    return result
+
+
+class ModelAssignmentUpdate(BaseModel):
+    model_config_id: int
+
+
+@router.put("/model-assignments/{slot_key:path}")
+def set_model_assignment(
+    slot_key: str,
+    req: ModelAssignmentUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """绑定调用点到指定模型。"""
+    from app.services.llm_gateway import SLOT_REGISTRY
+    if slot_key not in SLOT_REGISTRY:
+        raise HTTPException(400, f"未知调用点: {slot_key}")
+    mc = db.get(ModelConfig, req.model_config_id)
+    if not mc:
+        raise HTTPException(404, "模型配置不存在")
+    a = db.query(ModelAssignment).filter_by(slot_key=slot_key).first()
+    if a:
+        a.model_config_id = req.model_config_id
+    else:
+        a = ModelAssignment(slot_key=slot_key, model_config_id=req.model_config_id)
+        db.add(a)
+    db.commit()
+    return {"ok": True, "slot_key": slot_key, "model_config_id": req.model_config_id, "model_name": mc.name}
+
+
+@router.delete("/model-assignments/{slot_key:path}")
+def delete_model_assignment(
+    slot_key: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """解绑调用点（恢复 fallback）。"""
+    a = db.query(ModelAssignment).filter_by(slot_key=slot_key).first()
+    if not a:
+        raise HTTPException(404, "该调用点未绑定模型")
+    db.delete(a)
+    db.commit()
+    return {"ok": True}
 
 
 @router.delete("/models/{model_id}")

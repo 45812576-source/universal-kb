@@ -145,7 +145,7 @@ class LarkDocImporter:
 
         # 9. AI 命名/摘要
         try:
-            naming_result = await auto_name(content, url, file_type)
+            naming_result = await auto_name(content, url, file_type, db=db)
             entry.ai_title = naming_result["title"]
             entry.ai_summary = naming_result["summary"]
             entry.ai_tags = naming_result["tags"]

@@ -83,12 +83,12 @@ PASS 或 FAIL
 原因：<一句话说明>"""
 
 
-async def _generate_test_input(system_prompt: str) -> str:
+async def _generate_test_input(db: Session, system_prompt: str) -> str:
     """用 AI 根据 system_prompt 生成测试输入。"""
     prompt = _MOCK_GEN_PROMPT.format(system_prompt=system_prompt[:2000])
     try:
         result, _ = await llm_gateway.chat(
-            model_config=llm_gateway.get_lite_config(),
+            model_config=llm_gateway.resolve_config(db, "sandbox.mock_input"),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
             max_tokens=200,
@@ -99,7 +99,7 @@ async def _generate_test_input(system_prompt: str) -> str:
         return "请介绍一下你的功能，并给我一个示例输出。"
 
 
-async def _generate_tool_mock_params(tool: ToolRegistry) -> dict:
+async def _generate_tool_mock_params(db: Session, tool: ToolRegistry) -> dict:
     """用 AI 根据工具定义生成 mock 参数。"""
     config = tool.config or {}
     manifest = config.get("manifest", {})
@@ -114,7 +114,7 @@ async def _generate_tool_mock_params(tool: ToolRegistry) -> dict:
     )
     try:
         result, _ = await llm_gateway.chat(
-            model_config=llm_gateway.get_lite_config(),
+            model_config=llm_gateway.resolve_config(db, "sandbox.tool_mock"),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=500,
@@ -150,7 +150,7 @@ async def _generate_tool_mock_params(tool: ToolRegistry) -> dict:
 
 
 async def _evaluate_skill_response(
-    skill_name: str, system_prompt: str, test_input: str, response: str
+    db: Session, skill_name: str, system_prompt: str, test_input: str, response: str
 ) -> tuple[bool, str]:
     """用 AI 评估 skill 回复质量，返回 (passed, reason)。"""
     prompt = _SKILL_EVALUATE_PROMPT.format(
@@ -161,7 +161,7 @@ async def _evaluate_skill_response(
     )
     try:
         result, _ = await llm_gateway.chat(
-            model_config=llm_gateway.get_lite_config(),
+            model_config=llm_gateway.resolve_config(db, "sandbox.evaluate"),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             max_tokens=200,
@@ -223,7 +223,7 @@ async def test_skill(
 
     # Step 1: 生成测试输入
     t0 = time.time()
-    test_input = await _generate_test_input(system_prompt)
+    test_input = await _generate_test_input(db, system_prompt)
     steps.append({
         "step": "generate_input",
         "label": "生成测试用例",
@@ -237,7 +237,7 @@ async def test_skill(
     llm_response = ""
     llm_error = None
     try:
-        model_cfg = llm_gateway.get_config(db, latest_ver.model_config_id or None)
+        model_cfg = llm_gateway.resolve_config(db, "sandbox.execute", latest_ver.model_config_id or None)
         llm_response, _ = await llm_gateway.chat(
             model_config=model_cfg,
             messages=[
@@ -275,7 +275,7 @@ async def test_skill(
     # Step 3: AI 评估回复
     t0 = time.time()
     passed, reason = await _evaluate_skill_response(
-        skill.name, system_prompt, test_input, llm_response
+        db, skill.name, system_prompt, test_input, llm_response
     )
     steps.append({
         "step": "evaluate",
@@ -343,7 +343,7 @@ async def test_tool(
     t0 = time.time()
     mock_params = {}
     if has_schema or manifest.get("data_sources"):
-        mock_params = await _generate_tool_mock_params(tool)
+        mock_params = await _generate_tool_mock_params(db, tool)
     steps.append({
         "step": "mock_params",
         "label": "生成 Mock 参数",
@@ -676,7 +676,7 @@ async def preflight(
                     "只输出 YES 或 NO，不要解释。"
                 )
                 _fe_result, _ = await llm_gateway.chat(
-                    model_config=llm_gateway.get_lite_config(),
+                    model_config=llm_gateway.resolve_config(db, "sandbox.fe_detect"),
                     messages=[{"role": "user", "content": _fe_check_prompt}],
                     temperature=0.0,
                     max_tokens=10,
@@ -878,7 +878,7 @@ async def preflight(
         )
         try:
             raw_cases, _ = await llm_gateway.chat(
-                model_config=llm_gateway.get_lite_config(),
+                model_config=llm_gateway.resolve_config(db, "sandbox.preflight_gen"),
                 messages=[{"role": "user", "content": test_gen_prompt}],
                 temperature=0.7,
                 max_tokens=500,
@@ -890,7 +890,7 @@ async def preflight(
         if not test_cases:
             test_cases = ["请展示你的核心能力。"]
 
-        model_cfg = llm_gateway.get_preflight_exec_config()
+        model_cfg = llm_gateway.resolve_config(db, "sandbox.preflight_exec")
         tests = []
         total_score = 0
 
@@ -958,7 +958,7 @@ async def preflight(
             )
             try:
                 score_raw, _ = await llm_gateway.chat(
-                    model_config=llm_gateway.get_preflight_score_config(),
+                    model_config=llm_gateway.resolve_config(db, "sandbox.preflight_score"),
                     messages=[{"role": "user", "content": score_prompt}],
                     temperature=0.0,
                     max_tokens=1024,

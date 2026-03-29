@@ -152,7 +152,7 @@ async def process_raw_input(raw_input_id: int, db: Session) -> Draft:
 
     # Step 2: LLM detect & extract
     try:
-        model_config = llm_gateway.get_config(db)
+        model_config = llm_gateway.resolve_config(db, "input.process")
         result_str, _ = await llm_gateway.chat(
             model_config=model_config,
             messages=[{

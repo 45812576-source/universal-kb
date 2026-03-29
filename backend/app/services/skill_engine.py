@@ -200,6 +200,7 @@ class SkillEngine:
 
     async def _match_or_keep_skill(
         self,
+        db: Session,
         current_skill: "Skill",
         user_message: str,
         candidates: list["Skill"],
@@ -226,7 +227,7 @@ class SkillEngine:
         try:
             result, _ = await asyncio.wait_for(
                 llm_gateway.chat(
-                    model_config=llm_gateway.get_lite_config(),
+                    model_config=llm_gateway.resolve_config(db, "skill.switch_detect"),
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
                     max_tokens=50,
@@ -305,7 +306,7 @@ class SkillEngine:
                 )
 
             from app.services.llm_gateway import llm_gateway as _gw
-            config = _gw.get_config(db)
+            config = _gw.resolve_config(db, "skill.routing_prompt")
             result, _ = await _gw.chat(
                 config,
                 messages=[{"role": "user", "content": prompt}],
@@ -369,7 +370,7 @@ class SkillEngine:
         )
         import time as _time
         try:
-            match_config = llm_gateway.get_lite_config()
+            match_config = llm_gateway.resolve_config(db, "skill.match")
         except Exception:
             match_config = model_config
         _t0 = _time.monotonic()
@@ -428,6 +429,7 @@ class SkillEngine:
 
     async def _rerank_hits_with_llm(
         self,
+        db: Session,
         query: str,
         hits: list[dict],
         top_k: int = 5,
@@ -445,7 +447,7 @@ class SkillEngine:
         )
         try:
             result, _ = await llm_gateway.chat(
-                model_config=llm_gateway.get_lite_config(),
+                model_config=llm_gateway.resolve_config(db, "skill.rerank"),
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=50,
@@ -508,7 +510,7 @@ class SkillEngine:
         elif len(hits) >= 5 and all(h.get("score", 0) > 0.75 for h in hits[:5]):
             hits = hits[:5]  # top5 高置信度，直接截断
         else:
-            hits = await self._rerank_hits_with_llm(query, hits, top_k=5)
+            hits = await self._rerank_hits_with_llm(db, query, hits, top_k=5)
 
         # 查询哪些 knowledge_id 是已审批的（全局可见）或项目关联的（项目成员全量可见）
         approved_ids: set[int] = set()
@@ -686,7 +688,7 @@ class SkillEngine:
         async def _emit(stage: str):
             if on_status:
                 await on_status(stage)
-        default_config = llm_gateway.get_config(db)
+        default_config = llm_gateway.resolve_config(db, "skill.execute")
 
         # Load workspace if present
         workspace = None
@@ -725,7 +727,7 @@ class SkillEngine:
                 model_config_id = skill_version.model_config_id if skill_version else None
                 if not model_config_id and workspace and getattr(workspace, "model_config_id", None):
                     model_config_id = workspace.model_config_id
-                model_config = llm_gateway.get_config(db, model_config_id)
+                model_config = llm_gateway.resolve_config(db, "skill.execute", model_config_id)
                 _check_model_grant(db, model_config, user_id)
 
                 messages = (
@@ -799,7 +801,7 @@ class SkillEngine:
                 try:
                     # 一次 LLM 调用完成切换判断 + 匹配
                     skill = await self._match_or_keep_skill(
-                        current_skill, user_message, switch_candidates,
+                        db, current_skill, user_message, switch_candidates,
                     )
                 except Exception as e:
                     logger.warning(f"Skill match_or_keep failed: {e}")
@@ -902,7 +904,7 @@ class SkillEngine:
         model_config_id = skill_version.model_config_id if skill_version else None
         if not model_config_id and workspace and getattr(workspace, "model_config_id", None):
             model_config_id = workspace.model_config_id
-        model_config = llm_gateway.get_config(db, model_config_id)
+        model_config = llm_gateway.resolve_config(db, "skill.execute", model_config_id)
         _check_model_grant(db, model_config, user_id)
 
         # Helper to build early PrepareResult
@@ -1029,9 +1031,9 @@ class SkillEngine:
                 return None  # 让主模型自己决定，跳过 lite LLM 检测
             try:
                 selected_tools = await self._select_tools_for_message(
-                    user_message, available_tools, default_config
+                    db, user_message, available_tools, default_config
                 )
-                tool_intent = await self._detect_tool_intent(user_message, selected_tools, default_config)
+                tool_intent = await self._detect_tool_intent(db, user_message, selected_tools, default_config)
                 return tool_intent
             except Exception as e:
                 logger.warning(f"Tool chain detection failed: {e}")
@@ -1099,7 +1101,7 @@ class SkillEngine:
                 try:
                     from app.services.tool_executor import tool_executor
                     tool_params = await self._map_output_to_tool_input(
-                        structured_ctx, _tool_intent, default_config
+                        db, structured_ctx, _tool_intent, default_config
                     )
                     result = await tool_executor.execute_tool(
                         db, _tool_intent.name, tool_params, user_id
@@ -1303,7 +1305,7 @@ class SkillEngine:
         llm_messages.append({"role": "user", "content": user_message})
 
         # 9. Context window compaction
-        llm_messages = await self._compact_if_needed(llm_messages, model_config)
+        llm_messages = await self._compact_if_needed(db, llm_messages, model_config)
 
         return PrepareResult(
             llm_messages=llm_messages,
@@ -1318,6 +1320,7 @@ class SkillEngine:
 
     async def _compact_if_needed(
         self,
+        db: Session,
         llm_messages: list[dict],
         model_config: dict,
         threshold: float = 0.85,
@@ -1343,7 +1346,7 @@ class SkillEngine:
             return llm_messages
 
         try:
-            summary = await self._summarize_history(early, model_config)
+            summary = await self._summarize_history(db, early, model_config)
             compacted = [
                 *system_msgs,
                 {"role": "user", "content": f"[系统消息：前期对话摘要，非用户发言]\n{summary}"},
@@ -1359,7 +1362,7 @@ class SkillEngine:
             logger.warning(f"Context compaction failed, using original: {e}")
             return llm_messages
 
-    async def _summarize_history(self, messages: list[dict], model_config: dict) -> str:
+    async def _summarize_history(self, db: Session, messages: list[dict], model_config: dict) -> str:
         """Summarize a list of messages into a concise paragraph."""
         history_text = "\n".join(
             f"{m['role']}: {m.get('content', '')[:500]}" for m in messages
@@ -1373,7 +1376,7 @@ class SkillEngine:
             f"{history_text}"
         )
         try:
-            lite_config = llm_gateway.get_lite_config()
+            lite_config = llm_gateway.resolve_config(db, "skill.compress_history")
         except Exception:
             lite_config = model_config
         result, _ = await llm_gateway.chat(
@@ -1764,6 +1767,7 @@ class SkillEngine:
 
     async def _detect_tool_intent(
         self,
+        db: Session,
         user_message: str,
         available_tools: list,
         model_config: dict,
@@ -1783,7 +1787,7 @@ class SkillEngine:
             f"用户消息: {user_message}"
         )
         try:
-            lite_config = llm_gateway.get_lite_config()
+            lite_config = llm_gateway.resolve_config(db, "skill.tool_match")
         except Exception:
             lite_config = model_config
         result, _ = await llm_gateway.chat(
@@ -1802,6 +1806,7 @@ class SkillEngine:
 
     async def _extract_tool_params(
         self,
+        db: Session,
         user_message: str,
         messages: list,
         tool,
@@ -1830,7 +1835,7 @@ class SkillEngine:
             "只返回 JSON 对象（符合 Schema），如果必填参数无法从对话中确定，返回 null。"
         )
         try:
-            lite_config = llm_gateway.get_lite_config()
+            lite_config = llm_gateway.resolve_config(db, "skill.tool_param_extract")
         except Exception:
             lite_config = model_config
         result, _ = await llm_gateway.chat(
@@ -1850,6 +1855,7 @@ class SkillEngine:
 
     async def _select_tools_for_message(
         self,
+        db: Session,
         user_message: str,
         available_tools: list,
         model_config: dict,
@@ -1868,7 +1874,7 @@ class SkillEngine:
             "从以上工具中选出最相关的 3-5 个（返回 tool name，逗号分隔），只返回名称，不要其他内容。"
         )
         try:
-            lite_config = llm_gateway.get_lite_config()
+            lite_config = llm_gateway.resolve_config(db, "skill.tool_select")
         except Exception:
             lite_config = model_config
         try:
@@ -1887,6 +1893,7 @@ class SkillEngine:
 
     async def _map_output_to_tool_input(
         self,
+        db: Session,
         structured_output: dict,
         tool,
         model_config: dict,
@@ -1900,7 +1907,7 @@ class SkillEngine:
             "请将数据映射为工具需要的参数格式。只返回JSON，不要其他内容。"
         )
         try:
-            lite_config = llm_gateway.get_lite_config()
+            lite_config = llm_gateway.resolve_config(db, "skill.tool_output_map")
         except Exception:
             lite_config = model_config
         result, _ = await llm_gateway.chat(

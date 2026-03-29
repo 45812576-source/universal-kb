@@ -200,7 +200,7 @@ async def _llm_classify(
         content=text[:2000],
     )
 
-    model_config = llm_gateway.get_config(db)
+    model_config = llm_gateway.resolve_config(db, "knowledge.classify")
     result_str, _ = await llm_gateway.chat(
         model_config=model_config,
         messages=[{"role": "user", "content": prompt}],

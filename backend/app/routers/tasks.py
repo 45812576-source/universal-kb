@@ -286,7 +286,7 @@ async def generate_tasks(
         return {"pev_job_id": pev_job.id, "status": "launched", "message": "PEV 任务已启动，正在后台执行"}
 
     try:
-        model_config = llm_gateway.get_config(db)
+        model_config = llm_gateway.resolve_config(db, "task.engine")
     except ValueError as e:
         raise HTTPException(500, str(e))
 
