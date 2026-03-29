@@ -45,10 +45,10 @@ def _setup_two_depts(db):
     """创建两个部门各有一个员工 + 一个 dept_admin，返回 (dept_a, dept_b, da_a, da_b, emp_a, emp_b)。"""
     dept_a = _make_dept(db, "部门A")
     dept_b = _make_dept(db, "部门B")
-    da_a = _make_user(db, "da_a", Role.DEPT_ADMIN, dept_a.id, "Pass1234!")
-    da_b = _make_user(db, "da_b", Role.DEPT_ADMIN, dept_b.id, "Pass1234!")
-    emp_a = _make_user(db, "emp_a", Role.EMPLOYEE, dept_a.id, "Pass1234!")
-    emp_b = _make_user(db, "emp_b", Role.EMPLOYEE, dept_b.id, "Pass1234!")
+    da_a = _make_user(db, "da_a", Role.DEPT_ADMIN, dept_a.id)
+    da_b = _make_user(db, "da_b", Role.DEPT_ADMIN, dept_b.id)
+    emp_a = _make_user(db, "emp_a", Role.EMPLOYEE, dept_a.id)
+    emp_b = _make_user(db, "emp_b", Role.EMPLOYEE, dept_b.id)
     db.commit()
     return dept_a, dept_b, da_a, da_b, emp_a, emp_b
 
