@@ -631,6 +631,85 @@ async def preflight(
         gates = []
         all_passed = True
 
+        # ── Gate 0: 前端内容检测（一票否决）──────────────────────────
+        yield _sse("gate", {"gate": "frontend_check", "label": "检测前端内容...", "status": "running"})
+
+        fe_items = []
+        fe_pass = True
+
+        # 0a. 检查附属文件扩展名
+        FRONTEND_EXTS = {".tsx", ".jsx", ".html", ".css", ".scss", ".less", ".sass", ".vue", ".svelte", ".styl", ".pcss"}
+        for f in source_files:
+            fname = f.get("filename", "")
+            ext_pos = fname.rfind(".")
+            ext = fname[ext_pos:].lower() if ext_pos >= 0 else ""
+            if ext in FRONTEND_EXTS:
+                fe_items.append({
+                    "check": f"文件 {fname}",
+                    "ok": False,
+                    "issue": f"前端文件（{ext}），Le Desk 的 tool 不带前端界面，请移除此文件",
+                })
+                fe_pass = False
+
+        # 0b. 本地关键词检测 prompt 中的前端意图
+        import re as _re
+        _FE_PATTERNS = [
+            r"\bReact\b", r"\bVue\b", r"\bSvelte\b", r"\bAngular\b",
+            r"\bHTML\b.*组件", r"生成.*页面", r"生成.*组件", r"生成.*界面",
+            r"前端", r"\bCSS\b.*样式", r"\bJSX\b", r"\bTSX\b",
+            r"render.*component", r"create.*component", r"build.*UI",
+            r"web\s*page", r"landing\s*page", r"网页",
+        ]
+        prompt_fe_hits = []
+        for pattern in _FE_PATTERNS:
+            m = _re.search(pattern, system_prompt, _re.IGNORECASE)
+            if m:
+                prompt_fe_hits.append(m.group(0))
+
+        # 0c. 如果本地关键词命中，用 AI 二次确认（避免误报）
+        if prompt_fe_hits and not fe_items:
+            try:
+                _fe_check_prompt = (
+                    "判断以下 AI Skill 的 System Prompt 是否要求生成前端界面/UI 组件/网页。\n"
+                    "注意：如果只是「分析」「讨论」前端技术而非「生成前端代码」，则不算。\n\n"
+                    f"Prompt（前 2000 字）：\n{system_prompt[:2000]}\n\n"
+                    "只输出 YES 或 NO，不要解释。"
+                )
+                _fe_result, _ = await llm_gateway.chat(
+                    model_config=llm_gateway.get_lite_config(),
+                    messages=[{"role": "user", "content": _fe_check_prompt}],
+                    temperature=0.0,
+                    max_tokens=10,
+                )
+                if _fe_result.strip().upper().startswith("YES"):
+                    fe_items.append({
+                        "check": "System Prompt 内容",
+                        "ok": False,
+                        "issue": f"检测到前端/UI 生成意图（关键词：{', '.join(prompt_fe_hits[:3])}）。"
+                                 "Le Desk 的 tool 不带前端界面，Skill 应专注于数据处理、分析、文案生成等后端能力。",
+                    })
+                    fe_pass = False
+            except Exception as e:
+                logger.warning(f"Frontend AI check failed: {e}")
+                # AI 检测失败时，仅靠关键词不直接拦截，改为 warning
+                fe_items.append({
+                    "check": "System Prompt 内容",
+                    "ok": True,
+                    "detail": f"检测到前端关键词（{', '.join(prompt_fe_hits[:3])}），AI 确认失败，暂不拦截",
+                })
+
+        if not fe_items:
+            fe_items.append({"check": "前端内容", "ok": True, "detail": "未检测到前端相关内容"})
+
+        fe_status = "passed" if fe_pass else "failed"
+        gate0 = {"gate": "frontend_check", "label": "前端内容检测", "status": fe_status, "items": fe_items}
+        gates.append(gate0)
+        yield _sse("gate", gate0)
+        if not fe_pass:
+            all_passed = False
+            yield _sse("done", {"passed": False, "blocked_by": "frontend_check", "gates": gates})
+            return
+
         # ── Gate 1: 结构完整性 ──────────────────────────────────────
         yield _sse("gate", {"gate": "structure", "label": "检查目录结构...", "status": "running"})
 

@@ -1,7 +1,7 @@
 import logging
 import re
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
 
 logger = logging.getLogger(__name__)
 from sqlalchemy.orm import Session
@@ -257,6 +257,189 @@ def _parse_skill_md(content: str) -> dict:
         "system_prompt": body.strip(),
         "variables": [f"{{{v}}}" for v in variables],
     }
+
+
+# ─── 外部 Skill 导入转换 ────────────────────────────────────────────────────
+
+# 前端相关文件扩展名（沙盒检测用）
+FRONTEND_EXTENSIONS = {
+    ".tsx", ".jsx", ".html", ".css", ".scss", ".less", ".sass",
+    ".vue", ".svelte", ".styl", ".pcss",
+}
+
+# 前端语义关键词（用于 prompt 内容检测）
+FRONTEND_KEYWORDS = [
+    r"\bReact\b", r"\bVue\b", r"\bSvelte\b", r"\bAngular\b",
+    r"\bHTML\b.*组件", r"生成.*页面", r"生成.*组件", r"生成.*界面",
+    r"前端", r"\bCSS\b", r"\bDOM\b", r"\bJSX\b", r"\bTSX\b",
+    r"render.*component", r"create.*component", r"build.*UI",
+    r"web\s*page", r"landing\s*page", r"网页",
+]
+
+_IMPORT_CONVERT_PROMPT = """你是 Skill 格式转换专家。将以下外部 Skill 内容转换为内部统一格式。
+
+我们的系统是一个 AI Skill 工作台，Skill 的核心是 system_prompt（给 AI 的指令），不支持前端渲染。
+工具（tool）在我们系统中有独立的 Tool Registry 管理，不在 Skill 的 prompt 里定义。
+
+转换规则：
+1. 提取 name（skill 名称，简短中文或英文）
+2. 提取 description（一句话描述 skill 的用途，中文）
+3. system_prompt 只保留「给 AI 的行为指令」部分（prompt body），这是核心内容
+4. 移除以下不兼容内容，记入 removed_sections：
+   - frontmatter 中的 globs / tools / alwaysApply / model 等字段定义
+   - function calling / tool_use 的 JSON schema 声明
+   - 前端相关代码或生成 UI 的指令
+5. 检测 prompt 中是否包含前端/UI 相关意图（生成页面、组件、HTML/CSS 等）
+
+原始内容：
+```
+{raw_content}
+```
+
+只输出 JSON，不要其他内容：
+{{"name": "skill名称", "description": "一句话描述", "system_prompt": "转换后的 prompt 内容", "removed_sections": [{{"section": "被移除内容摘要", "reason": "移除原因"}}], "warnings": ["告警信息"], "has_frontend_content": false, "frontend_detail": ""}}"""
+
+
+def _detect_frontend_in_text(text: str) -> list[str]:
+    """检测文本中的前端相关内容，返回匹配到的关键词列表。"""
+    hits = []
+    for pattern in FRONTEND_KEYWORDS:
+        if re.search(pattern, text, re.IGNORECASE):
+            hits.append(re.search(pattern, text, re.IGNORECASE).group(0))
+    return hits
+
+
+class ImportConvertRequest(BaseModel):
+    content: str
+
+
+@router.post("/import-convert")
+async def import_convert_skill(
+    file: UploadFile = File(None),
+    content: str = Form(None),
+    user: User = Depends(get_current_user),
+):
+    """智能解析外部 Skill 内容，转换为内部统一格式。
+
+    支持两种输入方式：
+    - 上传 .md / .txt 文件
+    - 直接传入文本内容（content 字段）
+
+    返回转换预览结果（不入库），前端确认后再调用 POST /skills 创建。
+    """
+    import json as _json
+
+    raw_content = ""
+    source_filename = None
+
+    if file and file.filename:
+        raw = await file.read()
+        try:
+            raw_content = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(400, "文件编码必须是 UTF-8")
+        source_filename = file.filename
+    elif content:
+        raw_content = content
+    else:
+        raise HTTPException(400, "请上传文件或提供文本内容")
+
+    if not raw_content.strip():
+        raise HTTPException(400, "内容为空")
+
+    # Step 1: 尝试本地解析（已是标准格式则跳过 AI）
+    local_parsed = _parse_skill_md(raw_content)
+    is_standard = bool(local_parsed["name"]) and len(local_parsed["system_prompt"]) > 30
+
+    # Step 2: 本地前端检测（文件名 + 内容关键词）
+    frontend_hits = _detect_frontend_in_text(raw_content)
+    file_frontend_warning = None
+    if source_filename:
+        import os
+        ext = os.path.splitext(source_filename)[1].lower()
+        if ext in FRONTEND_EXTENSIONS:
+            file_frontend_warning = f"文件 {source_filename} 是前端文件"
+
+    # Step 3: 如果已是标准格式且无复杂内容，直接返回（不调 AI）
+    has_complex_frontmatter = any(
+        kw in raw_content[:500].lower()
+        for kw in ["globs:", "tools:", "alwaysapply:", "model:", "tool_use", "function_call"]
+    )
+
+    if is_standard and not has_complex_frontmatter:
+        result = {
+            "name": local_parsed["name"],
+            "description": local_parsed["description"],
+            "system_prompt": local_parsed["system_prompt"],
+            "original_content": raw_content,
+            "removed_sections": [],
+            "warnings": [],
+            "has_frontend_content": bool(frontend_hits) or bool(file_frontend_warning),
+            "frontend_detail": "",
+            "ai_converted": False,
+        }
+        if frontend_hits:
+            result["frontend_detail"] = f"检测到前端相关内容：{', '.join(frontend_hits[:5])}"
+            result["warnings"].append(
+                "此 Skill 包含前端相关内容。Le Desk 的 tool 不带前端界面，"
+                "Skill 应专注于数据处理、分析、文案生成等后端能力。"
+            )
+        if file_frontend_warning:
+            result["warnings"].insert(0, file_frontend_warning)
+        return result
+
+    # Step 4: 调 AI 做智能转换
+    try:
+        prompt = _IMPORT_CONVERT_PROMPT.format(raw_content=raw_content[:8000])
+        ai_result, _ = await llm_gateway.chat(
+            model_config=llm_gateway.get_lite_config(),
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=4000,
+        )
+        text = ai_result.strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        parsed = _json.loads(text.strip())
+    except Exception as e:
+        logger.warning(f"AI import-convert failed: {e}, falling back to local parse")
+        # AI 失败时回退到本地解析
+        parsed = {
+            "name": local_parsed["name"] or "unnamed-skill",
+            "description": local_parsed["description"],
+            "system_prompt": local_parsed["system_prompt"],
+            "removed_sections": [],
+            "warnings": [f"AI 智能转换失败（{str(e)[:80]}），已使用基础解析"],
+            "has_frontend_content": bool(frontend_hits),
+            "frontend_detail": f"检测到前端关键词：{', '.join(frontend_hits[:5])}" if frontend_hits else "",
+        }
+
+    # 补充本地前端检测结果
+    if frontend_hits and not parsed.get("has_frontend_content"):
+        parsed["has_frontend_content"] = True
+        parsed["frontend_detail"] = (
+            parsed.get("frontend_detail", "") +
+            f" 本地检测到前端关键词：{', '.join(frontend_hits[:5])}"
+        ).strip()
+
+    if parsed.get("has_frontend_content"):
+        warnings = parsed.get("warnings", [])
+        frontend_msg = (
+            "此 Skill 包含前端相关内容。Le Desk 的 tool 不带前端界面，"
+            "Skill 应专注于数据处理、分析、文案生成等后端能力。"
+        )
+        if frontend_msg not in warnings:
+            warnings.append(frontend_msg)
+        parsed["warnings"] = warnings
+
+    if file_frontend_warning:
+        parsed.setdefault("warnings", []).insert(0, file_frontend_warning)
+
+    parsed["original_content"] = raw_content
+    parsed["ai_converted"] = True
+    return parsed
 
 
 @router.post("/upload-md")
