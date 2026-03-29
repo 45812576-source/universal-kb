@@ -78,9 +78,20 @@ def _get_or_create_config(db: Session, user: User) -> UserWorkspaceConfig:
         .all()
     ) if user.department_id else []
 
+    # 应用市场收藏的 skill
+    from app.models.skill import UserSavedSkill
+    saved_rows = db.query(UserSavedSkill).filter(UserSavedSkill.user_id == user.id).all()
+    market_skill_ids = {row.skill_id for row in saved_rows}
+    market_skills = (
+        db.query(Skill)
+        .filter(Skill.id.in_(market_skill_ids), Skill.status == SkillStatus.PUBLISHED)
+        .all()
+    ) if market_skill_ids else []
+
     mounted_skills = (
         [{"skill_id": s.id, "source": "own", "mounted": True} for s in own_skills]
         + [{"skill_id": s.id, "source": "dept", "mounted": True} for s in dept_skills]
+        + [{"skill_id": s.id, "source": "market", "mounted": True} for s in market_skills]
     )
     mounted_tools = (
         [{"tool_id": t.id, "source": "own", "mounted": True} for t in own_tools]

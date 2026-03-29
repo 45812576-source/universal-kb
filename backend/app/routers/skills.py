@@ -64,6 +64,32 @@ class SaveFromMarketRequest(BaseModel):
     skill_id: int
 
 
+def _sync_skill_to_workspace_config(db: Session, user: User, skill_id: int, source: str, *, add: bool = True):
+    """同步 skill 到用户的 workspace config（add=True 追加，add=False 移除）。"""
+    from app.models.workspace import UserWorkspaceConfig
+
+    cfg = db.query(UserWorkspaceConfig).filter(UserWorkspaceConfig.user_id == user.id).first()
+    if not cfg:
+        if not add:
+            return
+        cfg = UserWorkspaceConfig(user_id=user.id, mounted_skills=[], mounted_tools=[], needs_prompt_refresh=True)
+        db.add(cfg)
+        db.flush()
+
+    skills = list(cfg.mounted_skills or [])
+    existing_ids = {item["skill_id"] for item in skills}
+
+    if add and skill_id not in existing_ids:
+        skills.append({"skill_id": skill_id, "source": source, "mounted": True})
+        cfg.mounted_skills = skills
+        cfg.needs_prompt_refresh = True
+        db.commit()
+    elif not add and skill_id in existing_ids:
+        cfg.mounted_skills = [item for item in skills if item["skill_id"] != skill_id]
+        cfg.needs_prompt_refresh = True
+        db.commit()
+
+
 @router.post("/save-from-market")
 def save_from_market(
     req: SaveFromMarketRequest,
@@ -84,6 +110,9 @@ def save_from_market(
         db.commit()
     except IntegrityError:
         db.rollback()  # 已保存，忽略
+
+    # 同步到 workspace config
+    _sync_skill_to_workspace_config(db, user, req.skill_id, "market", add=True)
     return {"ok": True}
 
 
@@ -104,6 +133,9 @@ def unsave_from_market(
     if row:
         db.delete(row)
         db.commit()
+
+    # 从 workspace config 移除
+    _sync_skill_to_workspace_config(db, user, skill_id, "market", add=False)
     return {"ok": True}
 
 
@@ -1489,8 +1521,97 @@ def add_version(
         skill.is_customized = True
         skill.local_modified_at = _dt.datetime.utcnow()
     db.add(v)
+    db.flush()
+
+    # 已发布 Skill 的版本变更 → 创建审批单
+    approval_id = None
+    if skill.status == SkillStatus.PUBLISHED and v.version > 1:
+        from app.models.permission import (
+            ApprovalRequest, ApprovalRequestType, ApprovalStatus,
+        )
+        existing_approval = (
+            db.query(ApprovalRequest)
+            .filter(
+                ApprovalRequest.target_id == skill_id,
+                ApprovalRequest.target_type == "skill",
+                ApprovalRequest.request_type
+                == ApprovalRequestType.SKILL_VERSION_CHANGE,
+                ApprovalRequest.status == ApprovalStatus.PENDING,
+            )
+            .first()
+        )
+        if not existing_approval:
+            approval = ApprovalRequest(
+                request_type=ApprovalRequestType.SKILL_VERSION_CHANGE,
+                target_id=skill_id,
+                target_type="skill",
+                requester_id=user.id,
+                status=ApprovalStatus.PENDING,
+                stage="dept_pending",
+            )
+            db.add(approval)
+            db.flush()
+            approval_id = approval.id
+
     db.commit()
-    return {"version": v.version, "id": v.id}
+    return {
+        "version": v.version,
+        "id": v.id,
+        "approval_id": approval_id,
+    }
+
+
+@router.post("/{skill_id}/transfer-ownership")
+def transfer_ownership(
+    skill_id: int,
+    new_owner_id: int = Query(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """发起 Skill 所有权转让审批。"""
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill not found")
+    if skill.created_by != user.id and user.role != Role.SUPER_ADMIN:
+        raise HTTPException(403, "只有 Skill 创建者或超管可以发起转让")
+    if skill.created_by == new_owner_id:
+        raise HTTPException(400, "新所有者与当前所有者相同")
+
+    from app.models.user import User as UserModel
+    new_owner = db.get(UserModel, new_owner_id)
+    if not new_owner:
+        raise HTTPException(404, "目标用户不存在")
+
+    from app.models.permission import (
+        ApprovalRequest, ApprovalRequestType, ApprovalStatus,
+    )
+    existing = (
+        db.query(ApprovalRequest)
+        .filter(
+            ApprovalRequest.target_id == skill_id,
+            ApprovalRequest.target_type == "skill",
+            ApprovalRequest.request_type
+            == ApprovalRequestType.SKILL_OWNERSHIP_TRANSFER,
+            ApprovalRequest.status == ApprovalStatus.PENDING,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(400, "已有待审批的转让申请")
+
+    approval = ApprovalRequest(
+        request_type=ApprovalRequestType.SKILL_OWNERSHIP_TRANSFER,
+        target_id=skill_id,
+        target_type="skill",
+        requester_id=user.id,
+        status=ApprovalStatus.PENDING,
+        stage="dept_pending",
+        conditions=[{"new_owner_id": new_owner_id}],
+    )
+    db.add(approval)
+    db.commit()
+    db.refresh(approval)
+    return {"approval_id": approval.id, "status": "pending"}
 
 
 @router.patch("/{skill_id}/status")
@@ -1510,6 +1631,26 @@ def update_status(
         raise HTTPException(404, "Skill not found")
     if status not in [s.value for s in SkillStatus]:
         raise HTTPException(400, f"Invalid status: {status}")
+
+    # 发布前校验：无绑定工具的 Skill，system_prompt 行数不得低于 200
+    if status == SkillStatus.PUBLISHED.value:
+        from app.models.tool import SkillTool
+        has_tools = db.query(SkillTool).filter(SkillTool.skill_id == skill_id).first() is not None
+        if not has_tools:
+            latest_ver = (
+                db.query(SkillVersion)
+                .filter(SkillVersion.skill_id == skill_id)
+                .order_by(SkillVersion.version.desc())
+                .first()
+            )
+            prompt = latest_ver.system_prompt if latest_ver else ""
+            line_count = len(prompt.strip().splitlines()) if prompt and prompt.strip() else 0
+            if line_count < 200:
+                raise HTTPException(
+                    400,
+                    f"Skill 未绑定任何工具，system_prompt 当前仅 {line_count} 行，"
+                    f"发布要求至少 200 行（请补充完整的指令内容，或为 Skill 绑定工具）",
+                )
 
     # DEPT_ADMIN 申请发布 → 转为审核中，创建审批单等超管审批
     if status == SkillStatus.PUBLISHED.value and user.role == Role.DEPT_ADMIN:
@@ -1593,12 +1734,32 @@ def batch_publish(
     """超管批量发布 Skill，全部设为 published + 指定 scope。"""
     if req.scope not in ("company", "department", "personal"):
         raise HTTPException(400, "Invalid scope")
+    from app.models.tool import SkillTool
     results = []
     for skill_id in req.skill_ids:
         skill = db.get(Skill, skill_id)
         if not skill:
             results.append({"id": skill_id, "ok": False, "reason": "not found"})
             continue
+        # 无绑定工具时校验 system_prompt 行数
+        has_tools = db.query(SkillTool).filter(SkillTool.skill_id == skill_id).first() is not None
+        if not has_tools:
+            latest_ver = (
+                db.query(SkillVersion)
+                .filter(SkillVersion.skill_id == skill_id)
+                .order_by(SkillVersion.version.desc())
+                .first()
+            )
+            prompt = latest_ver.system_prompt if latest_ver else ""
+            line_count = len(prompt.strip().splitlines()) if prompt and prompt.strip() else 0
+            if line_count < 200:
+                results.append({
+                    "id": skill_id,
+                    "ok": False,
+                    "name": skill.name,
+                    "reason": f"未绑定工具且 system_prompt 仅 {line_count} 行（要求 ≥200 行）",
+                })
+                continue
         skill.status = SkillStatus.PUBLISHED
         skill.scope = req.scope
         _ensure_skill_policy(skill_id, user, db)
@@ -1775,11 +1936,15 @@ def delete_skill(
     if not skill:
         raise HTTPException(404, "Skill not found")
     if user.role == Role.EMPLOYEE:
-        # 员工只能删自己创建的未发布 Skill（释放名额）
         if skill.created_by != user.id:
             raise HTTPException(403, "只能删除自己创建的 Skill")
+        # 已发布的 Skill：ownership 转公司，不真正删除
         if skill.status == SkillStatus.PUBLISHED:
-            raise HTTPException(403, "已发布的 Skill 不可删除，请联系管理员")
+            skill.created_by = None
+            skill.scope = "company"
+            _sync_skill_to_workspace_config(db, user, skill_id, "own", add=False)
+            db.commit()
+            return {"ok": True, "transferred": True}
     elif user.role == Role.DEPT_ADMIN:
         if skill.department_id != user.department_id and skill.created_by != user.id:
             raise HTTPException(403, "只能删除本部门的 Skill")
