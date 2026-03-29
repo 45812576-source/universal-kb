@@ -470,13 +470,29 @@ def _write_opencode_config(
 
 
 def _sync_company_skills_to_workdir(workdir: str) -> None:
-    """把公司级 published skill 的 system_prompt 写到 workdir/.opencode/skills/*.md。
+    """把 superpower 全家桶 skill 写到 workdir/.opencode/skills/*.md。
 
-    opencode 会自动发现该目录下的 .md 文件作为可加载的 skill。
-    每次启动时全量刷新，确保 skill 内容与数据库同步。
+    只同步开发相关的 superpower skills，不载入全部公司级 skill，
+    避免 opencode 启动时加载过多无关上下文。
     """
     from app.database import SessionLocal
     from app.models.skill import Skill, SkillStatus, SkillVersion
+
+    # superpower 全家桶 skill 名称白名单
+    _SUPERPOWER_NAMES = {
+        "dispatching-parallel-agents",
+        "executing-plans",
+        "finishing-a-development-branch",
+        "receiving-code-review",
+        "requesting-code-review",
+        "subagent-driven-development",
+        "test-driven-development",
+        "using-git-worktrees",
+        "using-superpowers",
+        "verification-before-completion",
+        "writing-plans",
+        "writing-skills",
+    }
 
     # 两个路径都写：.opencode/skills/（项目级）和 .config/opencode/skills/（XDG_CONFIG_HOME级）
     skills_dir = os.path.join(workdir, ".opencode", "skills")
@@ -488,7 +504,11 @@ def _sync_company_skills_to_workdir(workdir: str) -> None:
     try:
         skills = (
             db.query(Skill)
-            .filter(Skill.status == SkillStatus.PUBLISHED, Skill.scope == "company")
+            .filter(
+                Skill.status == SkillStatus.PUBLISHED,
+                Skill.scope == "company",
+                Skill.name.in_(_SUPERPOWER_NAMES),
+            )
             .all()
         )
         written = set()
@@ -640,7 +660,14 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
                 os.makedirs(os.path.join(workdir, subdir), exist_ok=True)
             readme = os.path.join(workdir, "README.md")
             with open(readme, "w", encoding="utf-8") as f:
-                f.write(f"# {display_name or folder_name} 的工作台\n\n这是你的专属开发工作台，文件会持久保存。\n")
+                f.write(
+                    f"# {display_name or folder_name} 的工作台\n\n"
+                    "这是你的专属开发工作台，文件会持久保存。\n\n"
+                    "## 使用建议\n\n"
+                    "- **建议仅用 Dev Studio 开发后端运算脚本**（数据处理、API 调用、自动化脚本等）\n"
+                    "- **切勿在 Dev Studio 开发前后端重型应用**（Next.js、React SPA 等），"
+                    "此类项目请在本地 IDE 开发后部署\n"
+                )
 
         # 启动前检查 workspace 大小，超过上限先清理再继续
         # 注意：_cleanup_workspace_if_needed 是同步 IO，用 executor 跑防止阻塞 event loop
