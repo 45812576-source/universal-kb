@@ -149,7 +149,10 @@ class SkillSuggestion(Base):
     problem_desc = Column(Text, nullable=False)
     expected_direction = Column(Text, nullable=False)
     case_example = Column(Text, nullable=True)
-    status = Column(Enum(SuggestionStatus), default=SuggestionStatus.PENDING)
+    status = Column(
+        Enum(SuggestionStatus, values_callable=lambda x: [e.value for e in x]),
+        default=SuggestionStatus.PENDING,
+    )
     review_note = Column(Text, nullable=True)
     reviewed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     reviewed_at = Column(DateTime, nullable=True)

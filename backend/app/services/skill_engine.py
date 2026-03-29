@@ -247,6 +247,90 @@ class SkillEngine:
             logger.warning(f"Skill match_or_keep failed: {e}, keeping current")
             return current_skill
 
+    async def _refresh_skill_routing_prompt(self, db: Session, user_config) -> None:
+        """根据已挂载 Skill 列表生成/更新路由 prompt。支持增量更新。"""
+        from app.models.skill import Skill
+
+        mounted_ids = [
+            item["skill_id"]
+            for item in (user_config.mounted_skills or [])
+            if item.get("mounted")
+        ]
+        if not mounted_ids:
+            user_config.skill_routing_prompt = None
+            user_config.last_skill_snapshot = None
+            user_config.needs_prompt_refresh = False
+            db.flush()
+            return
+
+        skills = db.query(Skill).filter(Skill.id.in_(mounted_ids)).all()
+        new_snapshot = [{"name": s.name, "description": s.description or ""} for s in skills]
+
+        old_snapshot = user_config.last_skill_snapshot or []
+        old_names = {s["name"] for s in old_snapshot}
+        new_names = {s["name"] for s in new_snapshot}
+
+        added = [s for s in new_snapshot if s["name"] not in old_names]
+        removed = [s for s in old_snapshot if s["name"] not in new_names]
+
+        try:
+            if not old_snapshot or not user_config.skill_routing_prompt:
+                # 首次：全量生成
+                skill_list = "\n".join(
+                    f"- {s['name']}: {s['description']}" for s in new_snapshot
+                )
+                prompt = (
+                    "你是 Skill 路由专家。根据以下 Skill 列表，生成一段简洁的路由指引，"
+                    "告知 AI 助手在什么场景下应该使用哪个 Skill。\n\n"
+                    f"Skill 列表:\n{skill_list}\n\n"
+                    "输出格式:\n"
+                    "## Skill 路由指引\n"
+                    "当用户请求匹配以下场景时，优先使用对应 Skill：\n"
+                    "- [场景描述] → 使用 [skill_name]\n"
+                    "...\n\n"
+                    "如果用户请求不明确匹配以上任何 Skill，使用通用对话模式。\n\n"
+                    "直接输出路由指引内容，不要有其他解释。"
+                )
+            else:
+                # 增量更新
+                added_text = "\n".join(f"- {s['name']}: {s['description']}" for s in added) if added else "无"
+                removed_text = "\n".join(f"- {s['name']}" for s in removed) if removed else "无"
+                prompt = (
+                    "你是 Skill 路由专家。请更新以下路由指引。\n\n"
+                    f"当前路由指引:\n{user_config.skill_routing_prompt}\n\n"
+                    f"新增 Skill:\n{added_text}\n\n"
+                    f"移除 Skill:\n{removed_text}\n\n"
+                    "请输出更新后的完整路由指引，保持原有格式。"
+                    "直接输出内容，不要有其他解释。"
+                )
+
+            from app.services.llm_gateway import llm_gateway as _gw
+            config = _gw.get_config(db)
+            result, _ = await _gw.chat(
+                config,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+            )
+            routing_prompt = result.strip() if isinstance(result, str) else str(result).strip()
+
+            if routing_prompt:
+                user_config.skill_routing_prompt = routing_prompt
+        except Exception as e:
+            logger.warning(f"Skill routing prompt generation failed: {e}")
+            # 生成失败时使用简单模板
+            lines = [
+                "## Skill 路由指引\n",
+                "当用户请求匹配以下场景时，优先使用对应 Skill：",
+            ]
+            for s in new_snapshot:
+                lines.append(f"- {s['description'] or s['name']} → 使用 {s['name']}")
+            lines.append("\n如果用户请求不明确匹配以上任何 Skill，使用通用对话模式。")
+            user_config.skill_routing_prompt = "\n".join(lines)
+
+        user_config.last_skill_snapshot = new_snapshot
+        user_config.needs_prompt_refresh = False
+        db.flush()
+
     async def _match_skill(
         self, db: Session, user_message: str, model_config: dict,
         candidate_skills: list[Skill] | None = None,
@@ -739,15 +823,47 @@ class SkillEngine:
                         candidate_skills=merged,
                     )
                 else:
-                    # 无 workspace：若有 active_skill_ids 限制，只在激活列表内匹配
+                    # 无 workspace：加载个人工作台配置中已挂载的 skill
+                    _user_config = None
+                    _personal_skills = []
+                    if user_id:
+                        try:
+                            from app.models.workspace import UserWorkspaceConfig
+                            _user_config = (
+                                db.query(UserWorkspaceConfig)
+                                .filter(UserWorkspaceConfig.user_id == user_id)
+                                .first()
+                            )
+                            if _user_config and _user_config.mounted_skills:
+                                mounted_ids = [
+                                    item["skill_id"]
+                                    for item in _user_config.mounted_skills
+                                    if item.get("mounted")
+                                ]
+                                if mounted_ids:
+                                    _personal_skills = [
+                                        s for s in db.query(Skill).filter(Skill.id.in_(mounted_ids)).all()
+                                        if s is not None
+                                    ]
+                        except Exception as e:
+                            logger.warning(f"UserWorkspaceConfig load failed: {e}")
+
                     if active_skill_ids is not None:
-                        active_skills = [
-                            db.get(Skill, sid) for sid in active_skill_ids
-                            if db.get(Skill, sid) is not None
-                        ]
+                        if _personal_skills:
+                            candidates = [s for s in _personal_skills if s.id in active_skill_ids]
+                        else:
+                            candidates = [
+                                db.get(Skill, sid) for sid in active_skill_ids
+                                if db.get(Skill, sid) is not None
+                            ]
                         skill = await self._match_skill(
                             db, user_message, default_config,
-                            candidate_skills=active_skills,
+                            candidate_skills=candidates,
+                        )
+                    elif _personal_skills:
+                        skill = await self._match_skill(
+                            db, user_message, default_config,
+                            candidate_skills=_personal_skills,
                         )
                     else:
                         skill = await self._match_skill(db, user_message, default_config)
@@ -1041,6 +1157,23 @@ class SkillEngine:
         if skill_version and workspace and workspace.system_context:
             # Skill selected: append workspace rules after skill's own prompt
             system_content += f"\n\n## 工作台附加指令\n\n{workspace.system_context}"
+
+        # ── 个人工作台 Skill 路由 prompt 注入 ──
+        if not workspace and user_id:
+            try:
+                from app.models.workspace import UserWorkspaceConfig
+                _uwc = (
+                    db.query(UserWorkspaceConfig)
+                    .filter(UserWorkspaceConfig.user_id == user_id)
+                    .first()
+                )
+                if _uwc:
+                    if _uwc.needs_prompt_refresh:
+                        await self._refresh_skill_routing_prompt(db, _uwc)
+                    if _uwc.skill_routing_prompt:
+                        system_content += f"\n\n{_uwc.skill_routing_prompt}"
+            except Exception as e:
+                logger.warning(f"Skill routing prompt injection failed: {e}")
 
         if workspace and getattr(workspace, "project_id", None):
             try:

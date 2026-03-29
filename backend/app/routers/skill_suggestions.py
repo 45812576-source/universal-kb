@@ -101,7 +101,7 @@ def review_suggestion(
     suggestion_id: int,
     req: SuggestionReview,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     valid = {s.value for s in SuggestionStatus} - {"pending"}
     if req.status not in valid:
@@ -109,6 +109,14 @@ def review_suggestion(
 
     s = db.get(SkillSuggestion, suggestion_id)
     if not s:
+        raise HTTPException(404, "Suggestion not found")
+
+    # 管理员或 skill 创建者可审核
+    skill = db.get(Skill, s.skill_id)
+    is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
+    is_owner = skill and skill.created_by == user.id
+    if not is_admin and not is_owner:
+        raise HTTPException(403, "仅管理员或 Skill 创建者可审核意见")
         raise HTTPException(404, "Suggestion not found")
 
     s.status = req.status

@@ -200,6 +200,7 @@ from app.routers import skill_policies, approvals, handoff, output_schemas  # no
 from app.routers import dev_studio  # noqa: E402
 from app.routers import sandbox  # noqa: E402
 from app.routers import onlyoffice  # noqa: E402
+from app.routers import user_workspace_config  # noqa: E402
 app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(skills.router)
@@ -232,6 +233,7 @@ app.include_router(output_schemas.router)
 app.include_router(dev_studio.router)
 app.include_router(sandbox.router)
 app.include_router(onlyoffice.router)
+app.include_router(user_workspace_config.router)
 
 # 头像静态文件服务
 _avatar_dir = Path("./uploads/avatars")

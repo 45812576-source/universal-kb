@@ -11,12 +11,13 @@ from typing import Optional
 import aiohttp
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user, require_role
 from app.models.skill import Skill, SkillStatus, SkillVersion
-from app.models.tool import ToolRegistry, ToolType
+from app.models.tool import ToolRegistry, ToolType, SkillTool
 from app.models.user import User, Role
 
 router = APIRouter(prefix="/api/dev-studio", tags=["dev-studio"])
@@ -548,7 +549,7 @@ def _port_open(port: int) -> bool:
         return False
 
 
-async def _wait_ready(port: int, retries: int = 20) -> bool:
+async def _wait_ready(port: int, retries: int = 60) -> bool:
     url = f"http://127.0.0.1:{port}"
     for _ in range(retries):
         await asyncio.sleep(0.5)
@@ -604,7 +605,7 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
                 for _pid_str in _lsof.stdout.strip().split('\n'):
                     if _pid_str.strip().isdigit():
                         _actual_cwd = os.readlink(f"/proc/{_pid_str.strip()}/cwd")
-                        if _actual_cwd == _expected_cwd:
+                        if _actual_cwd == _expected_cwd or os.path.realpath(_actual_cwd) == os.path.realpath(_expected_cwd):
                             _cwd_ok = True
                             break
             except Exception:
@@ -1180,6 +1181,91 @@ def save_skill(
         "status": skill.status.value,
         "approval_id": None,
     }
+
+
+# ─── Save to Existing Skill ──────────────────────────────────────────────────
+
+class SaveToSkillRequest(BaseModel):
+    skill_id: int
+    action: str  # "new_version" | "bind_tool"
+    # new_version fields
+    system_prompt: str = ""
+    change_note: str = "由工作台追加"
+    # bind_tool fields
+    tool_name: str = ""
+    tool_display_name: str = ""
+    tool_description: str = ""
+    tool_config: dict = {}
+
+
+@router.post("/save-to-skill")
+def save_to_skill(
+    req: SaveToSkillRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """将工作台产出追加到已有 Skill（新版本或绑定 Tool）。"""
+    skill = db.query(Skill).filter(Skill.id == req.skill_id).first()
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+
+    if req.action == "new_version":
+        if not req.system_prompt.strip():
+            raise HTTPException(400, "system_prompt 不能为空")
+        max_ver = (
+            db.query(func.max(SkillVersion.version))
+            .filter(SkillVersion.skill_id == skill.id)
+            .scalar()
+        ) or 0
+        version = SkillVersion(
+            skill_id=skill.id,
+            version=max_ver + 1,
+            system_prompt=req.system_prompt,
+            change_note=req.change_note,
+            created_by=user.id,
+        )
+        db.add(version)
+        db.commit()
+        return {
+            "skill_id": skill.id,
+            "skill_name": skill.name,
+            "version": max_ver + 1,
+            "action": "new_version",
+        }
+
+    elif req.action == "bind_tool":
+        if not req.tool_name.strip():
+            raise HTTPException(400, "tool_name 不能为空")
+        existing = db.query(ToolRegistry).filter(ToolRegistry.name == req.tool_name).first()
+        if existing:
+            raise HTTPException(409, f"工具名称 '{req.tool_name}' 已存在")
+        tool = ToolRegistry(
+            name=req.tool_name,
+            display_name=req.tool_display_name or req.tool_name,
+            description=req.tool_description or None,
+            tool_type=ToolType.HTTP,
+            input_schema={},
+            output_format="text",
+            config=req.tool_config,
+            created_by=user.id,
+            is_active=False,
+            scope="personal",
+            status="draft",
+        )
+        db.add(tool)
+        db.flush()
+        binding = SkillTool(skill_id=skill.id, tool_id=tool.id)
+        db.add(binding)
+        db.commit()
+        return {
+            "skill_id": skill.id,
+            "skill_name": skill.name,
+            "tool_id": tool.id,
+            "tool_name": tool.name,
+            "action": "bind_tool",
+        }
+    else:
+        raise HTTPException(400, f"不支持的 action: {req.action}")
 
 
 # ─── Transfer Table to Workdir ────────────────────────────────────────────────
