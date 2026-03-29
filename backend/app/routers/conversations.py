@@ -557,6 +557,14 @@ async def stream_message(
                     else:
                         _tools_text = "（暂无已注册工具）"
 
+                    # 查询当前 skill 的附属文件列表，供 AI 判断拆分
+                    _source_files: list[dict] = []
+                    if req.selected_skill_id:
+                        from app.models.skill import Skill as SkillModel
+                        _cur_skill = db.get(SkillModel, req.selected_skill_id)
+                        if _cur_skill:
+                            _source_files = list(_cur_skill.source_files or [])
+
                     yield _sse("status", {"stage": "generating"})
 
                     _final_content = ""
@@ -572,6 +580,7 @@ async def stream_message(
                             editor_prompt=req.editor_prompt,
                             editor_is_dirty=req.editor_is_dirty,
                             available_tools=_tools_text,
+                            source_files=_source_files,
                         )
                     ):
                         if isinstance(_item, str):
