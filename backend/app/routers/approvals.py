@@ -341,7 +341,11 @@ def list_approvals(
     if status:
         q = q.filter(ApprovalRequest.status == status)
     if request_type:
-        q = q.filter(ApprovalRequest.request_type == request_type)
+        if "," in request_type:
+            types = [t.strip() for t in request_type.split(",")]
+            q = q.filter(ApprovalRequest.request_type.in_(types))
+        else:
+            q = q.filter(ApprovalRequest.request_type == request_type)
 
     total = q.count()
     items = (
