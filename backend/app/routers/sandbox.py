@@ -833,12 +833,17 @@ async def preflight(
                 logger.warning(f"Preflight knowledge retrieval failed: {e}")
                 return ""
 
+        # 附属文件内容注入（与 skill_engine 运行时一致）
+        from app.services.skill_engine import _read_source_files
+        _source_file_ctx = _read_source_files(skill_id, source_files) if source_files else ""
+        _base_prompt = system_prompt + _source_file_ctx if _source_file_ctx else system_prompt
+
         for idx, tc in enumerate(test_cases):
             yield _sse("stage", {"label": f"运行测试 {idx + 1}/{len(test_cases)}..."})
 
             # 检索知识库，注入到 system_prompt
             knowledge_ctx = await _retrieve_knowledge(tc)
-            full_prompt = system_prompt
+            full_prompt = _base_prompt
             if knowledge_ctx:
                 full_prompt += f"\n\n## 参考知识\n\n{knowledge_ctx}"
 

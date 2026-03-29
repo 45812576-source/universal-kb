@@ -51,6 +51,65 @@ def _check_model_grant(db: Session, model_config: dict, user_id: int | None) -> 
         raise HTTPException(403, f"您没有使用模型 {model_id} 的权限，请联系管理员申请授权")
 
 
+# ── 附属文件运行时注入 ────────────────────────────────────────────────────────
+
+_FILE_CATEGORY_HEADERS = {
+    "knowledge-base": "知识库",
+    "example": "示例",
+    "reference": "参考资料",
+    "template": "输出模板",
+}
+
+_TEXT_EXTENSIONS = {
+    ".md", ".txt", ".py", ".js", ".ts", ".json", ".yaml", ".yml",
+    ".sh", ".toml", ".xml", ".csv", ".html", ".css", ".sql",
+}
+
+
+def _read_source_files(
+    skill_id: int,
+    source_files: list[dict],
+    max_total_chars: int = 30000,
+) -> str:
+    """读取 skill 附属文件，按 category 分组注入。跳过二进制、过大文件。"""
+    from pathlib import Path
+
+    grouped: dict[str, list[tuple[str, str]]] = {}
+    total = 0
+    for f in source_files:
+        fname = f.get("filename", "")
+        category = f.get("category", "other")
+        if category not in _FILE_CATEGORY_HEADERS:
+            continue
+        ext = fname[fname.rfind("."):].lower() if "." in fname else ""
+        if ext not in _TEXT_EXTENSIONS:
+            continue
+        fpath = Path(f"uploads/skills/{skill_id}") / Path(fname).name
+        if not fpath.exists():
+            continue
+        try:
+            content = fpath.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        if total + len(content) > max_total_chars:
+            break
+        total += len(content)
+        grouped.setdefault(category, []).append((fname, content))
+
+    if not grouped:
+        return ""
+
+    parts = []
+    for cat in ["knowledge-base", "example", "reference", "template"]:
+        files = grouped.get(cat)
+        if not files:
+            continue
+        header = _FILE_CATEGORY_HEADERS[cat]
+        for fname, content in files:
+            parts.append(f"\n\n## {header}：{fname}\n\n{content}")
+    return "".join(parts)
+
+
 @dataclass
 class PrepareResult:
     """Output of skill_engine.prepare() — everything needed to call LLM."""
@@ -1005,6 +1064,12 @@ class SkillEngine:
                         system_content += f"\n\n## 项目团队进展（其他成员）\n\n{project_ctx_text}"
             except Exception as e:
                 logger.warning(f"Project context injection failed: {e}")
+
+        # ── 附属文件内容注入（example / knowledge-base / reference / template）──
+        if skill and skill.source_files:
+            _file_ctx = _read_source_files(skill.id, skill.source_files)
+            if _file_ctx:
+                system_content += _file_ctx
 
         if knowledge_context:
             system_content += f"\n\n## 参考知识\n\n{knowledge_context}"

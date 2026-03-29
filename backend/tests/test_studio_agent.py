@@ -1,8 +1,10 @@
-"""studio_agent 单元测试 — 覆盖 _build_system / _extract_events / studio_file_split 新功能。"""
+"""studio_agent 单元测试 — 覆盖 _build_system / _extract_events / studio_file_split / _read_source_files。"""
 import json
+import os
 import pytest
 
 from app.services.studio_agent import _build_system, _extract_events
+from app.services.skill_engine import _read_source_files
 
 
 # ── _build_system ────────────────────────────────────────────────────────────
@@ -207,3 +209,107 @@ class TestExtractEvents:
         text = f'  \n```studio_draft\n{json.dumps(payload)}\n```\n  '
         clean, _ = _extract_events(text)
         assert clean == clean.strip()
+
+
+# ── _read_source_files ──────────────────────────────────────────────────────
+
+
+class TestReadSourceFiles:
+    """测试附属文件运行时注入。"""
+
+    @pytest.fixture(autouse=True)
+    def _setup_dir(self, tmp_path, monkeypatch):
+        """创建临时目录结构 uploads/skills/1/."""
+        self.skill_dir = tmp_path / "uploads" / "skills" / "1"
+        self.skill_dir.mkdir(parents=True)
+        monkeypatch.chdir(tmp_path)
+
+    def _write(self, filename: str, content: str):
+        (self.skill_dir / filename).write_text(content, encoding="utf-8")
+
+    def test_read_text_files(self):
+        """正常读取 md 文件并按 category 分组。"""
+        self._write("example-demo.md", "# 示例\n示例内容")
+        files = [{"filename": "example-demo.md", "category": "example"}]
+        result = _read_source_files(1, files)
+        assert "## 示例：example-demo.md" in result
+        assert "示例内容" in result
+
+    def test_knowledge_base_category(self):
+        self._write("kb-data.md", "知识库内容")
+        files = [{"filename": "kb-data.md", "category": "knowledge-base"}]
+        result = _read_source_files(1, files)
+        assert "## 知识库：kb-data.md" in result
+
+    def test_reference_category(self):
+        self._write("reference-api.md", "API 参考")
+        files = [{"filename": "reference-api.md", "category": "reference"}]
+        result = _read_source_files(1, files)
+        assert "## 参考资料：reference-api.md" in result
+
+    def test_template_category(self):
+        self._write("template-report.md", "模板内容")
+        files = [{"filename": "template-report.md", "category": "template"}]
+        result = _read_source_files(1, files)
+        assert "## 输出模板：template-report.md" in result
+
+    def test_skip_unknown_category(self):
+        """未知 category（如 tool、other）应跳过。"""
+        self._write("tool-calc.py", "print('hello')")
+        files = [{"filename": "tool-calc.py", "category": "tool"}]
+        result = _read_source_files(1, files)
+        assert result == ""
+
+    def test_skip_binary_extension(self):
+        """非文本扩展名应跳过。"""
+        self._write("image.png", "fake binary")
+        files = [{"filename": "image.png", "category": "example"}]
+        result = _read_source_files(1, files)
+        assert result == ""
+
+    def test_skip_missing_file(self):
+        """文件不存在时跳过，不报错。"""
+        files = [{"filename": "nonexistent.md", "category": "example"}]
+        result = _read_source_files(1, files)
+        assert result == ""
+
+    def test_max_total_chars_limit(self):
+        """超过 max_total_chars 时截断。"""
+        self._write("big.md", "x" * 500)
+        self._write("big2.md", "y" * 500)
+        files = [
+            {"filename": "big.md", "category": "example"},
+            {"filename": "big2.md", "category": "example"},
+        ]
+        result = _read_source_files(1, files, max_total_chars=600)
+        assert "x" * 500 in result
+        assert "y" * 500 not in result
+
+    def test_multiple_categories_ordered(self):
+        """多个 category 按 knowledge-base → example → reference → template 排序。"""
+        self._write("ref.md", "参考")
+        self._write("ex.md", "示例")
+        self._write("kb.md", "知识")
+        files = [
+            {"filename": "ref.md", "category": "reference"},
+            {"filename": "ex.md", "category": "example"},
+            {"filename": "kb.md", "category": "knowledge-base"},
+        ]
+        result = _read_source_files(1, files)
+        kb_pos = result.index("知识库")
+        ex_pos = result.index("示例")
+        ref_pos = result.index("参考资料")
+        assert kb_pos < ex_pos < ref_pos
+
+    def test_empty_source_files(self):
+        result = _read_source_files(1, [])
+        assert result == ""
+
+    def test_various_text_extensions(self):
+        """多种文本扩展名都能读取。"""
+        for ext in [".txt", ".json", ".yaml", ".csv", ".sql"]:
+            fname = f"data{ext}"
+            self._write(fname, f"content-{ext}")
+            files = [{"filename": fname, "category": "reference"}]
+            result = _read_source_files(1, files)
+            assert f"content-{ext}" in result
