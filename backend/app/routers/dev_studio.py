@@ -38,11 +38,19 @@ WORKSPACE_MAX_GB = 1
 _db_cleaner_task = None
 
 
-_DIR_SIZE_SKIP = {"node_modules", ".bun", ".cache", "__pycache__", ".venv", "venv", ".next", "dist", "build"}
+# ─── 统一 ignore 集合：所有目录跳过逻辑共用此集合 ──────────────────────────
+RUNTIME_IGNORE_DIRS = {
+    ".git", ".bin", ".bun", ".cache", ".config", ".local", ".opencode",
+    "node_modules", "__pycache__", ".venv", "venv",
+    ".next", "dist", "build", ".trae", ".npm", ".pnpm-store",
+    "runtime",  # 隔离后的运行时目录
+}
+
+_DIR_SIZE_SKIP = RUNTIME_IGNORE_DIRS
 
 
 def _dir_size_bytes(path: str) -> int:
-    """递归计算目录下所有文件的总字节数（跳过包管理器缓存等大目录）。"""
+    """递归计算目录下所有文件的总字节数（跳过运行时/缓存/依赖目录）。"""
     total = 0
     for dirpath, dirnames, filenames in os.walk(path):
         # 原地修改 dirnames 跳过无关目录，避免递归进缓存目录
@@ -56,6 +64,231 @@ def _dir_size_bytes(path: str) -> int:
     return total
 
 
+# ─── 目录布局：物理隔离 project（用户文件）和 runtime（OpenCode运行时）─────
+# workspace_root/<user>/project/  — OpenCode cwd，只含用户项目文件
+# workspace_root/<user>/runtime/data/    — XDG_DATA_HOME（opencode.db 等）
+# workspace_root/<user>/runtime/config/  — XDG_CONFIG_HOME（opencode config/skills）
+# workspace_root/<user>/runtime/cache/   — 缓存、日志
+# workspace_root/<user>/runtime/bin/     — 假 open 等注入脚本
+
+# ─── 统一路径工具函数 ────────────────────────────────────────────────────────
+
+def _workspace_root_for_user(user_id: int, display_name: str = "") -> str:
+    """返回用户顶层工作区目录（studio_root/<folder_name>）。"""
+    import re as _re
+    from app.config import settings as _cfg
+    studio_root = os.path.abspath(os.path.expanduser(
+        getattr(_cfg, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")
+    ))
+    safe_name = _re.sub(r'[^\w\u4e00-\u9fff\-]', '_', display_name).strip('_') if display_name else ""
+    folder_name = safe_name if safe_name else f"user_{user_id}"
+    return os.path.join(studio_root, folder_name)
+
+
+def _workspace_project_dir(workdir: str) -> str:
+    """返回用户工作区的 project 子目录（OpenCode cwd）。"""
+    return os.path.join(workdir, "project")
+
+
+def _workspace_runtime_dir(workdir: str) -> str:
+    """返回用户工作区的 runtime 子目录（OpenCode 运行时数据）。"""
+    return os.path.join(workdir, "runtime")
+
+
+def _workspace_runtime_data_dir(workdir: str) -> str:
+    """返回 runtime/data（XDG_DATA_HOME）。"""
+    return os.path.join(workdir, "runtime", "data")
+
+
+def _workspace_runtime_config_dir(workdir: str) -> str:
+    """返回 runtime/config（XDG_CONFIG_HOME）。"""
+    return os.path.join(workdir, "runtime", "config")
+
+
+def _user_opencode_db_path(workdir: str) -> Optional[str]:
+    """返回当前用户的 opencode.db 路径，优先新布局，兼容旧布局。
+    如果两个位置都不存在，返回新布局路径（供创建用）。
+    """
+    new_path = os.path.join(workdir, "runtime", "data", "opencode", "opencode.db")
+    if os.path.exists(new_path):
+        return new_path
+    old_path = os.path.join(workdir, ".local", "share", "opencode", "opencode.db")
+    if os.path.exists(old_path):
+        return old_path
+    return new_path  # 新布局路径作为默认
+
+
+# ─── 旧布局残留检测 + 迁移 ──────────────────────────────────────────────────
+
+_OLD_LAYOUT_MARKERS = {".local", ".config", ".bin", ".opencode"}
+
+
+def _has_old_layout_residue(workdir: str) -> bool:
+    """检查 workdir 根目录下是否还残留旧布局目录/文件。"""
+    for marker in _OLD_LAYOUT_MARKERS:
+        if os.path.exists(os.path.join(workdir, marker)):
+            return True
+    if os.path.exists(os.path.join(workdir, "opencode.json")):
+        return True
+    return False
+
+
+def _is_layout_complete(workdir: str) -> bool:
+    """检查新布局是否完整：project/ + runtime/data/ + runtime/config/ 都存在，且无旧残留。"""
+    project_dir = _workspace_project_dir(workdir)
+    runtime_data = _workspace_runtime_data_dir(workdir)
+    runtime_config = _workspace_runtime_config_dir(workdir)
+    if not (os.path.isdir(project_dir) and os.path.isdir(runtime_data) and os.path.isdir(runtime_config)):
+        return False
+    if _has_old_layout_residue(workdir):
+        return False
+    return True
+
+
+def _migrate_workspace_layout(workdir: str) -> None:
+    """将旧布局（所有文件混在 workdir 根）迁移到新的 project/runtime 分离布局。
+
+    判定规则：只有布局完整（project/ + runtime/data/ + runtime/config/ 都存在）
+    且根目录不存在旧布局残留（.local/.config/.bin/.opencode/opencode.json）才跳过。
+    否则继续迁移。
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    # 布局已完整且无旧残留：跳过
+    if _is_layout_complete(workdir):
+        return
+
+    project_dir = _workspace_project_dir(workdir)
+    runtime_dir = _workspace_runtime_dir(workdir)
+
+    # 全新工作区（无任何旧布局痕迹也无新布局）：无需迁移，ensure_workspace_layout 会创建
+    if not os.path.isdir(project_dir) and not _has_old_layout_residue(workdir):
+        return
+
+    logger.info(f"[Migration] 迁移工作区布局: {workdir}")
+
+    # 1. 确保新目录结构存在
+    os.makedirs(project_dir, exist_ok=True)
+    runtime_data = _workspace_runtime_data_dir(workdir)
+    runtime_config = _workspace_runtime_config_dir(workdir)
+    runtime_cache = os.path.join(runtime_dir, "cache")
+    runtime_bin = os.path.join(runtime_dir, "bin")
+    for d in (runtime_data, runtime_config, runtime_cache, runtime_bin):
+        os.makedirs(d, exist_ok=True)
+
+    # 2. 迁移运行时目录
+    # .local/share/* → runtime/data/*
+    old_share = os.path.join(workdir, ".local", "share")
+    if os.path.isdir(old_share):
+        for item in os.listdir(old_share):
+            src = os.path.join(old_share, item)
+            dst = os.path.join(runtime_data, item)
+            if not os.path.exists(dst):
+                shutil.move(src, dst)
+    # 清理整个 .local（即使 share 已空）
+    old_local = os.path.join(workdir, ".local")
+    if os.path.isdir(old_local):
+        shutil.rmtree(old_local, ignore_errors=True)
+
+    # .config/* → runtime/config/*
+    old_config_dir = os.path.join(workdir, ".config")
+    if os.path.isdir(old_config_dir):
+        for item in os.listdir(old_config_dir):
+            src = os.path.join(old_config_dir, item)
+            dst = os.path.join(runtime_config, item)
+            if not os.path.exists(dst):
+                shutil.move(src, dst)
+        shutil.rmtree(old_config_dir, ignore_errors=True)
+
+    # .bin/* → runtime/bin/*
+    old_bin = os.path.join(workdir, ".bin")
+    if os.path.isdir(old_bin):
+        for item in os.listdir(old_bin):
+            src = os.path.join(old_bin, item)
+            dst = os.path.join(runtime_bin, item)
+            if not os.path.exists(dst):
+                shutil.move(src, dst)
+        shutil.rmtree(old_bin, ignore_errors=True)
+
+    # 删除旧的 .opencode（skills 会重新同步到 runtime/config/opencode/skills）
+    old_opencode = os.path.join(workdir, ".opencode")
+    if os.path.isdir(old_opencode):
+        shutil.rmtree(old_opencode, ignore_errors=True)
+
+    # 删除旧的 opencode.json（会重新写到 runtime/config/opencode/config.json）
+    old_config_json = os.path.join(workdir, "opencode.json")
+    if os.path.exists(old_config_json):
+        os.remove(old_config_json)
+
+    # 3. 将剩余用户文件移到 project/
+    _skip_move = {"project", "runtime"}
+    for item in os.listdir(workdir):
+        if item in _skip_move:
+            continue
+        src = os.path.join(workdir, item)
+        dst = os.path.join(project_dir, item)
+        if not os.path.exists(dst):
+            shutil.move(src, dst)
+
+    # 4. 迁移后校验：如果还有旧残留，记 warning
+    if _has_old_layout_residue(workdir):
+        residue = [m for m in _OLD_LAYOUT_MARKERS if os.path.exists(os.path.join(workdir, m))]
+        if os.path.exists(os.path.join(workdir, "opencode.json")):
+            residue.append("opencode.json")
+        logger.warning(f"[Migration] 迁移后仍有旧残留: {workdir} -> {residue}")
+
+    logger.info(f"[Migration] 工作区迁移完成: {workdir}")
+
+
+# ─── 统一工作区初始化入口 ────────────────────────────────────────────────────
+
+def ensure_workspace_layout(workdir: str, display_name: str = "") -> tuple[str, str]:
+    """统一的工作区初始化入口。
+
+    负责：
+    1. 创建 workdir 根目录
+    2. 执行旧布局迁移（如有需要）
+    3. 创建 project/ 及首批项目目录（src/docs/scripts/README.md）
+    4. 创建 runtime/ 下所有子目录（data/config/cache/bin）
+
+    返回 (project_dir, runtime_dir)。
+    所有写文件入口必须通过此函数进入，不能分叉。
+    """
+    os.makedirs(workdir, exist_ok=True)
+
+    # 迁移旧布局（幂等）
+    _migrate_workspace_layout(workdir)
+
+    # 创建新布局目录结构
+    project_dir = _workspace_project_dir(workdir)
+    runtime_dir = _workspace_runtime_dir(workdir)
+    is_new = not os.path.exists(project_dir)
+
+    os.makedirs(project_dir, exist_ok=True)
+    for rd in ("data", "config", "cache", "bin"):
+        os.makedirs(os.path.join(runtime_dir, rd), exist_ok=True)
+
+    # 首次创建：初始化项目目录结构
+    if is_new:
+        for subdir in ("src", "docs", "scripts"):
+            os.makedirs(os.path.join(project_dir, subdir), exist_ok=True)
+        readme = os.path.join(project_dir, "README.md")
+        if not os.path.exists(readme):
+            folder_name = os.path.basename(workdir)
+            with open(readme, "w", encoding="utf-8") as f:
+                f.write(
+                    f"# {display_name or folder_name} 的工作台\n\n"
+                    "这是你的专属开发工作台，文件会持久保存。\n\n"
+                    "## 使用建议\n\n"
+                    "- **建议仅用 Dev Studio 开发后端运算脚本**（数据处理、API 调用、自动化脚本等）\n"
+                    "- **切勿在 Dev Studio 开发前后端重型应用**（Next.js、React SPA 等），"
+                    "此类项目请在本地 IDE 开发后部署\n"
+                )
+
+    return project_dir, runtime_dir
+
+
 def _cleanup_workspace_if_needed(workdir: str, max_bytes: int) -> None:
     """若 workdir 总大小超过 max_bytes，删最老 session 直到达标。同步函数，可在启动前直接调用。"""
     import sqlite3 as _sqlite3
@@ -65,7 +298,7 @@ def _cleanup_workspace_if_needed(workdir: str, max_bytes: int) -> None:
     ws_bytes = _dir_size_bytes(workdir)
     if ws_bytes <= max_bytes:
         return
-    db_path = os.path.join(workdir, ".local", "share", "opencode", "opencode.db")
+    db_path = _user_opencode_db_path(workdir)
     if not os.path.exists(db_path):
         return
     try:
@@ -210,29 +443,32 @@ _WINDOW_30D = 30 * 86400
 
 
 def _all_opencode_db_paths() -> list[str]:
-    """收集所有用户的 opencode.db 路径（含全局兜底路径）。"""
+    """收集所有用户的 opencode.db 路径（含全局兜底路径）。
+    通过 _user_opencode_db_path 自动兼容新旧布局。
+    """
     from app.config import settings as _cfg3
     _studio_root = os.path.abspath(os.path.expanduser(getattr(_cfg3, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
     paths: list[str] = []
-    # 各用户独立目录（内存中已知实例）
     seen = set()
-    for uid, inst in list(_user_instances.items()):
-        wdir = inst.get("workdir") or os.path.join(_studio_root, f"user_{uid}")
-        p = os.path.join(wdir, ".local", "share", "opencode", "opencode.db")
+
+    def _add(p: str):
         if p not in seen:
             seen.add(p)
             paths.append(p)
+
+    # 各用户独立目录（内存中已知实例）
+    for uid, inst in list(_user_instances.items()):
+        wdir = inst.get("workdir") or os.path.join(_studio_root, f"user_{uid}")
+        _add(_user_opencode_db_path(wdir))
     # 扫描 studio_root 下所有用户目录（兼容重启后 _user_instances 为空的情况）
     if os.path.isdir(_studio_root):
         for name in os.listdir(_studio_root):
-            p = os.path.join(_studio_root, name, ".local", "share", "opencode", "opencode.db")
-            if p not in seen:
-                seen.add(p)
-                paths.append(p)
+            wdir = os.path.join(_studio_root, name)
+            if os.path.isdir(wdir):
+                _add(_user_opencode_db_path(wdir))
     # 全局路径兜底
     global_db = os.environ.get("OPENCODE_DB_PATH", os.path.expanduser("~/.local/share/opencode/opencode.db"))
-    if global_db not in seen:
-        paths.append(global_db)
+    _add(global_db)
     return paths
 
 
@@ -300,10 +536,9 @@ async def _bailian_usage_monitor() -> None:
                 # 只更新配置文件，不主动杀进程（避免中断用户当前操作）。
                 # 下次用户调用 /instance 时，_ensure_user_instance 检测到配置变化会自动重启。
                 for uid, inst in list(_user_instances.items()):
-                    from app.config import settings as _cfg2
-                    _studio_root = os.path.abspath(os.path.expanduser(getattr(_cfg2, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
-                    wdir = inst.get("workdir") or os.path.join(_studio_root, f"user_{uid}")
-                    os.makedirs(wdir, exist_ok=True)
+                    wdir = inst.get("workdir")
+                    if not wdir:
+                        continue
                     _write_opencode_config(wdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=True)
         except Exception as e:
             logging.getLogger(__name__).warning(f"[BailianMonitor] 采样失败: {e}")
@@ -453,7 +688,11 @@ def _write_opencode_config(
             },
         },
     }
-    config_path = os.path.join(workdir, "opencode.json")
+    # 只写到 runtime/config/opencode/config.json（通过 XDG_CONFIG_HOME 生效）
+    # 不再写 workdir/opencode.json，避免项目根目录产生额外变更触发 watcher
+    oc_config_dir = os.path.join(_workspace_runtime_config_dir(workdir), "opencode")
+    os.makedirs(oc_config_dir, exist_ok=True)
+    config_path = os.path.join(oc_config_dir, "config.json")
     new_content = json.dumps(config, ensure_ascii=False, indent=2)
     # 内容没变则跳过写入，避免 mtime 更新触发 opencode file watcher 重启
     if os.path.exists(config_path):
@@ -462,11 +701,6 @@ def _write_opencode_config(
                 return
     with open(config_path, "w", encoding="utf-8") as f:
         f.write(new_content)
-    # opencode 优先读 XDG_CONFIG_HOME/opencode/config.json，同步写一份确保生效
-    xdg_config_dir = os.path.join(workdir, ".config", "opencode")
-    os.makedirs(xdg_config_dir, exist_ok=True)
-    with open(os.path.join(xdg_config_dir, "config.json"), "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
 
 
 def _sync_company_skills_to_workdir(workdir: str) -> None:
@@ -494,11 +728,10 @@ def _sync_company_skills_to_workdir(workdir: str) -> None:
         "writing-skills",
     }
 
-    # 两个路径都写：.opencode/skills/（项目级）和 .config/opencode/skills/（XDG_CONFIG_HOME级）
-    skills_dir = os.path.join(workdir, ".opencode", "skills")
-    skills_dir_xdg = os.path.join(workdir, ".config", "opencode", "skills")
+    # 只写到 runtime/config/opencode/skills/（通过 XDG_CONFIG_HOME 生效）
+    # 不再写 project/.opencode/skills，避免触发 OpenCode 文件 watcher
+    skills_dir = os.path.join(_workspace_runtime_config_dir(workdir), "opencode", "skills")
     os.makedirs(skills_dir, exist_ok=True)
-    os.makedirs(skills_dir_xdg, exist_ok=True)
 
     db = SessionLocal()
     try:
@@ -527,16 +760,14 @@ def _sync_company_skills_to_workdir(workdir: str) -> None:
             filename = f"{safe}.md"
             filepath = os.path.join(skills_dir, filename)
             content = f"---\nname: {skill.name}\ndescription: {skill.description or skill.name}\n---\n\n{ver.system_prompt}"
-            for d in (skills_dir, skills_dir_xdg):
-                with open(os.path.join(d, filename), "w", encoding="utf-8") as f:
-                    f.write(content)
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(content)
             written.add(filename)
 
         # 清理已删除或不再是 published/company 的旧文件
-        for d in (skills_dir, skills_dir_xdg):
-            for existing in os.listdir(d):
-                if existing.endswith(".md") and existing not in written:
-                    os.remove(os.path.join(d, existing))
+        for existing in os.listdir(skills_dir):
+            if existing.endswith(".md") and existing not in written:
+                os.remove(os.path.join(skills_dir, existing))
     except Exception:
         pass  # skill 同步失败不影响实例启动
     finally:
@@ -612,11 +843,7 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
         # 后端重启后 _user_instances 内存清空，但 opencode 进程可能仍在跑。
         # 若 proc 为 None 但固定端口已有进程在监听，检查 cwd 是否正确再决定复用或重启。
         if proc is None and _port_open(inst["port"]):
-            from app.config import settings as _cfg_chk
-            import re as _re_chk
-            _studio_root_chk = os.path.abspath(os.path.expanduser(getattr(_cfg_chk, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
-            _safe_chk = _re_chk.sub(r'[^\w\u4e00-\u9fff\-]', '_', display_name).strip('_') if display_name else ""
-            _expected_cwd = os.path.join(_studio_root_chk, _safe_chk if _safe_chk else f"user_{user_id}")
+            _expected_cwd = _workspace_project_dir(_workspace_root_for_user(user_id, display_name))
             # 通过端口找到占用该端口的进程，检查其 cwd
             _cwd_ok = False
             try:
@@ -644,47 +871,23 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             await _aio.sleep(1)  # 等端口释放
 
         # 每用户独立持久化 workdir，用姓名命名（重启后保留文件和 session 历史）
-        from app.config import settings as _cfg
-        import re
-        studio_root = os.path.abspath(os.path.expanduser(getattr(_cfg, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
-        # 用 display_name 做目录名，去掉不安全字符，兜底用 user_{id}
-        safe_name = re.sub(r'[^\w\u4e00-\u9fff\-]', '_', display_name).strip('_') if display_name else ""
-        folder_name = safe_name if safe_name else f"user_{user_id}"
-        workdir = os.path.join(studio_root, folder_name)
-        is_new = not os.path.exists(workdir)
-        os.makedirs(workdir, exist_ok=True)
+        workdir = _workspace_root_for_user(user_id, display_name)
 
-        # 首次创建：初始化项目目录结构
-        if is_new:
-            for subdir in ["src", "docs", "scripts", ".local/share", ".config"]:
-                os.makedirs(os.path.join(workdir, subdir), exist_ok=True)
-            readme = os.path.join(workdir, "README.md")
-            with open(readme, "w", encoding="utf-8") as f:
-                f.write(
-                    f"# {display_name or folder_name} 的工作台\n\n"
-                    "这是你的专属开发工作台，文件会持久保存。\n\n"
-                    "## 使用建议\n\n"
-                    "- **建议仅用 Dev Studio 开发后端运算脚本**（数据处理、API 调用、自动化脚本等）\n"
-                    "- **切勿在 Dev Studio 开发前后端重型应用**（Next.js、React SPA 等），"
-                    "此类项目请在本地 IDE 开发后部署\n"
-                )
+        # 统一初始化入口：迁移旧布局 + 创建 project/runtime 目录结构
+        loop = asyncio.get_event_loop()
+        project_dir, runtime_dir = await loop.run_in_executor(
+            None, ensure_workspace_layout, workdir, display_name
+        )
 
         # 启动前检查 workspace 大小，超过上限先清理再继续
-        # 注意：_cleanup_workspace_if_needed 是同步 IO，用 executor 跑防止阻塞 event loop
-        loop = asyncio.get_event_loop()
         await loop.run_in_executor(
             None, _cleanup_workspace_if_needed, workdir, WORKSPACE_MAX_GB * 1024 ** 3
         )
 
-        # 始终写入 .gitignore，避免 opencode snapshot 把子仓库的 packfile 吸进来导致磁盘爆炸
-        # snapshot 仓库的 worktree 指向 workdir，会读这里的 .gitignore
-        _gitignore_path = os.path.join(workdir, ".gitignore")
+        # .gitignore 只在内容变更时写入，避免 mtime 变化触发状态刷新
+        _gitignore_path = os.path.join(project_dir, ".gitignore")
         _gitignore_content = (
             "# opencode 运行时数据 — 禁止被 git diff/snapshot 统计进代码变更\n"
-            ".local/\n"
-            ".config/\n"
-            ".opencode/\n"
-            ".bin/\n"
             ".git/\n"
             "*.pack\n"
             "*.idx\n"
@@ -704,8 +907,14 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             "*.log\n"
             "*.tmp\n"
         )
-        with open(_gitignore_path, "w", encoding="utf-8") as _f:
-            _f.write(_gitignore_content)
+        _need_write_gitignore = True
+        if os.path.exists(_gitignore_path):
+            with open(_gitignore_path, encoding="utf-8") as _f:
+                if _f.read() == _gitignore_content:
+                    _need_write_gitignore = False
+        if _need_write_gitignore:
+            with open(_gitignore_path, "w", encoding="utf-8") as _f:
+                _f.write(_gitignore_content)
 
         from app.config import settings as _settings
         bailian_key = getattr(_settings, "BAILIAN_API_KEY", "") or os.environ.get("BAILIAN_API_KEY", "")
@@ -734,7 +943,7 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
                 _db.close()
 
         # 读取旧配置内容，用于检测是否需要重启
-        config_path = os.path.join(workdir, "opencode.json")
+        config_path = os.path.join(_workspace_runtime_config_dir(workdir), "opencode", "config.json")
         old_config = ""
         if os.path.exists(config_path):
             with open(config_path, encoding="utf-8") as _f:
@@ -743,7 +952,7 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
         # 内容无变化时 _write_opencode_config 会跳过写文件（不更新 mtime）
         _write_opencode_config(workdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=use_ark_fallback, lemondata_key=lemondata_key)
 
-        # 将公司级 published skill 写入 .opencode/skills/，供 opencode 按需加载
+        # 将公司级 published skill 写入 runtime/config/opencode/skills/，供 opencode 按需加载
         await loop.run_in_executor(None, _sync_company_skills_to_workdir, workdir)
 
         # 已有进程且还活着：若配置无变化直接复用，否则重启使新配置生效
@@ -767,11 +976,9 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
         if active_count >= MAX_ACTIVE_INSTANCES:
             raise HTTPException(503, f"当前并发实例已达上限（{MAX_ACTIVE_INSTANCES}），请稍后再试")
 
-        # 每用户独立数据目录（持久化，session db 隔离）
-        user_data_dir = os.path.join(workdir, ".local", "share")
-        os.makedirs(user_data_dir, exist_ok=True)
-        user_config_dir = os.path.join(workdir, ".config")
-        os.makedirs(user_config_dir, exist_ok=True)
+        # XDG 目录指向 runtime/，物理隔离于 project/ — OpenCode 运行时数据不在 cwd 下
+        user_data_dir = _workspace_runtime_data_dir(workdir)
+        user_config_dir = _workspace_runtime_config_dir(workdir)
 
         proc_env = os.environ.copy()
         proc_env["XDG_DATA_HOME"] = user_data_dir
@@ -786,10 +993,8 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             # 无授权时显式清除，防止从系统 env 继承后绕过授权
             proc_env.pop("LEMONDATA_API_KEY", None)
         # 禁止 opencode web 自动在服务器本机打开浏览器标签。
-        # opencode 在 macOS 上通过调用系统 `open` 命令打开浏览器，
-        # 在 PATH 最前面注入一个假 `open` 脚本来拦截这个行为。
-        fake_open_dir = os.path.join(workdir, ".bin")
-        os.makedirs(fake_open_dir, exist_ok=True)
+        # 假 `open` 脚本放在 runtime/bin/ 而非 project 内
+        fake_open_dir = os.path.join(runtime_dir, "bin")
         fake_open_path = os.path.join(fake_open_dir, "open")
         if not os.path.exists(fake_open_path):
             with open(fake_open_path, "w") as _f:
@@ -816,7 +1021,7 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             *cors_args,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
-            cwd=workdir,
+            cwd=project_dir,  # cwd 指向 project/，OpenCode 只看到用户项目文件
             env=proc_env,
         )
 
@@ -868,10 +1073,27 @@ async def set_provider_fallback(
     ark_key = getattr(_settings, "ARK_API_KEY", "") or os.environ.get("ARK_API_KEY", "")
     _lemondata_raw = getattr(_settings, "LEMONDATA_API_KEY", "") or os.environ.get("LEMONDATA_API_KEY", "")
 
-    # 更新所有已启动用户实例的配置，并逐一重启
+    # 全量刷新：扫描 STUDIO_WORKSPACE_ROOT 下所有用户目录，更新磁盘配置
+    from app.config import settings as _cfg_fb
+    _studio_root = os.path.abspath(os.path.expanduser(
+        getattr(_cfg_fb, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")
+    ))
+    _updated_wdirs = set()
+    if os.path.isdir(_studio_root):
+        for _entry in os.scandir(_studio_root):
+            if not _entry.is_dir():
+                continue
+            wdir = _entry.path
+            # 确保 runtime 布局存在（幂等）
+            ensure_workspace_layout(wdir)
+            _write_opencode_config(wdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=enable)
+            _updated_wdirs.add(wdir)
+
+    # 对活跃实例：按用户授权补写 lemondata key + 终止进程使新配置生效
     for uid, inst in list(_user_instances.items()):
-        wdir = inst.get("workdir") or os.path.join(tempfile.gettempdir(), f"ledesk_studio_user_{uid}")
-        os.makedirs(wdir, exist_ok=True)
+        wdir = inst.get("workdir")
+        if not wdir:
+            continue
         # 按用户授权决定是否传入 lemondata key
         _uid_lemondata_key = ""
         if _lemondata_raw:
@@ -889,7 +1111,9 @@ async def set_provider_fallback(
                     _uid_lemondata_key = _lemondata_raw
             finally:
                 _db.close()
-        _write_opencode_config(wdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=enable, lemondata_key=_uid_lemondata_key)
+        if _uid_lemondata_key:
+            # 有 lemondata 授权的用户需要重写含 key 的配置
+            _write_opencode_config(wdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=enable, lemondata_key=_uid_lemondata_key)
         proc = inst.get("proc")
         if proc is not None and proc.returncode is None:
             proc.terminate()
@@ -945,7 +1169,7 @@ async def get_instance(
         OpenCodeWorkspaceMapping.directory != None,
     ).first()
     if mapping is None:
-        user_workdir = os.path.join(tempfile.gettempdir(), f"ledesk_studio_user_{user.id}")
+        user_workdir = _user_workdir(user)
         mapping = OpenCodeWorkspaceMapping(
             user_id=user.id,
             directory=user_workdir,
@@ -1007,10 +1231,15 @@ def get_latest_output(
     import sqlite3 as _sqlite3
     import json as _json
 
-    db_path = os.environ.get(
-        "OPENCODE_DB_PATH",
-        os.path.expanduser("~/.local/share/opencode/opencode.db"),
-    )
+    # 优先读当前用户自己的 DB，不串用户、不读全局 DB
+    workdir = _workspace_root_for_user(user.id, user.display_name or "")
+    db_path = _user_opencode_db_path(workdir)
+    if not os.path.exists(db_path):
+        # 最后兜底：全局 DB（仅用于没有用户 workspace 的异常场景）
+        db_path = os.environ.get(
+            "OPENCODE_DB_PATH",
+            os.path.expanduser("~/.local/share/opencode/opencode.db"),
+        )
     if not os.path.exists(db_path):
         return []
 
@@ -1377,13 +1606,8 @@ async def transfer_table(
         content = "\n".join(lines)
         ext = "sql"
 
-    # 5. 确定用户 workdir
-    import re as _re
-    studio_root = os.path.abspath(os.path.expanduser(getattr(_cfg, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
-    safe_name = _re.sub(r'[^\w\u4e00-\u9fff\-]', '_', user.display_name).strip('_') if user.display_name else ""
-    folder_name = safe_name if safe_name else f"user_{user.id}"
-    workdir = os.path.join(studio_root, folder_name)
-    os.makedirs(workdir, exist_ok=True)
+    # 5. 确定用户 workdir（指向 project/ 子目录）
+    workdir = _user_workdir(user)
 
     # 6. 写文件
     if req.filename:
@@ -1417,15 +1641,8 @@ async def upload_file(
     user: User = Depends(get_current_user),
 ):
     """将用户上传的文件写入其 opencode workdir，支持指定子目录。"""
-    import re as _re
-    from app.config import settings as _cfg
-
-    # 确定用户 workdir（与 _ensure_user_instance 保持一致）
-    studio_root = os.path.abspath(os.path.expanduser(getattr(_cfg, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
-    safe_name = _re.sub(r'[^\w\u4e00-\u9fff\-]', '_', user.display_name).strip('_') if user.display_name else ""
-    folder_name = safe_name if safe_name else f"user_{user.id}"
-    workdir = os.path.join(studio_root, folder_name)
-    os.makedirs(workdir, exist_ok=True)
+    # 确定用户 workdir（指向 project/ 子目录）
+    workdir = _user_workdir(user)
 
     max_bytes = WORKSPACE_MAX_GB * 1024 ** 3
 
@@ -1767,15 +1984,12 @@ async def analyze_project(
 # ─── Workdir File Manager ──────────────────────────────────────────────────────
 
 def _user_workdir(user: User) -> str:
-    """返回当前用户的 workdir 路径，不存在则创建。"""
-    import re as _re
-    from app.config import settings as _cfg
-    studio_root = os.path.abspath(os.path.expanduser(getattr(_cfg, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")))
-    safe_name = _re.sub(r'[^\w\u4e00-\u9fff\-]', '_', user.display_name).strip('_') if user.display_name else ""
-    folder_name = safe_name if safe_name else f"user_{user.id}"
-    workdir = os.path.join(studio_root, folder_name)
-    os.makedirs(workdir, exist_ok=True)
-    return workdir
+    """返回当前用户的 project 目录路径（用户可见文件）。
+    内部调用统一初始化入口，确保 project/runtime 布局完整。
+    """
+    workdir = _workspace_root_for_user(user.id, user.display_name or "")
+    project_dir, _ = ensure_workspace_layout(workdir, display_name=user.display_name or "")
+    return project_dir
 
 
 def _safe_path(workdir: str, rel: str) -> str:
@@ -1786,11 +2000,7 @@ def _safe_path(workdir: str, rel: str) -> str:
     return abs_path
 
 
-_TREE_SKIP = {
-    ".git", ".bin", ".bun", ".cache", ".config", ".local",
-    "node_modules", "__pycache__", ".venv", "venv",
-    ".next", "dist", "build", ".trae",
-}
+_TREE_SKIP = RUNTIME_IGNORE_DIRS
 
 def _tree(base: str, rel: str = "") -> list:
     """递归列出目录树，返回节点列表（跳过隐藏/构建/依赖目录）。"""
