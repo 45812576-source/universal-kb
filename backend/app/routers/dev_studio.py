@@ -2077,10 +2077,33 @@ async def analyze_project(
 
 # ─── Workdir File Manager ──────────────────────────────────────────────────────
 
+def _user_opencode_cwd(user_id: int) -> Optional[str]:
+    """尝试从运行中的 opencode 实例获取其实际 CWD（Linux /proc）。
+    用于确保文件管理器和 opencode 看到同一个目录。
+    """
+    inst = _user_instances.get(user_id)
+    if not inst:
+        return None
+    proc = inst.get("proc")
+    if proc is None or proc.returncode is not None:
+        return None
+    try:
+        cwd = os.readlink(f"/proc/{proc.pid}/cwd")
+        if os.path.isdir(cwd):
+            return cwd
+    except Exception:
+        pass
+    return None
+
+
 def _user_workdir(user: User) -> str:
     """返回当前用户的 project 目录路径（用户可见文件）。
-    内部调用统一初始化入口，确保 project/runtime 布局完整。
+    优先使用 opencode 进程的实际 CWD，确保与 opencode 文件树一致。
+    回退到 project/ 目录（并确保布局完整）。
     """
+    cwd = _user_opencode_cwd(user.id)
+    if cwd:
+        return cwd
     workdir = _workspace_root_for_user(user.id, user.display_name or "")
     project_dir, _ = ensure_workspace_layout(workdir, display_name=user.display_name or "")
     return project_dir
