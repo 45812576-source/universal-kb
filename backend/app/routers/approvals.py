@@ -231,9 +231,21 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
                 "description": skill.description or "",
                 "scope": skill.scope,
                 "mode": skill.mode,
+                "version": latest_ver.version if latest_ver else None,
                 "system_prompt": latest_ver.system_prompt if latest_ver else "",
                 "change_note": latest_ver.change_note if latest_ver else "",
                 "source_files": skill.source_files or [],
+                "knowledge_tags": skill.knowledge_tags or [],
+                "data_queries": skill.data_queries or [],
+                "bound_tools": [
+                    {
+                        "id": t.id,
+                        "name": t.name,
+                        "display_name": t.display_name,
+                        "tool_type": t.tool_type.value if t.tool_type else "",
+                    }
+                    for t in list(skill.bound_tools)
+                ],
             }
     elif r.target_type == "tool" and r.target_id:
         from app.models.tool import ToolRegistry

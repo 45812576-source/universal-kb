@@ -1266,22 +1266,48 @@ async def submit_approval(
 
     req_type = ApprovalRequestType.SKILL_PUBLISH if session.target_type == "skill" else ApprovalRequestType.TOOL_PUBLISH
 
+    sandbox_scan_data = {
+        "sandbox_test_session_id": session.id,
+        "sandbox_test_report_id": report.id if report else None,
+        "report_knowledge_id": report.knowledge_entry_id if report else None,
+        "report_hash": report.report_hash if report else None,
+        "target_version": session.target_version,
+    }
+
     approval = ApprovalRequest(
         request_type=req_type,
         target_id=session.target_id,
         target_type=session.target_type,
         requester_id=user.id,
         status=ApprovalStatus.PENDING,
-        security_scan_result={
-            "sandbox_test_session_id": session.id,
-            "sandbox_test_report_id": report.id if report else None,
-            "report_knowledge_id": report.knowledge_entry_id if report else None,
-            "report_hash": report.report_hash if report else None,
-            "target_version": session.target_version,
-        },
+        security_scan_result=sandbox_scan_data,
     )
     db.add(approval)
     db.commit()
+    db.refresh(approval)
+
+    # 异步触发安全扫描，合并 suggested_policy 到 security_scan_result
+    if session.target_type == "skill":
+        import asyncio
+        from app.database import SessionLocal
+        from app.services.skill_security_scanner import skill_security_scanner
+
+        async def _run_scan(approval_id: int, skill_id: int, sandbox_data: dict):
+            scan_db = SessionLocal()
+            try:
+                scan_result = await skill_security_scanner.scan(skill_id, scan_db)
+                # 合并：保留 sandbox 字段，叠加安全扫描结果（suggested_policy, risk_level 等）
+                merged = {**scan_result, **sandbox_data}
+                ar = scan_db.get(ApprovalRequest, approval_id)
+                if ar:
+                    ar.security_scan_result = merged
+                    scan_db.commit()
+            except Exception as e:
+                logger.error(f"沙盒审批后安全扫描失败 approval={approval_id}: {e}")
+            finally:
+                scan_db.close()
+
+        asyncio.create_task(_run_scan(approval.id, session.target_id, sandbox_scan_data))
 
     return {
         "approval_request_id": approval.id,

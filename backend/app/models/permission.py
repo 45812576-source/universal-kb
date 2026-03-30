@@ -338,12 +338,15 @@ class HandoffSchemaCache(Base):
 
 class ApprovalRequestType(str, enum.Enum):
     SKILL_PUBLISH = "skill_publish"
+    SKILL_VERSION_CHANGE = "skill_version_change"
+    SKILL_OWNERSHIP_TRANSFER = "skill_ownership_transfer"
     TOOL_PUBLISH = "tool_publish"
     WEBAPP_PUBLISH = "webapp_publish"
     SCOPE_CHANGE = "scope_change"
     MASK_OVERRIDE = "mask_override"
     SCHEMA_APPROVAL = "schema_approval"
     KNOWLEDGE_EDIT = "knowledge_edit"
+    KNOWLEDGE_REVIEW = "knowledge_review"
 
 
 class ApprovalStatus(str, enum.Enum):

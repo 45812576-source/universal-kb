@@ -209,7 +209,7 @@ async def upload_knowledge(
     # AI 智能命名（异步，不阻塞入库）
     from app.services.knowledge_namer import auto_name
     try:
-        naming_result = await auto_name(content, file.filename or "", file_type)
+        naming_result = await auto_name(content, file.filename or "", file_type, db=db)
         entry.ai_title = naming_result["title"]
         entry.ai_summary = naming_result["summary"]
         entry.ai_tags = naming_result["tags"]
@@ -680,13 +680,57 @@ def review_knowledge(
     if user.role == Role.DEPT_ADMIN and entry.department_id != user.department_id:
         raise HTTPException(403, "Can only review your department's entries")
 
+    # 找到或创建对应的审批记录（统一审批流）
+    from app.models.permission import (
+        ApprovalAction as ApprovalActionModel,
+        ApprovalActionType,
+        ApprovalRequest,
+        ApprovalRequestType,
+        ApprovalStatus,
+    )
+    approval = (
+        db.query(ApprovalRequest)
+        .filter(
+            ApprovalRequest.target_id == kid,
+            ApprovalRequest.target_type == "knowledge",
+            ApprovalRequest.request_type == ApprovalRequestType.KNOWLEDGE_REVIEW,
+            ApprovalRequest.status == ApprovalStatus.PENDING,
+        )
+        .first()
+    )
+    if not approval:
+        approval = ApprovalRequest(
+            request_type=ApprovalRequestType.KNOWLEDGE_REVIEW,
+            target_id=kid,
+            target_type="knowledge",
+            requester_id=entry.created_by,
+            status=ApprovalStatus.PENDING,
+            stage="dept_pending",
+        )
+        db.add(approval)
+        db.flush()
+
     if req.action == "approve":
         entry = approve_knowledge(db, kid, user.id, req.note)
+        if entry.review_stage == ReviewStage.APPROVED:
+            approval.status = ApprovalStatus.APPROVED
+        else:
+            approval.stage = "super_pending"
+        db.add(ApprovalActionModel(
+            request_id=approval.id, actor_id=user.id,
+            action=ApprovalActionType.APPROVE, comment=req.note or None,
+        ))
     elif req.action == "reject":
         entry = reject_knowledge(db, kid, user.id, req.note)
+        approval.status = ApprovalStatus.REJECTED
+        db.add(ApprovalActionModel(
+            request_id=approval.id, actor_id=user.id,
+            action=ApprovalActionType.REJECT, comment=req.note or None,
+        ))
     else:
         raise HTTPException(400, "action must be 'approve' or 'reject'")
 
+    db.commit()
     return _entry_dict(entry)
 
 
@@ -707,16 +751,47 @@ def super_review_knowledge(
             f"Entry is not in dept_approved_pending_super stage (current: {entry.review_stage})",
         )
 
+    from app.models.permission import (
+        ApprovalAction as ApprovalActionModel,
+        ApprovalActionType,
+        ApprovalRequest,
+        ApprovalRequestType,
+        ApprovalStatus,
+    )
+    approval = (
+        db.query(ApprovalRequest)
+        .filter(
+            ApprovalRequest.target_id == kid,
+            ApprovalRequest.target_type == "knowledge",
+            ApprovalRequest.request_type == ApprovalRequestType.KNOWLEDGE_REVIEW,
+            ApprovalRequest.status == ApprovalStatus.PENDING,
+        )
+        .first()
+    )
+
     if req.action == "approve":
         try:
             entry = super_approve_knowledge(db, kid, user.id, req.note)
         except ValueError as e:
             raise HTTPException(400, str(e))
+        if approval:
+            approval.status = ApprovalStatus.APPROVED
+            db.add(ApprovalActionModel(
+                request_id=approval.id, actor_id=user.id,
+                action=ApprovalActionType.APPROVE, comment=req.note or None,
+            ))
     elif req.action == "reject":
         entry = super_reject_knowledge(db, kid, user.id, req.note)
+        if approval:
+            approval.status = ApprovalStatus.REJECTED
+            db.add(ApprovalActionModel(
+                request_id=approval.id, actor_id=user.id,
+                action=ApprovalActionType.REJECT, comment=req.note or None,
+            ))
     else:
         raise HTTPException(400, "action must be 'approve' or 'reject'")
 
+    db.commit()
     return _entry_dict(entry)
 
 
@@ -812,7 +887,7 @@ async def summarize_knowledge(
         import asyncio as _asyncio
         from app.services.llm_gateway import llm_gateway
         from app.utils.file_parser import foe_summarize
-        _cfg = llm_gateway.get_lite_config()
+        _cfg = llm_gateway.resolve_config(db, "knowledge.search")
         _content = entry.content
         summary = await _asyncio.get_event_loop().run_in_executor(
             None,
