@@ -173,6 +173,19 @@ async def startup_event():
                 db.close()
 
         upstream_scheduler.add_job(_run_workdir_kb_sync, "interval", minutes=30)
+
+        # 知识处理 Job Worker：每 30 秒扫一次 queued 的 render/classify 任务
+        from app.services.knowledge_worker import (
+            process_knowledge_jobs,
+            backfill_unclassified,
+            backfill_failed_renders,
+        )
+        upstream_scheduler.add_job(process_knowledge_jobs, "interval", seconds=30, id="knowledge_job_worker")
+        # 每 10 分钟补偿未分类条目
+        upstream_scheduler.add_job(backfill_unclassified, "interval", minutes=10, id="knowledge_backfill_classify")
+        # 每 10 分钟补偿渲染失败条目
+        upstream_scheduler.add_job(backfill_failed_renders, "interval", minutes=10, id="knowledge_backfill_render")
+
         upstream_scheduler.start()
     except Exception as e:
         import logging
@@ -184,6 +197,7 @@ from app.models import raw_input, draft, opportunity, feedback_item  # noqa: F40
 from app.models import permission  # noqa: F401
 from app.models import opencode  # noqa: F401
 from app.models import sandbox as sandbox_models  # noqa: F401
+from app.models import knowledge_job  # noqa: F401
 
 from app.routers import auth, admin, skills, knowledge, conversations  # noqa: E402
 from app.routers import business_tables, data_tables, audit, skill_suggestions, contributions  # noqa: E402

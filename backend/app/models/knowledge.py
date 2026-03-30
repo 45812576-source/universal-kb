@@ -130,6 +130,14 @@ class KnowledgeEntry(Base):
     # classification_confidence: AI 分类置信度 0-1
     classification_confidence = Column(Float, nullable=True)
 
+    # ── 分类状态追踪 ──────────────────────────────────────────────────────────
+    # pending/success/failed/needs_review
+    classification_status = Column(String(20), default="pending", nullable=True)
+    classification_error = Column(Text, nullable=True)
+    classified_at = Column(DateTime, nullable=True)
+    # keyword/llm/vector_assisted_llm/keyword_fallback
+    classification_source = Column(String(50), nullable=True)
+
     # ── 云文档渲染状态 ────────────────────────────────────────────────────────
     doc_render_status = Column(String(20), default="pending", nullable=True)  # pending/processing/ready/failed
     doc_render_error = Column(Text, nullable=True)            # 转换失败原因

@@ -133,9 +133,15 @@ async def classify(text: str, db: Session) -> ClassificationResult | None:
                 stage="keyword",
             )
 
-    # Stage 2: LLM 精确分类
+    # Stage 1.5: 向量候选辅助 —— 用 embedding 检索相似已分类文档，汇总高频 taxonomy
+    vector_candidates = _get_vector_candidates(text, db)
+
+    # Stage 2: LLM 精确分类（注入向量候选）
     try:
-        result = await _llm_classify(text, candidates, db)
+        stage = "vector_assisted_llm" if vector_candidates else "llm"
+        result = await _llm_classify(text, candidates, db, vector_candidates=vector_candidates)
+        if result:
+            result.stage = stage
         return result
     except Exception as e:
         logger.warning(f"[Classifier] LLM classification failed: {e}")
@@ -156,10 +162,69 @@ async def classify(text: str, db: Session) -> ClassificationResult | None:
         return None
 
 
+def _get_vector_candidates(text: str, db: Session) -> list[dict]:
+    """用 embedding 检索相似已分类知识条目，汇总高频 taxonomy 作为候选。"""
+    try:
+        from app.services import vector_service
+        hits = vector_service.search_knowledge(text[:500], top_k=10)
+    except Exception as e:
+        logger.debug(f"[Classifier] vector search failed, skipping: {e}")
+        return []
+
+    if not hits:
+        return []
+
+    # 从 hits 中拿到 knowledge_id，查询已分类的条目
+    from app.models.knowledge import KnowledgeEntry
+    kid_set = {h["knowledge_id"] for h in hits if h.get("knowledge_id")}
+    if not kid_set:
+        return []
+
+    entries = (
+        db.query(
+            KnowledgeEntry.taxonomy_code,
+            KnowledgeEntry.taxonomy_board,
+            KnowledgeEntry.taxonomy_path,
+        )
+        .filter(
+            KnowledgeEntry.id.in_(kid_set),
+            KnowledgeEntry.taxonomy_code.isnot(None),
+        )
+        .all()
+    )
+
+    if not entries:
+        return []
+
+    # 统计高频 taxonomy_code
+    from collections import Counter
+    code_counter = Counter()
+    code_info: dict[str, dict] = {}
+    for e in entries:
+        code_counter[e.taxonomy_code] += 1
+        if e.taxonomy_code not in code_info:
+            code_info[e.taxonomy_code] = {
+                "taxonomy_code": e.taxonomy_code,
+                "taxonomy_board": e.taxonomy_board,
+                "taxonomy_path": e.taxonomy_path or [],
+            }
+
+    # 返回出现次数最多的前 5 个
+    result = []
+    for code, count in code_counter.most_common(5):
+        info = code_info[code]
+        info["similar_count"] = count
+        result.append(info)
+
+    logger.debug(f"[Classifier] vector candidates: {[r['taxonomy_code'] for r in result]}")
+    return result
+
+
 async def _llm_classify(
     text: str,
     candidates: list[dict],
     db: Session,
+    vector_candidates: list[dict] | None = None,
 ) -> ClassificationResult | None:
     """Stage 2: 调用 LLM 精确分类。"""
     # 构建候选节点的简洁描述（避免 prompt 过长）
@@ -193,12 +258,22 @@ async def _llm_classify(
             for n in TAXONOMY
         ]
 
+    # 注入向量候选信息
+    vector_hint = ""
+    if vector_candidates:
+        vector_hint = "\n\n## 相似文档的分类参考（通过向量检索获得）\n"
+        for vc in vector_candidates:
+            vector_hint += f"- {vc['taxonomy_code']} ({' > '.join(vc.get('taxonomy_path', []))}) — 相似文档 {vc['similar_count']} 篇\n"
+        vector_hint += "\n以上是与待分类文档语义相似的已分类文档所属分类，仅作参考。\n"
+
     prompt = _CLASSIFY_PROMPT.format(
         board_summary=get_board_summary(),
         candidates_json=json.dumps(candidate_nodes, ensure_ascii=False, indent=2),
         kb_ids_json=json.dumps(KB_ID_DESCRIPTIONS, ensure_ascii=False, indent=2),
         content=text[:2000],
     )
+    if vector_hint:
+        prompt = prompt.replace("---\n请从候选节点中", f"{vector_hint}---\n请从候选节点中")
 
     model_config = llm_gateway.resolve_config(db, "knowledge.classify")
     result_str, _ = await llm_gateway.chat(

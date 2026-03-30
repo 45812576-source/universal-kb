@@ -112,9 +112,16 @@ def _entry_dict(e: KnowledgeEntry) -> dict:
         "lark_doc_token": e.lark_doc_token,
         "lark_sync_interval": e.lark_sync_interval,
         "lark_last_synced_at": e.lark_last_synced_at,
+        # 分类状态
+        "classification_status": e.classification_status,
+        "classification_error": e.classification_error,
+        "classification_confidence": e.classification_confidence,
+        "classification_source": e.classification_source,
+        "classified_at": e.classified_at.isoformat() if e.classified_at else None,
         # 能力标志
         "can_open_onlyoffice": bool(e.oss_key and ext in _ONLYOFFICE_EXTS),
         "can_retry_render": e.doc_render_status in ("failed", "pending", None),
+        "can_retry_classification": e.classification_status in ("failed", "pending", "needs_review", None),
         "created_at": e.created_at.isoformat(),
     }
 
@@ -217,13 +224,13 @@ async def upload_knowledge(
     db.add(entry)
     db.flush()
 
-    # 云文档转换（从本地临时文件）
+    # 云文档转换 —— 改为入队，不在请求内同步完成
     from app.services.doc_renderer import render_from_path
     try:
         render_from_path(db, entry, saved_path)
     except Exception as e:
         import logging
-        logging.getLogger(__name__).warning(f"Doc render failed: {e}")
+        logging.getLogger(__name__).warning(f"Doc render failed (will retry via job): {e}")
 
     # 清理本地临时文件
     try:
@@ -250,17 +257,26 @@ async def upload_knowledge(
         import logging
         logging.getLogger(__name__).warning(f"AI naming failed: {e}")
 
-    # 自动分类（异步，不阻塞入库）
-    from app.services.knowledge_classifier import classify, apply_classification_to_entry
-    try:
-        cls_result = await classify(content, db)
-        if cls_result:
-            apply_classification_to_entry(entry, cls_result)
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"Auto-classification failed: {e}")
-
     entry = submit_knowledge(db, entry)
+
+    # 创建异步 Job：render 补偿（如果同步渲染失败了）+ classify
+    from app.models.knowledge_job import KnowledgeJob
+    if entry.doc_render_status in ("failed", "pending"):
+        render_job = KnowledgeJob(
+            knowledge_id=entry.id,
+            job_type="render",
+            trigger_source="upload",
+        )
+        db.add(render_job)
+
+    classify_job = KnowledgeJob(
+        knowledge_id=entry.id,
+        job_type="classify",
+        trigger_source="upload",
+    )
+    db.add(classify_job)
+    entry.classification_status = "pending"
+    db.commit()
 
     return {
         "id": entry.id,
@@ -285,6 +301,8 @@ def list_knowledge(
     category: str = None,
     source_type: str = None,
     review_stage: str = None,
+    doc_render_status: str = None,
+    classification_status: str = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -318,6 +336,10 @@ def list_knowledge(
         q = q.filter(KnowledgeEntry.source_type == source_type)
     if review_stage:
         q = q.filter(KnowledgeEntry.review_stage == review_stage)
+    if doc_render_status:
+        q = q.filter(KnowledgeEntry.doc_render_status == doc_render_status)
+    if classification_status:
+        q = q.filter(KnowledgeEntry.classification_status == classification_status)
 
     entries = q.order_by(KnowledgeEntry.created_at.desc()).all()
     return [_entry_dict(e) for e in entries]
@@ -960,16 +982,50 @@ def retry_render(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """手动重试云文档转换。"""
+    """手动重试云文档转换（创建 render retry job）。"""
     entry = db.get(KnowledgeEntry, kid)
     if not entry:
         raise HTTPException(404, "Knowledge entry not found")
     if user.role != Role.SUPER_ADMIN and entry.created_by != user.id:
         raise HTTPException(403, "无权操作")
 
-    from app.services.doc_renderer import render_entry
-    result = render_entry(db, kid)
-    return result
+    from app.models.knowledge_job import KnowledgeJob
+    job = KnowledgeJob(
+        knowledge_id=kid,
+        job_type="render",
+        trigger_source="retry",
+    )
+    db.add(job)
+    entry.doc_render_status = "pending"
+    entry.doc_render_error = None
+    db.commit()
+    return {"ok": True, "job_id": job.id, "status": "queued"}
+
+
+@router.post("/{kid}/classify")
+def retry_classify(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """手动重试自动分类（创建 classify retry job）。"""
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    if user.role != Role.SUPER_ADMIN and entry.created_by != user.id:
+        raise HTTPException(403, "无权操作")
+
+    from app.models.knowledge_job import KnowledgeJob
+    job = KnowledgeJob(
+        knowledge_id=kid,
+        job_type="classify",
+        trigger_source="retry",
+    )
+    db.add(job)
+    entry.classification_status = "pending"
+    entry.classification_error = None
+    db.commit()
+    return {"ok": True, "job_id": job.id, "status": "queued"}
 
 
 @router.post("/{kid}/sync")
