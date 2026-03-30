@@ -7,3 +7,5 @@ uploads/
 build/
 .react-router/
 backend/studio_workspaces/
+._*
+.DS_Store
