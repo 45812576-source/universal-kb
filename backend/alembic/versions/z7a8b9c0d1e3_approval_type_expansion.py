@@ -1,12 +1,12 @@
 """审批类型扩展: knowledge_review, skill_version_change, skill_ownership_transfer
 
-Revision ID: z7a8b9c0d1e2
+Revision ID: z7a8b9c0d1e3
 Revises: y6z7a8b9c0d1
 Create Date: 2026-03-30
 """
 from alembic import op
 
-revision = "z7a8b9c0d1e2"
+revision = "z7a8b9c0d1e3"
 down_revision = "y6z7a8b9c0d1"
 branch_labels = None
 depends_on = None

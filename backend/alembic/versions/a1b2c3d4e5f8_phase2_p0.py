@@ -1,6 +1,6 @@
 """phase2 p0: business_tables, audit_logs, skill_data_queries, skills data_queries/tools
 
-Revision ID: a1b2c3d4e5f6
+Revision ID: a1b2c3d4e5f8
 Revises: 6bb20f9c928c
 Create Date: 2026-03-07 10:00:00.000000
 
@@ -11,7 +11,7 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import mysql
 
-revision: str = 'a1b2c3d4e5f6'
+revision: str = 'a1b2c3d4e5f8'
 down_revision: Union[str, Sequence[str], None] = '6bb20f9c928c'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

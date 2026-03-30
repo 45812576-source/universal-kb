@@ -1,13 +1,13 @@
 """add skill_memos table
 
-Revision ID: a1b2c3d4e5f6
+Revision ID: a1b2c3d4e5f7
 Revises: z7a8b9c0d1e2
 Create Date: 2026-03-30
 """
 from alembic import op
 import sqlalchemy as sa
 
-revision = "a1b2c3d4e5f6"
+revision = "a1b2c3d4e5f7"
 down_revision = "z7a8b9c0d1e2"
 branch_labels = None
 depends_on = None
