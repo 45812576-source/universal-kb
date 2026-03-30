@@ -272,10 +272,16 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
             target_detail = {
                 "name": entry.ai_title or entry.title,
                 "title": entry.title,
+                "content": (entry.content or "")[:500],
+                "category": entry.category,
                 "file_ext": entry.file_ext,
                 "source_file": entry.source_file,
                 "created_by": entry.created_by,
                 "creator_name": entry.creator.display_name if entry.creator else None,
+                "review_level": entry.review_level,
+                "review_stage": entry.review_stage.value if entry.review_stage else None,
+                "sensitivity_flags": entry.sensitivity_flags or [],
+                "auto_review_note": entry.auto_review_note,
             }
 
     return {
@@ -568,6 +574,35 @@ async def act_on_approval(
         and r.target_id
     )
 
+    # ── 审批前校验：沙盒测试报告消费 ──
+    # Skill/Tool 发布审批必须关联有效的沙盒测试报告
+    if req.action == "approve" and r.request_type in (
+        ApprovalRequestType.SKILL_PUBLISH,
+        ApprovalRequestType.TOOL_PUBLISH,
+    ):
+        scan = getattr(r, "security_scan_result", None) or {}
+        report_id = scan.get("sandbox_test_report_id")
+        report_hash = scan.get("report_hash")
+        if not report_id:
+            raise HTTPException(
+                400,
+                "审批请求未关联沙盒测试报告，无法审批通过。请先完成交互式沙盒测试。"
+            )
+        from app.models.sandbox import SandboxTestReport
+        report = db.get(SandboxTestReport, report_id)
+        if not report:
+            raise HTTPException(400, f"沙盒测试报告 #{report_id} 不存在")
+        if report_hash and report.report_hash != report_hash:
+            raise HTTPException(
+                400,
+                "沙盒测试报告哈希不匹配，报告可能已被篡改，请重新测试"
+            )
+        if not report.approval_eligible:
+            raise HTTPException(
+                400,
+                "沙盒测试报告显示未通过全部三项评价，无法审批通过"
+            )
+
     # 更新申请状态
     if req.action == "approve":
         is_skill_publish = (
@@ -692,6 +727,40 @@ async def act_on_approval(
                     user_id=r.requester_id,
                     granted_by=user.id,
                 ))
+        elif r.request_type == ApprovalRequestType.KNOWLEDGE_REVIEW:
+            # 知识内容审核：通过审批流处理时，实际审核已在 knowledge.py 完成
+            # 此处仅作为后补状态同步
+            r.status = ApprovalStatus.APPROVED
+            from app.models.knowledge import KnowledgeEntry
+            from app.services.knowledge_service import approve_knowledge, super_approve_knowledge
+            entry = db.get(KnowledgeEntry, r.target_id) if r.target_id else None
+            if entry and entry.status.value == "pending":
+                if stage == "super_pending" and user.role == Role.SUPER_ADMIN:
+                    try:
+                        super_approve_knowledge(db, r.target_id, user.id, req.comment or "")
+                    except ValueError:
+                        pass
+                else:
+                    approve_knowledge(db, r.target_id, user.id, req.comment or "")
+                    # L3 → 推给超管
+                    if entry.review_stage and entry.review_stage.value == "dept_approved_pending_super":
+                        r.status = ApprovalStatus.PENDING
+                        r.stage = "super_pending"
+        elif r.request_type == ApprovalRequestType.SKILL_VERSION_CHANGE:
+            # Skill 版本变更审批：通过 → 无需额外操作（版本已创建）
+            r.status = ApprovalStatus.APPROVED
+        elif r.request_type == ApprovalRequestType.SKILL_OWNERSHIP_TRANSFER:
+            # Skill 所有权转让：通过 → 更新 created_by
+            r.status = ApprovalStatus.APPROVED
+            if r.target_id and r.conditions:
+                from app.models.skill import Skill
+                skill = db.get(Skill, r.target_id)
+                new_owner_id = None
+                for cond in (r.conditions or []):
+                    if isinstance(cond, dict):
+                        new_owner_id = cond.get("new_owner_id")
+                if skill and new_owner_id:
+                    skill.created_by = new_owner_id
         else:
             # 其他审批类型，保持原逻辑
             r.status = ApprovalStatus.APPROVED
@@ -739,6 +808,13 @@ async def act_on_approval(
             webapp = db.get(WebApp, r.target_id)
             if webapp and webapp.status == "reviewing":
                 webapp.status = "draft"
+        # knowledge_review 拒绝 → reject_knowledge
+        if r.request_type == ApprovalRequestType.KNOWLEDGE_REVIEW and r.target_id:
+            from app.models.knowledge import KnowledgeEntry, KnowledgeStatus
+            entry = db.get(KnowledgeEntry, r.target_id)
+            if entry and entry.status == KnowledgeStatus.PENDING:
+                from app.services.knowledge_service import reject_knowledge
+                reject_knowledge(db, r.target_id, user.id, req.comment or "审批拒绝")
     elif req.action == "add_conditions":
         r.status = ApprovalStatus.CONDITIONS
         if req.conditions:
