@@ -353,8 +353,9 @@ async def import_convert_skill(
 ):
     """智能解析外部 Skill 内容，转换为内部统一格式。
 
-    支持两种输入方式：
+    支持三种输入方式：
     - 上传 .md / .txt 文件
+    - 上传 .zip 包（自动解压，读取 SKILL.md 或第一个 .md 文件）
     - 直接传入文本内容（content 字段）
 
     返回转换预览结果（不入库），前端确认后再调用 POST /skills 创建。
@@ -366,11 +367,38 @@ async def import_convert_skill(
 
     if file and file.filename:
         raw = await file.read()
-        try:
-            raw_content = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            raise HTTPException(400, "文件编码必须是 UTF-8")
         source_filename = file.filename
+
+        # zip 包：解压后读取 SKILL.md 或第一个 .md 文件
+        if file.filename.lower().endswith(".zip"):
+            import zipfile as _zf
+            import io as _io
+            try:
+                with _zf.ZipFile(_io.BytesIO(raw)) as zf:
+                    names = zf.namelist()
+                    # 优先找 SKILL.md（不区分路径深度）
+                    md_file = None
+                    for n in names:
+                        base = n.rsplit("/", 1)[-1] if "/" in n else n
+                        if base.upper() == "SKILL.MD":
+                            md_file = n
+                            break
+                    # 回退：第一个 .md 文件
+                    if not md_file:
+                        for n in names:
+                            if n.lower().endswith(".md") and not n.startswith("__MACOSX"):
+                                md_file = n
+                                break
+                    if not md_file:
+                        raise HTTPException(400, "zip 包中未找到 .md 文件")
+                    raw_content = zf.read(md_file).decode("utf-8")
+            except _zf.BadZipFile:
+                raise HTTPException(400, "无效的 zip 文件")
+        else:
+            try:
+                raw_content = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                raise HTTPException(400, "文件编码必须是 UTF-8")
     elif content:
         raw_content = content
     else:
