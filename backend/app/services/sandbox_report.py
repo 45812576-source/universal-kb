@@ -1,9 +1,9 @@
 """沙盒测试报告生成 + 知识库持久化。
 
 报告三部分：
-  Part 1 — Q1/Q2/Q3 检测结果
-  Part 2 — 权限穷尽测试用例矩阵
-  Part 3 — 质量/易用性/反幻觉三项评价
+  Part 1 — Q1/Q2/Q3 检测结果（含证据化审批字段）
+  Part 2 — 权限穷尽测试用例矩阵（含评分细项）
+  Part 3 — 质量/易用性/反幻觉三项评价 + Top Issues + Fix Plan
 
 报告不可变，生成后写入知识库，不覆盖旧报告。
 """
@@ -27,6 +27,54 @@ from app.models.knowledge import KnowledgeEntry, KnowledgeStatus
 logger = logging.getLogger(__name__)
 
 
+def _extract_top_issues(evaluation: dict) -> list[dict]:
+    """从 evaluation 中聚合 top issues。"""
+    issues = []
+    # 从质量扣分项
+    for d in evaluation.get("quality_detail", {}).get("top_deductions", []):
+        issues.append({
+            "source": "quality",
+            "dimension": d.get("dimension", ""),
+            "points": d.get("points", 0),
+            "reason": d.get("reason", ""),
+        })
+    # 从易用性
+    usability = evaluation.get("usability_detail", {})
+    if usability.get("reason"):
+        issues.append({
+            "source": "usability",
+            "dimension": "usability",
+            "reason": usability["reason"],
+        })
+    # 从反幻觉行为验证
+    for bc in evaluation.get("anti_hallucination_detail", {}).get("behavior_checks", []):
+        if not bc.get("passed"):
+            issues.append({
+                "source": "anti_hallucination",
+                "dimension": "behavior",
+                "reason": f"缺证据场景编造: {bc.get('prompt', '')[:50]}",
+            })
+    return issues[:5]
+
+
+def _extract_fix_plan(evaluation: dict) -> list[str]:
+    """从 evaluation 中聚合修复建议。"""
+    fixes = []
+    for d in evaluation.get("quality_detail", {}).get("top_deductions", []):
+        if d.get("fix_suggestion"):
+            fixes.append(d["fix_suggestion"])
+    for f in evaluation.get("quality_detail", {}).get("fix_plan", []):
+        if f and f not in fixes:
+            fixes.append(f)
+    usability_fix = evaluation.get("usability_detail", {}).get("fix_suggestion")
+    if usability_fix:
+        fixes.append(usability_fix)
+    ah_suggestion = evaluation.get("anti_hallucination_detail", {}).get("suggestion")
+    if ah_suggestion:
+        fixes.append(ah_suggestion)
+    return fixes[:5]
+
+
 async def generate_report(
     session: SandboxTestSession,
     cases: list[SandboxTestCase],
@@ -35,21 +83,39 @@ async def generate_report(
 ) -> SandboxTestReport:
     """生成不可变测试报告并持久化到知识库。"""
 
-    # ── Part 1: 证据检测结果 ──
+    # ── Part 1: 证据检测结果（含证据化审批字段） ──
     part1 = {
         "q1_input_slots": {
             "total_slots": len(session.detected_slots or []),
             "verified": sum(1 for s in (session.detected_slots or []) if s.get("evidence_status") == "verified"),
             "failed": sum(1 for s in (session.detected_slots or []) if s.get("evidence_status") == "failed"),
-            "slots": session.detected_slots or [],
+            "slots": [
+                {
+                    **slot,
+                    "pass_criteria": slot.get("pass_criteria", ""),
+                    "decision": slot.get("verification_conclusion", slot.get("evidence_status")),
+                    "reason": slot.get("verification_reason", ""),
+                    "evidence_ref": slot.get("evidence_ref", ""),
+                    "remediation": slot.get("suggested_source", ""),
+                }
+                for slot in (session.detected_slots or [])
+            ],
         },
         "q2_tool_review": {
             "total_tools": len(session.tool_review or []),
             "confirmed": sum(1 for t in (session.tool_review or []) if t.get("confirmed")),
+            "must_call": sum(1 for t in (session.tool_review or []) if t.get("decision") == "must_call"),
+            "no_need": sum(1 for t in (session.tool_review or []) if t.get("decision") == "no_need"),
             "tools": [
                 {
                     "tool_id": t.get("tool_id"),
                     "tool_name": t.get("tool_name"),
+                    "decision": t.get("decision", "must_call" if t.get("confirmed") else "unknown"),
+                    "no_tool_proof": t.get("no_tool_proof"),
+                    "pass_criteria": t.get("pass_criteria", ""),
+                    "reason": t.get("requiredness_reason", ""),
+                    "evidence_ref": f"tool:{t.get('tool_id')}",
+                    "remediation": "",
                     "confirmed": t.get("confirmed"),
                     "input_provenance": t.get("input_provenance", []),
                 }
@@ -60,13 +126,34 @@ async def generate_report(
             "total_tables": len(session.permission_snapshot or []),
             "confirmed": sum(1 for s in (session.permission_snapshot or []) if s.get("confirmed")),
             "included_in_test": sum(1 for s in (session.permission_snapshot or []) if s.get("included_in_test")),
-            "tables": session.permission_snapshot or [],
+            "no_permission_needed": sum(1 for s in (session.permission_snapshot or []) if s.get("decision") == "no_permission_needed"),
+            "tables": [
+                {
+                    **snap,
+                    "pass_criteria": "权限配置符合业务预期" if snap.get("permission_required") else "无需权限控制",
+                    "decision": snap.get("decision", "required_confirmed" if snap.get("confirmed") else "unknown"),
+                    "reason": snap.get("permission_required_reason", ""),
+                    "evidence_ref": f"table:{snap.get('table_name')}",
+                    "remediation": "",
+                }
+                for snap in (session.permission_snapshot or [])
+            ],
         },
     }
 
-    # ── Part 2: 测试用例矩阵 ──
+    # ── Part 2: 测试用例矩阵（含评分细项） ──
     case_results = []
     for c in cases:
+        # 尝试从 verdict_reason 解析 scoring_breakdown
+        scoring_breakdown = {}
+        if c.verdict_reason:
+            try:
+                parsed = json.loads(c.verdict_reason)
+                if isinstance(parsed, dict):
+                    scoring_breakdown = parsed
+            except (json.JSONDecodeError, TypeError):
+                scoring_breakdown = {"reason": c.verdict_reason}
+
         case_results.append({
             "case_index": c.case_index,
             "row_visibility": c.row_visibility,
@@ -79,6 +166,21 @@ async def generate_report(
             "verdict": c.verdict.value if c.verdict else None,
             "verdict_reason": c.verdict_reason,
             "execution_duration_ms": c.execution_duration_ms,
+            # 新增字段
+            "permissions_applied": [
+                snap["table_name"]
+                for snap in (session.permission_snapshot or [])
+                if snap.get("included_in_test")
+            ],
+            "tool_decision": {
+                str(t.get("tool_id")): t.get("decision", "must_call" if t.get("confirmed") else "unknown")
+                for t in (session.tool_review or [])
+            },
+            "slot_coverage": {
+                s["slot_key"]: s.get("verification_conclusion", s.get("evidence_status"))
+                for s in (session.detected_slots or [])
+            },
+            "scoring_breakdown": scoring_breakdown,
         })
 
     part2 = {
@@ -95,7 +197,10 @@ async def generate_report(
         },
     }
 
-    # ── Part 3: 评价 ──
+    # ── Part 3: 评价（含 Top Issues + Fix Plan） ──
+    top_issues = _extract_top_issues(evaluation)
+    fix_plan = _extract_fix_plan(evaluation)
+
     part3 = {
         "quality": {
             "passed": evaluation.get("quality_passed", False),
@@ -110,6 +215,8 @@ async def generate_report(
             "passed": evaluation.get("anti_hallucination_passed", False),
             "detail": evaluation.get("anti_hallucination_detail", {}),
         },
+        "top_issues": top_issues,
+        "fix_plan": fix_plan,
         "final_verdict": {
             "quality_passed": evaluation.get("quality_passed", False),
             "usability_passed": evaluation.get("usability_passed", False),
@@ -219,26 +326,40 @@ def _render_report_text(
     ]
 
     for slot in part1["q1_input_slots"]["slots"]:
-        status_icon = "✓" if slot.get("evidence_status") == "verified" else "✗"
+        decision = slot.get("decision", slot.get("evidence_status", "pending"))
+        status_icon = "OK" if decision == "verified" else "FAIL"
         lines.append(
-            f"  - {status_icon} **{slot.get('label', slot.get('slot_key', ''))}** — "
-            f"来源: {slot.get('chosen_source', '未确认')}, "
-            f"状态: {slot.get('evidence_status', 'pending')}"
+            f"  - [{status_icon}] **{slot.get('label', slot.get('slot_key', ''))}** — "
+            f"来源: {slot.get('chosen_source', '未确认')}"
         )
+        if slot.get("required_reason"):
+            lines.append(f"    - 必填原因: {slot['required_reason']}")
+        if slot.get("pass_criteria"):
+            lines.append(f"    - 通过标准: {slot['pass_criteria']}")
+        if slot.get("reason"):
+            lines.append(f"    - 判定理由: {slot['reason']}")
+        if slot.get("remediation"):
+            lines.append(f"    - 整改建议: {slot['remediation']}")
 
     lines += [
         "",
         "### Q2 Tool 检测与确认",
         f"- 总工具数: {part1['q2_tool_review']['total_tools']}",
-        f"- 已确认: {part1['q2_tool_review']['confirmed']}",
+        f"- 必须调用: {part1['q2_tool_review'].get('must_call', 0)}",
+        f"- 无需调用: {part1['q2_tool_review'].get('no_need', 0)}",
         "",
     ]
 
     for t in part1["q2_tool_review"]["tools"]:
-        icon = "✓" if t.get("confirmed") else "✗"
-        lines.append(f"  - {icon} **{t.get('tool_name', '')}** (ID: {t.get('tool_id', '')})")
+        decision = t.get("decision", "unknown")
+        icon = "CALL" if decision == "must_call" else "SKIP" if decision == "no_need" else "?"
+        lines.append(f"  - [{icon}] **{t.get('tool_name', '')}** (ID: {t.get('tool_id', '')})")
+        if t.get("reason"):
+            lines.append(f"    - 判定理由: {t['reason']}")
+        if t.get("no_tool_proof"):
+            lines.append(f"    - 无需调用证明: {t['no_tool_proof']}")
         for prov in t.get("input_provenance", []):
-            lines.append(f"    - {prov.get('field_name', '')}: {prov.get('source_kind', 'N/A')} → {prov.get('source_ref', 'N/A')}")
+            lines.append(f"    - {prov.get('field_name', '')}: {prov.get('source_kind', 'N/A')} -> {prov.get('source_ref', 'N/A')}")
 
     lines += [
         "",
@@ -246,16 +367,23 @@ def _render_report_text(
         f"- 总数据表: {part1['q3_permission_review']['total_tables']}",
         f"- 已确认: {part1['q3_permission_review']['confirmed']}",
         f"- 纳入测试: {part1['q3_permission_review']['included_in_test']}",
+        f"- 无需权限: {part1['q3_permission_review'].get('no_permission_needed', 0)}",
         "",
     ]
 
     for tbl in part1["q3_permission_review"]["tables"]:
-        icon = "✓" if tbl.get("confirmed") else "✗"
+        decision = tbl.get("decision", "unknown")
+        icon = "OK" if decision in ("required_confirmed", "no_permission_needed") else "FAIL"
         lines.append(
-            f"  - {icon} **{tbl.get('display_name', tbl.get('table_name', ''))}** — "
-            f"行可见: {tbl.get('row_visibility', 'N/A')}, "
-            f"遮罩字段: {len(tbl.get('field_masks', []))} 个"
+            f"  - [{icon}] **{tbl.get('display_name', tbl.get('table_name', ''))}** — "
+            f"决策: {decision}"
         )
+        if tbl.get("reason"):
+            lines.append(f"    - 权限理由: {tbl['reason']}")
+        if tbl.get("why_no_permission_needed"):
+            lines.append(f"    - 无需权限原因: {tbl['why_no_permission_needed']}")
+        for rule in tbl.get("applied_rules", []):
+            lines.append(f"    - 规则: {rule}")
 
     lines += [
         "",
@@ -268,11 +396,14 @@ def _render_report_text(
         f"- 实际执行数: {part2.get('executed_case_count', 0)}",
         f"- 语义折叠: {part2.get('collapsed_by_semantics', 0)}",
         "",
-        f"| # | 行可见 | 字段语义 | 分组 | Tool 前置 | 判定 | 原因 |",
-        f"|---|--------|----------|------|-----------|------|------|",
+        f"| # | 行可见 | 字段语义 | 分组 | Tool 前置 | 判定 | 分数 | 主问题 |",
+        f"|---|--------|----------|------|-----------|------|------|--------|",
     ]
 
     for c in part2.get("cases", []):
+        sb = c.get("scoring_breakdown", {})
+        score = sb.get("score", "")
+        main_issue = (sb.get("main_issue") or sb.get("reason") or "")[:40]
         lines.append(
             f"| {c.get('case_index', '')} "
             f"| {c.get('row_visibility', '')} "
@@ -280,7 +411,8 @@ def _render_report_text(
             f"| {c.get('group_semantic', '')} "
             f"| {c.get('tool_precondition', '')} "
             f"| {c.get('verdict', '')} "
-            f"| {(c.get('verdict_reason') or '')[:50]} |"
+            f"| {score} "
+            f"| {main_issue} |"
         )
 
     summary = part2.get("summary", {})
@@ -295,44 +427,96 @@ def _render_report_text(
         "",
     ]
 
+    # 3.1 质量
     q = part3.get("quality", {})
+    qd = q.get("detail", {})
     lines += [
-        f"### 3.1 质量 — {'✓ 通过' if q.get('passed') else '✗ 未通过'}",
+        f"### 3.1 质量 -- {'OK 通过' if q.get('passed') else 'FAIL 未通过'}",
         f"- 标准: {q.get('standard', '')}",
-        f"- 平均分: {q.get('detail', {}).get('avg_score', 'N/A')}",
+        f"- 综合分: {qd.get('avg_score', 'N/A')}",
+        f"- 覆盖度: {qd.get('avg_coverage', 'N/A')} | 正确性: {qd.get('avg_correctness', 'N/A')} | "
+        f"约束: {qd.get('avg_constraint', 'N/A')} | 可行动: {qd.get('avg_actionability', 'N/A')}",
         "",
     ]
+    top_deductions = qd.get("top_deductions", [])
+    if top_deductions:
+        lines.append("**主要扣分项:**")
+        for d in top_deductions:
+            lines.append(
+                f"  - [{d.get('dimension', '')}] {d.get('points', 0)} 分: "
+                f"{d.get('reason', '')} -> 建议: {d.get('fix_suggestion', '')}"
+            )
+        lines.append("")
 
+    # 3.2 易用性
     u = part3.get("usability", {})
+    ud = u.get("detail", {})
     lines += [
-        f"### 3.2 易用性 — {'✓ 通过' if u.get('passed') else '✗ 未通过'}",
-        f"- 结构化手动输入数: {u.get('detail', {}).get('structured_input_count', 0)} (阈值: 5)",
+        f"### 3.2 易用性 -- {'OK 通过' if u.get('passed') else 'FAIL 未通过'}",
     ]
-    if u.get("detail", {}).get("suggestion"):
-        lines.append(f"- 建议: {u['detail']['suggestion']}")
+    if ud.get("input_burden_score") is not None:
+        lines += [
+            f"- 输入负担: {ud.get('input_burden_score', 0)} (阈值 60)",
+            f"- 首轮成功: {ud.get('first_turn_success_score', 0)} (阈值 70)",
+            f"- 精简度: {ud.get('compact_answer_score', 0)}",
+            f"- 安全精简: {ud.get('safe_compact_answer_score', 0)} (阈值 70)",
+        ]
+    if ud.get("reason"):
+        lines.append(f"- 原因: {ud['reason']}")
+    if ud.get("fix_suggestion"):
+        lines.append(f"- 建议: {ud['fix_suggestion']}")
     lines.append("")
 
+    # 3.3 反幻觉
     a = part3.get("anti_hallucination", {})
+    ad = a.get("detail", {})
     lines += [
-        f"### 3.3 大模型幻觉限制 — {'✓ 通过' if a.get('passed') else '✗ 未通过'}",
+        f"### 3.3 大模型幻觉限制 -- {'OK 通过' if a.get('passed') else 'FAIL 未通过'}",
     ]
-    for chk in a.get("detail", {}).get("checks", []):
-        icon = "✓" if chk.get("found") else "✗"
-        lines.append(f"  - {icon} {chk.get('check', '')}")
-    if a.get("detail", {}).get("suggestion"):
-        lines.append(f"- 建议: {a['detail']['suggestion']}")
+    # 关键词检查
+    lines.append("**关键词检查:**")
+    for chk in ad.get("keyword_checks", ad.get("checks", [])):
+        icon = "OK" if chk.get("found") else "FAIL"
+        lines.append(f"  - [{icon}] {chk.get('check', '')}")
+    # 行为验证
+    behavior_checks = ad.get("behavior_checks", [])
+    if behavior_checks:
+        lines.append("")
+        lines.append("**行为验证:**")
+        for bc in behavior_checks:
+            icon = "OK" if bc.get("passed") else "FAIL"
+            lines.append(f"  - [{icon}] 场景: {bc.get('prompt', '')[:50]}")
+            if not bc.get("passed") and bc.get("response_preview"):
+                lines.append(f"    - 模型回复: {bc['response_preview'][:100]}")
+    if ad.get("suggestion"):
+        lines.append(f"- 建议: {ad['suggestion']}")
     lines.append("")
 
+    # Top Issues + Fix Plan
+    top_issues = part3.get("top_issues", [])
+    fix_plan = part3.get("fix_plan", [])
+    if top_issues:
+        lines += ["### Top Issues", ""]
+        for i, issue in enumerate(top_issues, 1):
+            lines.append(f"  {i}. [{issue.get('source', '')}] {issue.get('reason', '')}")
+        lines.append("")
+    if fix_plan:
+        lines += ["### Fix Plan", ""]
+        for i, fix in enumerate(fix_plan, 1):
+            lines.append(f"  {i}. {fix}")
+        lines.append("")
+
+    # 最终判定
     fv = part3.get("final_verdict", {})
     lines += [
         "---",
         "",
         "## 最终判定",
         "",
-        f"- 质量: {'✓' if fv.get('quality_passed') else '✗'}",
-        f"- 易用性: {'✓' if fv.get('usability_passed') else '✗'}",
-        f"- 幻觉限制: {'✓' if fv.get('anti_hallucination_passed') else '✗'}",
-        f"- **可提交审批: {'✓ 是' if fv.get('approval_eligible') else '✗ 否'}**",
+        f"- 质量: {'OK' if fv.get('quality_passed') else 'FAIL'}",
+        f"- 易用性: {'OK' if fv.get('usability_passed') else 'FAIL'}",
+        f"- 幻觉限制: {'OK' if fv.get('anti_hallucination_passed') else 'FAIL'}",
+        f"- **可提交审批: {'OK 是' if fv.get('approval_eligible') else 'FAIL 否'}**",
     ]
 
     return "\n".join(lines)

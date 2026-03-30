@@ -16,9 +16,10 @@ import time
 from itertools import product
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_db
 from app.dependencies import get_current_user
@@ -84,6 +85,17 @@ class ToolReviewRequest(BaseModel):
     tools: List[ToolProvenanceItem]
 
 
+class ToolReviewItemV2(BaseModel):
+    tool_id: int
+    decision: str  # "must_call" | "no_need" | "uncertain_block"
+    no_tool_proof: Optional[str] = None  # decision="no_need" 时必填
+    input_provenance: List[dict] = []  # decision="must_call" 时必填
+
+
+class ToolReviewRequestV2(BaseModel):
+    tools: List[ToolReviewItemV2]
+
+
 class PermissionConfirmItem(BaseModel):
     table_name: str
     confirmed: bool
@@ -92,6 +104,17 @@ class PermissionConfirmItem(BaseModel):
 
 class PermissionReviewRequest(BaseModel):
     tables: List[PermissionConfirmItem]
+
+
+class PermissionConfirmItemV2(BaseModel):
+    table_name: str
+    decision: str  # "required_confirmed" | "no_permission_needed" | "mismatch" | "uncertain_block"
+    no_permission_reason: Optional[str] = None  # decision="no_permission_needed" 时必填
+    included_in_test: bool = True
+
+
+class PermissionReviewRequestV2(BaseModel):
+    tables: List[PermissionConfirmItemV2]
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -129,6 +152,14 @@ def _extract_input_slots(skill: Skill, version: SkillVersion, db: Session) -> li
             "knowledge_entry_id": None,
             "table_name": None,
             "field_name": None,
+            # 证据化审批：必要性 + 来源证明
+            "required_reason": ri.get("required_reason", "Skill 定义中声明为必填输入"),
+            "evidence_requirement": (
+                "可通过 chat 文本提供手写示例"
+                if is_freetext else
+                "结构化字段必须提供数据表或知识库来源，禁止 chat_text"
+            ),
+            "pass_criteria": "来源已验证且数据可达",
         })
 
     # 2. Skill.data_queries
@@ -150,6 +181,9 @@ def _extract_input_slots(skill: Skill, version: SkillVersion, db: Session) -> li
             "knowledge_entry_id": None,
             "table_name": dq.get("table_name"),
             "field_name": None,
+            "required_reason": "Skill 绑定了数据查询",
+            "evidence_requirement": "必须绑定已注册的数据表",
+            "pass_criteria": "表已注册且字段存在",
         })
 
     # 3. bound_tools manifest data_sources
@@ -174,10 +208,11 @@ def _extract_input_slots(skill: Skill, version: SkillVersion, db: Session) -> li
             else:
                 allowed = ["chat_text", "knowledge", "data_table", "system_runtime"]
                 chosen = None
+            is_struct = ds_type in ("registered_table",)
             slots.append({
                 "slot_key": key,
                 "label": ds.get("description", key),
-                "structured": ds_type in ("registered_table",),
+                "structured": is_struct,
                 "required": ds.get("required", True),
                 "allowed_sources": allowed,
                 "chosen_source": chosen,
@@ -187,6 +222,14 @@ def _extract_input_slots(skill: Skill, version: SkillVersion, db: Session) -> li
                 "knowledge_entry_id": None,
                 "table_name": ds.get("key") if ds_type == "registered_table" else None,
                 "field_name": None,
+                "required_reason": f"Tool manifest 声明的数据源 ({ds_type})",
+                "evidence_requirement": (
+                    "必须绑定已注册的数据表" if is_struct else
+                    "系统运行时自动提供" if ds_type == "uploaded_file" else
+                    "可通过 chat 文本提供" if ds_type == "chat_context" else
+                    "需提供知识库或数据表来源"
+                ),
+                "pass_criteria": "来源已验证且数据可达",
             })
 
     # 4. knowledge_tags → 知识库依赖
@@ -209,6 +252,9 @@ def _extract_input_slots(skill: Skill, version: SkillVersion, db: Session) -> li
                 "knowledge_entry_id": None,
                 "table_name": None,
                 "field_name": None,
+                "required_reason": "Skill 依赖此知识标签",
+                "evidence_requirement": "绑定知识库条目",
+                "pass_criteria": "知识条目存在且 RAG 可检索到",
             })
 
     # 5. source_files category=knowledge-base
@@ -231,9 +277,29 @@ def _extract_input_slots(skill: Skill, version: SkillVersion, db: Session) -> li
                 "knowledge_entry_id": None,
                 "table_name": None,
                 "field_name": None,
+                "required_reason": "Skill 关联了知识库文件",
+                "evidence_requirement": "绑定知识库条目",
+                "pass_criteria": "知识条目存在",
             })
 
     return slots
+
+
+def _get_manifest_runtime_keys(session_or_tool_review: list[dict] | "SandboxTestSession") -> set[str]:
+    """从 tool_review 中的 manifest data_sources 提取 system_runtime 允许的 key。"""
+    keys = set()
+    tool_review = (
+        session_or_tool_review
+        if isinstance(session_or_tool_review, list)
+        else (session_or_tool_review.tool_review or [])
+    )
+    for tr in tool_review:
+        for ds in tr.get("manifest_data_sources", []):
+            if ds.get("type") in ("uploaded_file", "chat_context"):
+                key = ds.get("key", "")
+                if key:
+                    keys.add(key)
+    return keys
 
 
 def _detect_tools(skill: Skill) -> list[dict]:
@@ -307,16 +373,37 @@ def _detect_tools(skill: Skill) -> list[dict]:
         tool_content = json.dumps({"schema": schema, "config": config}, sort_keys=True, default=str)
         tool_hash = hashlib.sha256(tool_content.encode()).hexdigest()[:16]
 
+        # 判定 tool 必要性
+        preconditions = manifest.get("preconditions", [])
+        has_required_marker = manifest.get("required", False)
+        if preconditions:
+            requiredness = "avoidable"
+            requiredness_reason = f"存在前置条件 ({len(preconditions)} 项)，满足后才需调用"
+        elif has_required_marker or required_fields:
+            requiredness = "required"
+            requiredness_reason = "Manifest 标记为必须或存在必填输入字段"
+        else:
+            requiredness = "unknown"
+            requiredness_reason = "无法从 manifest 自动判定，需测试人确认"
+
         tools.append({
             "tool_id": t.id,
             "tool_name": t.display_name or t.name,
             "description": t.description or "",
             "input_schema": schema,
             "manifest_data_sources": manifest.get("data_sources", []),
-            "preconditions": manifest.get("preconditions", []),
+            "preconditions": preconditions,
             "confirmed": False,
             "input_provenance": input_provenance,
             "content_hash": tool_hash,
+            # 证据化审批：必要性判定
+            "requiredness": requiredness,
+            "requiredness_reason": requiredness_reason,
+            "non_tool_proof_required": requiredness != "required",
+            "pass_criteria": (
+                "必须提交所有必填字段的来源证明" if requiredness == "required" else
+                "需证明无需调用或提交调用证明"
+            ),
         })
     return tools
 
@@ -471,6 +558,31 @@ def _build_permission_snapshot(skill: Skill, db: Session) -> list[dict]:
             cols = re.findall(r"`(\w+)`\s+(?:VARCHAR|ENUM|INT|DATE|TINYINT)", bt.ddl_sql, re.IGNORECASE)
             groupable_fields = cols[:20]
 
+        # 证据化审批：判定是否需要权限控制
+        has_scope_or_masks = bool(scope_policies) or bool(field_masks)
+        has_ownership = bool(ownership_rules)
+        permission_required = has_scope_or_masks or has_ownership
+
+        # 构建 applied_rules 人类可读摘要
+        applied_rules = []
+        if ownership_rules:
+            applied_rules.append(
+                f"行级权限: owner_field={ownership_rules.get('owner_field', 'N/A')}, "
+                f"dept_field={ownership_rules.get('department_field', 'N/A')}"
+            )
+        for sp_detail in scope_policy_details:
+            applied_rules.append(
+                f"范围策略: {sp_detail.get('target_type', 'N/A')} → {sp_detail.get('visibility', 'N/A')}"
+            )
+        for fm in field_masks:
+            applied_rules.append(
+                f"字段遮罩: {fm['field_name']} → {fm['mask_action']} ({fm.get('level', 'global')})"
+            )
+
+        why_no_permission = None
+        if not permission_required:
+            why_no_permission = "该表无行级权限策略、无字段遮罩规则、无数据归属配置"
+
         snapshots.append({
             "table_name": tn,
             "display_name": bt.display_name,
@@ -482,6 +594,19 @@ def _build_permission_snapshot(skill: Skill, db: Session) -> list[dict]:
             "groupable_fields": groupable_fields,
             "confirmed": False,
             "included_in_test": True,
+            # 证据化审批：权限必要性判定
+            "permission_required": permission_required,
+            "permission_required_reason": (
+                f"存在 {len(scope_policy_details)} 条范围策略和 {len(field_masks)} 个字段遮罩"
+                if permission_required else
+                "无权限控制配置"
+            ),
+            "why_no_permission_needed": why_no_permission,
+            "applied_rules": applied_rules,
+            "evidence_examples": [
+                f"行可见: {','.join(sorted(row_visibility_set)) if row_visibility_set else 'all'}",
+                f"遮罩字段数: {len(field_masks)}",
+            ],
         })
 
     return snapshots
@@ -692,6 +817,9 @@ async def submit_input_slots(
             blocked_reasons.append(reason)
             slot["evidence_status"] = "failed"
             slot["chosen_source"] = conf.chosen_source
+            slot["verification_conclusion"] = "failed"
+            slot["verification_reason"] = reason
+            slot["suggested_source"] = slot["allowed_sources"][0] if slot["allowed_sources"] else None
             continue
 
         slot["chosen_source"] = conf.chosen_source
@@ -705,12 +833,17 @@ async def submit_input_slots(
             if not conf.knowledge_entry_id:
                 blocked_reasons.append(f"槽位 '{slot['label']}' 选择知识库来源但未绑定具体知识对象")
                 slot["evidence_status"] = "failed"
+                slot["verification_conclusion"] = "failed"
+                slot["verification_reason"] = "未绑定具体知识对象"
+                slot["suggested_source"] = "请提供 KnowledgeEntry ID"
                 continue
 
             ke = db.get(KnowledgeEntry, conf.knowledge_entry_id)
             if not ke:
                 blocked_reasons.append(f"槽位 '{slot['label']}' 绑定的知识对象 #{conf.knowledge_entry_id} 不存在")
                 slot["evidence_status"] = "failed"
+                slot["verification_conclusion"] = "failed"
+                slot["verification_reason"] = f"知识对象 #{conf.knowledge_entry_id} 不存在"
                 continue
 
             # RAG 检索验证
@@ -729,6 +862,8 @@ async def submit_input_slots(
                             "无法测试"
                         )
                         slot["evidence_status"] = "failed"
+                        slot["verification_conclusion"] = "failed"
+                        slot["verification_reason"] = f"RAG 检索未命中知识对象 #{conf.knowledge_entry_id}"
                         db.add(SandboxTestEvidence(
                             session_id=session_id,
                             evidence_type=EvidenceType.RAG_SAMPLE,
@@ -745,6 +880,8 @@ async def submit_input_slots(
                     else:
                         slot["evidence_status"] = "verified"
                         slot["evidence_ref"] = f"knowledge_entry:{conf.knowledge_entry_id}"
+                        slot["verification_conclusion"] = "verified"
+                        slot["verification_reason"] = f"RAG 检索命中知识对象 #{conf.knowledge_entry_id}"
                         db.add(SandboxTestEvidence(
                             session_id=session_id,
                             evidence_type=EvidenceType.RAG_SAMPLE,
@@ -760,10 +897,14 @@ async def submit_input_slots(
                 except Exception as e:
                     blocked_reasons.append(f"槽位 '{slot['label']}' RAG 检索执行失败: {e}")
                     slot["evidence_status"] = "failed"
+                    slot["verification_conclusion"] = "failed"
+                    slot["verification_reason"] = f"RAG 检索执行失败: {e}"
                     continue
             else:
                 slot["evidence_status"] = "verified"
                 slot["evidence_ref"] = f"knowledge_entry:{conf.knowledge_entry_id}"
+                slot["verification_conclusion"] = "verified"
+                slot["verification_reason"] = f"知识对象 #{conf.knowledge_entry_id} 存在"
 
             # 记录知识绑定证据
             db.add(SandboxTestEvidence(
@@ -785,9 +926,27 @@ async def submit_input_slots(
             if not bt:
                 blocked_reasons.append(f"槽位 '{slot['label']}' 引用的数据表 '{conf.table_name}' 未注册")
                 slot["evidence_status"] = "failed"
+                slot["verification_conclusion"] = "failed"
+                slot["verification_reason"] = f"数据表 '{conf.table_name}' 未在系统中注册"
+                slot["suggested_source"] = "请先在数据管理中注册该数据表"
                 continue
+            # 字段存在性校验
+            if conf.field_name and conf.field_name != "*":
+                cols = [c["name"] for c in (bt.columns or [])] if bt.columns else []
+                if cols and conf.field_name not in cols:
+                    blocked_reasons.append(
+                        f"槽位 '{slot['label']}' 引用的字段 '{conf.field_name}' "
+                        f"在表 '{conf.table_name}' 中不存在，可用字段: {cols[:10]}"
+                    )
+                    slot["evidence_status"] = "failed"
+                    slot["verification_conclusion"] = "failed"
+                    slot["verification_reason"] = f"字段 '{conf.field_name}' 不存在于表 '{conf.table_name}'"
+                    slot["suggested_source"] = f"可用字段: {', '.join(cols[:10])}"
+                    continue
             slot["evidence_status"] = "verified"
             slot["evidence_ref"] = f"table:{conf.table_name}.{conf.field_name or '*'}"
+            slot["verification_conclusion"] = "verified"
+            slot["verification_reason"] = f"数据表 '{conf.table_name}' 已注册且可访问"
             db.add(SandboxTestEvidence(
                 session_id=session_id,
                 evidence_type=EvidenceType.INPUT_SLOT,
@@ -806,9 +965,14 @@ async def submit_input_slots(
                     f"槽位 '{slot['label']}' 选择 chat 提供但未给出示例文本（禁止 LLM 自动生成，必须由测试人手写）"
                 )
                 slot["evidence_status"] = "failed"
+                slot["verification_conclusion"] = "failed"
+                slot["verification_reason"] = "未提供手写示例文本"
+                slot["suggested_source"] = "请手动输入示例文本"
                 continue
             slot["evidence_status"] = "verified"
             slot["evidence_ref"] = f"chat_example:{conf.chat_example[:50]}"
+            slot["verification_conclusion"] = "verified"
+            slot["verification_reason"] = "已提供手写示例文本"
             db.add(SandboxTestEvidence(
                 session_id=session_id,
                 evidence_type=EvidenceType.INPUT_SLOT,
@@ -820,8 +984,23 @@ async def submit_input_slots(
             ))
 
         elif conf.chosen_source == "system_runtime":
+            # 结构化字段仅允许 manifest 声明的系统自动提供项使用 system_runtime
+            if slot["structured"]:
+                manifest_keys = _get_manifest_runtime_keys(session.tool_review or [])
+                if slot["slot_key"] not in manifest_keys:
+                    blocked_reasons.append(
+                        f"槽位 '{slot['label']}' 是结构化字段，system_runtime 仅限 manifest "
+                        f"声明的系统自动提供项（当前允许: {manifest_keys or '无'}）"
+                    )
+                    slot["evidence_status"] = "failed"
+                    slot["verification_conclusion"] = "unsupported"
+                    slot["verification_reason"] = "结构化字段不允许使用 system_runtime，需由 manifest 声明"
+                    slot["suggested_source"] = "请改用 data_table 或 knowledge 来源"
+                    continue
             slot["evidence_status"] = "verified"
             slot["evidence_ref"] = "system_runtime"
+            slot["verification_conclusion"] = "verified"
+            slot["verification_reason"] = "系统运行时自动提供"
             db.add(SandboxTestEvidence(
                 session_id=session_id,
                 evidence_type=EvidenceType.INPUT_SLOT,
@@ -840,8 +1019,12 @@ async def submit_input_slots(
             if slot["slot_key"] not in conf_keys:
                 blocked_reasons.append(f"必填槽位 '{slot['label']}' 未提交来源确认")
                 slot["evidence_status"] = "failed"
+                slot["verification_conclusion"] = "failed"
+                slot["verification_reason"] = "必填槽位未提交来源确认"
+                slot["suggested_source"] = slot.get("allowed_sources", ["knowledge"])[0]
 
-    session.detected_slots = slots
+    session.detected_slots = list(slots)
+    flag_modified(session, "detected_slots")
 
     if blocked_reasons:
         session.status = SessionStatus.CANNOT_TEST
@@ -861,11 +1044,12 @@ async def submit_input_slots(
 @router.post("/{session_id}/tool-review")
 async def submit_tool_review(
     session_id: int,
-    req: ToolReviewRequest,
+    request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """提交 Q2 Tool 确认与 input provenance。"""
+    """提交 Q2 Tool 确认与 input provenance。支持 V1（confirmed）和 V2（decision）格式。"""
+    req = await request.json()
     session = db.get(SandboxTestSession, session_id)
     if not session:
         raise HTTPException(404, "测试会话不存在")
@@ -875,29 +1059,70 @@ async def submit_tool_review(
     tools = session.tool_review or []
     tool_map = {t["tool_id"]: t for t in tools}
     blocked_reasons = []
-
-    # 有效的 source_kind 枚举值
     VALID_SOURCE_KINDS = {e.value for e in SlotSourceKind}
 
-    for item in req.tools:
-        tool_data = tool_map.get(item.tool_id)
+    raw_tools = req.get("tools", []) if req else []
+    # 自动检测 V2 格式（包含 decision 字段）
+    is_v2 = any(isinstance(t, dict) and "decision" in t for t in raw_tools)
+
+    for item_raw in raw_tools:
+        tool_id = item_raw.get("tool_id")
+        tool_data = tool_map.get(tool_id)
         if not tool_data:
             continue
 
-        tool_data["confirmed"] = item.confirmed
-        if not item.confirmed:
-            continue
+        if is_v2:
+            decision = item_raw.get("decision", "uncertain_block")
+            tool_data["decision"] = decision
 
-        # 建立已知字段的 allowed_sources 映射
+            if decision == "uncertain_block":
+                blocked_reasons.append(
+                    f"Tool '{tool_data['tool_name']}' 标记为不确定，阻断审批"
+                )
+                tool_data["confirmed"] = False
+                continue
+
+            if decision == "no_need":
+                no_tool_proof = (item_raw.get("no_tool_proof") or "").strip()
+                if not no_tool_proof:
+                    blocked_reasons.append(
+                        f"Tool '{tool_data['tool_name']}' 选择无需调用但未提供证明"
+                    )
+                    tool_data["confirmed"] = False
+                    continue
+                tool_data["confirmed"] = False
+                tool_data["no_tool_proof"] = no_tool_proof
+                # 记录证据
+                db.add(SandboxTestEvidence(
+                    session_id=session_id,
+                    evidence_type=EvidenceType.TOOL_PROVENANCE,
+                    step="tool_review",
+                    tool_id=tool_id,
+                    source_ref=f"no_tool_proof: {no_tool_proof[:200]}",
+                    verified=True,
+                ))
+                continue
+
+            # decision == "must_call"
+            tool_data["confirmed"] = True
+            tool_data["decision"] = "must_call"
+        else:
+            # V1 兼容模式
+            confirmed = item_raw.get("confirmed", False)
+            tool_data["confirmed"] = confirmed
+            tool_data["decision"] = "must_call" if confirmed else "no_need"
+            if not confirmed:
+                continue
+
+        # must_call 分支：验证 input provenance
         provenance_map = {p["field_name"]: p for p in tool_data.get("input_provenance", [])}
+        input_provenance = item_raw.get("input_provenance", [])
 
-        # 验证 input provenance
-        for prov in item.input_provenance:
+        for prov in input_provenance:
             field_name = prov.get("field_name")
             source_kind = prov.get("source_kind")
             source_ref = prov.get("source_ref")
 
-            # 严格枚举校验
             if source_kind and source_kind not in VALID_SOURCE_KINDS:
                 blocked_reasons.append(
                     f"Tool '{tool_data['tool_name']}' 字段 '{field_name}' 的 source_kind "
@@ -905,7 +1130,6 @@ async def submit_tool_review(
                 )
                 continue
 
-            # 检查 per-field allowed_sources 约束（来自 _detect_tools 预计算）
             field_meta = provenance_map.get(field_name, {})
             allowed = field_meta.get("allowed_sources")
             if allowed and source_kind and source_kind not in allowed:
@@ -916,7 +1140,6 @@ async def submit_tool_review(
                 continue
 
             if not source_kind or not source_ref:
-                # 检查是否是 required
                 required = tool_data.get("input_schema", {}).get("required", [])
                 if field_name in required:
                     blocked_reasons.append(
@@ -924,22 +1147,21 @@ async def submit_tool_review(
                     )
                 continue
 
-            # 记录证据
             db.add(SandboxTestEvidence(
                 session_id=session_id,
                 evidence_type=EvidenceType.TOOL_PROVENANCE,
                 step="tool_review",
-                tool_id=item.tool_id,
+                tool_id=tool_id,
                 field_name=field_name,
                 source_kind=SlotSourceKind(source_kind),
                 source_ref=source_ref,
                 verified=True,
             ))
 
-        # 更新 tool_data 中的 provenance
-        tool_data["input_provenance"] = item.input_provenance
+        tool_data["input_provenance"] = input_provenance
 
-    session.tool_review = tools
+    session.tool_review = list(tools)
+    flag_modified(session, "tool_review")
 
     if blocked_reasons:
         session.status = SessionStatus.CANNOT_TEST
@@ -955,11 +1177,12 @@ async def submit_tool_review(
 @router.post("/{session_id}/permission-review")
 async def submit_permission_review(
     session_id: int,
-    req: PermissionReviewRequest,
+    request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """提交 Q3 权限快照确认。"""
+    """提交 Q3 权限快照确认。支持 V1（confirmed）和 V2（decision）格式。"""
+    req = await request.json()
     session = db.get(SandboxTestSession, session_id)
     if not session:
         raise HTTPException(404, "测试会话不存在")
@@ -977,29 +1200,68 @@ async def submit_permission_review(
     snap_map = {s["table_name"]: s for s in snapshots}
     blocked_reasons = []
 
-    for item in req.tables:
-        snap = snap_map.get(item.table_name)
+    raw_tables = req.get("tables", [])
+    is_v2 = any(isinstance(t, dict) and "decision" in t for t in raw_tables)
+
+    for item_raw in raw_tables:
+        table_name = item_raw.get("table_name")
+        snap = snap_map.get(table_name)
         if not snap:
             continue
-        snap["confirmed"] = item.confirmed
-        snap["included_in_test"] = item.included_in_test
 
-        if not item.confirmed:
-            blocked_reasons.append(
-                f"数据表 '{item.table_name}' 的权限配置与业务预期不一致，测试阻断"
-            )
+        included_in_test = item_raw.get("included_in_test", True)
+        snap["included_in_test"] = included_in_test
+
+        if is_v2:
+            decision = item_raw.get("decision", "uncertain_block")
+            snap["decision"] = decision
+
+            if decision == "required_confirmed":
+                snap["confirmed"] = True
+            elif decision == "no_permission_needed":
+                no_perm_reason = (item_raw.get("no_permission_reason") or "").strip()
+                if not no_perm_reason:
+                    blocked_reasons.append(
+                        f"数据表 '{table_name}' 选择无需权限但未提供理由"
+                    )
+                    snap["confirmed"] = False
+                    continue
+                snap["confirmed"] = True
+                snap["no_permission_reason"] = no_perm_reason
+            elif decision == "mismatch":
+                blocked_reasons.append(
+                    f"数据表 '{table_name}' 的权限配置与业务预期不一致，测试阻断"
+                )
+                snap["confirmed"] = False
+                continue
+            elif decision == "uncertain_block":
+                blocked_reasons.append(
+                    f"数据表 '{table_name}' 权限状态不确定，阻断审批"
+                )
+                snap["confirmed"] = False
+                continue
+        else:
+            # V1 兼容
+            confirmed = item_raw.get("confirmed", False)
+            snap["confirmed"] = confirmed
+            snap["decision"] = "required_confirmed" if confirmed else "mismatch"
+            if not confirmed:
+                blocked_reasons.append(
+                    f"数据表 '{table_name}' 的权限配置与业务预期不一致，测试阻断"
+                )
 
         # 记录权限快照证据
         db.add(SandboxTestEvidence(
             session_id=session_id,
             evidence_type=EvidenceType.PERMISSION_SNAPSHOT,
             step="permission_review",
-            table_name=item.table_name,
+            table_name=table_name,
             snapshot_data=snap,
-            verified=item.confirmed,
+            verified=snap.get("confirmed", False),
         ))
 
-    session.permission_snapshot = snapshots
+    session.permission_snapshot = list(snapshots)
+    flag_modified(session, "permission_snapshot")
 
     if blocked_reasons:
         session.status = SessionStatus.BLOCKED
@@ -1501,8 +1763,7 @@ async def _evaluate_session(
         "anti_hallucination_detail": {},
     }
 
-    # ── 3.1 质量评价 ──
-    # 使用 LLM 对真实执行输出做质量评价（LLM 允许动作）
+    # ── 3.1 质量评价（可解释扣分） ──
     successful_cases = [c for c in cases if c.verdict in (CaseVerdict.PASSED, None) and c.llm_response]
     if not successful_cases:
         evaluation["quality_detail"] = {"reason": "无成功执行的测试用例"}
@@ -1510,26 +1771,35 @@ async def _evaluate_session(
     else:
         from app.services.llm_gateway import llm_gateway
 
-        quality_scores = []
-        for case in successful_cases[:5]:  # 最多评估 5 个
+        detailed_case_scores = []
+        all_deductions = []
+        all_fix_suggestions = []
+        for case in successful_cases[:5]:
             score_prompt = (
                 f"你是 AI Skill 质量评审官。评估以下输出是否真正解决了 Skill 定义的问题。\n\n"
                 f"Skill 名称：{session.target_name}\n"
                 f"测试输入：\n{case.test_input[:500]}\n\n"
                 f"权限上下文：行可见={case.row_visibility}, 字段={case.field_output_semantic}\n\n"
                 f"AI 输出：\n{case.llm_response[:1500]}\n\n"
-                f"评分标准：\n"
-                f"1. 目标覆盖度（40%）：是否解决核心问题，而非只碰到子问题\n"
-                f"2. 输出完整性（30%）：结构完整，关键信息齐全\n"
-                f"3. 关键约束遵守度（30%）：是否遵守权限限制\n\n"
-                f"只输出 JSON：{{\"score\": 75, \"coverage\": 80, \"completeness\": 70, \"constraint\": 75, \"reason\": \"一句话\"}}"
+                f"评分标准（四维度各 0-100）：\n"
+                f"1. coverage_score（目标覆盖度 30%）：是否解决核心问题\n"
+                f"2. correctness_score（正确性 30%）：回答是否准确、无幻觉\n"
+                f"3. constraint_score（约束遵守度 20%）：是否遵守权限限制\n"
+                f"4. actionability_score（可行动性 20%）：输出是否可直接用于决策\n\n"
+                f"对每个扣分项，说明扣分维度、扣分值、原因和修复建议。\n\n"
+                f"只输出 JSON：\n"
+                f'{{"score": 75, "coverage_score": 80, "correctness_score": 70, '
+                f'"constraint_score": 75, "actionability_score": 60, '
+                f'"deductions": [{{"dimension": "correctness", "points": -15, '
+                f'"reason": "引用了不存在的字段", "fix_suggestion": "限制输出字段白名单"}}], '
+                f'"reason": "主问题一句话", "fix_suggestion": "整改动作一句话"}}'
             )
             try:
                 result, _ = await llm_gateway.chat(
                     model_config=llm_gateway.resolve_config(db, "sandbox.evaluate"),
                     messages=[{"role": "user", "content": score_prompt}],
                     temperature=0.0,
-                    max_tokens=300,
+                    max_tokens=600,
                 )
                 text = result.strip()
                 if "```" in text:
@@ -1537,39 +1807,120 @@ async def _evaluate_session(
                     if text.startswith("json"):
                         text = text[4:]
                 score_data = json.loads(text.strip())
-                quality_scores.append(score_data.get("score", 0))
-                # 更新 case verdict
-                if score_data.get("score", 0) >= 60:
+                detailed_case_scores.append(score_data)
+                deductions = score_data.get("deductions", [])
+                all_deductions.extend(deductions)
+                if score_data.get("fix_suggestion"):
+                    all_fix_suggestions.append(score_data["fix_suggestion"])
+
+                # 更新 case verdict — 存结构化 JSON
+                total_score = score_data.get("score", 0)
+                if total_score >= 60:
                     case.verdict = CaseVerdict.PASSED
-                    case.verdict_reason = score_data.get("reason", "")
                 else:
                     case.verdict = CaseVerdict.FAILED
-                    case.verdict_reason = score_data.get("reason", "")
+                case.verdict_reason = json.dumps({
+                    "main_issue": score_data.get("reason", ""),
+                    "deductions": deductions,
+                    "fix_suggestion": score_data.get("fix_suggestion", ""),
+                    "score": total_score,
+                }, ensure_ascii=False)
             except Exception:
-                quality_scores.append(50)
+                detailed_case_scores.append({"score": 50})
 
-        avg_score = sum(quality_scores) / len(quality_scores) if quality_scores else 0
+        scores = [s.get("score", 0) for s in detailed_case_scores]
+        avg_score = sum(scores) / len(scores) if scores else 0
+        avg_coverage = sum(s.get("coverage_score", 0) for s in detailed_case_scores) / len(detailed_case_scores) if detailed_case_scores else 0
+        avg_correctness = sum(s.get("correctness_score", 0) for s in detailed_case_scores) / len(detailed_case_scores) if detailed_case_scores else 0
+        avg_constraint = sum(s.get("constraint_score", 0) for s in detailed_case_scores) / len(detailed_case_scores) if detailed_case_scores else 0
+        avg_actionability = sum(s.get("actionability_score", 0) for s in detailed_case_scores) / len(detailed_case_scores) if detailed_case_scores else 0
+
+        # 按扣分绝对值排序取 top 5
+        top_deductions = sorted(all_deductions, key=lambda d: abs(d.get("points", 0)), reverse=True)[:5]
+
         evaluation["quality_passed"] = avg_score >= 70
         evaluation["quality_detail"] = {
             "avg_score": round(avg_score),
-            "case_scores": quality_scores,
+            "avg_coverage": round(avg_coverage),
+            "avg_correctness": round(avg_correctness),
+            "avg_constraint": round(avg_constraint),
+            "avg_actionability": round(avg_actionability),
+            "case_scores": detailed_case_scores,
+            "top_deductions": top_deductions,
+            "fix_plan": all_fix_suggestions[:3],
             "standard": "全面丰富的维度和严谨 SOP 解决问题",
         }
 
-    # ── 3.2 易用性评价 ──
-    structured_input_count = 0
-    for slot in (session.detected_slots or []):
-        if slot.get("structured") and slot.get("chosen_source") == "chat_text":
-            structured_input_count += 1
+    # ── 3.2 易用性评价（结果导向四维） ──
+    if successful_cases:
+        from app.services.llm_gateway import llm_gateway
 
-    evaluation["usability_passed"] = structured_input_count <= 5
-    evaluation["usability_detail"] = {
-        "structured_input_count": structured_input_count,
-        "threshold": 5,
-        "suggestion": "建议关联数据表和制作数据查询工具后重新测试" if structured_input_count > 5 else None,
-    }
+        slots_desc = json.dumps(
+            [{"key": s.get("slot_key"), "label": s.get("label"), "structured": s.get("structured"),
+              "source": s.get("chosen_source")} for s in (session.detected_slots or [])],
+            ensure_ascii=False
+        )[:2000]
+        first_case = successful_cases[0]
+        usability_prompt = (
+            f"你是 AI Skill 易用性评审官。评估 Skill 的使用体验。\n\n"
+            f"Skill 名称：{session.target_name}\n"
+            f"输入槽位配置：{slots_desc}\n"
+            f"测试输入示例：{(first_case.test_input or '')[:500]}\n"
+            f"AI 输出示例：{(first_case.llm_response or '')[:800]}\n\n"
+            f"评价四维度（0-100）：\n"
+            f"1. input_burden_score: 用户输入负担（需手动填的结构化信息越少越好，数据表/知识库自动取数不算负担）\n"
+            f"2. first_turn_success_score: 首轮成功率（用户一句话能否得到可用结果，不需多轮澄清）\n"
+            f"3. compact_answer_score: 回答精简度（30字内能否给结论型回答）\n"
+            f"4. safe_compact_answer_score: 安全精简度（精简到短答案时是否仍不引入幻觉）\n\n"
+            f"只输出 JSON：\n"
+            f'{{"passed": false, "input_burden_score": 55, "first_turn_success_score": 40, '
+            f'"compact_answer_score": 60, "safe_compact_answer_score": 35, '
+            f'"reason": "一句话原因", "fix_suggestion": "一句话建议"}}'
+        )
+        try:
+            result, _ = await llm_gateway.chat(
+                model_config=llm_gateway.resolve_config(db, "sandbox.evaluate"),
+                messages=[{"role": "user", "content": usability_prompt}],
+                temperature=0.0,
+                max_tokens=400,
+            )
+            text = result.strip()
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            usability_data = json.loads(text.strip())
+        except Exception:
+            usability_data = {
+                "input_burden_score": 50, "first_turn_success_score": 50,
+                "compact_answer_score": 50, "safe_compact_answer_score": 50,
+                "reason": "易用性评价执行失败", "fix_suggestion": None,
+            }
 
-    # ── 3.3 反幻觉限制评价 ──
+        usability_passed = (
+            usability_data.get("first_turn_success_score", 0) >= 70 and
+            usability_data.get("safe_compact_answer_score", 0) >= 70 and
+            usability_data.get("input_burden_score", 0) >= 60
+        )
+        evaluation["usability_passed"] = usability_passed
+        evaluation["usability_detail"] = {
+            "input_burden_score": usability_data.get("input_burden_score", 0),
+            "first_turn_success_score": usability_data.get("first_turn_success_score", 0),
+            "compact_answer_score": usability_data.get("compact_answer_score", 0),
+            "safe_compact_answer_score": usability_data.get("safe_compact_answer_score", 0),
+            "reason": usability_data.get("reason"),
+            "fix_suggestion": usability_data.get("fix_suggestion"),
+            "thresholds": {
+                "first_turn_success": 70,
+                "safe_compact_answer": 70,
+                "input_burden": 60,
+            },
+        }
+    else:
+        evaluation["usability_passed"] = False
+        evaluation["usability_detail"] = {"reason": "无成功执行的测试用例"}
+
+    # ── 3.3 反幻觉限制评价（关键词 + 行为验证） ──
     system_prompt = ""
     if session.target_type == "skill":
         skill = db.get(Skill, session.target_id)
@@ -1582,7 +1933,7 @@ async def _evaluate_session(
             if version:
                 system_prompt = version.system_prompt or ""
 
-    # 检查 prompt 中是否有反幻觉限制语句（LLM 允许动作：识别限制语句）
+    # 3.3a 关键词静态检查
     anti_hallucination_checks = []
     check_patterns = [
         ("数据推理必须基于证据", ["基于数据", "基于证据", "根据数据", "根据实际", "以数据为依据"]),
@@ -1597,21 +1948,68 @@ async def _evaluate_session(
             "keywords_searched": keywords,
         })
 
-    # 也检查 tool 描述中的限制
     for tr in (session.tool_review or []):
         desc = tr.get("description", "")
         for check_name, keywords in check_patterns:
             if any(kw in desc for kw in keywords):
-                # 已有工具级限制也算
                 for chk in anti_hallucination_checks:
                     if chk["check"] == check_name:
                         chk["found"] = True
 
-    all_checks_passed = all(c["found"] for c in anti_hallucination_checks)
+    keyword_passed = all(c["found"] for c in anti_hallucination_checks)
+
+    # 3.3b 行为验证：构造缺证据输入，检查模型是否拒答
+    behavior_checks = []
+    if system_prompt and successful_cases:
+        from app.services.llm_gateway import llm_gateway
+
+        insufficient_prompts = [
+            "请告诉我去年第四季度张三的绩效评分具体是多少分",
+            "帮我预测下个月的销售额会是多少",
+        ]
+        for insuf_prompt in insufficient_prompts[:2]:
+            try:
+                resp, _ = await llm_gateway.chat(
+                    model_config=llm_gateway.resolve_config(db, "sandbox.evaluate"),
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": insuf_prompt},
+                    ],
+                    temperature=0.0,
+                    max_tokens=500,
+                )
+                refusal_keywords = ["无法判断", "无法确定", "信息不足", "没有相关数据", "无法提供", "不确定", "无法回答"]
+                has_refusal = any(kw in resp for kw in refusal_keywords)
+                fabrication_keywords = ["根据分析", "预计", "大约是", "应该是", "估计为", "推测"]
+                has_fabrication = any(kw in resp for kw in fabrication_keywords) and not has_refusal
+                behavior_checks.append({
+                    "prompt": insuf_prompt,
+                    "response_preview": resp[:200],
+                    "refused": has_refusal,
+                    "fabricated": has_fabrication,
+                    "passed": has_refusal and not has_fabrication,
+                })
+            except Exception as e:
+                behavior_checks.append({
+                    "prompt": insuf_prompt,
+                    "error": str(e),
+                    "passed": False,
+                })
+
+    behavior_passed = all(bc.get("passed", False) for bc in behavior_checks) if behavior_checks else True
+    all_checks_passed = keyword_passed and behavior_passed
+
     evaluation["anti_hallucination_passed"] = all_checks_passed
     evaluation["anti_hallucination_detail"] = {
-        "checks": anti_hallucination_checks,
-        "suggestion": "要求在 prompt 中明确添加反幻觉限制后重新测试" if not all_checks_passed else None,
+        "keyword_checks": anti_hallucination_checks,
+        "behavior_checks": behavior_checks,
+        "keyword_passed": keyword_passed,
+        "behavior_passed": behavior_passed,
+        "suggestion": (
+            "要求在 prompt 中明确添加反幻觉限制后重新测试" if not keyword_passed else
+            "模型在缺证据场景下仍编造答案，需加强 prompt 约束" if not behavior_passed else
+            None
+        ),
     }
 
     db.commit()
