@@ -2080,17 +2080,33 @@ async def analyze_project(
 def _user_opencode_cwd(user_id: int) -> Optional[str]:
     """尝试从运行中的 opencode 实例获取其实际 CWD（Linux /proc）。
     用于确保文件管理器和 opencode 看到同一个目录。
+
+    路径 1：inst 里有 proc 对象 → 直接读 /proc/<pid>/cwd
+    路径 2：后端重启后 proc 为 None，但端口上有旧进程 → lsof 找 PID 再读 cwd
     """
     inst = _user_instances.get(user_id)
-    if not inst:
-        return None
-    proc = inst.get("proc")
-    if proc is None or proc.returncode is not None:
-        return None
+
+    # 路径 1：有 proc 对象
+    if inst:
+        proc = inst.get("proc")
+        if proc is not None and proc.returncode is None:
+            try:
+                cwd = os.readlink(f"/proc/{proc.pid}/cwd")
+                if os.path.isdir(cwd):
+                    return cwd
+            except Exception:
+                pass
+
+    # 路径 2：通过端口找进程 PID
+    port = _port_for_user(user_id)
     try:
-        cwd = os.readlink(f"/proc/{proc.pid}/cwd")
-        if os.path.isdir(cwd):
-            return cwd
+        import subprocess as _sp
+        result = _sp.run(["lsof", "-ti", f":{port}"], capture_output=True, text=True, timeout=3)
+        for pid_str in result.stdout.strip().split('\n'):
+            if pid_str.strip().isdigit():
+                cwd = os.readlink(f"/proc/{pid_str.strip()}/cwd")
+                if os.path.isdir(cwd):
+                    return cwd
     except Exception:
         pass
     return None
