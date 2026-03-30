@@ -147,6 +147,9 @@ def _employee_draft_count(db: Session, user_id: int) -> int:
 
 def _user_can_see(ws: Workspace, user: User) -> bool:
     """Can user see this workspace?"""
+    # 系统预置工作台对所有登录用户可见
+    if ws.workspace_type == "skill_studio" and ws.is_active:
+        return True
     if ws.status == WorkspaceStatus.PUBLISHED and ws.is_active:
         if ws.visibility == "all":
             return True

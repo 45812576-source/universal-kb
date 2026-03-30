@@ -12,6 +12,14 @@ _LARK_API_BASE = "https://open.feishu.cn/open-apis"
 _TOKEN_CACHE: dict = {}  # Simple in-memory cache
 
 
+class LarkConfigError(Exception):
+    """飞书应用配置缺失（LARK_APP_ID / LARK_APP_SECRET 未配置）"""
+
+
+class LarkAuthError(Exception):
+    """飞书租户 token 获取失败（应用配置错误、secret 错误等）"""
+
+
 class LarkClient:
 
     def __init__(self):
@@ -26,6 +34,8 @@ class LarkClient:
     async def get_tenant_access_token(self) -> str:
         """Get or refresh tenant access token."""
         self._load_config()
+        if not self._app_id or not self._app_secret:
+            raise LarkConfigError("飞书集成尚未配置，请联系管理员")
         import time
 
         cache_key = self._app_id
@@ -41,7 +51,7 @@ class LarkClient:
             resp.raise_for_status()
             data = resp.json()
             if data.get("code") != 0:
-                raise RuntimeError(f"Lark auth failed: {data.get('msg')}")
+                raise LarkAuthError(f"飞书认证失败: {data.get('msg')}")
 
             token = data["tenant_access_token"]
             expires_in = data.get("expire", 7200)

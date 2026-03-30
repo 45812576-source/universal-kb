@@ -11,6 +11,7 @@ from app.models.business import BusinessTable, DataOwnership, VisibilityLevel, S
 from app.models.user import User, Role, Department
 from app.models.skill import Skill
 from app.services.llm_gateway import llm_gateway
+from app.services.lark_client import LarkConfigError, LarkAuthError
 
 router = APIRouter(prefix="/api/business-tables", tags=["business-tables"])
 
@@ -434,8 +435,10 @@ async def resolve_wiki(
     from app.services.lark_client import lark_client
     try:
         token = await lark_client.get_tenant_access_token()
-    except Exception as e:
-        raise HTTPException(400, f"飞书认证失败: {e}")
+    except LarkConfigError:
+        raise HTTPException(503, "飞书集成尚未配置，请联系管理员")
+    except LarkAuthError:
+        raise HTTPException(502, "飞书认证失败，请检查应用配置")
 
     import httpx
     base = "https://open.feishu.cn/open-apis"
@@ -489,8 +492,10 @@ async def probe_bitable(
     from app.services.lark_client import lark_client
     try:
         token = await lark_client.get_tenant_access_token()
-    except Exception as e:
-        raise HTTPException(400, f"飞书认证失败: {e}")
+    except LarkConfigError:
+        raise HTTPException(503, "飞书集成尚未配置，请联系管理员")
+    except LarkAuthError:
+        raise HTTPException(502, "飞书认证失败，请检查应用配置")
 
     base = "https://open.feishu.cn/open-apis"
     headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"}
@@ -580,8 +585,10 @@ async def sync_bitable(
 
     try:
         token = await lark_client.get_tenant_access_token()
-    except Exception as e:
-        raise HTTPException(400, f"飞书认证失败: {e}")
+    except LarkConfigError:
+        raise HTTPException(503, "飞书集成尚未配置，请联系管理员")
+    except LarkAuthError:
+        raise HTTPException(502, "飞书认证失败，请检查应用配置")
 
     base = "https://open.feishu.cn/open-apis"
     headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"}
@@ -652,7 +659,7 @@ async def sync_bitable(
         db.commit()
     except Exception as e:
         db.rollback()
-        raise HTTPException(500, f"建表失败: {e}")
+        raise HTTPException(500, f"本地建表失败，请联系管理员检查数据库: {e}")
 
     # 6. Insert records
     import json as _json
@@ -841,7 +848,7 @@ def create_blank_table(
         db.commit()
     except Exception as e:
         db.rollback()
-        raise HTTPException(500, f"建表失败: {e}")
+        raise HTTPException(500, f"本地建表失败，请联系管理员检查数据库: {e}")
 
     # Register
     rules = {
@@ -1100,5 +1107,9 @@ async def sync_now(
     try:
         result = await bitable_sync.incremental_sync(db, bt)
         return {"ok": True, **result}
+    except LarkConfigError:
+        raise HTTPException(503, "飞书集成尚未配置，请联系管理员")
+    except LarkAuthError:
+        raise HTTPException(502, "飞书认证失败，请检查应用配置")
     except Exception as e:
         raise HTTPException(500, f"同步失败: {e}")
