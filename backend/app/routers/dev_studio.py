@@ -356,6 +356,7 @@ async def _db_cleaner() -> None:
 
 
 MAX_RSS_MB = 800  # 单实例内存硬上限（含 Go 主进程 + Node 启动器），超过则强制重启
+MAX_FD_COUNT = 2000  # 单实例 fd 上限，pty 泄漏时 fd 会持续累积，超过则强制重启
 
 
 def _get_proc_tree_rss_mb(pid: int) -> int:
@@ -398,6 +399,21 @@ async def _idle_reaper() -> None:
             rss = _get_proc_tree_rss_mb(proc.pid)
             if rss > MAX_RSS_MB:
                 logger.warning(f"[Reaper] user={uid} RSS={rss}MB 超过 {MAX_RSS_MB}MB 限制，强制终止")
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                inst["proc"] = None
+                continue
+            # fd 泄漏强杀（pty 不释放导致 /dev/ptmx fd 堆积）
+            try:
+                fd_count = len(os.listdir(f"/proc/{proc.pid}/fd"))
+            except Exception:
+                fd_count = 0
+            if fd_count > MAX_FD_COUNT:
+                logger.warning(
+                    f"[Reaper] user={uid} fd={fd_count} 超过 {MAX_FD_COUNT} 限制（pty泄漏），强制终止"
+                )
                 try:
                     proc.kill()
                 except Exception:
