@@ -75,6 +75,14 @@ services:
     volumes:
       - onlyoffice_data:/var/www/onlyoffice/Data
       - onlyoffice_log:/var/log/onlyoffice
+      # 禁止 pluginsmanager 联网下载（no-op 脚本）
+      - ./onlyoffice/plugins/documentserver-pluginsmanager.sh:/usr/bin/documentserver-pluginsmanager.sh:ro
+      # 空列表：不触发自动更新
+      - ./onlyoffice/plugins/plugin-list-default.json:/var/www/onlyoffice/documentserver/sdkjs-plugins/plugin-list-default.json:ro
+      # 离线插件（按 GUID 目录名挂载，OnlyOffice 会自动识别）
+      - ./onlyoffice/onlyoffice-plugins/highlightcode:/var/www/onlyoffice/documentserver/sdkjs-plugins/{BE5CBF95-C0AD-4842-B157-AC40FEDD9841}:ro
+      - ./onlyoffice/onlyoffice-plugins/ocr:/var/www/onlyoffice/documentserver/sdkjs-plugins/{440EBF13-9B19-4BD8-8621-05200E58140B}:ro
+      - ./onlyoffice/onlyoffice-plugins/translator:/var/www/onlyoffice/documentserver/sdkjs-plugins/{7327FC95-16DA-41D9-9AF2-0E7F449F6800}:ro
     restart: unless-stopped
 
 volumes:
