@@ -67,7 +67,7 @@ class LarkDocImporter:
         from app.services.knowledge_classifier import classify, apply_classification_to_entry
         from app.services.knowledge_service import submit_knowledge
         from app.services.review_policy import review_policy
-        from app.utils.file_parser import extract_text
+        from app.utils.file_parser import extract_text, extract_html
 
         # 1. 解析链接
         token, doc_type = self.parse_lark_url(url)
@@ -98,6 +98,16 @@ class LarkDocImporter:
                 f.write(file_bytes)
             content = extract_text(tmp_path)
 
+            # 5.5 生成 content_html
+            content_html = None
+            doc_render_mode = "text_fallback"
+            try:
+                content_html = extract_html(tmp_path)
+                if content_html:
+                    doc_render_mode = "converted_html"
+            except Exception as e:
+                logger.warning(f"extract_html failed for lark doc: {e}")
+
             # 6. 上传到 OSS
             oss_key = generate_oss_key(ext)
             oss_upload(tmp_path, oss_key)
@@ -119,9 +129,11 @@ class LarkDocImporter:
         capture_mode = "upload" if (sensitive_flags or strategic_flags) else "upload_ai_clean"
 
         # 8. 创建 KnowledgeEntry
+        import datetime
         entry = KnowledgeEntry(
             title=title or wiki_title or f"飞书文档导入 {token[:8]}",
             content=content,
+            content_html=content_html,
             category=category,
             created_by=user.id,
             department_id=user.department_id,
@@ -139,6 +151,13 @@ class LarkDocImporter:
             lark_doc_url=url,
             lark_sync_interval=sync_interval,
             lark_last_synced_at=int(time.time()),
+            # 云文档渲染状态
+            doc_render_status="ready" if content_html else "pending",
+            doc_render_mode=doc_render_mode,
+            last_rendered_at=datetime.datetime.utcnow() if content_html else None,
+            source_uri=url,
+            # 同步状态
+            sync_status="ok",
         )
         db.add(entry)
         db.flush()
@@ -178,7 +197,7 @@ class LarkDocImporter:
         """增量同步：导出飞书文档最新版，对比内容，有变化则更新。"""
         from app.services.lark_client import lark_client
         from app.services.oss_service import generate_oss_key, upload_file as oss_upload
-        from app.utils.file_parser import extract_text
+        from app.utils.file_parser import extract_text, extract_html
         from sqlalchemy.orm.attributes import flag_modified
 
         token = entry.lark_doc_token
@@ -224,6 +243,16 @@ class LarkDocImporter:
                 entry.content = new_content
                 entry.oss_key = oss_key
                 entry.file_size = len(file_bytes)
+
+                # 更新 content_html
+                try:
+                    new_html = extract_html(tmp_path)
+                    if new_html:
+                        entry.content_html = new_html
+                        entry.doc_render_status = "ready"
+                        entry.doc_render_mode = "converted_html"
+                except Exception as e:
+                    logger.warning(f"extract_html failed during sync for entry {entry.id}: {e}")
 
                 # 重新向量化
                 try:

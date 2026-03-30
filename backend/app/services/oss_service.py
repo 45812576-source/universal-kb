@@ -67,6 +67,14 @@ def generate_signed_upload_url(oss_key: str, expires: int = 600) -> str:
     return bucket.sign_url("PUT", oss_key, expires)
 
 
+def download_file(oss_key: str, local_path: str) -> str:
+    """下载 OSS 对象到本地路径，返回 local_path。"""
+    bucket = _get_bucket()
+    bucket.get_object_to_file(oss_key, local_path)
+    logger.info(f"Downloaded from OSS: {oss_key} -> {local_path}")
+    return local_path
+
+
 def delete_file(oss_key: str) -> None:
     """删除 OSS 对象。"""
     bucket = _get_bucket()

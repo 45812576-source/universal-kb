@@ -130,12 +130,23 @@ class KnowledgeEntry(Base):
     # classification_confidence: AI 分类置信度 0-1
     classification_confidence = Column(Float, nullable=True)
 
+    # ── 云文档渲染状态 ────────────────────────────────────────────────────────
+    doc_render_status = Column(String(20), default="pending", nullable=True)  # pending/processing/ready/failed
+    doc_render_error = Column(Text, nullable=True)            # 转换失败原因
+    doc_render_mode = Column(String(30), nullable=True)       # native_html/converted_html/onlyoffice/pdf_fallback/text_fallback
+    last_rendered_at = Column(DateTime, nullable=True)         # 最近渲染完成时间
+
+    # ── 统一来源 ──────────────────────────────────────────────────────────────
+    source_uri = Column(String(500), nullable=True)           # 统一来源 URI
+
     # ── 飞书文档同步 ──────────────────────────────────────────────────────────
     lark_doc_token = Column(String(200), nullable=True)       # 飞书文档 token
     lark_doc_type = Column(String(50), nullable=True)         # docx / wiki / sheet / file
     lark_doc_url = Column(String(500), nullable=True)         # 原始飞书链接
     lark_sync_interval = Column(Integer, default=0)           # 同步间隔（分钟），0=不同步
     lark_last_synced_at = Column(Integer, default=0)          # 上次同步时间戳
+    sync_status = Column(String(20), default="idle", nullable=True)   # idle/syncing/ok/error
+    sync_error = Column(Text, nullable=True)                  # 同步失败原因
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(

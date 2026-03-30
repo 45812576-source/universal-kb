@@ -53,7 +53,15 @@ _REVIEW_STAGE_LABEL = {
 }
 
 
+_ONLYOFFICE_EXTS = {
+    ".docx", ".doc", ".odt", ".rtf", ".txt",
+    ".xlsx", ".xls", ".ods", ".csv",
+    ".pptx", ".ppt", ".odp",
+}
+
+
 def _entry_dict(e: KnowledgeEntry) -> dict:
+    ext = (e.file_ext or "").lower()
     return {
         "id": e.id,
         "title": e.title,
@@ -92,6 +100,21 @@ def _entry_dict(e: KnowledgeEntry) -> dict:
         "ai_summary": e.ai_summary,
         "ai_tags": e.ai_tags,
         "quality_score": e.quality_score,
+        # 云文档渲染状态
+        "doc_render_status": e.doc_render_status,
+        "doc_render_error": e.doc_render_error,
+        "doc_render_mode": e.doc_render_mode,
+        # 来源与同步
+        "source_uri": e.source_uri,
+        "sync_status": e.sync_status,
+        "sync_error": e.sync_error,
+        "lark_doc_url": e.lark_doc_url,
+        "lark_doc_token": e.lark_doc_token,
+        "lark_sync_interval": e.lark_sync_interval,
+        "lark_last_synced_at": e.lark_last_synced_at,
+        # 能力标志
+        "can_open_onlyoffice": bool(e.oss_key and ext in _ONLYOFFICE_EXTS),
+        "can_retry_render": e.doc_render_status in ("failed", "pending", None),
         "created_at": e.created_at.isoformat(),
     }
 
@@ -149,13 +172,6 @@ async def upload_knowledge(
         os.unlink(saved_path)
         raise HTTPException(400, str(e))
 
-    # 提取 HTML 内容（供前端云文档编辑器）
-    try:
-        from app.utils.file_parser import extract_html
-        content_html = extract_html(saved_path)
-    except Exception:
-        content_html = None
-
     # 上传原件到 OSS
     oss_key = None
     file_size = len(file_data)
@@ -168,13 +184,7 @@ async def upload_knowledge(
         import logging
         logging.getLogger(__name__).warning(f"OSS upload failed, file kept locally: {e}")
 
-    # 清理本地临时文件（OSS 上传成功后）
-    if oss_key:
-        try:
-            os.unlink(saved_path)
-        except OSError:
-            pass
-
+    # 注意：暂不清理本地文件，后续 doc_renderer 需要读取
     # 检测敏感词决定 capture_mode
     from app.services.review_policy import review_policy
     sensitive_flags = review_policy.detect_sensitive(content)
@@ -187,7 +197,6 @@ async def upload_knowledge(
     entry = KnowledgeEntry(
         title=title,
         content=content,
-        content_html=content_html,
         category=category,
         industry_tags=json.loads(industry_tags),
         platform_tags=json.loads(platform_tags),
@@ -202,9 +211,25 @@ async def upload_knowledge(
         file_type=file_type,
         file_ext=ext,
         file_size=file_size,
+        # 云文档渲染状态
+        doc_render_status="pending",
     )
     db.add(entry)
     db.flush()
+
+    # 云文档转换（从本地临时文件）
+    from app.services.doc_renderer import render_from_path
+    try:
+        render_from_path(db, entry, saved_path)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Doc render failed: {e}")
+
+    # 清理本地临时文件
+    try:
+        os.unlink(saved_path)
+    except OSError:
+        pass
 
     # AI 智能命名（异步，不阻塞入库）
     from app.services.knowledge_namer import auto_name
@@ -248,6 +273,9 @@ async def upload_knowledge(
         "classification_confidence": entry.classification_confidence,
         "oss_key": entry.oss_key,
         "file_type": entry.file_type,
+        "file_ext": entry.file_ext,
+        "doc_render_status": entry.doc_render_status,
+        "doc_render_mode": entry.doc_render_mode,
     }
 
 
@@ -921,6 +949,62 @@ def move_entry_to_folder(
     entry.folder_id = folder_id
     db.commit()
     return {"ok": True, "folder_id": folder_id}
+
+
+# ── 云文档转换 & 同步 ─────────────────────────────────────────────────
+
+
+@router.post("/{kid}/render")
+def retry_render(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """手动重试云文档转换。"""
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    if user.role != Role.SUPER_ADMIN and entry.created_by != user.id:
+        raise HTTPException(403, "无权操作")
+
+    from app.services.doc_renderer import render_entry
+    result = render_entry(db, kid)
+    return result
+
+
+@router.post("/{kid}/sync")
+async def manual_sync(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """手动触发飞书文档同步，仅对 source_type=lark_doc 有效。"""
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    if entry.source_type != "lark_doc":
+        raise HTTPException(400, "此知识条目不是飞书文档，无法同步")
+    if user.role != Role.SUPER_ADMIN and entry.created_by != user.id:
+        raise HTTPException(403, "无权操作")
+
+    from app.services.lark_doc_importer import lark_doc_importer
+
+    # 标记同步中
+    entry.sync_status = "syncing"
+    entry.sync_error = None
+    db.commit()
+
+    try:
+        result = await lark_doc_importer.sync_doc(db, entry)
+        entry.sync_status = "ok"
+        entry.sync_error = None
+        db.commit()
+        return result
+    except Exception as e:
+        entry.sync_status = "error"
+        entry.sync_error = str(e)[:500]
+        db.commit()
+        raise HTTPException(502, f"飞书同步失败: {e}")
 
 
 # ── 飞书文档导入 ──────────────────────────────────────────────────────

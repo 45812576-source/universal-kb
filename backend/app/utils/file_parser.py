@@ -161,15 +161,16 @@ def extract_html(file_path: str) -> str:
 
     if ext in (".docx",):
         import mammoth
+        _style_map = "\n".join([
+            "p[style-name='Heading 1'] => h1:fresh",
+            "p[style-name='Heading 2'] => h2:fresh",
+            "p[style-name='Heading 3'] => h3:fresh",
+            "p[style-name='标题 1'] => h1:fresh",
+            "p[style-name='标题 2'] => h2:fresh",
+            "p[style-name='标题 3'] => h3:fresh",
+        ])
         with open(file_path, "rb") as f:
-            result = mammoth.convert_to_html(f, style_map=[
-                "p[style-name='Heading 1'] => h1:fresh",
-                "p[style-name='Heading 2'] => h2:fresh",
-                "p[style-name='Heading 3'] => h3:fresh",
-                "p[style-name='标题 1'] => h1:fresh",
-                "p[style-name='标题 2'] => h2:fresh",
-                "p[style-name='标题 3'] => h3:fresh",
-            ])
+            result = mammoth.convert_to_html(f, style_map=_style_map)
             return result.value
 
     elif ext in (".md",):
