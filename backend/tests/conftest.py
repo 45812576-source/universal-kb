@@ -41,8 +41,13 @@ def clean_tables():
     yield
     db = TestingSessionLocal()
     try:
+        db.execute(text("PRAGMA foreign_keys = OFF"))
         for table in reversed(Base.metadata.sorted_tables):
-            db.execute(table.delete())
+            try:
+                db.execute(table.delete())
+            except Exception:
+                db.rollback()
+        db.execute(text("PRAGMA foreign_keys = ON"))
         db.commit()
     finally:
         db.close()
