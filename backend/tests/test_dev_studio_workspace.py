@@ -224,10 +224,11 @@ class TestEnsureWorkspaceLayout:
         assert project_dir == os.path.join(workspace, "project")
         assert runtime_dir == os.path.join(workspace, "runtime")
 
-        # project subdirs
-        assert os.path.isdir(os.path.join(project_dir, "src"))
-        assert os.path.isdir(os.path.join(project_dir, "docs"))
-        assert os.path.isdir(os.path.join(project_dir, "scripts"))
+        # project subdirs (四个业务目录)
+        assert os.path.isdir(os.path.join(project_dir, "inbox"))
+        assert os.path.isdir(os.path.join(project_dir, "work"))
+        assert os.path.isdir(os.path.join(project_dir, "export"))
+        assert os.path.isdir(os.path.join(project_dir, "archive"))
         assert os.path.isfile(os.path.join(project_dir, "README.md"))
 
         # runtime subdirs
@@ -354,10 +355,10 @@ class TestFileWriteToProject:
         # Simulating what _user_workdir does
         assert "project" in project_dir
 
-    def test_ensure_creates_src_docs_scripts(self, workspace):
-        """统一初始化创建 src/docs/scripts。"""
+    def test_ensure_creates_business_dirs(self, workspace):
+        """统一初始化创建 inbox/work/export/archive。"""
         project_dir, _ = ensure_workspace_layout(workspace, "test")
-        for d in ("src", "docs", "scripts"):
+        for d in ("inbox", "work", "export", "archive"):
             assert os.path.isdir(os.path.join(project_dir, d))
 
     def test_upload_to_project_not_root(self, workspace):

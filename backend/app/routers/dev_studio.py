@@ -73,16 +73,72 @@ def _dir_size_bytes(path: str) -> int:
 
 # ─── 统一路径工具函数 ────────────────────────────────────────────────────────
 
-def _workspace_root_for_user(user_id: int, display_name: str = "") -> str:
-    """返回用户顶层工作区目录（studio_root/<folder_name>）。"""
-    import re as _re
+def _studio_root() -> str:
+    """返回 studio workspace 总根目录。"""
     from app.config import settings as _cfg
-    studio_root = os.path.abspath(os.path.expanduser(
+    return os.path.abspath(os.path.expanduser(
         getattr(_cfg, "STUDIO_WORKSPACE_ROOT", "~/studio_workspaces")
     ))
-    safe_name = _re.sub(r'[^\w\u4e00-\u9fff\-]', '_', display_name).strip('_') if display_name else ""
-    folder_name = safe_name if safe_name else f"user_{user_id}"
-    return os.path.join(studio_root, folder_name)
+
+
+def _workspace_root_for_user(user_id: int, display_name: str = "") -> str:
+    """返回用户顶层工作区目录，固定为 studio_root/user_<id>。
+
+    display_name 仅用于旧目录迁移时定位旧路径，不参与新路径拼接。
+    """
+    import re as _re
+    studio_root = _studio_root()
+    new_root = os.path.join(studio_root, f"user_{user_id}")
+
+    # 旧目录迁移：如果旧 display_name 目录存在而新 user_<id> 目录不存在，整体迁移
+    if display_name and not os.path.isdir(new_root):
+        safe_name = _re.sub(r'[^\w\u4e00-\u9fff\-]', '_', display_name).strip('_')
+        if safe_name and safe_name != f"user_{user_id}":
+            old_root = os.path.join(studio_root, safe_name)
+            if os.path.isdir(old_root):
+                import logging
+                logger = logging.getLogger(__name__)
+                try:
+                    shutil.move(old_root, new_root)
+                    logger.info(
+                        f"[Migration] 旧目录迁移: {old_root} -> {new_root}, "
+                        f"user_id={user_id}, display_name={display_name}"
+                    )
+                except Exception as e:
+                    logger.warning(f"[Migration] 迁移失败: {old_root} -> {new_root}: {e}")
+
+    # 新目录已存在，但旧目录也存在 — 合并迁移
+    if display_name and os.path.isdir(new_root):
+        import re as _re2
+        safe_name = _re2.sub(r'[^\w\u4e00-\u9fff\-]', '_', display_name).strip('_')
+        if safe_name and safe_name != f"user_{user_id}":
+            old_root = os.path.join(studio_root, safe_name)
+            if os.path.isdir(old_root):
+                import logging, time as _time_mod
+                logger = logging.getLogger(__name__)
+                moved_count = 0
+                for item in os.listdir(old_root):
+                    src = os.path.join(old_root, item)
+                    dst = os.path.join(new_root, item)
+                    if not os.path.exists(dst):
+                        try:
+                            shutil.move(src, dst)
+                            moved_count += 1
+                        except Exception:
+                            pass
+                # 迁移完成后重命名旧目录
+                ts = int(_time_mod.time())
+                migrated_name = f".migrated_{ts}_{safe_name}"
+                try:
+                    os.rename(old_root, os.path.join(studio_root, migrated_name))
+                except Exception:
+                    shutil.rmtree(old_root, ignore_errors=True)
+                logger.info(
+                    f"[Migration] 合并迁移: {old_root} -> {new_root}, "
+                    f"user_id={user_id}, moved_files={moved_count}"
+                )
+
+    return new_root
 
 
 def _workspace_project_dir(workdir: str) -> str:
@@ -269,10 +325,12 @@ def ensure_workspace_layout(workdir: str, display_name: str = "") -> tuple[str, 
     for rd in ("data", "config", "cache", "bin"):
         os.makedirs(os.path.join(runtime_dir, rd), exist_ok=True)
 
-    # 首次创建：初始化项目目录结构
+    # 确保四个一级业务目录始终存在
+    for subdir in ("inbox", "work", "export", "archive"):
+        os.makedirs(os.path.join(project_dir, subdir), exist_ok=True)
+
+    # 首次创建：初始化 README
     if is_new:
-        for subdir in ("src", "docs", "scripts"):
-            os.makedirs(os.path.join(project_dir, subdir), exist_ok=True)
         readme = os.path.join(project_dir, "README.md")
         if not os.path.exists(readme):
             folder_name = os.path.basename(workdir)
@@ -280,10 +338,11 @@ def ensure_workspace_layout(workdir: str, display_name: str = "") -> tuple[str, 
                 f.write(
                     f"# {display_name or folder_name} 的工作台\n\n"
                     "这是你的专属开发工作台，文件会持久保存。\n\n"
-                    "## 使用建议\n\n"
-                    "- **建议仅用 Dev Studio 开发后端运算脚本**（数据处理、API 调用、自动化脚本等）\n"
-                    "- **切勿在 Dev Studio 开发前后端重型应用**（Next.js、React SPA 等），"
-                    "此类项目请在本地 IDE 开发后部署\n"
+                    "## 目录说明\n\n"
+                    "- **inbox/** — 系统生成的待处理文件\n"
+                    "- **work/** — 用户上传、AI 生成的工作文件\n"
+                    "- **export/** — 导出产物\n"
+                    "- **archive/** — 归档内容\n"
                 )
 
     return project_dir, runtime_dir
@@ -1184,14 +1243,19 @@ async def get_instance(
         OpenCodeWorkspaceMapping.user_id == user.id,
         OpenCodeWorkspaceMapping.directory != None,
     ).first()
+    # directory 保存 workspace_root（user_<id>），不是 project_dir
+    workspace_root = _workspace_root_for_user(user.id, user.display_name or "")
     if mapping is None:
-        user_workdir = _user_workdir(user)
         mapping = OpenCodeWorkspaceMapping(
             user_id=user.id,
-            directory=user_workdir,
+            directory=workspace_root,
             opencode_workspace_name=user.display_name,
         )
         db.add(mapping)
+        db.commit()
+    elif mapping.directory != workspace_root:
+        # 旧数据可能存的是 display_name 路径，纠正为 user_<id>
+        mapping.directory = workspace_root
         db.commit()
 
     return {"url": info["url"], "port": info["port"], "status": "ready"}
@@ -1295,16 +1359,22 @@ def get_latest_output(
             continue
         seen_paths.add(file_path)
 
+        # 路径安全：只返回 project_dir 内的文件
+        project_dir = _workspace_project_dir(workdir)
+        exists_on_disk = os.path.isfile(file_path)
+
         content = ""
         if tool == "write":
             content = inp.get("content") or ""
-        else:
-            # edit/patch: 读磁盘当前版本
-            try:
-                with open(file_path, encoding="utf-8", errors="replace") as f:
-                    content = f.read()
-            except Exception:
-                content = ""
+        elif exists_on_disk:
+            # edit/patch: 读磁盘当前版本，限制在 project_dir 内
+            norm_path = os.path.normpath(file_path)
+            if norm_path == project_dir or norm_path.startswith(project_dir + os.sep):
+                try:
+                    with open(file_path, encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                except Exception:
+                    content = ""
 
         result.append({
             "path": file_path,
@@ -1312,6 +1382,8 @@ def get_latest_output(
             "content": content,
             "tool": tool,
             "session_title": row["title"] or "",
+            "exists_on_disk": exists_on_disk,
+            "category": "recent_output",
         })
 
     return result
@@ -1354,7 +1426,9 @@ def create_tool_task(
 
 保存为 Tool，回到 Skill Studio 绑定到源 Skill。
 """
-    dest = os.path.join(workdir, "TOOL_REQUEST.md")
+    inbox_dir = os.path.join(workdir, "inbox")
+    os.makedirs(inbox_dir, exist_ok=True)
+    dest = os.path.join(inbox_dir, "TOOL_REQUEST.md")
     with open(dest, "w", encoding="utf-8") as f:
         f.write(content)
 
@@ -1625,14 +1699,16 @@ async def transfer_table(
     # 5. 确定用户 workdir（指向 project/ 子目录）
     workdir = _user_workdir(user)
 
-    # 6. 写文件
+    # 6. 系统生成文件统一落到 inbox/
+    inbox_dir = os.path.join(workdir, "inbox")
+    os.makedirs(inbox_dir, exist_ok=True)
+
     if req.filename:
-        # 安全检查：不允许路径分隔符或 ..
         safe_filename = os.path.basename(req.filename)
     else:
         safe_filename = f"{table_name}.{ext}"
 
-    dest = os.path.join(workdir, safe_filename)
+    dest = os.path.join(inbox_dir, safe_filename)
     with open(dest, "w", encoding="utf-8", newline="" if fmt == "csv" else "\n") as f:
         f.write(content)
 
@@ -1698,7 +1774,9 @@ async def upload_file(
         dest_dir = _safe_path(workdir, target_path.strip())
         os.makedirs(dest_dir, exist_ok=True)
     else:
-        dest_dir = workdir
+        # 默认落到 work/ 目录
+        dest_dir = os.path.join(workdir, "work")
+        os.makedirs(dest_dir, exist_ok=True)
 
     dest = os.path.join(dest_dir, safe_filename)
     with open(dest, "wb") as f:
@@ -2011,7 +2089,8 @@ def _user_workdir(user: User) -> str:
 def _safe_path(workdir: str, rel: str) -> str:
     """将相对路径解析为绝对路径，确保不超出 workdir（防路径穿越）。"""
     abs_path = os.path.normpath(os.path.join(workdir, rel.lstrip("/")))
-    if not abs_path.startswith(workdir):
+    # 用 trailing separator 防止 /a/project 被 /a/project_evil 绕过
+    if not (abs_path == workdir or abs_path.startswith(workdir + os.sep)):
         raise HTTPException(400, "路径不合法")
     return abs_path
 
@@ -2039,11 +2118,31 @@ def _tree(base: str, rel: str = "") -> list:
     return nodes
 
 
+_REQUIRED_TOP_DIRS = ("inbox", "work", "export", "archive")
+
+
 @router.get("/workdir/tree")
 def workdir_tree(user: User = Depends(get_current_user)):
-    """返回用户 workdir 的完整文件树。"""
+    """返回用户 workdir 的完整文件树，始终包含四个一级业务目录。"""
     workdir = _user_workdir(user)
-    return {"workdir": workdir, "tree": _tree(workdir)}
+    tree = _tree(workdir)
+
+    # 确保四个一级目录节点始终存在（即使为空）
+    existing_names = {n["name"] for n in tree if n["type"] == "dir"}
+    for d in _REQUIRED_TOP_DIRS:
+        if d not in existing_names:
+            tree.insert(0, {"name": d, "path": d, "type": "dir", "children": []})
+
+    # 把四个必需目录排到前面
+    required_set = set(_REQUIRED_TOP_DIRS)
+    required_nodes = [n for n in tree if n["name"] in required_set and n["type"] == "dir"]
+    other_nodes = [n for n in tree if not (n["name"] in required_set and n["type"] == "dir")]
+    # 按 _REQUIRED_TOP_DIRS 顺序排列
+    order = {name: i for i, name in enumerate(_REQUIRED_TOP_DIRS)}
+    required_nodes.sort(key=lambda n: order.get(n["name"], 99))
+    tree = required_nodes + other_nodes
+
+    return {"workdir": workdir, "tree": tree}
 
 
 class MkdirRequest(BaseModel):
