@@ -17,6 +17,7 @@ from app.models.raw_input import RawInput  # noqa: F401
 from app.models.project import Project, ProjectMember, ProjectKnowledgeShare, ProjectReport, ProjectContext, ProjectStatus, ReportType  # noqa: F401
 from app.models.pev_job import PEVJob, PEVStep, PEVJobStatus, PEVStepStatus  # noqa: F401
 from app.models.lark_approval import LarkApprovalInstance  # noqa: F401
+from app.models.skill_memo import SkillMemo  # noqa: F401
 from app.models.permission import (  # noqa: F401
     Position, DataDomain, DataScopePolicy,
     MaskAction, PublishScope,

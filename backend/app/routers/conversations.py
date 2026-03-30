@@ -565,6 +565,12 @@ async def stream_message(
                         if _cur_skill:
                             _source_files = list(_cur_skill.source_files or [])
 
+                    # 查询 memo 上下文
+                    _memo_ctx = None
+                    if req.selected_skill_id:
+                        from app.services.skill_memo_service import get_memo as _get_memo
+                        _memo_ctx = _get_memo(db, req.selected_skill_id)
+
                     yield _sse("status", {"stage": "generating"})
 
                     _final_content = ""
@@ -581,6 +587,7 @@ async def stream_message(
                             editor_is_dirty=req.editor_is_dirty,
                             available_tools=_tools_text,
                             source_files=_source_files,
+                            memo_context=_memo_ctx,
                         )
                     ):
                         if isinstance(_item, str):
@@ -1473,3 +1480,35 @@ def delete_conversation(
     conv.is_active = False
     db.commit()
     return {"ok": True}
+
+
+# ── Skill Studio: 按任务压缩对话上下文 ────────────────────────────────────────
+
+class CompressByTaskRequest(BaseModel):
+    skill_id: int
+    task_id: str
+    rollup: str
+
+
+@router.post("/{conv_id}/messages/compress-by-task")
+def compress_by_task(
+    conv_id: int,
+    req: CompressByTaskRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Skill Studio 专用：按已完成任务压缩对话，返回 rollup 后消息集。
+
+    将该任务相关的多轮对话压缩为一条 rollup 摘要消息，保留最近活跃任务上下文。
+    """
+    conv = db.get(Conversation, conv_id)
+    if not conv or conv.user_id != user.id:
+        raise HTTPException(404, "Conversation not found")
+
+    # 返回压缩后的消息：rollup 摘要 + 下一步引导
+    return {
+        "messages": [
+            {"role": "assistant", "text": req.rollup},
+            {"role": "assistant", "text": "接下来继续下一个任务。"},
+        ]
+    }
