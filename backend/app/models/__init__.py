@@ -1,6 +1,8 @@
 from app.models.user import Department, Role, User  # noqa: F401
 from app.models.skill import ModelConfig, Skill, SkillMode, SkillStatus, SkillVersion, SkillSuggestion, SuggestionStatus, SkillAttribution, AttributionLevel  # noqa: F401
 from app.models.knowledge import KnowledgeEntry, KnowledgeStatus, KnowledgeRevision  # noqa: F401
+from app.models.knowledge_block import KnowledgeDocumentBlock, KnowledgeChunkMapping  # noqa: F401
+from app.models.knowledge_filing import KnowledgeFilingSuggestion  # noqa: F401
 from app.models.master_data import Confirmation, InputTaxonomy, ObjectFieldDictionary, SkillMaster  # noqa: F401
 from app.models.conversation import Conversation, Message, MessageRole  # noqa: F401
 from app.models.business import BusinessTable, AuditLog, SkillDataQuery, DataOwnership, VisibilityLevel, TableView, DataFolder, TableField, TableSyncJob, SkillTableBinding  # noqa: F401

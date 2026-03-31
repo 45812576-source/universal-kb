@@ -303,6 +303,7 @@ def list_knowledge(
     review_stage: str = None,
     doc_render_status: str = None,
     classification_status: str = None,
+    unfiled: bool = False,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -340,9 +341,40 @@ def list_knowledge(
         q = q.filter(KnowledgeEntry.doc_render_status == doc_render_status)
     if classification_status:
         q = q.filter(KnowledgeEntry.classification_status == classification_status)
+    if unfiled:
+        q = q.filter(KnowledgeEntry.folder_id.is_(None))
 
     entries = q.order_by(KnowledgeEntry.created_at.desc()).all()
     return [_entry_dict(e) for e in entries]
+
+
+def _enrich_search_results_with_blocks(db: Session, best: dict) -> None:
+    """为搜索命中结果补充 block 映射信息。"""
+    try:
+        from app.models.knowledge_block import KnowledgeChunkMapping
+        kid_chunk_pairs = [(v["knowledge_id"], v["chunk_index"]) for v in best.values()]
+        if not kid_chunk_pairs:
+            return
+        all_kids = list({p[0] for p in kid_chunk_pairs})
+        mappings = (
+            db.query(KnowledgeChunkMapping)
+            .filter(KnowledgeChunkMapping.knowledge_id.in_(all_kids))
+            .all()
+        )
+        mapping_index = {}
+        for m in mappings:
+            mapping_index[(m.knowledge_id, m.chunk_index)] = m
+        for kid, result in best.items():
+            m = mapping_index.get((kid, result["chunk_index"]))
+            if m:
+                result["block_id"] = m.block_id
+                result["block_key"] = m.block_key
+                result["heading_path"] = None
+                result["char_range"] = [m.char_start_in_block, m.char_end_in_block]
+                if m.block:
+                    result["heading_path"] = m.block.heading_path
+    except Exception:
+        pass  # 降级：无 block 信息也不影响搜索
 
 
 @router.get("/chunks/search")
@@ -411,7 +443,14 @@ def search_chunks(
                             "taxonomy_board": e.taxonomy_board,
                             "category": e.category,
                             "title": e.title,
+                            # block 映射（向后兼容：无映射时为 None）
+                            "block_id": None,
+                            "block_key": None,
+                            "heading_path": None,
+                            "char_range": None,
                         }
+            # 补充 block 映射信息
+            _enrich_search_results_with_blocks(db, best)
             results = sorted(best.values(), key=lambda x: x["score"], reverse=True)
             return results[:limit]
         except Exception:
@@ -1322,3 +1361,213 @@ def serve_image(filename: str, user: User = Depends(get_current_user)):
     if not os.path.exists(path):
         raise HTTPException(404, "Image not found")
     return FileResponse(path)
+
+
+# ── Job 查询 ─────────────────────────────────────────────────────────
+
+
+@router.get("/{kid}/jobs")
+def list_jobs(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """返回知识条目的 render/classify job 列表（最近 20 条）。"""
+    from app.models.knowledge_job import KnowledgeJob
+
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+
+    jobs = (
+        db.query(KnowledgeJob)
+        .filter(KnowledgeJob.knowledge_id == kid)
+        .order_by(KnowledgeJob.created_at.desc())
+        .limit(20)
+        .all()
+    )
+    return [
+        {
+            "id": j.id,
+            "job_type": j.job_type,
+            "status": j.status,
+            "phase": j.phase,
+            "attempt_count": j.attempt_count,
+            "max_attempts": j.max_attempts,
+            "error_type": j.error_type,
+            "error_message": j.error_message,
+            "trigger_source": j.trigger_source,
+            "started_at": j.started_at.isoformat() if j.started_at else None,
+            "finished_at": j.finished_at.isoformat() if j.finished_at else None,
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+        }
+        for j in jobs
+    ]
+
+
+# ── Block 信息 ───────────────────────────────────────────────────────
+
+
+@router.get("/{kid}/blocks")
+def list_blocks(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """返回知识条目的 document blocks（前端锚点定位用）。"""
+    from app.models.knowledge_block import KnowledgeDocumentBlock
+
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+
+    blocks = (
+        db.query(KnowledgeDocumentBlock)
+        .filter(KnowledgeDocumentBlock.knowledge_id == kid)
+        .order_by(KnowledgeDocumentBlock.block_order)
+        .all()
+    )
+    return [
+        {
+            "id": b.id,
+            "block_key": b.block_key,
+            "block_type": b.block_type,
+            "block_order": b.block_order,
+            "plain_text": b.plain_text,
+            "heading_path": b.heading_path,
+            "start_offset": b.start_offset,
+            "end_offset": b.end_offset,
+            "source_anchor": b.source_anchor,
+        }
+        for b in blocks
+    ]
+
+
+# ── 批量归档 ─────────────────────────────────────────────────────────
+
+
+class BatchMoveRequest(BaseModel):
+    entry_ids: list[int]
+    folder_id: int
+
+
+@router.post("/batch/move")
+def batch_move(
+    req: BatchMoveRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """批量移动知识条目到指定文件夹。"""
+    moved = 0
+    for eid in req.entry_ids:
+        entry = db.get(KnowledgeEntry, eid)
+        if not entry:
+            continue
+        if user.role != Role.SUPER_ADMIN and entry.created_by != user.id:
+            continue
+        entry.folder_id = req.folder_id
+        moved += 1
+    db.commit()
+    return {"ok": True, "moved": moved, "total": len(req.entry_ids)}
+
+
+class BatchSuggestRequest(BaseModel):
+    entry_ids: list[int]
+
+
+@router.post("/batch/suggest-folders")
+async def batch_suggest_folders(
+    req: BatchSuggestRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """批量生成归档建议。"""
+    from app.services.filing_suggester import suggest_folders_batch
+
+    suggestions = await suggest_folders_batch(db, req.entry_ids, user.id)
+    return {"total": len(req.entry_ids), "suggestions": suggestions}
+
+
+@router.get("/{kid}/filing-suggestion")
+def get_filing_suggestion(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """获取单篇文档的归档建议。"""
+    from app.models.knowledge_filing import KnowledgeFilingSuggestion
+
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+
+    suggestion = (
+        db.query(KnowledgeFilingSuggestion)
+        .filter(
+            KnowledgeFilingSuggestion.knowledge_id == kid,
+            KnowledgeFilingSuggestion.status == "pending",
+        )
+        .order_by(KnowledgeFilingSuggestion.created_at.desc())
+        .first()
+    )
+
+    if not suggestion:
+        return {"suggestion": None}
+
+    return {
+        "suggestion": {
+            "id": suggestion.id,
+            "suggested_folder_id": suggestion.suggested_folder_id,
+            "suggested_folder_path": suggestion.suggested_folder_path,
+            "confidence": suggestion.confidence,
+            "reason": suggestion.reason,
+            "status": suggestion.status,
+        }
+    }
+
+
+class AcceptSuggestionRequest(BaseModel):
+    suggestion_id: int
+
+
+@router.post("/{kid}/filing-suggestion/accept")
+def accept_filing_suggestion(
+    kid: int,
+    req: AcceptSuggestionRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """接受归档建议，将文档移到建议的文件夹。"""
+    from app.models.knowledge_filing import KnowledgeFilingSuggestion
+
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+
+    suggestion = db.get(KnowledgeFilingSuggestion, req.suggestion_id)
+    if not suggestion or suggestion.knowledge_id != kid:
+        raise HTTPException(404, "Suggestion not found")
+
+    entry.folder_id = suggestion.suggested_folder_id
+    suggestion.status = "accepted"
+    db.commit()
+    return {"ok": True, "folder_id": entry.folder_id}
+
+
+@router.post("/{kid}/filing-suggestion/reject")
+def reject_filing_suggestion(
+    kid: int,
+    req: AcceptSuggestionRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """拒绝归档建议。"""
+    from app.models.knowledge_filing import KnowledgeFilingSuggestion
+
+    suggestion = db.get(KnowledgeFilingSuggestion, req.suggestion_id)
+    if not suggestion or suggestion.knowledge_id != kid:
+        raise HTTPException(404, "Suggestion not found")
+
+    suggestion.status = "rejected"
+    db.commit()
+    return {"ok": True}

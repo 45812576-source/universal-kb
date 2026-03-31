@@ -20,6 +20,8 @@ class KnowledgeJob(Base):
     max_attempts = Column(Integer, default=3)
     error_type = Column(String(50), nullable=True)
     error_message = Column(Text, nullable=True)
+    # queued | extracting | rendering | persisting | classifying
+    phase = Column(String(30), nullable=True)
     # upload | retry | scheduled
     trigger_source = Column(String(20), default="upload")
     payload = Column(JSON, nullable=True)

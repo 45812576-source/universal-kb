@@ -58,10 +58,31 @@ def render_entry(db: Session, entry_id: int) -> dict:
     entry.doc_render_error = None
     db.commit()
 
+    # 更新 job phase（如果有 running job）
+    def _update_phase(phase: str):
+        try:
+            from app.models.knowledge_job import KnowledgeJob
+            job = (
+                db.query(KnowledgeJob)
+                .filter(
+                    KnowledgeJob.knowledge_id == entry_id,
+                    KnowledgeJob.job_type == "render",
+                    KnowledgeJob.status == "running",
+                )
+                .first()
+            )
+            if job:
+                job.phase = phase
+                db.flush()
+        except Exception:
+            pass
+
     try:
+        _update_phase("extracting")
         content_html = _do_render(entry, ext)
         render_mode = _EXT_RENDER_MODE.get(ext, "text_fallback")
 
+        _update_phase("rendering")
         if content_html:
             entry.content_html = content_html
             entry.doc_render_status = "ready"
@@ -75,8 +96,17 @@ def render_entry(db: Session, entry_id: int) -> dict:
                 entry.doc_render_status = "ready"
                 entry.doc_render_mode = "text_fallback"
 
+        _update_phase("persisting")
         entry.doc_render_error = None
         entry.last_rendered_at = datetime.datetime.utcnow()
+
+        # 渲染成功后生成 document blocks
+        try:
+            from app.services.block_splitter import generate_blocks
+            generate_blocks(db, entry)
+        except Exception as e:
+            logger.warning(f"Block generation failed for entry {entry_id}: {e}")
+
         db.commit()
 
         return {"ok": True, "mode": entry.doc_render_mode, "status": "ready"}

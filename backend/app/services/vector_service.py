@@ -189,9 +189,30 @@ def index_knowledge(
     quality_score: float = 0.5,
     db=None,
 ) -> list[int]:
-    """Chunk text, embed, desensitize, and insert into Milvus with metadata."""
+    """Chunk text, embed, desensitize, and insert into Milvus with metadata.
+
+    如果传入 db 且能获取到 KnowledgeEntry，优先走 block→chunk 流水线，
+    自动生成 document_blocks 和 chunk_mappings。否则回退到原始 chunk_text。
+    """
     col = get_collection()
-    chunks = chunk_text(text)
+
+    # 尝试走 block→chunk 流水线
+    block_chunks = None
+    if db is not None:
+        try:
+            from app.models.knowledge import KnowledgeEntry
+            from app.services.block_splitter import generate_blocks_and_chunks
+            entry = db.get(KnowledgeEntry, knowledge_id)
+            if entry:
+                block_chunks = generate_blocks_and_chunks(db, entry)
+        except Exception as e:
+            logger.warning(f"Block-based chunking failed for {knowledge_id}, falling back: {e}")
+
+    if block_chunks:
+        chunks = [c["text"] for c in block_chunks]
+    else:
+        chunks = chunk_text(text)
+
     if not chunks:
         return []
 
@@ -214,6 +235,24 @@ def index_knowledge(
         embeddings,                       # embedding
     ])
     col.flush()
+
+    # 回写 milvus_chunk_id 到 chunk_mappings
+    if block_chunks and db is not None:
+        try:
+            from app.models.knowledge_block import KnowledgeChunkMapping
+            milvus_ids = list(result.primary_keys)
+            mappings = (
+                db.query(KnowledgeChunkMapping)
+                .filter(KnowledgeChunkMapping.knowledge_id == knowledge_id)
+                .order_by(KnowledgeChunkMapping.chunk_index)
+                .all()
+            )
+            for mapping, mid in zip(mappings, milvus_ids):
+                mapping.milvus_chunk_id = str(mid)
+            db.flush()
+        except Exception as e:
+            logger.warning(f"Failed to update milvus_chunk_id for {knowledge_id}: {e}")
+
     return list(result.primary_keys)
 
 
