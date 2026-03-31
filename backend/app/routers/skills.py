@@ -349,6 +349,7 @@ class ImportConvertRequest(BaseModel):
 async def import_convert_skill(
     file: UploadFile = File(None),
     content: str = Form(None),
+    db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """智能解析外部 Skill 内容，转换为内部统一格式。
@@ -1427,11 +1428,12 @@ def get_skill(
         raise HTTPException(404, "Skill not found")
 
     is_external = skill.source_type in ("imported", "forked")
+    is_own = skill.created_by == user.id
     is_own_dept = (user.role == Role.DEPT_ADMIN and skill.department_id == user.department_id)
     is_super = user.role == Role.SUPER_ADMIN
 
-    # employee: 外部引入的可看完整内容，内部 local 只看摘要
-    if user.role == Role.EMPLOYEE:
+    # employee 看别人的非外部 Skill：只返回摘要
+    if user.role == Role.EMPLOYEE and not is_own:
         if not is_external:
             return _skill_summary(skill)
         # 外部引入：返回最新版 system_prompt（只读，不含版本历史）
@@ -1441,6 +1443,9 @@ def get_skill(
             "source_type": skill.source_type,
             "system_prompt": latest.system_prompt if latest else "",
         }
+
+    # 可查看完整 prompt 的条件：超管 / 同部门管理员 / 自己创建的 / 外部引入
+    can_view_prompt = is_super or is_own_dept or is_own or is_external
 
     def _version_dict(v) -> dict:
         base = {
@@ -1454,7 +1459,7 @@ def get_skill(
             "created_by": v.created_by,
             "created_at": v.created_at.isoformat(),
         }
-        if is_super or is_own_dept or is_external:
+        if can_view_prompt:
             base["system_prompt"] = v.system_prompt
         return base
 
@@ -1471,17 +1476,24 @@ def update_skill(
     skill_id: int,
     req: SkillCreate,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     skill = db.get(Skill, skill_id)
     if not skill:
         raise HTTPException(404, "Skill not found")
 
+    # 权限：超管/部门管理员可编辑，普通员工只能编辑自己创建的
+    is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
+    if not is_admin and skill.created_by != user.id:
+        raise HTTPException(403, "无权编辑此 Skill")
+
     skill.name = req.name
     skill.description = req.description
     skill.mode = req.mode
-    skill.department_id = req.department_id
-    skill.knowledge_tags = req.knowledge_tags
+    # 普通员工不可自行设置 department_id / knowledge_tags
+    if is_admin:
+        skill.department_id = req.department_id
+        skill.knowledge_tags = req.knowledge_tags
     skill.auto_inject = req.auto_inject
     db.commit()
     return {"id": skill.id}
@@ -1525,11 +1537,15 @@ def add_version(
     skill_id: int,
     req: SkillVersionCreate,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     skill = db.get(Skill, skill_id)
     if not skill:
         raise HTTPException(404, "Skill not found")
+
+    # 权限：超管/部门管理员可编辑，普通员工只能编辑自己创建的
+    if user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN) and skill.created_by != user.id:
+        raise HTTPException(403, "无权编辑此 Skill")
 
     max_ver = max((v.version for v in skill.versions), default=0)
     v = SkillVersion(
@@ -1848,7 +1864,7 @@ async def edit_with_ai(
     skill_id: int,
     req: AIEditRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Generate AI-powered edit preview from natural language instruction."""
     from app.services.skill_editor import skill_editor
@@ -1856,6 +1872,8 @@ async def edit_with_ai(
     skill = db.get(Skill, skill_id)
     if not skill:
         raise HTTPException(404, "Skill not found")
+    if user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN) and skill.created_by != user.id:
+        raise HTTPException(403, "无权编辑此 Skill")
     try:
         preview = await skill_editor.edit_skill(skill_id, req.instruction, model_config, db)
         return preview
@@ -1868,13 +1886,15 @@ def apply_ai_edit(
     skill_id: int,
     req: AIEditApply,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Apply AI-generated edit by creating a new version."""
     from app.services.skill_editor import skill_editor
     skill = db.get(Skill, skill_id)
     if not skill:
         raise HTTPException(404, "Skill not found")
+    if user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN) and skill.created_by != user.id:
+        raise HTTPException(403, "无权编辑此 Skill")
     try:
         result = skill_editor.apply_edit(skill_id, req.proposed, req.change_note, user.id, db)
         return result
@@ -1898,7 +1918,7 @@ async def iterate_from_suggestions(
     skill_id: int,
     req: IterateRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Generate AI-powered diff based on adopted suggestions."""
     from app.services.skill_editor import skill_editor
@@ -1906,6 +1926,8 @@ async def iterate_from_suggestions(
     skill = db.get(Skill, skill_id)
     if not skill:
         raise HTTPException(404, "Skill not found")
+    if user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN) and skill.created_by != user.id:
+        raise HTTPException(403, "无权编辑此 Skill")
     try:
         preview = await skill_editor.iterate_from_suggestions(
             skill_id, req.suggestion_ids, model_config, db
@@ -1920,7 +1942,7 @@ def apply_iterate(
     skill_id: int,
     req: IterateApply,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Apply iterated version and generate attributions."""
     from app.services.skill_editor import skill_editor
@@ -1928,6 +1950,8 @@ def apply_iterate(
     skill = db.get(Skill, skill_id)
     if not skill:
         raise HTTPException(404, "Skill not found")
+    if user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN) and skill.created_by != user.id:
+        raise HTTPException(403, "无权编辑此 Skill")
     latest = skill.versions[0] if skill.versions else None
     version_from = latest.version if latest else 0
     try:
