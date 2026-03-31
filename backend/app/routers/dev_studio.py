@@ -479,6 +479,47 @@ async def _idle_reaper() -> None:
                     pass
                 inst["proc"] = None
 
+        # ── 游离进程扫描：后端重启后 _user_instances 清空，但旧 opencode 进程仍在跑 ──
+        # 扫描系统中所有 .opencode web 进程，不在 _user_instances 管辖内的也做 fd 检查
+        managed_pids = {
+            inst["proc"].pid
+            for inst in _user_instances.values()
+            if inst.get("proc") and inst["proc"].returncode is None
+        }
+        try:
+            import subprocess as _sp
+            result = _sp.run(
+                ["pgrep", "-f", ".opencode web"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.strip().splitlines():
+                try:
+                    pid = int(line.strip())
+                except ValueError:
+                    continue
+                if pid in managed_pids:
+                    continue
+                # 游离进程，只做 fd 检查
+                try:
+                    fd_count = len(os.listdir(f"/proc/{pid}/fd"))
+                except Exception:
+                    continue
+                if fd_count > MAX_FD_COUNT:
+                    try:
+                        cwd = os.readlink(f"/proc/{pid}/cwd")
+                    except Exception:
+                        cwd = "unknown"
+                    logger.warning(
+                        f"[Reaper] 游离进程 pid={pid} fd={fd_count} 超限（cwd={cwd}），强制终止"
+                    )
+                    try:
+                        import signal as _sig
+                        os.kill(pid, _sig.SIGKILL)
+                    except Exception:
+                        pass
+        except Exception as _e:
+            logger.debug(f"[Reaper] 游离进程扫描失败: {_e}")
+
 
 def _start_idle_reaper():
     global _idle_reaper_task
