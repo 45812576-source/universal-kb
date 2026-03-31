@@ -1,7 +1,7 @@
 """Shared test fixtures for the Universal KB backend."""
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, LargeBinary, event
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base, get_db
@@ -12,6 +12,14 @@ from app.services.auth_service import hash_password
 
 # Use an in-memory SQLite for speed; override as needed
 TEST_DB_URL = "sqlite:///./test_universal_kb.db"
+
+# SQLite 不支持 MySQL 的 LONGBLOB，编译时映射为 BLOB
+from sqlalchemy.dialects.mysql import LONGBLOB
+from sqlalchemy.ext.compiler import compiles
+
+@compiles(LONGBLOB, "sqlite")
+def _compile_longblob_sqlite(type_, compiler, **kw):
+    return "BLOB"
 
 engine = create_engine(
     TEST_DB_URL,

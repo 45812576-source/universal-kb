@@ -1571,3 +1571,113 @@ def reject_filing_suggestion(
     suggestion.status = "rejected"
     db.commit()
     return {"ok": True}
+
+
+# ── 自动归档治理 ─────────────────────────────────────────────────────
+
+
+@router.post("/filing/auto-run")
+def filing_auto_run(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """一键自动归档所有未归档文档。仅超管可操作。"""
+    from app.services.auto_filer import auto_file_batch
+    stats = auto_file_batch(db, user_id=user.id)
+    return stats
+
+
+@router.get("/filing/unfiled")
+def filing_unfiled(
+    limit: int = 200,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """获取未归档文档列表。"""
+    from app.services.auto_filer import get_unfiled_entries
+    return get_unfiled_entries(db, limit=limit)
+
+
+class UndoBatchRequest(BaseModel):
+    batch_id: str
+
+
+@router.post("/filing/undo")
+def filing_undo(
+    req: UndoBatchRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """撤销一批自动归档。"""
+    from app.services.auto_filer import undo_batch
+    count = undo_batch(db, req.batch_id)
+    return {"ok": True, "undone": count}
+
+
+@router.post("/filing/undo-single/{action_id}")
+def filing_undo_single(
+    action_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """撤销单条自动归档。"""
+    from app.services.auto_filer import undo_single
+    ok = undo_single(db, action_id)
+    if not ok:
+        raise HTTPException(400, "无法撤销此操作")
+    return {"ok": True}
+
+
+@router.get("/filing/actions")
+def filing_actions(
+    batch_id: Optional[str] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """查看归档操作记录。"""
+    from app.services.auto_filer import get_filing_actions
+    return get_filing_actions(db, batch_id=batch_id, limit=limit)
+
+
+@router.get("/filing/suggestions")
+def filing_suggestions(
+    status: str = "pending",
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """列出归档建议（支持 status 过滤：pending/accepted/rejected）。"""
+    from app.models.knowledge_filing import KnowledgeFilingSuggestion
+
+    q = db.query(KnowledgeFilingSuggestion)
+    if status:
+        q = q.filter(KnowledgeFilingSuggestion.status == status)
+    suggestions = q.order_by(KnowledgeFilingSuggestion.created_at.desc()).limit(limit).all()
+
+    results = []
+    for s in suggestions:
+        entry = db.get(KnowledgeEntry, s.knowledge_id)
+        results.append({
+            "id": s.id,
+            "knowledge_id": s.knowledge_id,
+            "title": (entry.ai_title or entry.title) if entry else "",
+            "suggested_folder_id": s.suggested_folder_id,
+            "suggested_folder_path": s.suggested_folder_path,
+            "confidence": s.confidence,
+            "reason": s.reason,
+            "status": s.status,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+        })
+    return results
+
+
+@router.post("/filing/ensure-system-tree")
+def filing_ensure_system_tree(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """初始化/刷新系统归档树。"""
+    from app.services.system_folder_service import ensure_system_folders
+    mapping = ensure_system_folders(db, owner_id=user.id)
+    return {"ok": True, "nodes": len(mapping)}

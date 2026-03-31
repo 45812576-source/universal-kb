@@ -18,6 +18,10 @@ class KnowledgeFolder(Base):
     created_by = Column(Integer, ForeignKey("users.id"))
     department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
     sort_order = Column(Integer, default=0)
+    # 系统归档树标记：True=基于 taxonomy 自动生成的系统目录，不可删除
+    is_system = Column(Integer, default=0)               # 0=用户自建 1=系统归档树
+    taxonomy_board = Column(String(10), nullable=True)    # A/B/C/D/E/F 对应知识大类
+    taxonomy_code = Column(String(50), nullable=True)     # 完整分类编码
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     children = relationship(
