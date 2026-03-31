@@ -29,7 +29,7 @@ _user_instances: dict = {}
 _instances_lock: object = None   # 全局 asyncio.Lock，保护 _user_instances 写入
 
 IDLE_TIMEOUT_SECONDS = 600   # 10分钟无操作自动回收（降低内存压力）
-_REAPER_INTERVAL = 120       # 每2分钟检查一次空闲实例
+_REAPER_INTERVAL = 30        # 每2分钟检查一次空闲实例
 _idle_reaper_task = None
 MAX_ACTIVE_INSTANCES = 12    # 最多同时运行 12 个 opencode 进程
 
@@ -415,7 +415,7 @@ async def _db_cleaner() -> None:
 
 
 MAX_RSS_MB = 800  # 单实例内存硬上限（含 Go 主进程 + Node 启动器），超过则强制重启
-MAX_FD_COUNT = 2000  # 单实例 fd 上限，pty 泄漏时 fd 会持续累积，超过则强制重启
+MAX_FD_COUNT = 500   # 单实例 fd 上限，pty 泄漏时 fd 会持续累积，超过则强制重启
 
 
 def _get_proc_tree_rss_mb(pid: int) -> int:
@@ -521,8 +521,48 @@ async def _idle_reaper() -> None:
             logger.debug(f"[Reaper] 游离进程扫描失败: {_e}")
 
 
+def _kill_orphan_opencode_procs():
+    """Scan and kill orphan opencode processes exceeding fd limit on startup."""
+    import logging as _log, signal as _sig, subprocess as _sp
+    logger = _log.getLogger(__name__)
+    managed_pids = {
+        inst["proc"].pid
+        for inst in _user_instances.values()
+        if inst.get("proc") and inst["proc"].returncode is None
+    }
+    try:
+        result = _sp.run(["pgrep", "-f", ".opencode web"],
+                         capture_output=True, text=True, timeout=5)
+        for line in result.stdout.strip().splitlines():
+            try:
+                pid = int(line.strip())
+            except ValueError:
+                continue
+            if pid in managed_pids:
+                continue
+            try:
+                fd_count = len(os.listdir(f"/proc/{pid}/fd"))
+            except Exception:
+                continue
+            if fd_count > MAX_FD_COUNT:
+                try:
+                    cwd = os.readlink(f"/proc/{pid}/cwd")
+                except Exception:
+                    cwd = "unknown"
+                logger.warning(
+                    f"[Startup] orphan pid={pid} fd={fd_count} cwd={cwd}, killing"
+                )
+                try:
+                    os.kill(pid, _sig.SIGKILL)
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.debug(f"[Startup] orphan scan failed: {e}")
+
+
 def _start_idle_reaper():
     global _idle_reaper_task
+    _kill_orphan_opencode_procs()  # kill any leaked procs from previous run
     _idle_reaper_task = asyncio.create_task(_idle_reaper())
 
 OPENCODE_BASE_PORT = 17171   # user_id=1 → 17172, user_id=2 → 17173, ...
