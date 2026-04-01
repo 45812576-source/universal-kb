@@ -118,8 +118,11 @@ _ONLYOFFICE_EXTS = {
 def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None) -> dict:
     ext = (e.file_ext or "").lower()
     _folder_name = None
+    _is_in_my_knowledge = False
     if e.folder_id and folder_name_map:
         _folder_name = folder_name_map.get(e.folder_id)
+        if _folder_name == "我的知识":
+            _is_in_my_knowledge = True
     return {
         "id": e.id,
         "title": e.title,
@@ -146,6 +149,7 @@ def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None
         "auto_review_note": e.auto_review_note,
         "folder_id": e.folder_id,
         "folder_name": _folder_name,
+        "is_in_my_knowledge": _is_in_my_knowledge,
         "taxonomy_board": e.taxonomy_board,
         "taxonomy_code": e.taxonomy_code,
         "taxonomy_path": e.taxonomy_path or [],
