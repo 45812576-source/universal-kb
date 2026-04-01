@@ -1,14 +1,19 @@
 """Data table read builtin tool — 视图优先模式。
 
+v4 §1.1: 普通用户只认视图资产，禁止裸 table_name 入口。
+v4 §8.1: Agent 必须携带 view_id，否则后端拒绝。
+v4 §8.2: view_id 无效直接报错，不回退整表。
+
 Input params:
 {
-  "view_id": 5,                    # 优先级 1: 直接指定视图
-  "view_name": "风控汇总",          # 优先级 2: 配合 table_id/table_name 查视图
-  "table_name": "creative_topics", # 优先级 3: 仅 admin 可裸表读取
+  "view_id": 5,                    # 必须（非admin用户）
+  "view_name": "风控汇总",          # 配合 table_id/table_name 查视图
+  "table_name": "creative_topics", # 仅 super_admin 可裸表读取且需 admin_raw_table=true
   "table_id": 1,
   "filters": [{"field": "status", "op": "eq", "value": "pending"}],
   "columns": ["topic", "status"],
-  "limit": 50
+  "limit": 50,
+  "admin_raw_table": false         # 高级开关：仅 super_admin 可用
 }
 
 Output: {"ok": true, "rows": [...], "columns": [...], "total": 10, "table_id": 1, "view_id": 5}
@@ -33,7 +38,10 @@ _OP_MAP = {
 
 
 async def execute(params: dict, db: Session, user_id: int | None = None) -> dict:
-    """Read rows from a registered business table — view-first with permission enforcement."""
+    """Read rows from a registered business table — view-first with permission enforcement.
+
+    v4: 普通用户只能通过视图读取。整表直读仅 super_admin + 显式高级开关。
+    """
     view_id = params.get("view_id")
     view_name = params.get("view_name", "")
     table_name = params.get("table_name", "")
@@ -41,12 +49,16 @@ async def execute(params: dict, db: Session, user_id: int | None = None) -> dict
     filters = params.get("filters") or []
     columns = params.get("columns") or []
     limit = min(int(params.get("limit", 50)), 500)
+    admin_raw_table = params.get("admin_raw_table", False)
 
     # 获取用户对象
     user = None
     if user_id:
         from app.models.user import User
         user = db.get(User, user_id)
+
+    from app.models.user import Role
+    is_admin = user and user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
 
     # ── 视图查找链路 ──
     view = None
@@ -56,7 +68,13 @@ async def execute(params: dict, db: Session, user_id: int | None = None) -> dict
     if view_id:
         view = db.get(TableView, view_id)
         if not view:
-            return {"ok": False, "error": f"视图 {view_id} 不存在"}
+            return {"ok": False, "error": f"视图 {view_id} 不存在", "error_code": "view_invalid"}
+        # v4 §7.1: 检查 view_state
+        view_state = getattr(view, "view_state", None) or "available"
+        if view_state != "available":
+            error_code = f"view_{view_state}"
+            reason = getattr(view, "view_invalid_reason", None) or f"视图状态异常: {view_state}"
+            return {"ok": False, "error": reason, "error_code": error_code}
         bt = db.get(BusinessTable, view.table_id)
 
     # 2. table_id + view_name
@@ -79,7 +97,6 @@ async def execute(params: dict, db: Session, user_id: int | None = None) -> dict
                 TableView.name == view_name,
             ).first()
             if not view:
-                # 列出可用视图帮助用户
                 avail_views = db.query(TableView.name).filter(
                     TableView.table_id == bt.id,
                     ).all()
@@ -115,6 +132,13 @@ async def execute(params: dict, db: Session, user_id: int | None = None) -> dict
         if not user:
             return {"ok": False, "error": "需要用户身份才能通过视图读取数据"}
 
+        # v4 §7.3: 后端二次校验 view_state
+        view_state = getattr(view, "view_state", None) or "available"
+        if view_state != "available":
+            error_code = f"view_{view_state}"
+            reason = getattr(view, "view_invalid_reason", None) or f"视图状态异常: {view_state}"
+            return {"ok": False, "error": reason, "error_code": error_code}
+
         from app.services.data_view_runtime import execute_view_read
         result = execute_view_read(
             db=db,
@@ -130,12 +154,12 @@ async def execute(params: dict, db: Session, user_id: int | None = None) -> dict
         out["columns"] = [f["field_name"] for f in result.fields] if result.fields else []
         return out
 
-    # ── 无视图 fallback ──
+    # ── 无视图 ──
 
     # 没找到表
     if not bt:
         if not table_name and not table_id:
-            return {"ok": False, "error": "请提供 view_id、table_name 或 table_id"}
+            return {"ok": False, "error": "请提供 view_id 来读取数据。OpenCode 不接受无视图的数据读取请求。"}
 
         name_hint = table_name or str(table_id)
         # 检查是否是工作区文件
@@ -150,9 +174,8 @@ async def execute(params: dict, db: Session, user_id: int | None = None) -> dict
         hint = "、".join(f"{t.display_name}({t.table_name})" for t in available) if available else "暂无已注册表"
         return {"ok": False, "error": f"表 '{name_hint}' 未在业务表注册表中。可用的表：{hint}"}
 
-    # 有表但无视图 — 非 admin 拒绝
-    from app.models.user import User, Role
-    if user and user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
+    # v4 §1.1: 有表但无视图 — 非 admin 直接拒绝，不允许隐式 fallback
+    if not is_admin:
         avail_views = db.query(TableView.name).filter(
             TableView.table_id == bt.id,
         ).all()
@@ -161,7 +184,17 @@ async def execute(params: dict, db: Session, user_id: int | None = None) -> dict
             return {"ok": False, "error": f"请指定视图读取数据。表 '{bt.display_name}' 下可用视图：{hints}"}
         return {"ok": False, "error": f"表 '{bt.display_name}' 暂无可用视图，请联系管理员配置。"}
 
-    # Admin fallback: 裸表读取（保留旧逻辑）
+    # v4 §1.1: Admin 整表直读 — 必须显式 admin_raw_table=true 高级开关
+    if not admin_raw_table:
+        avail_views = db.query(TableView.name).filter(
+            TableView.table_id == bt.id,
+        ).all()
+        if avail_views:
+            hints = "、".join(v.name for v in avail_views)
+            return {"ok": False, "error": f"请通过视图读取数据。表 '{bt.display_name}' 下可用视图：{hints}。如需整表直读请设置 admin_raw_table=true。"}
+        return {"ok": False, "error": f"表 '{bt.display_name}' 暂无视图。如需管理员整表直读请设置 admin_raw_table=true。"}
+
+    # Admin fallback with explicit switch: 裸表读取
     table_name = bt.table_name
     columns_info = data_engine._get_columns(db, table_name)
     allowed_cols = {c["name"] for c in columns_info}
@@ -238,6 +271,7 @@ async def execute(params: dict, db: Session, user_id: int | None = None) -> dict
             "total": len(rows),
             "table_name": table_name,
             "table_id": bt.id,
+            "warnings": ["管理员整表直读模式，非视图结果"],
         }
     except Exception as e:
         logger.error(f"data_table_reader failed: {e}")

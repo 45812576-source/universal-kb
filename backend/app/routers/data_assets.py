@@ -29,35 +29,108 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/data-assets", tags=["data-assets"])
 
 
+def _compute_default_view_fields(all_fields: list) -> tuple[list[int], str]:
+    """计算默认视图的可见字段和 disclosure_ceiling。
+
+    v4 §4.2 严格规则：
+    - 排除所有 identifier
+    - 排除所有 sensitive / S3 / S4 字段
+    - 若字段 field_role_tags 为空，默认排除（标签缺失）
+    - 只纳入 dimension/metric 且安全等级可接受字段
+
+    v4 §4.3 披露规则：
+    - 含任何 S3/S4 字段 → L2 (aggregate_only)
+    - 仅 S0/S1/S2 且无标识符 → L3 (masked_detail)
+    - 默认不允许 L4
+    """
+    has_s3_s4 = False
+    has_identifier = False
+    visible_ids = []
+
+    # 安全标签集合
+    EXCLUDE_TAGS = {"identifier", "sensitive", "system"}
+    ACCEPT_TAGS = {"dimension", "metric"}
+    HIGH_SENSITIVITY_TAGS = {"S3", "S4"}
+
+    for f in all_fields:
+        if f.is_hidden_by_default:
+            continue
+
+        tags = set(f.field_role_tags or [])
+
+        # 检测高敏字段
+        if f.is_sensitive or tags & HIGH_SENSITIVITY_TAGS:
+            has_s3_s4 = True
+            continue
+
+        # 检测标识符
+        if "identifier" in tags:
+            has_identifier = True
+            continue
+
+        # v4 §4.2: 字段标签缺失默认排除
+        if not tags:
+            continue
+
+        # 排除 system / sensitive 标签字段
+        if tags & EXCLUDE_TAGS:
+            continue
+
+        # 只纳入 dimension / metric
+        if not (tags & ACCEPT_TAGS):
+            continue
+
+        visible_ids.append(f.id)
+
+    # 如果全部字段都被排除，不生成默认视图（返回空列表让调用方决定）
+    # 但 fallback: 至少取非隐藏+非敏感+非标识符字段
+    if not visible_ids:
+        for f in all_fields:
+            if f.is_hidden_by_default:
+                continue
+            tags = set(f.field_role_tags or [])
+            if f.is_sensitive or "identifier" in tags or tags & HIGH_SENSITIVITY_TAGS:
+                continue
+            visible_ids.append(f.id)
+
+    # v4 §4.3: 固定规则
+    if has_s3_s4:
+        ceiling = "L2"  # aggregate_only
+    elif has_identifier:
+        ceiling = "L3"  # masked_detail
+    else:
+        ceiling = "L3"  # 保守默认，不允许 L4
+
+    return visible_ids, ceiling
+
+
+# v4 §4.1: 视图状态常量
+VIEW_STATE_AVAILABLE = "available"
+VIEW_STATE_INVALID_SCHEMA = "invalid_schema"
+VIEW_STATE_SYNC_FAILED = "sync_failed"
+VIEW_STATE_COMPILE_FAILED = "compile_failed"
+
+
 def ensure_default_view(db: Session, table_id: int) -> TableView | None:
     """确保数据表存在默认系统视图。同步完成/表创建后调用。
 
-    如果已存在 is_system=True & is_default=True 的视图则跳过。
-    否则创建一个包含所有非隐藏字段的默认探索视图。
+    v4 §4.1 前置条件（全部满足才允许生成）：
+    1. 表已成功注册为 BusinessTable
+    2. 字段画像已完成 (field_profile_status == 'ready')
+    3. 当前没有任何现有视图
+    4. 表不在同步失败或 schema 失效状态
     """
-    existing = (
-        db.query(TableView)
-        .filter(
-            TableView.table_id == table_id,
-            TableView.is_system == True,  # noqa: E712
-            TableView.is_default == True,  # noqa: E712
-        )
-        .first()
-    )
-    if existing:
-        # 同步后字段可能变化，更新 visible_field_ids
-        all_fields = (
-            db.query(TableField)
-            .filter(TableField.table_id == table_id)
-            .order_by(TableField.sort_order)
-            .all()
-        )
-        visible_ids = [f.id for f in all_fields if not f.is_hidden_by_default]
-        if set(existing.visible_field_ids or []) != set(visible_ids):
-            existing.visible_field_ids = visible_ids
-            from sqlalchemy.orm.attributes import flag_modified
-            flag_modified(existing, "visible_field_ids")
-        return existing
+    bt = db.get(BusinessTable, table_id)
+    if not bt:
+        return None
+
+    # v4 §4.1 条件 4: 表不在同步失败状态
+    if bt.sync_status in ("failed", "disabled"):
+        return None
+
+    # v4 §4.1 条件 2: 字段画像已完成
+    if bt.field_profile_status != "ready":
+        return None
 
     all_fields = (
         db.query(TableField)
@@ -68,9 +141,47 @@ def ensure_default_view(db: Session, table_id: int) -> TableView | None:
     if not all_fields:
         return None
 
-    visible_ids = [f.id for f in all_fields if not f.is_hidden_by_default]
+    visible_ids, ceiling = _compute_default_view_fields(all_fields)
+
+    # 已有默认视图 → 同步更新
+    existing = (
+        db.query(TableView)
+        .filter(
+            TableView.table_id == table_id,
+            TableView.is_system == True,  # noqa: E712
+            TableView.is_default == True,  # noqa: E712
+        )
+        .first()
+    )
+    if existing:
+        from sqlalchemy.orm.attributes import flag_modified
+        changed = False
+        if set(existing.visible_field_ids or []) != set(visible_ids):
+            existing.visible_field_ids = visible_ids
+            flag_modified(existing, "visible_field_ids")
+            changed = True
+        if existing.disclosure_ceiling != ceiling:
+            existing.disclosure_ceiling = ceiling
+            changed = True
+        # 同步更新 view_state
+        if not visible_ids:
+            existing.view_state = VIEW_STATE_COMPILE_FAILED
+            existing.view_invalid_reason = "默认视图无可纳入字段"
+        elif bt.sync_status == "failed":
+            existing.view_state = VIEW_STATE_SYNC_FAILED
+            existing.view_invalid_reason = "数据同步失败"
+        else:
+            existing.view_state = VIEW_STATE_AVAILABLE
+            existing.view_invalid_reason = None
+        return existing
+
+    # v4 §4.1 条件 3: 当前没有任何现有视图 → 才生成
+    any_view = db.query(TableView).filter(TableView.table_id == table_id).first()
+    if any_view:
+        return None
+
     if not visible_ids:
-        visible_ids = [f.id for f in all_fields]
+        return None
 
     view = TableView(
         table_id=table_id,
@@ -80,7 +191,8 @@ def ensure_default_view(db: Session, table_id: int) -> TableView | None:
         is_system=True,
         is_default=True,
         visible_field_ids=visible_ids,
-        disclosure_ceiling=None,  # 继承表级策略
+        disclosure_ceiling=ceiling,
+        view_state=VIEW_STATE_AVAILABLE,
     )
     db.add(view)
     db.flush()

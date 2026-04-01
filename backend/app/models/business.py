@@ -119,6 +119,8 @@ class TableView(Base):
     allowed_role_group_ids = Column(JSON, default=list)
     allowed_skill_ids = Column(JSON, default=list)
     view_kind = Column(String(20), default="list")            # list | board | metric | pivot | review_queue
+    view_state = Column(String(30), default="available")      # available | invalid_schema | sync_failed | permission_blocked | risk_blocked | compile_failed
+    view_invalid_reason = Column(Text, nullable=True)         # 视图不可用时的原因描述
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 

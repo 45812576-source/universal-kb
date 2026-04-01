@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 OUTPUT_MODE_MAP = {
     "L0": "blocked",
     "L1": "decision",
-    "L2": "aggregate",
+    "L2": "aggregates",
     "L3": "rows",
     "L4": "rows",
 }
@@ -54,14 +54,24 @@ OUTPUT_MODE_MAP = {
 class ViewReadResult:
     ok: bool = True
     error: str | None = None
-    mode: str = "rows"  # rows | aggregate | decision | blocked
+    mode: str = "rows"  # rows | aggregates | mixed | decision | blocked
     table_id: int | None = None
     table_name: str = ""
     view_id: int | None = None
     view_name: str = ""
+    # rows 模式
     fields: list[dict] = dc_field(default_factory=list)
     rows: list[dict] = dc_field(default_factory=list)
+    # aggregates 模式
+    group_by: list[str] = dc_field(default_factory=list)
+    metrics: list[dict] = dc_field(default_factory=list)
+    buckets: list[dict] = dc_field(default_factory=list)
+    # mixed 模式
+    grouped_rows: list[dict] = dc_field(default_factory=list)
+    sample_rows: list[dict] = dc_field(default_factory=list)
+    # 通用
     summary: dict = dc_field(default_factory=dict)
+    warnings: list[str] = dc_field(default_factory=list)
     total: int = 0
     applied_rules: list[str] = dc_field(default_factory=list)
     disclosure_level: str = "L0"
@@ -80,11 +90,19 @@ class ViewReadResult:
             "applied_rules": self.applied_rules,
             "disclosure_level": self.disclosure_level,
             "capabilities": self.capabilities,
+            "warnings": self.warnings,
         }
         if self.error:
             d["error"] = self.error
         if self.mode == "rows":
             d["rows"] = self.rows
+        elif self.mode == "aggregates":
+            d["group_by"] = self.group_by
+            d["metrics"] = self.metrics
+            d["buckets"] = self.buckets
+        elif self.mode == "mixed":
+            d["grouped_rows"] = self.grouped_rows
+            d["sample_rows"] = self.sample_rows
         if self.summary:
             d["summary"] = self.summary
         return d
@@ -97,6 +115,8 @@ class ViewAvailability:
     available: bool = True
     risk_flags: list[str] = dc_field(default_factory=list)
     display_mode: str = "rows"
+    view_state: str = "available"  # v4 §7.1
+    unavailable_reason: str | None = None  # v4 §7.2
 
 
 def assess_view_availability(
@@ -104,18 +124,50 @@ def assess_view_availability(
     policy: PolicyResult,
     bt: BusinessTable | None = None,
 ) -> ViewAvailability:
-    """判定视图对当前用户是否可用，返回可用性 + 风险标记 + 展示模式。"""
+    """判定视图对当前用户是否可用，返回可用性 + 风险标记 + 展示模式。
+
+    v4 §7.1 状态分类: available / invalid_schema / sync_failed /
+    permission_blocked / risk_blocked / compile_failed
+    """
     result = ViewAvailability()
+
+    # v4 §7.1: view_state 检查
+    view_state = getattr(view, "view_state", None) or "available"
+    if view_state == "invalid_schema":
+        result.available = False
+        result.view_state = "invalid_schema"
+        result.risk_flags.append("INVALID_SCHEMA")
+        result.display_mode = "blocked"
+        result.unavailable_reason = getattr(view, "view_invalid_reason", None) or "视图 schema 已失效"
+        return result
+    if view_state == "sync_failed":
+        result.available = False
+        result.view_state = "sync_failed"
+        result.risk_flags.append("SYNC_FAILED")
+        result.display_mode = "blocked"
+        result.unavailable_reason = getattr(view, "view_invalid_reason", None) or "数据同步失败"
+        return result
+    if view_state == "compile_failed":
+        result.available = False
+        result.view_state = "compile_failed"
+        result.risk_flags.append("COMPILE_FAILED")
+        result.display_mode = "blocked"
+        result.unavailable_reason = getattr(view, "view_invalid_reason", None) or "视图编译失败"
+        return result
 
     # 无可见字段
     if not (view.visible_field_ids or []):
         result.available = False
         result.risk_flags.append("NO_FIELDS")
+        result.view_state = "compile_failed"
+        result.unavailable_reason = "视图无可见字段"
 
     # 权限拒绝
     if policy.denied:
         result.available = False
+        result.view_state = "permission_blocked"
         result.risk_flags.append("ACCESS_DENIED")
+        result.unavailable_reason = "无访问权限"
         return result
 
     # 披露级别
@@ -126,8 +178,10 @@ def assess_view_availability(
 
     if effective_dl == "L0":
         result.available = False
+        result.view_state = "risk_blocked"
         result.risk_flags.append("L0_BLOCKED")
         result.display_mode = "blocked"
+        result.unavailable_reason = "披露级别为 L0（禁止访问）"
     elif effective_dl == "L1":
         result.display_mode = "decision"
         result.risk_flags.append("DECISION_ONLY")
@@ -143,6 +197,10 @@ def assess_view_availability(
     # 同步状态
     if bt and bt.sync_status == "failed":
         result.risk_flags.append("SYNC_FAILED")
+
+    # v4 §7.1: 最终状态判定
+    if result.available:
+        result.view_state = "available"
 
     return result
 
@@ -260,10 +318,11 @@ def _build_view_sql(
         if sort_parts:
             sql += " ORDER BY " + ", ".join(sort_parts)
 
-    # LIMIT
-    view_limit = view.row_limit
-    effective_limit = min(limit, view_limit) if view_limit else limit
-    effective_limit = min(effective_limit, 500)
+    # LIMIT — v4 §2.4: 优先级固定 1.权限引擎上限 2.视图row_limit 3.调用参数limit，取三者最小值
+    policy_limit = getattr(policy, 'max_row_limit', None) or 500  # 权限引擎上限（默认500硬顶）
+    view_limit = view.row_limit or 500
+    effective_limit = min(policy_limit, view_limit, limit)
+    effective_limit = max(1, min(effective_limit, 500))  # 硬顶500
     sql += f" LIMIT {effective_limit}"
 
     return sql
@@ -413,7 +472,13 @@ def execute_view_read(
         result.summary = {"message": "此视图仅提供决策级信息，不返回明细或汇总数据"}
         return result
 
-    aggregate_mode = (output_mode == "aggregate")
+    aggregate_mode = (output_mode == "aggregates")
+
+    # v4 §2.3: mixed 模式仅在 L3/L4 且视图明确定义了 aggregate_rule_json 时可用
+    has_aggregate_rules = bool(view.aggregate_rule_json and (view.aggregate_rule_json.get("aggregates") or view.aggregate_rule_json.get("group_by")))
+    if effective_dl in ("L3", "L4") and has_aggregate_rules and not aggregate_mode:
+        output_mode = "mixed"
+        result.mode = "mixed"
 
     try:
         sql = _build_view_sql(
@@ -451,11 +516,46 @@ def execute_view_read(
     if effective_dl == "L3":
         result.applied_rules.append("L3_MASKED_DETAIL")
 
-    # 7. 组装结果
+    # 7. 组装结果 (v4 §2.3)
     if aggregate_mode:
-        result.summary = {"aggregates": rows}
+        # aggregates 模式: group_by + metrics + buckets + summary
+        agg_rules = view.aggregate_rule_json or {}
+        result.group_by = agg_rules.get("group_by", [])
+        result.metrics = agg_rules.get("aggregates", [])
+        result.buckets = rows
+        result.summary = {"total_buckets": len(rows)}
         result.applied_rules.append("L2_AGGREGATE_ONLY")
         result.total = len(rows)
+        result.warnings.append("仅返回聚合结果，不包含明细行")
+    elif output_mode == "mixed":
+        # mixed 模式: summary + grouped_rows + sample_rows
+        # 先跑一遍聚合 SQL
+        try:
+            agg_sql = _build_view_sql(
+                table_name=bt.table_name,
+                visible_columns=visible_col_names,
+                view=view,
+                policy=policy,
+                user=user,
+                extra_filters=filters,
+                limit=limit,
+                aggregate_mode=True,
+            )
+            ok2, reason2 = data_engine.validate_sql(agg_sql, "read", [bt.table_name])
+            if ok2:
+                agg_result = db.execute(text(agg_sql))
+                agg_col_names = list(agg_result.keys())
+                agg_raw = agg_result.fetchall()
+                agg_rows = [dict(zip(agg_col_names, [_serialize_value(c) for c in row])) for row in agg_raw]
+                result.grouped_rows = agg_rows
+        except Exception:
+            result.warnings.append("聚合查询失败，仅返回明细")
+
+        result.sample_rows = rows[:20]  # 受控明细上限 20 行
+        result.summary = {"total_rows": len(rows), "sample_count": min(len(rows), 20)}
+        result.total = len(rows)
+        result.applied_rules.append("MIXED_MODE")
+        result.warnings.append("mixed 模式：同时返回聚合结果和受控明细样本")
     else:
         result.rows = rows
         result.total = len(rows)
@@ -481,3 +581,116 @@ def execute_view_read(
         logger.warning("Failed to write audit log for view read", exc_info=True)
 
     return result
+
+
+# ─── v4 §5.2/§5.3: 视图失效检测与重编译 ────────────────────────────────────────
+
+def revalidate_view(db: Session, view: TableView) -> tuple[bool, str | None]:
+    """校验视图的字段/过滤/聚合/分组是否仍然有效。
+
+    v4 §5.2: 每次同步后执行：
+    - 视图字段存在性检查
+    - 视图过滤字段存在性检查
+    - 聚合字段类型检查
+    - 分组字段可枚举性检查
+
+    返回 (is_valid, reason_if_invalid)
+    """
+    bt = db.get(BusinessTable, view.table_id)
+    if not bt:
+        return False, "关联数据表不存在"
+
+    all_fields = db.query(TableField).filter(TableField.table_id == view.table_id).all()
+    field_ids = {f.id for f in all_fields}
+    field_by_name = {(f.physical_column_name or f.field_name): f for f in all_fields}
+
+    reasons = []
+
+    # 1. 视图字段存在性检查
+    view_field_ids = view.visible_field_ids or []
+    missing_field_ids = [fid for fid in view_field_ids if fid not in field_ids]
+    if missing_field_ids:
+        reasons.append(f"视图引用了 {len(missing_field_ids)} 个已删除的字段")
+
+    # 2. 视图过滤字段存在性检查
+    filter_rules = view.filter_rule_json or {}
+    for flt in (filter_rules.get("filters") or []):
+        field_name = flt.get("field", "")
+        if field_name and field_name not in field_by_name:
+            reasons.append(f"过滤条件引用了不存在的字段: {field_name}")
+
+    # 3. 聚合字段类型检查
+    agg_rules = view.aggregate_rule_json or {}
+    for agg in (agg_rules.get("aggregates") or []):
+        field_name = agg.get("field", "")
+        func_name = agg.get("func", "").upper()
+        if field_name and field_name in field_by_name:
+            f = field_by_name[field_name]
+            if func_name in ("SUM", "AVG") and f.field_type not in ("number", "currency", "percent"):
+                reasons.append(f"聚合函数 {func_name} 不适用于字段 {field_name} (类型: {f.field_type})")
+        elif field_name:
+            reasons.append(f"聚合引用了不存在的字段: {field_name}")
+
+    # 4. 分组字段可枚举性检查
+    for gf in (agg_rules.get("group_by") or []):
+        if gf in field_by_name:
+            f = field_by_name[gf]
+            if f.field_type in ("long_text", "json", "attachment"):
+                reasons.append(f"分组字段 {gf} 的类型 {f.field_type} 不适合分组")
+        else:
+            reasons.append(f"分组引用了不存在的字段: {gf}")
+
+    # 5. 排序字段检查
+    sort_rules = view.sort_rule_json or {}
+    for sr in (sort_rules.get("sorts") or []):
+        field_name = sr.get("field", "")
+        if field_name and field_name not in field_by_name:
+            reasons.append(f"排序引用了不存在的字段: {field_name}")
+
+    if reasons:
+        return False, "；".join(reasons)
+    return True, None
+
+
+def revalidate_table_views(db: Session, table_id: int) -> list[dict]:
+    """v4 §5.2: 对表下所有视图执行失效检测，更新 view_state。"""
+    views = db.query(TableView).filter(TableView.table_id == table_id).all()
+    results = []
+
+    for v in views:
+        is_valid, reason = revalidate_view(db, v)
+        old_state = getattr(v, "view_state", "available")
+
+        if is_valid:
+            v.view_state = "available"
+            v.view_invalid_reason = None
+        else:
+            v.view_state = "invalid_schema"
+            v.view_invalid_reason = reason
+
+        results.append({
+            "view_id": v.id,
+            "view_name": v.name,
+            "old_state": old_state,
+            "new_state": v.view_state,
+            "reason": reason,
+        })
+
+    db.flush()
+    return results
+
+
+def rebuild_default_view(db: Session, table_id: int) -> TableView | None:
+    """v4 §5.3: 重建系统默认视图。"""
+    from app.routers.data_assets import ensure_default_view
+    # 先删除旧的系统默认视图
+    old = db.query(TableView).filter(
+        TableView.table_id == table_id,
+        TableView.is_system == True,  # noqa: E712
+        TableView.is_default == True,  # noqa: E712
+    ).first()
+    if old:
+        db.delete(old)
+        db.flush()
+
+    return ensure_default_view(db, table_id)

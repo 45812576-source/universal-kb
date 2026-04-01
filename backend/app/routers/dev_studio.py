@@ -2407,6 +2407,40 @@ def workdir_download(path: str, user: User = Depends(get_current_user)):
 
 # ─── 数据视图接口 ─────────────────────────────────────────────────────────────
 
+def _risk_level_from_flags(risk_flags: list[str]) -> str:
+    """根据 risk_flags 推算风险等级。"""
+    high_flags = {"L0_BLOCKED", "ACCESS_DENIED", "INVALID_SCHEMA", "COMPILE_FAILED"}
+    medium_flags = {"AGGREGATE_ONLY", "SYNC_FAILED", "NO_FIELDS", "NO_VIEW", "CEILING_CAPPED", "DECISION_ONLY"}
+    if any(f in high_flags for f in risk_flags):
+        return "high"
+    if any(f in medium_flags for f in risk_flags):
+        return "medium"
+    return "low"
+
+
+def _unavailable_reason_from_avail(avail) -> str | None:
+    """从 ViewAvailability 取 unavailable_reason（优先用其自身生成的原因）。"""
+    if avail.available:
+        return None
+    if avail.unavailable_reason:
+        return avail.unavailable_reason
+    # fallback
+    flag_map = {
+        "L0_BLOCKED": "披露级别为 L0（禁止访问）",
+        "ACCESS_DENIED": "无访问权限",
+        "NO_FIELDS": "视图无可见字段",
+        "SYNC_FAILED": "数据同步失败",
+        "NO_VIEW": "未配置数据视图",
+        "INVALID_SCHEMA": "视图 schema 已失效",
+        "COMPILE_FAILED": "视图编译失败",
+    }
+    reasons = []
+    for flag in avail.risk_flags:
+        if flag in flag_map:
+            reasons.append(flag_map[flag])
+    return "；".join(reasons) if reasons else "不可用"
+
+
 @router.get("/data-views")
 def list_data_views(
     q: str = "",
@@ -2414,15 +2448,21 @@ def list_data_views(
     table_id: Optional[int] = None,
     only_bindable: bool = True,
     include_direct_table: bool = False,
+    disclosure_mode: str = "",
+    only_available: bool = False,
+    include_system: bool = True,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """返回当前用户可见的数据视图列表（表 + 视图二级）。"""
+    """返回当前用户可见的数据视图列表（先表后视图分组格式）。"""
     from app.models.business import (
         BusinessTable, TableView, TableField,
     )
     from app.services.policy_engine import resolve_user_role_groups, resolve_effective_policy
     from app.services.data_view_runtime import assess_view_availability
+
+    # 解析 disclosure_mode 过滤
+    disclosure_set = set(disclosure_mode.split(",")) if disclosure_mode else set()
 
     # 查所有非归档表
     tq = db.query(BusinessTable).filter(BusinessTable.is_archived == False)  # noqa: E712
@@ -2432,7 +2472,7 @@ def list_data_views(
         tq = tq.filter(BusinessTable.id == table_id)
     tables = tq.all()
 
-    items = []
+    result_tables = []
     for bt in tables:
         # 查该表的视图
         vq = db.query(TableView).filter(
@@ -2440,38 +2480,33 @@ def list_data_views(
         )
         if only_bindable:
             vq = vq.filter(TableView.view_purpose.in_(["skill_runtime", "explore", "ops"]))
+        if not include_system:
+            vq = vq.filter(TableView.is_system == False)  # noqa: E712
         views = vq.all()
-
-        if not views:
-            # 无视图的裸表 — 仅 admin 且 include_direct_table 时返回
-            if include_direct_table and user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
-                items.append({
-                    "table_id": bt.id,
-                    "table_name": bt.table_name,
-                    "display_name": bt.display_name or bt.table_name,
-                    "source_type": bt.source_type,
-                    "sync_status": bt.sync_status,
-                    "view_id": None,
-                    "view_name": None,
-                    "view_purpose": None,
-                    "view_kind": None,
-                    "disclosure_ceiling": None,
-                    "field_count": 0,
-                    "record_count_cache": bt.record_count_cache,
-                    "risk_flags": ["NO_VIEW"],
-                })
-            continue
 
         # 获取用户对该表的权限
         role_groups = resolve_user_role_groups(db, bt.id, user)
         group_ids = [g.id for g in role_groups]
 
+        view_items = []
         for v in views:
             policy = resolve_effective_policy(db, bt.id, group_ids, view_id=v.id)
             avail = assess_view_availability(v, policy, bt)
 
+            # v4 §7.2: permission_blocked → 不显示（非admin）
+            if avail.view_state == "permission_blocked" and user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
+                continue
+
             # 权限完全拒绝且非 admin → 不返回
             if policy.denied and user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
+                continue
+
+            # disclosure_mode 过滤
+            if disclosure_set and (v.disclosure_ceiling or "") not in disclosure_set:
+                continue
+
+            # only_available 过滤
+            if only_available and not avail.available:
                 continue
 
             # 文本搜索过滤
@@ -2481,26 +2516,69 @@ def list_data_views(
                     continue
 
             field_count = len(v.visible_field_ids or [])
+            risk_flags = avail.risk_flags
+            available = avail.available
+            risk_level = _risk_level_from_flags(risk_flags)
 
-            items.append({
-                "table_id": bt.id,
-                "table_name": bt.table_name,
-                "display_name": bt.display_name or bt.table_name,
-                "source_type": bt.source_type,
-                "sync_status": bt.sync_status,
+            view_items.append({
                 "view_id": v.id,
                 "view_name": v.name,
                 "view_purpose": v.view_purpose,
                 "view_kind": v.view_kind,
                 "disclosure_ceiling": v.disclosure_ceiling,
+                "is_system": v.is_system or False,
+                "is_default": v.is_default or False,
+                "result_mode": avail.display_mode,
                 "field_count": field_count,
-                "record_count_cache": bt.record_count_cache,
-                "risk_flags": avail.risk_flags,
-                "available": avail.available,
+                "available": available,
+                "risk_level": risk_level,
                 "display_mode": avail.display_mode,
+                "risk_flags": risk_flags,
+                "view_state": avail.view_state,
+                "unavailable_reason": _unavailable_reason_from_avail(avail),
             })
 
-    return {"ok": True, "items": items, "total": len(items)}
+        # 排序：可用在前，不可用在后
+        view_items.sort(key=lambda x: (0 if x["available"] else 1, x["view_id"]))
+
+        # 无视图且 include_direct_table → admin 才返回裸表
+        if not views and not view_items:
+            if include_direct_table and user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
+                view_items.append({
+                    "view_id": None,
+                    "view_name": None,
+                    "view_purpose": None,
+                    "view_kind": None,
+                    "disclosure_ceiling": None,
+                    "is_system": False,
+                    "is_default": False,
+                    "result_mode": "blocked",
+                    "field_count": 0,
+                    "available": False,
+                    "risk_level": "high",
+                    "display_mode": "blocked",
+                    "risk_flags": ["NO_VIEW"],
+                    "unavailable_reason": "未配置数据视图",
+                })
+
+        # 文本搜索时如果视图全被过滤、但表名匹配，仍然需要保留表（空 views）
+        if q and not view_items:
+            haystack = f"{bt.display_name} {bt.table_name}".lower()
+            if q.lower() not in haystack:
+                continue
+
+        if view_items or not q:
+            result_tables.append({
+                "table_id": bt.id,
+                "table_name": bt.table_name,
+                "display_name": bt.display_name or bt.table_name,
+                "source_type": bt.source_type,
+                "sync_status": bt.sync_status,
+                "record_count_cache": bt.record_count_cache,
+                "views": view_items,
+            })
+
+    return {"ok": True, "tables": result_tables}
 
 
 @router.get("/data-views/{view_id}")
@@ -2522,6 +2600,12 @@ def get_data_view_detail(
     view = db.get(TableView, view_id)
     if not view:
         raise HTTPException(404, "视图不存在")
+
+    # v4 §7.3: 后端二次校验 view_state
+    view_state = getattr(view, "view_state", None) or "available"
+    if view_state != "available":
+        # 不可用视图仍可查看详情（只读），但标记不可用
+        pass
 
     bt = db.get(BusinessTable, view.table_id)
     if not bt:
@@ -2598,6 +2682,8 @@ def get_data_view_detail(
             "disclosure_ceiling": view.disclosure_ceiling,
             "is_system": view.is_system,
             "is_default": view.is_default,
+            "result_mode": avail.display_mode,
+            "view_state": avail.view_state,
         },
         "fields": fields_info,
         "permission": permission_summary,
@@ -2605,6 +2691,8 @@ def get_data_view_detail(
             "available": avail.available,
             "risk_flags": avail.risk_flags,
             "display_mode": avail.display_mode,
+            "view_state": avail.view_state,
+            "unavailable_reason": _unavailable_reason_from_avail(avail),
         },
         "preview": preview,
     }
