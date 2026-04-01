@@ -1670,16 +1670,26 @@ def update_status(
     scope: Optional[str] = Query(None),          # company / department / personal
     department_id: Optional[int] = Query(None),  # 指定部门时填写
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """更新 Skill 状态，发布时可同时设置可见范围。
     scope: company=全公司, department=指定部门（需提供 department_id）, personal=仅自己
+
+    权限：
+    - EMPLOYEE：只能对自己创建的 Skill 提交审核（status=published → 实际转为 reviewing）
+    - DEPT_ADMIN：可对本部门 Skill 提交审核
+    - SUPER_ADMIN：可直接发布
     """
     skill = db.get(Skill, skill_id)
     if not skill:
         raise HTTPException(404, "Skill not found")
     if status not in [s.value for s in SkillStatus]:
         raise HTTPException(400, f"Invalid status: {status}")
+
+    # 权限校验：员工只能操作自己创建的 Skill
+    if user.role == Role.EMPLOYEE:
+        if skill.created_by != user.id:
+            raise HTTPException(403, "只能操作自己创建的 Skill")
 
     # 发布前校验：无绑定工具的 Skill，system_prompt 行数不得低于 200
     if status == SkillStatus.PUBLISHED.value:
@@ -1701,8 +1711,8 @@ def update_status(
                     f"发布要求至少 200 行（请补充完整的指令内容，或为 Skill 绑定工具）",
                 )
 
-    # DEPT_ADMIN 申请发布 → 转为审核中，创建审批单等超管审批
-    if status == SkillStatus.PUBLISHED.value and user.role == Role.DEPT_ADMIN:
+    # EMPLOYEE / DEPT_ADMIN 申请发布 → 转为审核中，创建审批单等超管审批
+    if status == SkillStatus.PUBLISHED.value and user.role in (Role.EMPLOYEE, Role.DEPT_ADMIN):
         if scope is not None:
             skill.scope = scope
         if department_id is not None:
