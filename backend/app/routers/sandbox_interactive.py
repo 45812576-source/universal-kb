@@ -1416,15 +1416,14 @@ async def run_tests(
         evaluation["usability_passed"],
         evaluation["anti_hallucination_passed"],
     ])
-    session.current_step = SessionStep.DONE
-    session.status = SessionStatus.COMPLETED
-    session.completed_at = datetime.datetime.utcnow()
-    db.commit()
-
-    # 6. 生成报告
+    # 6. 生成报告（在标记 DONE 之前，确保报告生成成功）
     from app.services.sandbox_report import generate_report
     report = await generate_report(session, cases, evaluation, db)
     session.report_id = report.id
+
+    session.current_step = SessionStep.DONE
+    session.status = SessionStatus.COMPLETED
+    session.completed_at = datetime.datetime.utcnow()
     db.commit()
 
     return _serialize_session(session)
