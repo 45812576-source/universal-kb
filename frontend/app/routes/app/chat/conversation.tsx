@@ -14,6 +14,11 @@ import {
   type DraftData,
 } from "~/lib/draft-api";
 
+export function shouldRevalidate() {
+  // 阻止 fetcher action 完成后自动 revalidation，避免闪屏和消息被吞
+  return false;
+}
+
 export async function loader({ request, params }: Route.LoaderArgs) {
   const { token, user } = await requireUser(request);
   const [messages, convList] = await Promise.all([

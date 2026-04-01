@@ -5,6 +5,12 @@ import { requireUser } from "~/lib/auth.server";
 import { apiFetch } from "~/lib/api";
 import type { User } from "~/lib/types";
 
+export function shouldRevalidate({ formAction, currentUrl, nextUrl }: { formAction?: string; currentUrl: URL; nextUrl: URL }) {
+  // 仅在路径变化时 revalidate，子路由 fetcher action 不触发
+  if (formAction) return false;
+  return currentUrl.pathname !== nextUrl.pathname;
+}
+
 export async function loader({ request }: Route.LoaderArgs) {
   const { user, token } = await requireUser(request);
   const taskStats = await apiFetch("/api/tasks/stats", { token }).catch(() => ({ total_pending: 0 }));

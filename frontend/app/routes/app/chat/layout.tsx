@@ -7,6 +7,12 @@ import type { Conversation } from "~/lib/types";
 
 const TABS_KEY = "chat_open_tabs";
 
+export function shouldRevalidate({ formAction }: { formAction?: string }) {
+  // 仅在导航到新对话时 revalidate，fetcher action 不触发
+  if (formAction) return false;
+  return true;
+}
+
 export async function loader({ request }: Route.LoaderArgs) {
   const { token } = await requireUser(request);
   const conversations = await apiFetch("/api/conversations", { token });
