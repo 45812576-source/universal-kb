@@ -309,6 +309,14 @@ class BitableSync:
 
             stats = {"inserted": inserted, "updated": updated, "total_fields": len(fields), "total_records": len(records)}
             self._finish_sync_job(db, bt, job, "success", stats)
+
+            # 确保默认系统视图存在
+            try:
+                from app.routers.data_assets import ensure_default_view
+                ensure_default_view(db, bt.id)
+            except Exception as e:
+                logger.warning(f"ensure_default_view failed for {table_name}: {e}")
+
             db.commit()
 
             # 触发字段画像（异步，不阻塞同步完成）
@@ -374,6 +382,14 @@ class BitableSync:
 
             stats = {"inserted": inserted, "updated": updated, "total_fetched": len(records)}
             self._finish_sync_job(db, bt, job, "success", stats)
+
+            # 确保默认系统视图存在
+            try:
+                from app.routers.data_assets import ensure_default_view
+                ensure_default_view(db, bt.id)
+            except Exception as e:
+                logger.warning(f"ensure_default_view failed for {bt.table_name}: {e}")
+
             db.commit()
 
             # 触发字段画像

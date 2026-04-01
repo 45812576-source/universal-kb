@@ -57,6 +57,13 @@ async def profile_table(
         except Exception:
             pass
 
+        # 确保默认系统视图存在
+        try:
+            from app.routers.data_assets import ensure_default_view
+            ensure_default_view(db, bt.id)
+        except Exception as e:
+            logger.warning(f"ensure_default_view failed for {bt.table_name}: {e}")
+
         db.commit()
     except Exception as e:
         logger.error(f"Field profiling failed for {bt.table_name}: {e}")

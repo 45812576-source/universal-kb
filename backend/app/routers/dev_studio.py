@@ -2403,3 +2403,208 @@ def workdir_download(path: str, user: User = Depends(get_current_user)):
         media_type="application/octet-stream",
         filename=filename,
     )
+
+
+# ─── 数据视图接口 ─────────────────────────────────────────────────────────────
+
+@router.get("/data-views")
+def list_data_views(
+    q: str = "",
+    source_type: str = "",
+    table_id: Optional[int] = None,
+    only_bindable: bool = True,
+    include_direct_table: bool = False,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """返回当前用户可见的数据视图列表（表 + 视图二级）。"""
+    from app.models.business import (
+        BusinessTable, TableView, TableField,
+    )
+    from app.services.policy_engine import resolve_user_role_groups, resolve_effective_policy
+    from app.services.data_view_runtime import assess_view_availability
+
+    # 查所有非归档表
+    tq = db.query(BusinessTable).filter(BusinessTable.is_archived == False)  # noqa: E712
+    if source_type:
+        tq = tq.filter(BusinessTable.source_type == source_type)
+    if table_id:
+        tq = tq.filter(BusinessTable.id == table_id)
+    tables = tq.all()
+
+    items = []
+    for bt in tables:
+        # 查该表的视图
+        vq = db.query(TableView).filter(
+            TableView.table_id == bt.id,
+        )
+        if only_bindable:
+            vq = vq.filter(TableView.view_purpose.in_(["skill_runtime", "explore", "ops"]))
+        views = vq.all()
+
+        if not views:
+            # 无视图的裸表 — 仅 admin 且 include_direct_table 时返回
+            if include_direct_table and user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
+                items.append({
+                    "table_id": bt.id,
+                    "table_name": bt.table_name,
+                    "display_name": bt.display_name or bt.table_name,
+                    "source_type": bt.source_type,
+                    "sync_status": bt.sync_status,
+                    "view_id": None,
+                    "view_name": None,
+                    "view_purpose": None,
+                    "view_kind": None,
+                    "disclosure_ceiling": None,
+                    "field_count": 0,
+                    "record_count_cache": bt.record_count_cache,
+                    "risk_flags": ["NO_VIEW"],
+                })
+            continue
+
+        # 获取用户对该表的权限
+        role_groups = resolve_user_role_groups(db, bt.id, user)
+        group_ids = [g.id for g in role_groups]
+
+        for v in views:
+            policy = resolve_effective_policy(db, bt.id, group_ids, view_id=v.id)
+            avail = assess_view_availability(v, policy, bt)
+
+            # 权限完全拒绝且非 admin → 不返回
+            if policy.denied and user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
+                continue
+
+            # 文本搜索过滤
+            if q:
+                haystack = f"{bt.display_name} {bt.table_name} {v.name}".lower()
+                if q.lower() not in haystack:
+                    continue
+
+            field_count = len(v.visible_field_ids or [])
+
+            items.append({
+                "table_id": bt.id,
+                "table_name": bt.table_name,
+                "display_name": bt.display_name or bt.table_name,
+                "source_type": bt.source_type,
+                "sync_status": bt.sync_status,
+                "view_id": v.id,
+                "view_name": v.name,
+                "view_purpose": v.view_purpose,
+                "view_kind": v.view_kind,
+                "disclosure_ceiling": v.disclosure_ceiling,
+                "field_count": field_count,
+                "record_count_cache": bt.record_count_cache,
+                "risk_flags": avail.risk_flags,
+                "available": avail.available,
+                "display_mode": avail.display_mode,
+            })
+
+    return {"ok": True, "items": items, "total": len(items)}
+
+
+@router.get("/data-views/{view_id}")
+def get_data_view_detail(
+    view_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """返回单个数据视图的详情：字段列表 + 权限摘要 + 预览数据。"""
+    from app.models.business import (
+        BusinessTable, TableView, TableField,
+    )
+    from app.services.policy_engine import (
+        resolve_user_role_groups, resolve_effective_policy,
+        check_disclosure_capability,
+    )
+    from app.services.data_view_runtime import execute_view_read, assess_view_availability
+
+    view = db.get(TableView, view_id)
+    if not view:
+        raise HTTPException(404, "视图不存在")
+
+    bt = db.get(BusinessTable, view.table_id)
+    if not bt:
+        raise HTTPException(404, "关联数据表不存在")
+
+    if bt.is_archived:
+        raise HTTPException(400, f"数据表 '{bt.display_name}' 已归档")
+
+    # 权限检查
+    role_groups = resolve_user_role_groups(db, bt.id, user)
+    group_ids = [g.id for g in role_groups]
+    policy = resolve_effective_policy(db, bt.id, group_ids, view_id=view.id)
+
+    if policy.denied and user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
+        raise HTTPException(403, "无权访问此视图: " + "; ".join(policy.deny_reasons))
+
+    avail = assess_view_availability(view, policy, bt)
+    caps = check_disclosure_capability(policy.disclosure_level)
+
+    # 字段信息
+    all_fields = db.query(TableField).filter(TableField.table_id == bt.id).order_by(TableField.sort_order).all()
+    view_field_ids = set(view.visible_field_ids or [])
+    visible_fields = [f for f in all_fields if f.id in view_field_ids] if view_field_ids else all_fields
+
+    fields_info = [
+        {
+            "id": f.id,
+            "field_name": f.field_name,
+            "display_name": f.display_name or f.field_name,
+            "field_type": f.field_type,
+            "is_enum": f.is_enum or False,
+            "enum_values": f.enum_values or [],
+            "is_sensitive": f.is_sensitive or False,
+            "is_filterable": f.is_filterable or False,
+            "is_groupable": f.is_groupable or False,
+            "is_sortable": f.is_sortable or False,
+        }
+        for f in visible_fields
+    ]
+
+    # 权限摘要
+    permission_summary = {
+        "disclosure_level": policy.disclosure_level,
+        "row_access_mode": policy.row_access_mode,
+        "tool_permission_mode": policy.tool_permission_mode,
+        "denied": policy.denied,
+        "deny_reasons": policy.deny_reasons,
+        "capabilities": caps,
+    }
+
+    # 预览数据（前 20 行）
+    preview = None
+    if avail.available and avail.display_mode in ("rows", "aggregate"):
+        try:
+            result = execute_view_read(db, view_id, user, limit=20)
+            preview = result.to_dict()
+        except Exception as e:
+            preview = {"ok": False, "error": str(e)}
+
+    return {
+        "ok": True,
+        "table": {
+            "id": bt.id,
+            "table_name": bt.table_name,
+            "display_name": bt.display_name or bt.table_name,
+            "source_type": bt.source_type,
+            "sync_status": bt.sync_status,
+        },
+        "view": {
+            "id": view.id,
+            "name": view.name,
+            "view_kind": view.view_kind,
+            "view_purpose": view.view_purpose,
+            "disclosure_ceiling": view.disclosure_ceiling,
+            "is_system": view.is_system,
+            "is_default": view.is_default,
+        },
+        "fields": fields_info,
+        "permission": permission_summary,
+        "availability": {
+            "available": avail.available,
+            "risk_flags": avail.risk_flags,
+            "display_mode": avail.display_mode,
+        },
+        "preview": preview,
+    }

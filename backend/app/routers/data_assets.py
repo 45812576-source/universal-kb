@@ -29,6 +29,64 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/data-assets", tags=["data-assets"])
 
 
+def ensure_default_view(db: Session, table_id: int) -> TableView | None:
+    """确保数据表存在默认系统视图。同步完成/表创建后调用。
+
+    如果已存在 is_system=True & is_default=True 的视图则跳过。
+    否则创建一个包含所有非隐藏字段的默认探索视图。
+    """
+    existing = (
+        db.query(TableView)
+        .filter(
+            TableView.table_id == table_id,
+            TableView.is_system == True,  # noqa: E712
+            TableView.is_default == True,  # noqa: E712
+        )
+        .first()
+    )
+    if existing:
+        # 同步后字段可能变化，更新 visible_field_ids
+        all_fields = (
+            db.query(TableField)
+            .filter(TableField.table_id == table_id)
+            .order_by(TableField.sort_order)
+            .all()
+        )
+        visible_ids = [f.id for f in all_fields if not f.is_hidden_by_default]
+        if set(existing.visible_field_ids or []) != set(visible_ids):
+            existing.visible_field_ids = visible_ids
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(existing, "visible_field_ids")
+        return existing
+
+    all_fields = (
+        db.query(TableField)
+        .filter(TableField.table_id == table_id)
+        .order_by(TableField.sort_order)
+        .all()
+    )
+    if not all_fields:
+        return None
+
+    visible_ids = [f.id for f in all_fields if not f.is_hidden_by_default]
+    if not visible_ids:
+        visible_ids = [f.id for f in all_fields]
+
+    view = TableView(
+        table_id=table_id,
+        name="默认视图",
+        view_purpose="explore",
+        view_kind="list",
+        is_system=True,
+        is_default=True,
+        visible_field_ids=visible_ids,
+        disclosure_ceiling=None,  # 继承表级策略
+    )
+    db.add(view)
+    db.flush()
+    return view
+
+
 def _write_audit_log(db: Session, user: User, action: str, target_table: str, target_id: int | None, old_values=None, new_values=None):
     """写入权限审计日志。"""
     log = PermissionAuditLog(
