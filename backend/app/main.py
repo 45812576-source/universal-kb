@@ -25,6 +25,17 @@ def health():
     return {"status": "ok"}
 
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    """关闭时终止所有 opencode 子进程，防止游离进程。"""
+    try:
+        from app.routers.dev_studio import shutdown_all_instances
+        await shutdown_all_instances()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Shutdown cleanup failed: {e}")
+
+
 @app.on_event("startup")
 async def startup_event():
     """Start background schedulers on app startup."""

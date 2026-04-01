@@ -499,24 +499,20 @@ async def _idle_reaper() -> None:
                     continue
                 if pid in managed_pids:
                     continue
-                # 游离进程，只做 fd 检查
+                # 游离进程：不在 _user_instances 管辖内，无条件终止
+                # （后端重启后内存字典清空，旧进程全部视为游离）
                 try:
-                    fd_count = len(os.listdir(f"/proc/{pid}/fd"))
+                    cwd = os.readlink(f"/proc/{pid}/cwd")
                 except Exception:
-                    continue
-                if fd_count > MAX_FD_COUNT:
-                    try:
-                        cwd = os.readlink(f"/proc/{pid}/cwd")
-                    except Exception:
-                        cwd = "unknown"
-                    logger.warning(
-                        f"[Reaper] 游离进程 pid={pid} fd={fd_count} 超限（cwd={cwd}），强制终止"
-                    )
-                    try:
-                        import signal as _sig
-                        os.kill(pid, _sig.SIGKILL)
-                    except Exception:
-                        pass
+                    cwd = "unknown"
+                logger.warning(
+                    f"[Reaper] 游离进程 pid={pid}（cwd={cwd}），强制终止"
+                )
+                try:
+                    import signal as _sig
+                    os.kill(pid, _sig.SIGKILL)
+                except Exception:
+                    pass
         except Exception as _e:
             logger.debug(f"[Reaper] 游离进程扫描失败: {_e}")
 
@@ -540,22 +536,18 @@ def _kill_orphan_opencode_procs():
                 continue
             if pid in managed_pids:
                 continue
+            # 游离进程无条件清理（后端重启后字典清空，旧进程全部视为游离）
             try:
-                fd_count = len(os.listdir(f"/proc/{pid}/fd"))
+                cwd = os.readlink(f"/proc/{pid}/cwd")
             except Exception:
-                continue
-            if fd_count > MAX_FD_COUNT:
-                try:
-                    cwd = os.readlink(f"/proc/{pid}/cwd")
-                except Exception:
-                    cwd = "unknown"
-                logger.warning(
-                    f"[Startup] orphan pid={pid} fd={fd_count} cwd={cwd}, killing"
-                )
-                try:
-                    os.kill(pid, _sig.SIGKILL)
-                except Exception:
-                    pass
+                cwd = "unknown"
+            logger.warning(
+                f"[Startup] orphan pid={pid} cwd={cwd}, killing"
+            )
+            try:
+                os.kill(pid, _sig.SIGKILL)
+            except Exception:
+                pass
     except Exception as e:
         logger.debug(f"[Startup] orphan scan failed: {e}")
 
@@ -564,6 +556,33 @@ def _start_idle_reaper():
     global _idle_reaper_task
     _kill_orphan_opencode_procs()  # kill any leaked procs from previous run
     _idle_reaper_task = asyncio.create_task(_idle_reaper())
+
+
+async def shutdown_all_instances() -> None:
+    """uvicorn 关闭时调用：终止所有托管的 opencode 子进程，防止产生游离进程。"""
+    import logging
+    logger = logging.getLogger(__name__)
+    for uid, inst in list(_user_instances.items()):
+        proc = inst.get("proc")
+        if proc is None or proc.returncode is not None:
+            continue
+        logger.info(f"[Shutdown] 终止 user={uid} pid={proc.pid}")
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    # 等待最多 5 秒让进程优雅退出
+    import asyncio as _aio
+    await _aio.sleep(2)
+    for uid, inst in list(_user_instances.items()):
+        proc = inst.get("proc")
+        if proc is not None and proc.returncode is None:
+            logger.warning(f"[Shutdown] user={uid} pid={proc.pid} 未退出，强杀")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        inst["proc"] = None
 
 OPENCODE_BASE_PORT = 17171   # user_id=1 → 17172, user_id=2 → 17173, ...
 
