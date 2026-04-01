@@ -107,6 +107,18 @@ class TableView(Base):
     is_system = Column(Boolean, default=False)
     last_used_at = Column(DateTime, nullable=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # ── Phase v1: 视图能力升级 ──
+    visible_field_ids = Column(JSON, default=list)
+    field_layout_json = Column(JSON, default=dict)
+    filter_rule_json = Column(JSON, default=dict)
+    group_rule_json = Column(JSON, default=dict)
+    sort_rule_json = Column(JSON, default=dict)
+    aggregate_rule_json = Column(JSON, default=dict)
+    row_limit = Column(Integer, nullable=True)
+    disclosure_ceiling = Column(String(5), nullable=True)     # L0-L4
+    allowed_role_group_ids = Column(JSON, default=list)
+    allowed_skill_ids = Column(JSON, default=list)
+    view_kind = Column(String(20), default="list")            # list | board | metric | pivot | review_queue
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
@@ -162,6 +174,11 @@ class TableField(Base):
     null_ratio = Column(Float, nullable=True)
     description = Column(Text, nullable=True)
     sort_order = Column(Integer, default=0)
+    # ── Phase v1: 字段数据字典扩展 ──
+    field_role_tags = Column(JSON, default=list)    # ["dimension","metric","identifier","sensitive","derived","system"]
+    is_enum = Column(Boolean, default=False)
+    is_free_text = Column(Boolean, default=False)
+    is_sensitive = Column(Boolean, default=False)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
     table = relationship("BusinessTable", foreign_keys=[table_id])
@@ -211,3 +228,97 @@ class SkillTableBinding(Base):
     skill = relationship("Skill", foreign_keys=[skill_id])
     table = relationship("BusinessTable", foreign_keys=[table_id])
     view = relationship("TableView", foreign_keys=[view_id])
+
+
+# ── Phase v1: 数据资产升级 ─────────────────────────────────────────────────────
+
+
+class TableRoleGroup(Base):
+    """角色组——权限策略的主语。"""
+    __tablename__ = "table_role_groups"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    table_id = Column(Integer, ForeignKey("business_tables.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(100), nullable=False)
+    group_type = Column(String(20), default="human_role")  # human_role | skill_role | mixed
+    subject_scope = Column(String(20), default="custom")   # custom | all_users | all_skills
+    user_ids = Column(JSON, default=list)
+    department_ids = Column(JSON, default=list)
+    role_keys = Column(JSON, default=list)
+    skill_ids = Column(JSON, default=list)
+    description = Column(Text, nullable=True)
+    is_system = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    table = relationship("BusinessTable", foreign_keys=[table_id])
+
+
+class TablePermissionPolicy(Base):
+    """权限策略——角色组在某表/视图上能做什么。"""
+    __tablename__ = "table_permission_policies"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    table_id = Column(Integer, ForeignKey("business_tables.id", ondelete="CASCADE"), nullable=False)
+    view_id = Column(Integer, ForeignKey("table_views.id", ondelete="SET NULL"), nullable=True)
+    role_group_id = Column(Integer, ForeignKey("table_role_groups.id", ondelete="CASCADE"), nullable=False)
+    row_access_mode = Column(String(20), default="none")       # none | all | owner | department | rule
+    row_rule_json = Column(JSON, default=dict)                  # v1: 仅支持 owner/department 预设
+    field_access_mode = Column(String(20), default="all")       # all | allowlist | blocklist
+    allowed_field_ids = Column(JSON, default=list)
+    blocked_field_ids = Column(JSON, default=list)
+    disclosure_level = Column(String(5), default="L0")          # L0 | L1 | L2 | L3 | L4
+    masking_rule_json = Column(JSON, default=dict)              # v1: 6种固定规则
+    tool_permission_mode = Column(String(20), default="deny")   # deny | readonly | readwrite
+    export_permission = Column(Boolean, default=False)
+    reason_template = Column(Text, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    table = relationship("BusinessTable", foreign_keys=[table_id])
+    view = relationship("TableView", foreign_keys=[view_id])
+    role_group = relationship("TableRoleGroup", foreign_keys=[role_group_id])
+
+
+class FieldValueDictionary(Base):
+    """字段枚举全集——从推断值升级为受控枚举。"""
+    __tablename__ = "field_value_dictionary"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    field_id = Column(Integer, ForeignKey("table_fields.id", ondelete="CASCADE"), nullable=False)
+    value = Column(String(500), nullable=False)
+    label = Column(String(200), nullable=True)
+    is_active = Column(Boolean, default=True)
+    source = Column(String(20), default="manual")  # manual | inferred | synced
+    sort_order = Column(Integer, default=0)
+    hit_count = Column(Integer, default=0)
+    last_seen_at = Column(DateTime, nullable=True)
+
+    field = relationship("TableField", foreign_keys=[field_id])
+
+
+class SkillDataGrant(Base):
+    """Skill 数据授权——Skill 通过哪个视图、什么级别读数据。"""
+    __tablename__ = "skill_data_grants"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skill_id = Column(Integer, ForeignKey("skills.id", ondelete="CASCADE"), nullable=False)
+    table_id = Column(Integer, ForeignKey("business_tables.id", ondelete="CASCADE"), nullable=False)
+    view_id = Column(Integer, ForeignKey("table_views.id", ondelete="SET NULL"), nullable=True)
+    role_group_id = Column(Integer, ForeignKey("table_role_groups.id", ondelete="SET NULL"), nullable=True)
+    grant_mode = Column(String(10), default="allow")   # deny | allow
+    allowed_actions = Column(JSON, default=list)        # ["read", "aggregate", "export"]
+    max_disclosure_level = Column(String(5), default="L2")  # 外部 Skill 默认不超过 L2
+    row_rule_override_json = Column(JSON, default=dict)
+    field_rule_override_json = Column(JSON, default=dict)
+    approval_required = Column(Boolean, default=False)
+    audit_level = Column(String(10), default="basic")   # none | basic | full
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    skill = relationship("Skill", foreign_keys=[skill_id])
+    table = relationship("BusinessTable", foreign_keys=[table_id])
+    view = relationship("TableView", foreign_keys=[view_id])
+    role_group = relationship("TableRoleGroup", foreign_keys=[role_group_id])

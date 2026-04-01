@@ -9,9 +9,17 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models.business import AuditLog, BusinessTable, DataOwnership
+from app.models.business import AuditLog, BusinessTable, DataOwnership, TableRoleGroup, TableField
 from app.models.user import User, Role
 from app.services.data_visibility import data_visibility
+from app.services.policy_engine import (
+    resolve_user_role_groups,
+    resolve_effective_policy,
+    check_disclosure_capability,
+    compute_visible_columns,
+    apply_field_masking,
+    build_row_filter_sql,
+)
 
 
 def _check_write_permission(bt: BusinessTable, user: User):
@@ -178,15 +186,107 @@ def list_rows(
 ):
     bt = _get_registered_table(db, table_name)
     offset = (page - 1) * page_size
-    rules = bt.validation_rules or {}
 
     from app.models.user import Role
     is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
 
+    # ── 检查是否启用新权限模型（有 TableRoleGroup 记录） ──
+    has_new_policy = (
+        db.query(TableRoleGroup)
+        .filter(TableRoleGroup.table_id == bt.id)
+        .first()
+        is not None
+    )
+
+    if has_new_policy and not is_admin:
+        return _list_rows_new_policy(db, bt, user, page, page_size, offset, view_id)
+    else:
+        return _list_rows_legacy(db, bt, user, page, page_size, offset, view_id, is_admin)
+
+
+def _list_rows_new_policy(
+    db: Session,
+    bt: BusinessTable,
+    user: User,
+    page: int,
+    page_size: int,
+    offset: int,
+    view_id: int | None,
+):
+    """新权限引擎路径。"""
+    table_name = bt.table_name
+    empty = {"total": 0, "page": page, "page_size": page_size, "columns": [], "rows": []}
+
+    groups = resolve_user_role_groups(db, bt.id, user, skill_id=None)
+    policy = resolve_effective_policy(db, bt.id, [g.id for g in groups], view_id)
+
+    if policy.denied:
+        return empty
+
+    caps = check_disclosure_capability(policy.disclosure_level)
+    if not caps["can_see_rows"]:
+        return empty
+
+    # 构建 SQL
+    base_sql = f"SELECT * FROM `{table_name}`"
+
+    # 行过滤
+    row_filter = build_row_filter_sql(policy, user, table_name)
+    if row_filter:
+        base_sql += f" WHERE ({row_filter})"
+
+    # 视图 config（filters + sorts）
+    if view_id:
+        from app.models.business import TableView
+        view = db.get(TableView, view_id)
+        if view and view.table_id == bt.id:
+            base_sql = _apply_view_config(base_sql, view.config or {})
+
+    count_result = db.execute(text(f"SELECT COUNT(*) FROM ({base_sql}) AS _t")).scalar()
+    rows_result = db.execute(
+        text(base_sql + " LIMIT :limit OFFSET :offset"),
+        {"limit": page_size, "offset": offset},
+    )
+    all_columns = list(rows_result.keys())
+    rows = [_serialize_row(dict(zip(all_columns, row))) for row in rows_result.fetchall()]
+
+    # 字段过滤
+    fields = db.query(TableField).filter(TableField.table_id == bt.id).all()
+    if fields and policy.field_access_mode != "all":
+        visible_cols = compute_visible_columns(all_columns, fields, policy)
+        rows = [{k: v for k, v in row.items() if k in visible_cols} for row in rows]
+        all_columns = visible_cols
+
+    # 脱敏（L3 走脱敏，L4 不脱敏）
+    if policy.masking_rules and not caps["can_see_raw"]:
+        rows = apply_field_masking(rows, policy.masking_rules, fields)
+
+    return {
+        "total": count_result,
+        "page": page,
+        "page_size": page_size,
+        "columns": all_columns,
+        "rows": rows,
+    }
+
+
+def _list_rows_legacy(
+    db: Session,
+    bt: BusinessTable,
+    user: User,
+    page: int,
+    page_size: int,
+    offset: int,
+    view_id: int | None,
+    is_admin: bool,
+):
+    """旧权限逻辑（向后兼容）。"""
+    table_name = bt.table_name
+    rules = bt.validation_rules or {}
+
     # ── Row scope: check validation_rules["row_scope"] ──
     row_scope = rules.get("row_scope", "private")
     if not is_admin and row_scope == "private":
-        # Private: only admins can see
         return {"total": 0, "page": page, "page_size": page_size, "columns": [], "rows": []}
 
     base_sql = f"SELECT * FROM `{table_name}`"
@@ -228,7 +328,6 @@ def list_rows(
     col_scope = rules.get("column_scope", "all")
     if not is_admin:
         if col_scope == "private":
-            # No columns visible for non-admins
             rows = [{} for _ in rows]
             all_columns = []
         elif col_scope == "department":

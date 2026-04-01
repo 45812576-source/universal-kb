@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 _GROUPABLE_TYPES = {"single_select", "multi_select", "boolean", "person", "department"}
 _NON_SORTABLE_TYPES = {"attachment", "json", "multi_select"}
 
+# 枚举源优先级: synced > manual > inferred > observed
+ENUM_SOURCE_PRIORITY = {"synced": 3, "manual": 2, "inferred": 1, "observed": 0}
+
 
 def _infer_field_capabilities(field_type: str) -> dict:
     return {
@@ -127,8 +130,10 @@ async def _profile_from_scratch(db: Session, bt: BusinessTable):
 
         try:
             _fill_stats(db, bt.table_name, col_name, tf)
-            # 对非飞书来源，推断枚举值
-            if tf.distinct_count_cache and tf.distinct_count_cache <= 20:
+            # 对非飞书来源，推断枚举值（但不覆盖更高优先级的来源）
+            existing_priority = ENUM_SOURCE_PRIORITY.get(tf.enum_source or "", -1)
+            new_priority = ENUM_SOURCE_PRIORITY.get("observed", 0)
+            if existing_priority < new_priority and tf.distinct_count_cache and tf.distinct_count_cache <= 20:
                 total = db.execute(text(f"SELECT COUNT(*) FROM `{bt.table_name}`")).scalar() or 1
                 ratio = tf.distinct_count_cache / total
                 if ratio <= 0.6:
@@ -164,12 +169,46 @@ def _fill_stats(db: Session, table_name: str, col_name: str, tf: TableField):
     total, nulls = row[0] or 0, row[1] or 0
     tf.null_ratio = round(nulls / total, 4) if total > 0 else None
 
+    # 敏感字段不采集 sample_values
+    if tf.is_sensitive:
+        tf.sample_values = []
+        return
+
     # sample values (max 10 distinct non-null)
     result = db.execute(text(
         f"SELECT DISTINCT `{col_name}` FROM `{table_name}` "
         f"WHERE `{col_name}` IS NOT NULL LIMIT 10"
     ))
     tf.sample_values = [str(r[0]) for r in result if r[0] is not None]
+
+
+def suggest_enum_upgrade(db: Session, table_id: int) -> list[dict]:
+    """找出可能应该升级为枚举的 free text 字段。"""
+    from app.models.business import BusinessTable
+    bt = db.get(BusinessTable, table_id)
+    if not bt:
+        return []
+
+    fields = db.query(TableField).filter(
+        TableField.table_id == table_id,
+        TableField.is_free_text == True,  # noqa: E712
+        TableField.is_enum == False,  # noqa: E712
+    ).all()
+
+    suggestions = []
+    for tf in fields:
+        if tf.distinct_count_cache and tf.distinct_count_cache <= 20:
+            total = bt.record_count_cache or 1
+            ratio = tf.distinct_count_cache / total if total > 0 else 1
+            if ratio <= 0.5:
+                suggestions.append({
+                    "field_id": tf.id,
+                    "field_name": tf.field_name,
+                    "display_name": tf.display_name,
+                    "distinct_count": tf.distinct_count_cache,
+                    "suggested_values": tf.sample_values[:20] if tf.sample_values else [],
+                })
+    return suggestions
 
 
 def _mysql_type_to_field_type(data_type: str) -> str:
