@@ -39,10 +39,27 @@ async def execute(params: dict, db: Session, user_id: int | None = None) -> dict
     if not table_name:
         return {"ok": False, "error": "table_name 不能为空"}
 
-    # Validate table is registered
+    # Validate table is registered — support table_name and display_name lookup
     bt = db.query(BusinessTable).filter(BusinessTable.table_name == table_name).first()
     if not bt:
-        return {"ok": False, "error": f"表 '{table_name}' 未在业务表注册表中"}
+        # Fallback: try matching by display_name
+        bt = db.query(BusinessTable).filter(BusinessTable.display_name == table_name).first()
+    if not bt:
+        # Check if it might be an uploaded file that hasn't been imported as a business table
+        from pathlib import Path
+        workspace_files = list(Path("workspace").glob(f"**/{table_name}*")) if Path("workspace").exists() else []
+        if workspace_files:
+            return {
+                "ok": False,
+                "error": f"文件 '{table_name}' 已上传到工作区，但尚未导入为业务数据表。请先在数据管理中将文件导入为数据表后再读取。",
+            }
+        # List available tables to help the user
+        available = db.query(BusinessTable.table_name, BusinessTable.display_name).limit(20).all()
+        hint = "、".join(f"{t.display_name}({t.table_name})" for t in available) if available else "暂无已注册表"
+        return {"ok": False, "error": f"表 '{table_name}' 未在业务表注册表中。可用的表：{hint}"}
+
+    # Use the actual table_name (in case we matched by display_name)
+    table_name = bt.table_name
 
     # Get allowed column names
     columns_info = data_engine._get_columns(db, table_name)

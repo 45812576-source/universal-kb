@@ -203,6 +203,8 @@ def _build_system(
     editor_is_dirty: bool,
     available_tools: str = "（暂无已注册工具）",
     source_files: list[dict] | None = None,
+    source_files_content: str = "",
+    selected_source_filename: str | None = None,
     memo_context: dict | None = None,
 ) -> str:
     if editor_prompt and editor_prompt.strip():
@@ -226,7 +228,19 @@ def _build_system(
         ctx = _EDITOR_NO_CONTEXT
 
     memo_text = _build_memo_context(memo_context)
-    return _STUDIO_SYSTEM.format(editor_context=ctx, memo_context=memo_text)
+    result = _STUDIO_SYSTEM.format(editor_context=ctx, memo_context=memo_text)
+
+    # 注入附属文件正文内容（knowledge-base / example / reference / template）
+    if source_files_content:
+        result += "\n\n## 附属文件正文（可直接阅读和引用）\n"
+        result += "以下是当前 Skill 的附属文件内容。当用户提到「读取文件」、「按 md 文件理解需求」等时，请基于这些内容回答。\n"
+        result += source_files_content
+
+    # 标注用户当前正在查看的附属文件
+    if selected_source_filename:
+        result += f"\n\n> 用户当前正在编辑器中查看附属文件：**{selected_source_filename}**。当用户说「这个文件」、「当前文件」时，指的就是它。\n"
+
+    return result
 
 
 _BLOCK_PATTERN = re.compile(
@@ -252,6 +266,20 @@ def _extract_events(text: str) -> tuple[str, list[tuple[str, dict]]]:
     return clean.strip(), events
 
 
+# 整段被 fenced code block 包裹的正文清洗
+_WRAPPER_BLOCK_RE = re.compile(
+    r"^\s*```(?:markdown|md|text|plain|)?\s*\n([\s\S]*?)\n\s*```\s*$"
+)
+
+
+def _strip_wrapper_codeblock(text: str) -> str:
+    """若整段文本只是一个 markdown/text/plain fenced code block 包裹，剥离外层。"""
+    m = _WRAPPER_BLOCK_RE.match(text)
+    if m:
+        return m.group(1)
+    return text
+
+
 async def run_stream(
     db: Session,
     conv_id: int,
@@ -264,6 +292,8 @@ async def run_stream(
     editor_is_dirty: bool = False,
     available_tools: str = "（暂无已注册工具）",
     source_files: list[dict] | None = None,
+    source_files_content: str = "",
+    selected_source_filename: str | None = None,
     memo_context: dict | None = None,
 ) -> AsyncIterator[tuple[str, dict] | str]:
     """
@@ -275,7 +305,7 @@ async def run_stream(
     """
     # 优先使用动态构建的 studio system prompt；若 workspace 没有设置 system_context 则
     # 直接使用内置 _STUDIO_SYSTEM（仍能工作，只是没有 workspace 级自定义内容）
-    system_content = _build_system(selected_skill_id, editor_prompt, editor_is_dirty, available_tools, source_files, memo_context)
+    system_content = _build_system(selected_skill_id, editor_prompt, editor_is_dirty, available_tools, source_files, source_files_content, selected_source_filename, memo_context)
     if workspace_system_context:
         # 将 workspace system_context 追加到 studio system 之后，作为补充上下文
         system_content = system_content + "\n\n## 额外上下文\n" + workspace_system_context
@@ -303,11 +333,12 @@ async def run_stream(
             yield ("content_block_delta", {"index": 0, "delta": {"text": cdata}})
             yield ("delta", {"text": cdata})
 
-    # Post-process: extract studio_* blocks
+    # Post-process: extract studio_* blocks, then strip wrapper code blocks
     clean_text, events = _extract_events(full_content)
+    clean_text = _strip_wrapper_codeblock(clean_text)
 
-    # If clean_text differs from full_content (blocks were stripped), send replace event
-    if events:
+    # If clean_text differs from full_content (blocks were stripped or cleaned), send replace event
+    if clean_text != full_content:
         yield ("replace", {"text": clean_text})
 
     for evt_name, payload in events:

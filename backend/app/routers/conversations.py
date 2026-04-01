@@ -75,6 +75,7 @@ class SendMessage(BaseModel):
     selected_skill_id: int | None = None
     editor_prompt: str | None = None
     editor_is_dirty: bool = False
+    selected_source_filename: str | None = None
 
     @field_validator("content")
     @classmethod
@@ -560,13 +561,19 @@ async def stream_message(
                     else:
                         _tools_text = "（暂无已注册工具）"
 
-                    # 查询当前 skill 的附属文件列表，供 AI 判断拆分
+                    # 查询当前 skill 的附属文件列表 + 读取文件内容注入
                     _source_files: list[dict] = []
+                    _source_files_content: str = ""
                     if req.selected_skill_id:
                         from app.models.skill import Skill as SkillModel
                         _cur_skill = db.get(SkillModel, req.selected_skill_id)
                         if _cur_skill:
                             _source_files = list(_cur_skill.source_files or [])
+                            if _source_files:
+                                from app.services.skill_engine import _read_source_files
+                                _source_files_content = _read_source_files(
+                                    req.selected_skill_id, _source_files
+                                )
 
                     # 查询 memo 上下文
                     _memo_ctx = None
@@ -590,6 +597,8 @@ async def stream_message(
                             editor_is_dirty=req.editor_is_dirty,
                             available_tools=_tools_text,
                             source_files=_source_files,
+                            source_files_content=_source_files_content,
+                            selected_source_filename=req.selected_source_filename,
                             memo_context=_memo_ctx,
                         )
                     ):
