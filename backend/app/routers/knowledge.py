@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import uuid
 from typing import Optional
 
@@ -24,13 +25,67 @@ from app.utils.file_parser import extract_text
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
 
 
+# ── 标题清洗 ─────────────────────────────────────────────────────────────────
+
+def _sanitize_title(raw: str) -> str:
+    """清洗文件名 / 标题：修复编码、去控制字符、去扩展名。"""
+    if not raw:
+        return "未命名文档"
+    # 尝试修复 latin1 误编码的 UTF-8
+    try:
+        if any(ord(c) > 127 for c in raw):
+            fixed = raw.encode("latin1").decode("utf-8")
+            if fixed != raw:
+                raw = fixed
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        pass
+    # 去控制字符
+    raw = re.sub(r"[\x00-\x1f\x7f]", "", raw)
+    # 去文件扩展名
+    name, ext = os.path.splitext(raw)
+    if ext and len(ext) <= 6:
+        raw = name
+    # strip 空白
+    raw = raw.strip()
+    return raw or "未命名文档"
+
+
+# ── "我的知识" 个人根目录 ────────────────────────────────────────────────────
+
+def _ensure_personal_root(db: Session, user: "User") -> KnowledgeFolder:
+    """确保用户存在名为 '我的知识' 的个人根目录，返回该 folder。幂等。"""
+    existing = (
+        db.query(KnowledgeFolder)
+        .filter(
+            KnowledgeFolder.created_by == user.id,
+            KnowledgeFolder.name == "我的知识",
+            KnowledgeFolder.parent_id.is_(None),
+            KnowledgeFolder.is_system == 0,
+        )
+        .first()
+    )
+    if existing:
+        return existing
+    folder = KnowledgeFolder(
+        name="我的知识",
+        parent_id=None,
+        created_by=user.id,
+        department_id=user.department_id,
+        sort_order=-1,  # 排在最前
+    )
+    db.add(folder)
+    db.flush()
+    return folder
+
+
 class KnowledgeCreate(BaseModel):
-    title: str
-    content: str
+    title: str = "未命名文档"
+    content: str = ""
     category: str = "experience"
     industry_tags: list[str] = []
     platform_tags: list[str] = []
     topic_tags: list[str] = []
+    folder_id: int | None = None
 
 
 class ReviewAction(BaseModel):
@@ -60,8 +115,11 @@ _ONLYOFFICE_EXTS = {
 }
 
 
-def _entry_dict(e: KnowledgeEntry) -> dict:
+def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None) -> dict:
     ext = (e.file_ext or "").lower()
+    _folder_name = None
+    if e.folder_id and folder_name_map:
+        _folder_name = folder_name_map.get(e.folder_id)
     return {
         "id": e.id,
         "title": e.title,
@@ -87,6 +145,7 @@ def _entry_dict(e: KnowledgeEntry) -> dict:
         "sensitivity_flags": e.sensitivity_flags or [],
         "auto_review_note": e.auto_review_note,
         "folder_id": e.folder_id,
+        "folder_name": _folder_name,
         "taxonomy_board": e.taxonomy_board,
         "taxonomy_code": e.taxonomy_code,
         "taxonomy_path": e.taxonomy_path or [],
@@ -132,8 +191,14 @@ def create_knowledge(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    # 自动归入"我的知识"
+    folder_id = req.folder_id
+    if folder_id is None:
+        personal_root = _ensure_personal_root(db, user)
+        folder_id = personal_root.id
+
     entry = KnowledgeEntry(
-        title=req.title,
+        title=_sanitize_title(req.title) if req.title else "未命名文档",
         content=req.content,
         category=req.category,
         industry_tags=req.industry_tags,
@@ -143,11 +208,27 @@ def create_knowledge(
         department_id=user.department_id,
         source_type="manual",
         capture_mode="manual_form",
+        folder_id=folder_id,
     )
     db.add(entry)
     db.flush()
     entry = submit_knowledge(db, entry)
-    return {"id": entry.id, "status": entry.status.value, "review_level": entry.review_level}
+
+    folder_name = None
+    if entry.folder_id:
+        f = db.get(KnowledgeFolder, entry.folder_id)
+        if f:
+            folder_name = f.name
+
+    return {
+        "id": entry.id,
+        "title": entry.title,
+        "status": entry.status.value,
+        "review_level": entry.review_level,
+        "folder_id": entry.folder_id,
+        "folder_name": folder_name,
+        "doc_render_status": entry.doc_render_status,
+    }
 
 
 async def _bg_post_upload(entry_id: int, content: str, filename: str, file_type: str, saved_path: str):
@@ -201,9 +282,11 @@ async def _bg_post_upload(entry_id: int, content: str, filename: str, file_type:
 def _create_entry_from_file(
     db: Session, saved_path: str, filename: str, file_data: bytes,
     category: str, industry_tags: str, platform_tags: str, topic_tags: str,
-    user: "User", folder_id: int | None,
+    user: "User", folder_id: int | None, explicit_title: str | None = None,
 ) -> tuple["KnowledgeEntry", str, str]:
-    """从单个文件创建 KnowledgeEntry，返回 (entry, content, file_type)。"""
+    """从单个文件创建 KnowledgeEntry，返回 (entry, content, file_type)。
+    explicit_title: 前端显式传入的标题，优先级最高。
+    """
     import mimetypes
     ext = os.path.splitext(filename)[1].lower()
 
@@ -225,8 +308,17 @@ def _create_entry_from_file(
     strategic_flags = review_policy.detect_strategic(content)
     capture_mode = "upload" if (sensitive_flags or strategic_flags) else "upload_ai_clean"
 
+    # 标题优先级：显式传入 > 清洗后文件名 > 原始文件名
+    display_title = explicit_title or _sanitize_title(filename) or filename
+
+    # 自动归入"我的知识"
+    effective_folder = folder_id
+    if effective_folder is None:
+        personal_root = _ensure_personal_root(db, user)
+        effective_folder = personal_root.id
+
     entry = KnowledgeEntry(
-        title=filename,
+        title=display_title,
         content=content,
         category=category,
         industry_tags=json.loads(industry_tags),
@@ -239,7 +331,7 @@ def _create_entry_from_file(
         capture_mode=capture_mode,
         oss_key=oss_key, file_type=file_type, file_ext=ext, file_size=file_size,
         doc_render_status="pending",
-        folder_id=folder_id,
+        folder_id=effective_folder,
     )
     db.add(entry)
     db.flush()
@@ -301,12 +393,13 @@ async def upload_knowledge(
                 entry, content, file_type = _create_entry_from_file(
                     db, inner_path, inner_name, inner_data,
                     category, industry_tags, platform_tags, topic_tags, user, folder_id,
+                    explicit_title=_sanitize_title(inner_name),
                 )
                 db.commit()
                 # 后台 AI naming + 渲染
                 import asyncio
                 asyncio.create_task(_bg_post_upload(entry.id, content, inner_name, file_type, inner_path))
-                results.append({"id": entry.id, "name": inner_name})
+                results.append({"id": entry.id, "name": inner_name, "title": entry.title, "folder_id": entry.folder_id})
             except ValueError as e:
                 try:
                     os.unlink(inner_path)
@@ -323,10 +416,15 @@ async def upload_knowledge(
     with open(saved_path, "wb") as f:
         f.write(file_data)
 
+    # title 显式传入时优先使用；否则 _create_entry_from_file 内部会从文件名清洗
+    raw_filename = file.filename or "unknown"
+    explicit_title = title if title and title != raw_filename else None
+
     try:
         entry, content, file_type = _create_entry_from_file(
-            db, saved_path, file.filename or title, file_data,
+            db, saved_path, raw_filename, file_data,
             category, industry_tags, platform_tags, topic_tags, user, folder_id,
+            explicit_title=explicit_title,
         )
     except ValueError as e:
         os.unlink(saved_path)
@@ -336,14 +434,25 @@ async def upload_knowledge(
 
     # 后台执行 AI naming + 文档渲染（不阻塞响应）
     import asyncio
-    asyncio.create_task(_bg_post_upload(entry.id, content, file.filename or "", file_type, saved_path))
+    asyncio.create_task(_bg_post_upload(entry.id, content, raw_filename, file_type, saved_path))
+
+    # 查询 folder_name
+    folder_name = None
+    if entry.folder_id:
+        _f = db.get(KnowledgeFolder, entry.folder_id)
+        if _f:
+            folder_name = _f.name
 
     return {
         "id": entry.id,
+        "title": entry.title,
+        "source_file": entry.source_file,
         "status": entry.status.value,
         "content_length": len(content),
         "review_level": entry.review_level,
         "capture_mode": entry.capture_mode,
+        "folder_id": entry.folder_id,
+        "folder_name": folder_name,
         "taxonomy_code": entry.taxonomy_code,
         "taxonomy_board": entry.taxonomy_board,
         "classification_confidence": entry.classification_confidence,
@@ -351,6 +460,7 @@ async def upload_knowledge(
         "file_type": entry.file_type,
         "file_ext": entry.file_ext,
         "doc_render_status": entry.doc_render_status,
+        "doc_render_error": entry.doc_render_error,
         "doc_render_mode": entry.doc_render_mode,
     }
 
@@ -405,7 +515,17 @@ def list_knowledge(
         q = q.filter(KnowledgeEntry.folder_id.is_(None))
 
     entries = q.order_by(KnowledgeEntry.created_at.desc()).all()
-    return [_entry_dict(e) for e in entries]
+
+    # 构建 folder_id -> name 映射，让 _entry_dict 返回 folder_name
+    folder_ids = {e.folder_id for e in entries if e.folder_id}
+    folder_name_map: dict[int, str] = {}
+    if folder_ids:
+        folder_rows = db.query(KnowledgeFolder.id, KnowledgeFolder.name).filter(
+            KnowledgeFolder.id.in_(folder_ids)
+        ).all()
+        folder_name_map = {r.id: r.name for r in folder_rows}
+
+    return [_entry_dict(e, folder_name_map) for e in entries]
 
 
 def _enrich_search_results_with_blocks(db: Session, best: dict) -> None:
@@ -700,6 +820,17 @@ def list_folders(
     q = db.query(KnowledgeFolder).filter(KnowledgeFolder.created_by == user.id)
     folders = q.order_by(KnowledgeFolder.sort_order, KnowledgeFolder.id).all()
     return [_folder_dict(f) for f in folders]
+
+
+@router.post("/ensure-my-folder")
+def ensure_my_folder(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """确保当前用户存在"我的知识"个人根目录，返回 folder 信息。幂等。"""
+    folder = _ensure_personal_root(db, user)
+    db.commit()
+    return _folder_dict(folder)
 
 
 @router.post("/folders")
