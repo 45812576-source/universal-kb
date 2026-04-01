@@ -213,6 +213,7 @@ def create_knowledge(
     db.add(entry)
     db.flush()
     entry = submit_knowledge(db, entry)
+    db.commit()
 
     folder_name = None
     if entry.folder_id:
@@ -287,10 +288,15 @@ def _create_entry_from_file(
     """从单个文件创建 KnowledgeEntry，返回 (entry, content, file_type)。
     explicit_title: 前端显式传入的标题，优先级最高。
     """
-    import mimetypes
+    import mimetypes, logging as _logging
+    _log = _logging.getLogger(__name__)
     ext = os.path.splitext(filename)[1].lower()
 
-    content = extract_text(saved_path)
+    try:
+        content = extract_text(saved_path)
+    except Exception as _e:
+        _log.warning(f"extract_text failed for {filename}: {_e}")
+        content = ""  # 文本抽取失败不阻断上传，entry 仍创建
 
     # OSS
     oss_key = None
@@ -930,7 +936,13 @@ def get_knowledge(
     if user.role != Role.SUPER_ADMIN:
         if entry.created_by != user.id and entry.status != KnowledgeStatus.APPROVED:
             raise HTTPException(403, "Access denied")
-    result = _entry_dict(entry)
+    # 查 folder_name
+    _fmap: dict[int, str] = {}
+    if entry.folder_id:
+        _f = db.get(KnowledgeFolder, entry.folder_id)
+        if _f:
+            _fmap[entry.folder_id] = _f.name
+    result = _entry_dict(entry, _fmap)
     result["content"] = entry.content  # full content for detail view
     result["content_html"] = entry.content_html  # HTML for cloud doc editor
     return result
