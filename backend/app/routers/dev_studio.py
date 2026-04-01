@@ -28,8 +28,8 @@ router = APIRouter(prefix="/api/dev-studio", tags=["dev-studio"])
 _user_instances: dict = {}
 _instances_lock: object = None   # 全局 asyncio.Lock，保护 _user_instances 写入
 
-IDLE_TIMEOUT_SECONDS = 600   # 10分钟无操作自动回收（降低内存压力）
-_REAPER_INTERVAL = 30        # 每2分钟检查一次空闲实例
+IDLE_TIMEOUT_SECONDS = 900   # 15分钟无操作自动回收（降低内存压力）
+_REAPER_INTERVAL = 300        # 每5分钟检查一次空闲实例
 _idle_reaper_task = None
 MAX_ACTIVE_INSTANCES = 12    # 最多同时运行 12 个 opencode 进程
 
@@ -414,7 +414,7 @@ async def _db_cleaner() -> None:
             logging.getLogger(__name__).warning(f"[DbCleaner] 扫描失败: {e}")
 
 
-MAX_RSS_MB = 800  # 单实例内存硬上限（含 Go 主进程 + Node 启动器），超过则强制重启
+MAX_RSS_MB = 500  # 单实例内存硬上限（含 Go 主进程 + Node 启动器），超过则强制重启
 MAX_FD_COUNT = 500   # 单实例 fd 上限，pty 泄漏时 fd 会持续累积，超过则强制重启
 
 
