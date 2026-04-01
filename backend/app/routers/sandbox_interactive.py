@@ -1284,11 +1284,21 @@ async def run_tests(
     session = db.get(SandboxTestSession, session_id)
     if not session:
         raise HTTPException(404, "测试会话不存在")
-    if session.status not in (SessionStatus.READY_TO_RUN, SessionStatus.DRAFT) or \
-       session.current_step not in (SessionStep.CASE_GENERATION, SessionStep.PERMISSION_REVIEW):
-        # 允许从 CASE_GENERATION 或 READY_TO_RUN 启动
-        if session.current_step != SessionStep.CASE_GENERATION:
-            raise HTTPException(400, f"当前状态不允许执行测试: step={session.current_step.value}, status={session.status.value}")
+    # 允许从 CASE_GENERATION / PERMISSION_REVIEW 启动，也允许已完成的 session 重跑
+    allow_status = (SessionStatus.READY_TO_RUN, SessionStatus.DRAFT, SessionStatus.COMPLETED)
+    allow_step = (SessionStep.CASE_GENERATION, SessionStep.PERMISSION_REVIEW, SessionStep.DONE)
+    if session.status not in allow_status or session.current_step not in allow_step:
+        raise HTTPException(400, f"当前状态不允许执行测试: step={session.current_step.value}, status={session.status.value}")
+
+    # 重跑时清理旧的测试用例和报告
+    if session.current_step == SessionStep.DONE:
+        for case in list(session.cases):
+            db.delete(case)
+        if session.report_id:
+            old_report = db.get(SandboxTestReport, session.report_id)
+            if old_report:
+                db.delete(old_report)
+            session.report_id = None
 
     session.current_step = SessionStep.EXECUTION
     session.status = SessionStatus.RUNNING
