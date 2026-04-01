@@ -264,7 +264,7 @@ def get_business_table(
 async def generate_from_description(
     req: GenerateFromDescRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Direction A: natural language → DDL + Skill preview."""
     from app.services.schema_generator import schema_generator
@@ -280,7 +280,7 @@ async def generate_from_description(
 async def generate_from_existing(
     req: GenerateFromExistingRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Direction B: existing table → Skill preview."""
     from app.services.schema_generator import schema_generator
@@ -296,7 +296,7 @@ async def generate_from_existing(
 def apply_schema(
     req: ApplySchemaRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Confirm: execute DDL, register table, optionally create Skill."""
     from app.services.schema_generator import schema_generator
@@ -429,7 +429,7 @@ class ProbeTableRequest(BaseModel):
 @router.post("/resolve-wiki")
 async def resolve_wiki(
     req: ResolveWikiRequest,
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Resolve a Feishu Wiki node token → bitable app_token + table list."""
     from app.services.lark_client import lark_client
@@ -486,7 +486,7 @@ async def resolve_wiki(
 @router.post("/probe-bitable")
 async def probe_bitable(
     req: ProbeBitableRequest,
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Preview a Feishu Bitable table: fetch fields + first 20 records. Does NOT persist."""
     from app.services.lark_client import lark_client
@@ -577,7 +577,7 @@ _BITABLE_TYPE_MAP = {
 async def sync_bitable(
     req: SyncBitableRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Full sync: fetch ALL records from Feishu Bitable → create/replace local MySQL table → register."""
     from app.services.lark_client import lark_client
@@ -727,7 +727,7 @@ async def sync_bitable(
 @router.post("/probe")
 def probe_external_table(
     req: ProbeTableRequest,
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Connect to an external DB, fetch schema + first 20 rows. Does NOT persist anything."""
     from sqlalchemy import create_engine, inspect, text as sa_text
@@ -796,7 +796,7 @@ class CreateBlankTableRequest(BaseModel):
 def create_blank_table(
     req: CreateBlankTableRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Create a new blank table with user-defined fields."""
     import re, time
@@ -890,7 +890,7 @@ def add_column(
     table_id: int,
     req: AddColumnRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Add a new column to an existing business table."""
     import re
@@ -931,7 +931,7 @@ def rename_column(
     col_name: str,
     req: RenameColumnRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Rename a column (or update its comment)."""
     import re
@@ -988,7 +988,7 @@ def drop_column(
     table_id: int,
     col_name: str,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Drop a column from a business table. Protected columns (id, created_at, updated_at) cannot be dropped."""
     PROTECTED = {"id", "created_at", "updated_at", "_record_id", "_synced_at"}
@@ -1032,7 +1032,7 @@ def patch_business_table(
     table_id: int,
     req: PatchTableRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """Partial update: rename display_name, hide fields, set folder/sort/scope metadata."""
     bt = db.get(BusinessTable, table_id)
@@ -1073,7 +1073,7 @@ def set_sync_config(
     table_id: int,
     req: SyncConfigRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """设置飞书多维表格定时同步配置。"""
     bt = db.get(BusinessTable, table_id)
@@ -1096,7 +1096,7 @@ def set_sync_config(
 async def sync_now(
     table_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """手动触发飞书多维表格增量同步。"""
     bt = db.get(BusinessTable, table_id)

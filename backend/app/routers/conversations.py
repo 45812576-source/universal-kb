@@ -518,8 +518,10 @@ async def stream_message(
                                 else:
                                     _pending_user = None
                             elif _m.role == MessageRole.ASSISTANT and _pending_user is not None:
-                                _skill_pairs.append(_pending_user)
-                                _skill_pairs.append({"role": "assistant", "content": _m.content or ""})
+                                _asst_content = (_m.content or "").strip()
+                                if _asst_content:
+                                    _skill_pairs.append(_pending_user)
+                                    _skill_pairs.append({"role": "assistant", "content": _asst_content})
                                 _pending_user = None
                         # 最多保留最近 30 轮
                         _llm_history = _skill_pairs[-(_STUDIO_HISTORY_ROUNDS * 2):]
@@ -534,8 +536,9 @@ async def stream_message(
                         )
                         _llm_history = [
                             {"role": "user" if _m.role == MessageRole.USER else "assistant",
-                             "content": _m.content or ""}
+                             "content": (_m.content or "").strip() or "(empty)"}
                             for _m in reversed(_all_msgs)
+                            if (_m.content or "").strip()
                         ]
 
                     _fast_model = llm_gateway.resolve_config(db, "conversation.main", getattr(_ws_fast, "model_config_id", None))

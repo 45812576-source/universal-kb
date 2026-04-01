@@ -150,59 +150,83 @@ def create_knowledge(
     return {"id": entry.id, "status": entry.status.value, "review_level": entry.review_level}
 
 
-@router.post("/upload")
-async def upload_knowledge(
-    title: str = Form(...),
-    category: str = Form("experience"),
-    industry_tags: str = Form("[]"),
-    platform_tags: str = Form("[]"),
-    topic_tags: str = Form("[]"),
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    import mimetypes
-
-    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    ext = os.path.splitext(file.filename or "")[1].lower()
-    local_filename = f"{uuid.uuid4()}{ext}"
-    saved_path = os.path.join(settings.UPLOAD_DIR, local_filename)
-
-    file_data = await file.read()
-    with open(saved_path, "wb") as f:
-        f.write(file_data)
-
-    # 提取文本内容（供 AI/向量化）
+async def _bg_post_upload(entry_id: int, content: str, filename: str, file_type: str, saved_path: str):
+    """后台执行 AI 命名 + 文档渲染 + 清理，不阻塞上传响应。"""
+    import logging
+    _logger = logging.getLogger(__name__)
+    from app.database import SessionLocal
+    bg_db = SessionLocal()
     try:
-        content = extract_text(saved_path)
-    except ValueError as e:
-        os.unlink(saved_path)
-        raise HTTPException(400, str(e))
+        entry = bg_db.get(KnowledgeEntry, entry_id)
+        if not entry:
+            return
 
-    # 上传原件到 OSS
+        # 文档渲染
+        try:
+            from app.services.doc_renderer import render_from_path
+            render_from_path(bg_db, entry, saved_path)
+        except Exception as e:
+            _logger.warning(f"Doc render failed (will retry via job): {e}")
+
+        # AI 智能命名
+        try:
+            from app.services.knowledge_namer import auto_name
+            naming_result = await auto_name(content, filename, file_type, db=bg_db)
+            entry.ai_title = naming_result["title"]
+            entry.ai_summary = naming_result["summary"]
+            entry.ai_tags = naming_result["tags"]
+            entry.quality_score = naming_result["quality_score"]
+            if naming_result["tags"].get("industry"):
+                entry.industry_tags = naming_result["tags"]["industry"]
+            if naming_result["tags"].get("platform"):
+                entry.platform_tags = naming_result["tags"]["platform"]
+            if naming_result["tags"].get("topic"):
+                entry.topic_tags = naming_result["tags"]["topic"]
+        except Exception as e:
+            _logger.warning(f"AI naming failed: {e}")
+
+        bg_db.commit()
+    except Exception as e:
+        bg_db.rollback()
+        _logger.warning(f"bg_post_upload failed: {e}")
+    finally:
+        bg_db.close()
+        # 清理本地临时文件
+        try:
+            os.unlink(saved_path)
+        except OSError:
+            pass
+
+
+def _create_entry_from_file(
+    db: Session, saved_path: str, filename: str, file_data: bytes,
+    category: str, industry_tags: str, platform_tags: str, topic_tags: str,
+    user: "User", folder_id: int | None,
+) -> tuple["KnowledgeEntry", str, str]:
+    """从单个文件创建 KnowledgeEntry，返回 (entry, content, file_type)。"""
+    import mimetypes
+    ext = os.path.splitext(filename)[1].lower()
+
+    content = extract_text(saved_path)
+
+    # OSS
     oss_key = None
     file_size = len(file_data)
-    file_type = mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
+    file_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     try:
         from app.services.oss_service import generate_oss_key, upload_file as oss_upload
         oss_key = generate_oss_key(ext)
         oss_upload(saved_path, oss_key)
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"OSS upload failed, file kept locally: {e}")
+    except Exception:
+        pass
 
-    # 注意：暂不清理本地文件，后续 doc_renderer 需要读取
-    # 检测敏感词决定 capture_mode
     from app.services.review_policy import review_policy
     sensitive_flags = review_policy.detect_sensitive(content)
     strategic_flags = review_policy.detect_strategic(content)
-    if sensitive_flags or strategic_flags:
-        capture_mode = "upload"
-    else:
-        capture_mode = "upload_ai_clean"
+    capture_mode = "upload" if (sensitive_flags or strategic_flags) else "upload_ai_clean"
 
     entry = KnowledgeEntry(
-        title=title,
+        title=filename,
         content=content,
         category=category,
         industry_tags=json.loads(industry_tags),
@@ -211,72 +235,108 @@ async def upload_knowledge(
         created_by=user.id,
         department_id=user.department_id,
         source_type="upload",
-        source_file=file.filename,
+        source_file=filename,
         capture_mode=capture_mode,
-        # OSS 文件信息
-        oss_key=oss_key,
-        file_type=file_type,
-        file_ext=ext,
-        file_size=file_size,
-        # 云文档渲染状态
+        oss_key=oss_key, file_type=file_type, file_ext=ext, file_size=file_size,
         doc_render_status="pending",
+        folder_id=folder_id,
     )
     db.add(entry)
     db.flush()
 
-    # 云文档转换 —— 改为入队，不在请求内同步完成
-    from app.services.doc_renderer import render_from_path
-    try:
-        render_from_path(db, entry, saved_path)
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"Doc render failed (will retry via job): {e}")
-
-    # 清理本地临时文件
-    try:
-        os.unlink(saved_path)
-    except OSError:
-        pass
-
-    # AI 智能命名（异步，不阻塞入库）
-    from app.services.knowledge_namer import auto_name
-    try:
-        naming_result = await auto_name(content, file.filename or "", file_type, db=db)
-        entry.ai_title = naming_result["title"]
-        entry.ai_summary = naming_result["summary"]
-        entry.ai_tags = naming_result["tags"]
-        entry.quality_score = naming_result["quality_score"]
-        # AI 生成的标签也同步到筛选用标签字段
-        if naming_result["tags"].get("industry"):
-            entry.industry_tags = naming_result["tags"]["industry"]
-        if naming_result["tags"].get("platform"):
-            entry.platform_tags = naming_result["tags"]["platform"]
-        if naming_result["tags"].get("topic"):
-            entry.topic_tags = naming_result["tags"]["topic"]
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"AI naming failed: {e}")
-
     entry = submit_knowledge(db, entry)
 
-    # 创建异步 Job：render 补偿（如果同步渲染失败了）+ classify
     from app.models.knowledge_job import KnowledgeJob
     if entry.doc_render_status in ("failed", "pending"):
-        render_job = KnowledgeJob(
-            knowledge_id=entry.id,
-            job_type="render",
-            trigger_source="upload",
-        )
-        db.add(render_job)
-
-    classify_job = KnowledgeJob(
-        knowledge_id=entry.id,
-        job_type="classify",
-        trigger_source="upload",
-    )
-    db.add(classify_job)
+        db.add(KnowledgeJob(knowledge_id=entry.id, job_type="render", trigger_source="upload"))
+    db.add(KnowledgeJob(knowledge_id=entry.id, job_type="classify", trigger_source="upload"))
     entry.classification_status = "pending"
+
+    return entry, content, file_type
+
+
+@router.post("/upload")
+async def upload_knowledge(
+    title: str = Form(...),
+    category: str = Form("experience"),
+    industry_tags: str = Form("[]"),
+    platform_tags: str = Form("[]"),
+    topic_tags: str = Form("[]"),
+    folder_id: int | None = Form(None),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+    ext = os.path.splitext(file.filename or "")[1].lower()
+
+    file_data = await file.read()
+
+    # ── ZIP 解压：逐文件入库 ──
+    if ext == ".zip":
+        import zipfile, io, tempfile
+        results = []
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(file_data))
+        except zipfile.BadZipFile:
+            raise HTTPException(400, "无效的 ZIP 文件")
+
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            inner_name = os.path.basename(info.filename)
+            if not inner_name or inner_name.startswith("."):
+                continue
+            inner_ext = os.path.splitext(inner_name)[1].lower()
+            if inner_ext not in (".txt", ".pdf", ".docx", ".pptx", ".md", ".xlsx", ".xls", ".csv",
+                                  ".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+                continue
+
+            inner_data = zf.read(info.filename)
+            inner_path = os.path.join(settings.UPLOAD_DIR, f"{uuid.uuid4()}{inner_ext}")
+            with open(inner_path, "wb") as f:
+                f.write(inner_data)
+
+            try:
+                entry, content, file_type = _create_entry_from_file(
+                    db, inner_path, inner_name, inner_data,
+                    category, industry_tags, platform_tags, topic_tags, user, folder_id,
+                )
+                db.commit()
+                # 后台 AI naming + 渲染
+                import asyncio
+                asyncio.create_task(_bg_post_upload(entry.id, content, inner_name, file_type, inner_path))
+                results.append({"id": entry.id, "name": inner_name})
+            except ValueError as e:
+                try:
+                    os.unlink(inner_path)
+                except OSError:
+                    pass
+                results.append({"id": None, "name": inner_name, "error": str(e)})
+
+        zf.close()
+        return {"zip": True, "results": results}
+
+    # ── 普通单文件上传 ──
+    local_filename = f"{uuid.uuid4()}{ext}"
+    saved_path = os.path.join(settings.UPLOAD_DIR, local_filename)
+    with open(saved_path, "wb") as f:
+        f.write(file_data)
+
+    try:
+        entry, content, file_type = _create_entry_from_file(
+            db, saved_path, file.filename or title, file_data,
+            category, industry_tags, platform_tags, topic_tags, user, folder_id,
+        )
+    except ValueError as e:
+        os.unlink(saved_path)
+        raise HTTPException(400, str(e))
+
     db.commit()
+
+    # 后台执行 AI naming + 文档渲染（不阻塞响应）
+    import asyncio
+    asyncio.create_task(_bg_post_upload(entry.id, content, file.filename or "", file_type, saved_path))
 
     return {
         "id": entry.id,

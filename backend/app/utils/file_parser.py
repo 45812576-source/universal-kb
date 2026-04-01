@@ -21,7 +21,7 @@ def _call_kimi_vision(image_path: str) -> str:
 
     client = openai.OpenAI(
         api_key=api_key,
-        base_url="https://coding.dashscope.aliyuncs.com/apps/anthropic/v1",
+        base_url="https://coding.dashscope.aliyuncs.com/apps/openai/v1",
     )
     resp = client.chat.completions.create(
         model="kimi-k2.5",

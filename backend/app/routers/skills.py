@@ -4,6 +4,7 @@ import re
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
 
 logger = logging.getLogger(__name__)
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
@@ -256,7 +257,11 @@ def create_skill(
         change_note="初始版本",
     )
     db.add(v)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(400, f"已存在同名 Skill '{req.name}'，请修改名称")
     db.refresh(skill)
     return {"id": skill.id, "name": skill.name}
 

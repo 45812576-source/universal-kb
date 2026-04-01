@@ -774,8 +774,11 @@ class SkillEngine:
                 for user_m, asst_m in raw_pairs:
                     if asst_m is None:
                         continue
-                    llm_messages.append({"role": "user", "content": user_m.content})
-                    llm_messages.append({"role": "assistant", "content": asst_m.content})
+                    _ac = (asst_m.content or "").strip()
+                    if not _ac:
+                        continue
+                    llm_messages.append({"role": "user", "content": user_m.content or "(empty)"})
+                    llm_messages.append({"role": "assistant", "content": _ac})
                 llm_messages.append({"role": "user", "content": user_message})
 
                 return PrepareResult(
@@ -1300,8 +1303,11 @@ class SkillEngine:
         for user_m, asst_m in raw_pairs:
             if asst_m is None:
                 continue  # orphaned user turn with no valid reply — skip entirely
-            llm_messages.append({"role": "user", "content": user_m.content})
-            llm_messages.append({"role": "assistant", "content": asst_m.content})
+            _ac = (asst_m.content or "").strip()
+            if not _ac:
+                continue
+            llm_messages.append({"role": "user", "content": user_m.content or "(empty)"})
+            llm_messages.append({"role": "assistant", "content": _ac})
         llm_messages.append({"role": "user", "content": user_message})
 
         # 9. Context window compaction
@@ -1693,7 +1699,7 @@ class SkillEngine:
                 goal_reminder = ""
                 if round_num >= 1 and original_user_request:
                     goal_reminder = f"\n\n[提醒] 用户的原始请求是：{original_user_request}"
-                llm_messages.append({"role": "assistant", "content": response})
+                llm_messages.append({"role": "assistant", "content": response or "(calling tools)"})
                 llm_messages.append({
                     "role": "user",
                     "content": f"[工具执行结果]\n\n{tool_result_text}\n\n请基于以上工具结果，给出最终回复。不需要重复展示JSON，直接告知用户结果即可。{goal_reminder}",
