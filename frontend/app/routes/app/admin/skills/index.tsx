@@ -22,6 +22,8 @@ export async function action({ request }: Route.ActionArgs) {
     await apiFetch(`/api/skills/${skillId}/status?status=archived`, { method: "PATCH", token });
   } else if (intent === "draft") {
     await apiFetch(`/api/skills/${skillId}/status?status=draft`, { method: "PATCH", token });
+  } else if (intent === "delete") {
+    await apiFetch(`/api/skills/${skillId}`, { method: "DELETE", token });
   }
   return null;
 }
@@ -132,6 +134,14 @@ export default function SkillList() {
                               恢复草稿
                             </button>
                           )}
+                          <button
+                            name="intent"
+                            value="delete"
+                            onClick={(e) => { if (!confirm(`确认删除 Skill「${skill.name}」？此操作不可恢复。`)) e.preventDefault(); }}
+                            className="text-[10px] font-bold uppercase text-red-500 hover:text-red-700"
+                          >
+                            删除
+                          </button>
                         </fetcher.Form>
                       </div>
                     </td>
