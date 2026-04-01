@@ -479,13 +479,27 @@ async def _idle_reaper() -> None:
                     pass
                 inst["proc"] = None
 
-        # ── 游离进程扫描：后端重启后 _user_instances 清空，但旧 opencode 进程仍在跑 ──
-        # 扫描系统中所有 .opencode web 进程，不在 _user_instances 管辖内的也做 fd 检查
-        managed_pids = {
-            inst["proc"].pid
-            for inst in _user_instances.values()
-            if inst.get("proc") and inst["proc"].returncode is None
-        }
+        # ── 游离进程扫描（安全版）──
+        # 收集所有托管进程及其子进程树的 PID
+        managed_pids = set()
+        managed_user_cwd_markers = set()
+        for _uid, _inst in _user_instances.items():
+            _p = _inst.get("proc")
+            if _p and _p.returncode is None:
+                managed_pids.add(_p.pid)
+                try:
+                    import subprocess as _sp
+                    _children = _sp.run(
+                        ["pgrep", "-P", str(_p.pid)],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    for _cl in _children.stdout.strip().splitlines():
+                        if _cl.strip().isdigit():
+                            managed_pids.add(int(_cl.strip()))
+                except Exception:
+                    pass
+            managed_user_cwd_markers.add(f"user_{_uid}/")
+
         try:
             import subprocess as _sp
             result = _sp.run(
@@ -499,15 +513,31 @@ async def _idle_reaper() -> None:
                     continue
                 if pid in managed_pids:
                     continue
-                # 游离进程：不在 _user_instances 管辖内，无条件终止
-                # （后端重启后内存字典清空，旧进程全部视为游离）
                 try:
                     cwd = os.readlink(f"/proc/{pid}/cwd")
                 except Exception:
                     cwd = "unknown"
-                logger.warning(
-                    f"[Reaper] 游离进程 pid={pid}（cwd={cwd}），强制终止"
-                )
+                # 通过 cwd 检查是否属于已托管用户的子进程
+                if any(marker in cwd for marker in managed_user_cwd_markers):
+                    logger.debug(f"[Reaper] pid={pid} cwd={cwd} 属于已托管用户子进程，跳过")
+                    continue
+                # 通过 cwd 提取 user_id，尝试认领
+                import re as _re
+                _m = _re.search(r"user_(\d+)", cwd)
+                if _m:
+                    _orphan_uid = int(_m.group(1))
+                    if _orphan_uid not in _user_instances:
+                        _user_instances[_orphan_uid] = {
+                            "proc": None,
+                            "port": _port_for_user(_orphan_uid),
+                            "workdir": None,
+                            "lock": asyncio.Lock(),
+                            "last_active": _time.time(),
+                        }
+                        logger.info(f"[Reaper] 认领 user={_orphan_uid} 的遗留进程 pid={pid}，纳入管理")
+                        continue
+                # 真正的游离进程
+                logger.warning(f"[Reaper] 游离进程 pid={pid}（cwd={cwd}），强制终止")
                 try:
                     import signal as _sig
                     os.kill(pid, _sig.SIGKILL)
@@ -518,14 +548,9 @@ async def _idle_reaper() -> None:
 
 
 def _kill_orphan_opencode_procs():
-    """Scan and kill orphan opencode processes exceeding fd limit on startup."""
-    import logging as _log, signal as _sig, subprocess as _sp
+    """Startup: 扫描遗留 opencode 进程，通过 cwd 认领而非无条件杀死。"""
+    import logging as _log, signal as _sig, subprocess as _sp, re as _re
     logger = _log.getLogger(__name__)
-    managed_pids = {
-        inst["proc"].pid
-        for inst in _user_instances.values()
-        if inst.get("proc") and inst["proc"].returncode is None
-    }
     try:
         result = _sp.run(["pgrep", "-f", ".opencode web"],
                          capture_output=True, text=True, timeout=5)
@@ -534,20 +559,32 @@ def _kill_orphan_opencode_procs():
                 pid = int(line.strip())
             except ValueError:
                 continue
-            if pid in managed_pids:
-                continue
-            # 游离进程无条件清理（后端重启后字典清空，旧进程全部视为游离）
             try:
                 cwd = os.readlink(f"/proc/{pid}/cwd")
             except Exception:
                 cwd = "unknown"
-            logger.warning(
-                f"[Startup] orphan pid={pid} cwd={cwd}, killing"
-            )
-            try:
-                os.kill(pid, _sig.SIGKILL)
-            except Exception:
-                pass
+            # 通过 cwd 提取 user_id，尝试认领到 _user_instances
+            _m = _re.search(r"user_(\d+)", cwd)
+            if _m:
+                _uid = int(_m.group(1))
+                if _uid not in _user_instances:
+                    _user_instances[_uid] = {
+                        "proc": None,
+                        "port": _port_for_user(_uid),
+                        "workdir": None,
+                        "lock": asyncio.Lock(),
+                        "last_active": _time.time(),
+                    }
+                    logger.info(f"[Startup] 认领遗留进程 user={_uid} pid={pid} cwd={cwd}")
+                else:
+                    logger.debug(f"[Startup] pid={pid} 属于已托管 user={_uid}，跳过")
+            else:
+                # cwd 无法识别用户，真正的游离进程
+                logger.warning(f"[Startup] orphan pid={pid} cwd={cwd}, killing")
+                try:
+                    os.kill(pid, _sig.SIGKILL)
+                except Exception:
+                    pass
     except Exception as e:
         logger.debug(f"[Startup] orphan scan failed: {e}")
 
