@@ -157,7 +157,7 @@ def _do_render(entry: KnowledgeEntry, ext: str) -> Optional[str]:
     """下载 OSS 文件到临时目录，调用 extract_html，返回 HTML 或 None。"""
     if not entry.oss_key:
         # 无 OSS 文件，尝试从 content 生成
-        return _render_from_content(entry.content or "", ext)
+        return render_from_content(entry.content or "", ext)
 
     from app.services.oss_service import download_file
 
@@ -175,7 +175,7 @@ def _do_render(entry: KnowledgeEntry, ext: str) -> Optional[str]:
             pass
 
 
-def _render_from_content(content: str, ext: str) -> Optional[str]:
+def render_from_content(content: str, ext: str) -> Optional[str]:
     """无文件时从纯文本 content 生成 HTML（fallback）。"""
     if not content:
         return None

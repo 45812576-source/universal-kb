@@ -400,6 +400,7 @@ async def _bg_post_upload(entry_id: int, content: str, filename: str, file_type:
             render_from_path(bg_db, entry, saved_path)
         except Exception as e:
             _logger.warning(f"Doc render failed (will retry via job): {e}")
+            entry.doc_render_error = str(e)[:500]
 
         # ── 统一文档理解流水线（替代原 AI 命名）──────────────────────────
         try:
@@ -502,9 +503,16 @@ def _create_entry_from_file(
         personal_root = _ensure_personal_root(db, user)
         effective_folder = personal_root.id
 
+    # 生成 fallback HTML，确保 entry 创建时即有可渲染内容
+    fallback_html = None
+    if content:
+        from app.services.doc_renderer import render_from_content
+        fallback_html = render_from_content(content, ext)
+
     entry = KnowledgeEntry(
         title=display_title,
         content=content,
+        content_html=fallback_html,
         category=category,
         industry_tags=json.loads(industry_tags),
         platform_tags=json.loads(platform_tags),
@@ -620,8 +628,10 @@ async def upload_knowledge(
     try:
         from app.services.doc_renderer import render_from_path
         render_from_path(db, entry, saved_path)
-    except Exception:
-        pass
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Sync render failed for entry {entry.id}: {e}")
+        entry.doc_render_error = str(e)[:500]
 
     db.commit()
 
@@ -655,6 +665,9 @@ async def upload_knowledge(
         "doc_render_status": entry.doc_render_status,
         "doc_render_error": entry.doc_render_error,
         "doc_render_mode": entry.doc_render_mode,
+        "has_editable_fallback": bool(entry.content or entry.content_html),
+        "render_pending": entry.doc_render_status in ("pending", "processing"),
+        "content_available": bool(entry.content),
     }
 
 
