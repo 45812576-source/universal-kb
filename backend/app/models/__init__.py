@@ -1,6 +1,7 @@
 from app.models.user import Department, Role, User  # noqa: F401
 from app.models.skill import ModelConfig, Skill, SkillMode, SkillStatus, SkillVersion, SkillSuggestion, SuggestionStatus, SkillAttribution, AttributionLevel  # noqa: F401
 from app.models.knowledge import KnowledgeEntry, KnowledgeStatus, KnowledgeRevision  # noqa: F401
+from app.models.knowledge_share import KnowledgeShareLink  # noqa: F401
 from app.models.knowledge_block import KnowledgeDocumentBlock, KnowledgeChunkMapping  # noqa: F401
 from app.models.knowledge_filing import KnowledgeFilingSuggestion, KnowledgeFilingAction  # noqa: F401
 from app.models.knowledge_doc import KnowledgeDoc, KnowledgeDocSnapshot, KnowledgeDocComment  # noqa: F401

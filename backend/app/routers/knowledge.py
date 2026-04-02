@@ -1,6 +1,8 @@
 import json
+import datetime
 import os
 import re
+import secrets
 import uuid
 from typing import Optional
 
@@ -12,6 +14,7 @@ from app.config import settings
 from app.database import get_db
 from app.dependencies import get_current_user, require_role
 from app.models.knowledge import KnowledgeEntry, KnowledgeEditGrant, KnowledgeFolder, KnowledgeStatus, ReviewStage
+from app.models.knowledge_share import KnowledgeShareLink
 from app.models.user import Role, User
 from app.services.knowledge_service import (
     approve_knowledge,
@@ -238,6 +241,37 @@ def _knowledge_visibility_scope(e: KnowledgeEntry) -> dict:
         "reason": "pending_or_unapproved",
         "owner_id": e.created_by,
         "department_id": e.department_id,
+    }
+
+
+def _can_manage_share(entry: KnowledgeEntry, user: User) -> bool:
+    if user.role == Role.SUPER_ADMIN:
+        return True
+    if entry.created_by == user.id:
+        return True
+    if user.role == Role.DEPT_ADMIN and user.department_id and entry.department_id == user.department_id:
+        return True
+    return False
+
+
+def _share_url(token: str) -> str:
+    public_base = (os.getenv("PUBLIC_WEB_BASE_URL") or os.getenv("FRONTEND_ORIGIN") or "").strip().rstrip("/")
+    if public_base:
+        return f"{public_base}/s/knowledge/{token}"
+    return f"/s/knowledge/{token}"
+
+
+def _share_dict(share: KnowledgeShareLink) -> dict:
+    return {
+        "id": share.id,
+        "share_token": share.share_token,
+        "share_url": _share_url(share.share_token),
+        "is_active": bool(share.is_active),
+        "access_scope": share.access_scope,
+        "expires_at": share.expires_at.isoformat() if share.expires_at else None,
+        "created_at": share.created_at.isoformat() if share.created_at else None,
+        "last_accessed_at": share.last_accessed_at.isoformat() if share.last_accessed_at else None,
+        "access_count": share.access_count or 0,
     }
 
 
@@ -1027,6 +1061,149 @@ def get_knowledge(
     result["content"] = entry.content  # full content for detail view
     result["content_html"] = entry.content_html  # HTML for cloud doc editor
     return result
+
+
+@router.post("/{kid}/share-links")
+def create_share_link(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    if not _can_manage_share(entry, user):
+        raise HTTPException(403, "无权分享该文档")
+
+    existing = (
+        db.query(KnowledgeShareLink)
+        .filter(
+            KnowledgeShareLink.knowledge_id == entry.id,
+            KnowledgeShareLink.is_active.is_(True),
+        )
+        .order_by(KnowledgeShareLink.created_at.desc())
+        .first()
+    )
+    if existing:
+        return _share_dict(existing)
+
+    share = KnowledgeShareLink(
+        knowledge_id=entry.id,
+        share_token=secrets.token_urlsafe(24),
+        created_by=user.id,
+        is_active=True,
+        access_scope="public_readonly",
+    )
+    db.add(share)
+    db.commit()
+    db.refresh(share)
+    return _share_dict(share)
+
+
+@router.get("/{kid}/share-links")
+def list_share_links(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    if not _can_manage_share(entry, user):
+        raise HTTPException(403, "无权查看分享状态")
+
+    shares = (
+        db.query(KnowledgeShareLink)
+        .filter(KnowledgeShareLink.knowledge_id == entry.id)
+        .order_by(KnowledgeShareLink.created_at.desc())
+        .all()
+    )
+    return [_share_dict(share) for share in shares]
+
+
+@router.delete("/share-links/{share_id}")
+def disable_share_link(
+    share_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    share = db.get(KnowledgeShareLink, share_id)
+    if not share:
+        raise HTTPException(404, "Share link not found")
+    entry = db.get(KnowledgeEntry, share.knowledge_id)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    if not _can_manage_share(entry, user):
+        raise HTTPException(403, "无权关闭分享")
+
+    share.is_active = False
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/{kid}/share-links/regenerate")
+def regenerate_share_link(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    if not _can_manage_share(entry, user):
+        raise HTTPException(403, "无权重置分享")
+
+    db.query(KnowledgeShareLink).filter(
+        KnowledgeShareLink.knowledge_id == entry.id,
+        KnowledgeShareLink.is_active.is_(True),
+    ).update({"is_active": False})
+
+    share = KnowledgeShareLink(
+        knowledge_id=entry.id,
+        share_token=secrets.token_urlsafe(24),
+        created_by=user.id,
+        is_active=True,
+        access_scope="public_readonly",
+    )
+    db.add(share)
+    db.commit()
+    db.refresh(share)
+    return _share_dict(share)
+
+
+@router.get("/public/share/{share_token}")
+def get_public_share(
+    share_token: str,
+    db: Session = Depends(get_db),
+):
+    share = db.query(KnowledgeShareLink).filter(KnowledgeShareLink.share_token == share_token).first()
+    if not share or not share.is_active:
+        raise HTTPException(404, "链接已失效")
+    if share.expires_at and share.expires_at <= datetime.datetime.utcnow():
+        raise HTTPException(410, "链接已过期")
+
+    entry = db.get(KnowledgeEntry, share.knowledge_id)
+    if not entry:
+        raise HTTPException(404, "文档不存在")
+
+    share.access_count = (share.access_count or 0) + 1
+    share.last_accessed_at = datetime.datetime.utcnow()
+    db.commit()
+
+    return {
+        "title": _display_title(entry),
+        "content": entry.content,
+        "content_html": entry.content_html,
+        "source_type": entry.source_type,
+        "source_origin_label": "飞书" if entry.source_type == "lark_doc" else "工作台",
+        "updated_at": entry.updated_at.isoformat() if entry.updated_at else None,
+        "created_at": entry.created_at.isoformat() if entry.created_at else None,
+        "doc_render_status": entry.doc_render_status,
+        "share_meta": {
+            "access_scope": share.access_scope,
+            "expires_at": share.expires_at.isoformat() if share.expires_at else None,
+        },
+    }
 
 
 @router.post("/{kid}/review")
