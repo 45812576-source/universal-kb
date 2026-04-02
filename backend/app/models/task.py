@@ -39,6 +39,11 @@ class Task(Base):
     workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
     pev_job_id = Column(Integer, ForeignKey("pev_jobs.id"), nullable=True)
+    governance_objective_id = Column(Integer, ForeignKey("governance_objectives.id"), nullable=True)
+    resource_library_id = Column(Integer, ForeignKey("governance_resource_libraries.id"), nullable=True)
+    governance_kr_id = Column(Integer, ForeignKey("governance_krs.id"), nullable=True)
+    governance_object_id = Column(Integer, ForeignKey("governance_objects.id"), nullable=True)
+    object_anchor = Column(String(100), nullable=True)
     metadata_ = Column("metadata", JSON, default=dict)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(

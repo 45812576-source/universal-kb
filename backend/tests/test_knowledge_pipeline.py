@@ -3,6 +3,8 @@ import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from tests.conftest import (
@@ -16,7 +18,6 @@ from tests.conftest import (
 )
 
 from app.database import get_db
-from app.main import app
 from app.models.knowledge import KnowledgeEntry, KnowledgeStatus, ReviewStage
 from app.models.knowledge_job import KnowledgeJob
 from app.models.user import Role
@@ -357,17 +358,33 @@ class TestVectorCandidates:
 class TestKnowledgeAPIs:
     @pytest.fixture(autouse=True)
     def setup_api(self, db, client):
-        app.dependency_overrides[get_db] = override_get_db
+        from app.routers import auth, knowledge
+
+        test_app = FastAPI(title="Knowledge Pipeline Test API")
+        test_app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        test_app.include_router(auth.router)
+        test_app.include_router(knowledge.router)
+        test_app.dependency_overrides[get_db] = override_get_db
         self._dept = _make_dept(db, name=f"API测试部门")
         self._user = _make_user(
             db, username="apitest", role=Role.SUPER_ADMIN, dept_id=self._dept.id
         )
         db.commit()
-        self._token = _login(client, "apitest")
-        yield
-        app.dependency_overrides.clear()
+        from fastapi.testclient import TestClient
 
-    def test_classify_retry(self, db, client):
+        with TestClient(test_app, raise_server_exceptions=True) as local_client:
+            self._client = local_client
+            self._token = _login(local_client, "apitest")
+            yield
+        test_app.dependency_overrides.clear()
+
+    def test_classify_retry(self, db):
         entry = KnowledgeEntry(
             title="需要重分类",
             content="内容",
@@ -378,7 +395,7 @@ class TestKnowledgeAPIs:
         db.add(entry)
         db.commit()
 
-        resp = client.post(
+        resp = self._client.post(
             f"/api/knowledge/{entry.id}/classify",
             headers=_auth(self._token),
         )
@@ -397,7 +414,7 @@ class TestKnowledgeAPIs:
         db.refresh(entry)
         assert entry.classification_status == "pending"
 
-    def test_render_retry_creates_job(self, db, client):
+    def test_render_retry_creates_job(self, db):
         entry = KnowledgeEntry(
             title="渲染失败",
             content="内容",
@@ -408,7 +425,7 @@ class TestKnowledgeAPIs:
         db.add(entry)
         db.commit()
 
-        resp = client.post(
+        resp = self._client.post(
             f"/api/knowledge/{entry.id}/render",
             headers=_auth(self._token),
         )
@@ -423,7 +440,7 @@ class TestKnowledgeAPIs:
         ).first()
         assert job is not None
 
-    def test_list_filter_classification_status(self, db, client):
+    def test_list_filter_classification_status(self, db):
         for status in ["success", "failed", "pending"]:
             e = KnowledgeEntry(
                 title=f"状态{status}",
@@ -437,7 +454,7 @@ class TestKnowledgeAPIs:
             db.add(e)
         db.commit()
 
-        resp = client.get(
+        resp = self._client.get(
             "/api/knowledge?classification_status=failed",
             headers=_auth(self._token),
         )
@@ -446,7 +463,7 @@ class TestKnowledgeAPIs:
         assert len(data) == 1
         assert data[0]["classification_status"] == "failed"
 
-    def test_entry_dict_has_new_fields(self, db, client):
+    def test_entry_dict_has_new_fields(self, db):
         entry = KnowledgeEntry(
             title="详情测试",
             content="内容详情",
@@ -459,7 +476,7 @@ class TestKnowledgeAPIs:
         db.add(entry)
         db.commit()
 
-        resp = client.get(
+        resp = self._client.get(
             f"/api/knowledge/{entry.id}",
             headers=_auth(self._token),
         )

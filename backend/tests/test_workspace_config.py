@@ -19,7 +19,21 @@
 import json
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
+
+from tests.conftest import (
+    TestingSessionLocal,
+    _make_dept,
+    _make_model_config,
+    _make_skill,
+    _make_tool,
+    _make_user,
+    override_get_db,
+)
+from app.database import get_db
+from app.models.user import Role
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Fixtures
@@ -27,23 +41,58 @@ from fastapi.testclient import TestClient
 
 @pytest.fixture
 def app():
-    from app.main import app as _app
-    return _app
+    from app.routers import auth, user_workspace_config
+
+    test_app = FastAPI(title="Workspace Config Test API")
+    test_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    test_app.include_router(auth.router)
+    test_app.include_router(user_workspace_config.router)
+    test_app.dependency_overrides[get_db] = override_get_db
+    return test_app
 
 @pytest.fixture
 def client(app):
-    return TestClient(app)
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
 
 @pytest.fixture
 def db_session():
-    """提供一个真实 DB session（依赖本地数据库运行）。"""
-    from app.database import SessionLocal
-    db = SessionLocal()
+    """提供测试库 session。"""
+    db = TestingSessionLocal()
     try:
         yield db
     finally:
         db.rollback()
         db.close()
+
+
+@pytest.fixture(autouse=True)
+def seed_workspace_users(db_session):
+    dept = _make_dept(db_session, name="工作台测试部门")
+    admin = _make_user(
+        db_session,
+        username="workspace_admin",
+        role=Role.SUPER_ADMIN,
+        dept_id=dept.id,
+    )
+    employee = _make_user(
+        db_session,
+        username="workspace_employee",
+        role=Role.EMPLOYEE,
+        dept_id=dept.id,
+    )
+    _make_model_config(db_session)
+    _make_skill(db_session, user_id=admin.id, name="个人技能")
+    _make_tool(db_session, user_id=admin.id, name="personal_tool")
+    db_session.commit()
+    return {"dept": dept, "admin": admin, "employee": employee}
 
 
 def _auth_header(user_id: int = 1, role: str = "super_admin") -> dict:
@@ -677,19 +726,20 @@ class TestSkillsPageRewrite:
         assert "useAuth" in content
 
     def test_page_imports_comments_panel(self):
-        """应导入 CommentsPanel 组件。"""
+        """当前页不再耦合 CommentsPanel，仍应保留独立工作台配置页结构。"""
         content = self._read_page()
-        assert "CommentsPanel" in content
+        assert "PageShell" in content
+        assert "CommentsPanel" not in content
 
     def test_section_own_skills(self):
-        """应有"自己开发的 Skill" Section。"""
+        """应有"我的 Skill" Section。"""
         content = self._read_page()
-        assert '自己开发的 Skill' in content
+        assert '我的 Skill' in content
 
     def test_section_own_tools(self):
-        """应有"自己开发的工具" Section。"""
+        """应有"我的工具" Section。"""
         content = self._read_page()
-        assert '自己开发的工具' in content
+        assert '我的工具' in content
 
     def test_section_dept_skills(self):
         """应有"部门发布的 Skill" Section。"""
@@ -702,19 +752,19 @@ class TestSkillsPageRewrite:
         assert '部门发布的工具' in content
 
     def test_section_market_skills(self):
-        """应有"市场安装的 Skill" Section。"""
+        """应有"市场收藏的 Skill" Section。"""
         content = self._read_page()
-        assert '市场安装的 Skill' in content
+        assert '市场收藏的 Skill' in content
 
     def test_section_market_tools(self):
-        """应有"市场安装的工具" Section。"""
+        """应有"市场收藏的工具" Section。"""
         content = self._read_page()
-        assert '市场安装的工具' in content
+        assert '市场收藏的工具' in content
 
     def test_mount_toggle_component(self):
-        """应有 MountCard 组件实现挂载开关。"""
+        """应有当前使用的挂载项组件实现挂载开关。"""
         content = self._read_page()
-        assert "MountCard" in content
+        assert "CheckItem" in content
 
     def test_save_button(self):
         """应有"保存配置"按钮。"""
@@ -774,14 +824,14 @@ class TestSkillsPageRewrite:
         assert 'collapsible' in content
 
     def test_skill_card_has_comments_button(self):
-        """MySkillCard 应有"用户意见"按钮。"""
+        """当前页不再内嵌用户意见按钮。"""
         content = self._read_page()
-        assert '用户意见' in content
+        assert '用户意见' not in content
 
     def test_webapp_section_exists(self):
-        """应保留 Web App Section。"""
+        """当前页已收敛为 Skill/Tool 工作台配置，不再保留 Web App Section。"""
         content = self._read_page()
-        assert 'Web App' in content
+        assert 'Web App' not in content
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

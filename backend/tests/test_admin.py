@@ -1,6 +1,11 @@
 """TC-ADMIN: Model config CRUD and department listing, role enforcement."""
 import pytest
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.testclient import TestClient
 from tests.conftest import _make_user, _make_dept, _make_model_config, _login, _auth
+from tests.conftest import override_get_db
+from app.database import get_db
 from app.models.user import Role
 
 
@@ -17,6 +22,27 @@ def _model_payload(**overrides):
     }
     base.update(overrides)
     return base
+
+
+@pytest.fixture
+def client():
+    from app.routers import auth, admin
+
+    test_app = FastAPI(title="Admin Test API")
+    test_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    test_app.include_router(auth.router)
+    test_app.include_router(admin.router)
+    test_app.dependency_overrides[get_db] = override_get_db
+
+    with TestClient(test_app, raise_server_exceptions=True) as c:
+        yield c
+    test_app.dependency_overrides.clear()
 
 
 # ── Model Config — role enforcement ──────────────────────────────────────────

@@ -38,6 +38,10 @@ class Project(Base):
     department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
     max_members = Column(Integer, default=5)
     llm_generated_plan = Column(JSON, nullable=True)
+    governance_objective_id = Column(Integer, ForeignKey("governance_objectives.id"), nullable=True)
+    resource_library_ids = Column(JSON, default=list)
+    governance_kr_id = Column(Integer, ForeignKey("governance_krs.id"), nullable=True)
+    governance_note = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(
         DateTime,

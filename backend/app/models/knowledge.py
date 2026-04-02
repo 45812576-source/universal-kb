@@ -162,6 +162,17 @@ class KnowledgeEntry(Base):
     sync_status = Column(String(20), default="idle", nullable=True)   # idle/syncing/ok/error
     sync_error = Column(Text, nullable=True)                  # 同步失败原因
 
+    # ── 知识治理底座锚点 ──────────────────────────────────────────────────────
+    governance_objective_id = Column(Integer, ForeignKey("governance_objectives.id"), nullable=True)
+    resource_library_id = Column(Integer, ForeignKey("governance_resource_libraries.id"), nullable=True)
+    object_type_id = Column(Integer, ForeignKey("governance_object_types.id"), nullable=True)
+    governance_object_id = Column(Integer, ForeignKey("governance_objects.id"), nullable=True)
+    governance_kr_id = Column(Integer, ForeignKey("governance_krs.id"), nullable=True)
+    governance_element_id = Column(Integer, ForeignKey("governance_required_elements.id"), nullable=True)
+    governance_status = Column(String(20), default="ungoverned", nullable=True)  # ungoverned | suggested | aligned | needs_review
+    governance_confidence = Column(Float, nullable=True)
+    governance_note = Column(Text, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(
         DateTime,
