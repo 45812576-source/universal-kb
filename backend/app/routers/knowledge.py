@@ -440,6 +440,13 @@ async def upload_knowledge(
         os.unlink(saved_path)
         raise HTTPException(400, str(e))
 
+    # 尽量在请求内完成一次同步转换，避免用户长时间看到 pending。
+    try:
+        from app.services.doc_renderer import render_from_path
+        render_from_path(db, entry, saved_path)
+    except Exception:
+        pass
+
     db.commit()
 
     # 后台执行 AI naming + 文档渲染（不阻塞响应）
@@ -473,6 +480,8 @@ async def upload_knowledge(
         "doc_render_error": entry.doc_render_error,
         "doc_render_mode": entry.doc_render_mode,
     }
+
+
 
 
 @router.get("")
@@ -814,6 +823,9 @@ def _folder_dict(f: KnowledgeFolder) -> dict:
         "parent_id": f.parent_id,
         "sort_order": f.sort_order,
         "created_by": f.created_by,
+        "is_system": bool(f.is_system),
+        "taxonomy_board": f.taxonomy_board,
+        "taxonomy_code": f.taxonomy_code,
         "created_at": f.created_at.isoformat(),
     }
 
@@ -823,12 +835,25 @@ def list_folders(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """返回当前用户自己创建的文件夹（扁平列表，前端自行构建树）。
-    "我的整理"文件夹属于个人空间，任何角色都只看自己的；
-    超管/部门管理员的跨用户权限体现在系统归档视图里。
+    """返回文件夹列表（扁平列表，前端自行构建树）。
+
+    规则：
+    - 用户自建目录：只返回当前用户自己的
+    - 系统归档树：所有用户 always visible，保证自动归档后的文档不会“消失”
     """
-    q = db.query(KnowledgeFolder).filter(KnowledgeFolder.created_by == user.id)
-    folders = q.order_by(KnowledgeFolder.sort_order, KnowledgeFolder.id).all()
+    folders = (
+        db.query(KnowledgeFolder)
+        .filter(
+            (KnowledgeFolder.created_by == user.id) |
+            (KnowledgeFolder.is_system == 1)
+        )
+        .order_by(
+            KnowledgeFolder.is_system.desc(),
+            KnowledgeFolder.sort_order,
+            KnowledgeFolder.id,
+        )
+        .all()
+    )
     return [_folder_dict(f) for f in folders]
 
 
