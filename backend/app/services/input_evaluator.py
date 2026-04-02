@@ -107,7 +107,7 @@ class InputEvaluator:
         )
 
         try:
-            lite_config = llm_gateway.resolve_config(db, "input.evaluate")
+            lite_config = llm_gateway.resolve_config(db, "input.evaluate") if db is not None else None
             raw, _ = await llm_gateway.chat(
                 model_config=lite_config,
                 messages=[{"role": "user", "content": prompt}],

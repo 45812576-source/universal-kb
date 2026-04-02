@@ -635,6 +635,7 @@ async def stream_message(
             async def _on_status(stage: str):
                 await _status_queue.put(("status", stage))
 
+            yield _sse("status", {"stage": "preparing"})
             _prep_task = asyncio.ensure_future(skill_engine.prepare(
                 db, conv, req.content,
                 user_id=current_user_id,

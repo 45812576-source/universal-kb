@@ -49,9 +49,9 @@ def client():
 
 def test_employee_cannot_list_models(client, db):
     dept = _make_dept(db)
-    _make_user(db, "aemp1", Role.EMPLOYEE, dept.id)
+    _make_user(db, "aemp_list_models", Role.EMPLOYEE, dept.id)
     db.commit()
-    token = _login(client, "aemp1")
+    token = _login(client, "aemp_list_models")
 
     resp = client.get("/api/admin/models", headers=_auth(token))
     assert resp.status_code == 403
@@ -59,9 +59,9 @@ def test_employee_cannot_list_models(client, db):
 
 def test_dept_admin_cannot_list_models(client, db):
     dept = _make_dept(db)
-    _make_user(db, "adept1", Role.DEPT_ADMIN, dept.id)
+    _make_user(db, "adept_list_models", Role.DEPT_ADMIN, dept.id)
     db.commit()
-    token = _login(client, "adept1")
+    token = _login(client, "adept_list_models")
 
     resp = client.get("/api/admin/models", headers=_auth(token))
     assert resp.status_code == 403
@@ -71,9 +71,9 @@ def test_dept_admin_cannot_list_models(client, db):
 
 def test_super_admin_can_list_models(client, db):
     dept = _make_dept(db)
-    _make_user(db, "aadmin1", Role.SUPER_ADMIN, dept.id)
+    _make_user(db, "aadmin_list_models", Role.SUPER_ADMIN, dept.id)
     db.commit()
-    token = _login(client, "aadmin1")
+    token = _login(client, "aadmin_list_models")
 
     resp = client.get("/api/admin/models", headers=_auth(token))
     assert resp.status_code == 200
@@ -82,9 +82,9 @@ def test_super_admin_can_list_models(client, db):
 
 def test_create_model_config(client, db):
     dept = _make_dept(db)
-    _make_user(db, "aadmin2", Role.SUPER_ADMIN, dept.id)
+    _make_user(db, "aadmin_create_model", Role.SUPER_ADMIN, dept.id)
     db.commit()
-    token = _login(client, "aadmin2")
+    token = _login(client, "aadmin_create_model")
 
     resp = client.post("/api/admin/models", headers=_auth(token), json=_model_payload(name="新模型"))
     assert resp.status_code == 200
@@ -95,9 +95,9 @@ def test_create_model_config(client, db):
 
 def test_list_models_returns_created(client, db):
     dept = _make_dept(db)
-    _make_user(db, "aadmin3", Role.SUPER_ADMIN, dept.id)
+    _make_user(db, "aadmin_list_created", Role.SUPER_ADMIN, dept.id)
     db.commit()
-    token = _login(client, "aadmin3")
+    token = _login(client, "aadmin_list_created")
 
     client.post("/api/admin/models", headers=_auth(token), json=_model_payload(name="列表模型1"))
     client.post("/api/admin/models", headers=_auth(token), json=_model_payload(name="列表模型2"))
@@ -110,18 +110,19 @@ def test_list_models_returns_created(client, db):
 
 def test_update_model_config(client, db):
     dept = _make_dept(db)
-    _make_user(db, "aadmin4", Role.SUPER_ADMIN, dept.id)
+    _make_user(db, "aadmin_update_model", Role.SUPER_ADMIN, dept.id)
     mc = _make_model_config(db)
+    mc_id = mc.id
     db.commit()
-    token = _login(client, "aadmin4")
+    token = _login(client, "aadmin_update_model")
 
-    resp = client.put(f"/api/admin/models/{mc.id}", headers=_auth(token), json=_model_payload(
+    resp = client.put(f"/api/admin/models/{mc_id}", headers=_auth(token), json=_model_payload(
         name="更新后模型", provider="deepseek"
     ))
     assert resp.status_code == 200
 
     models = client.get("/api/admin/models", headers=_auth(token)).json()
-    updated = next((m for m in models if m["id"] == mc.id), None)
+    updated = next((m for m in models if m["id"] == mc_id), None)
     assert updated is not None
     assert updated["name"] == "更新后模型"
     assert updated["provider"] == "deepseek"
@@ -129,9 +130,9 @@ def test_update_model_config(client, db):
 
 def test_update_model_not_found(client, db):
     dept = _make_dept(db)
-    _make_user(db, "aadmin5", Role.SUPER_ADMIN, dept.id)
+    _make_user(db, "aadmin_update_missing", Role.SUPER_ADMIN, dept.id)
     db.commit()
-    token = _login(client, "aadmin5")
+    token = _login(client, "aadmin_update_missing")
 
     resp = client.put("/api/admin/models/99999", headers=_auth(token), json=_model_payload())
     assert resp.status_code == 404
@@ -139,24 +140,25 @@ def test_update_model_not_found(client, db):
 
 def test_delete_model_config(client, db):
     dept = _make_dept(db)
-    _make_user(db, "aadmin6", Role.SUPER_ADMIN, dept.id)
+    _make_user(db, "aadmin_delete_model", Role.SUPER_ADMIN, dept.id)
     mc = _make_model_config(db)
+    mc_id = mc.id
     db.commit()
-    token = _login(client, "aadmin6")
+    token = _login(client, "aadmin_delete_model")
 
-    resp = client.delete(f"/api/admin/models/{mc.id}", headers=_auth(token))
+    resp = client.delete(f"/api/admin/models/{mc_id}", headers=_auth(token))
     assert resp.status_code == 200
     assert resp.json()["ok"] is True
 
     models = client.get("/api/admin/models", headers=_auth(token)).json()
-    assert not any(m["id"] == mc.id for m in models)
+    assert not any(m["id"] == mc_id for m in models)
 
 
 def test_delete_model_not_found(client, db):
     dept = _make_dept(db)
-    _make_user(db, "aadmin7", Role.SUPER_ADMIN, dept.id)
+    _make_user(db, "aadmin_delete_missing", Role.SUPER_ADMIN, dept.id)
     db.commit()
-    token = _login(client, "aadmin7")
+    token = _login(client, "aadmin_delete_missing")
 
     resp = client.delete("/api/admin/models/99999", headers=_auth(token))
     assert resp.status_code == 404
@@ -164,9 +166,9 @@ def test_delete_model_not_found(client, db):
 
 def test_set_default_model_clears_previous_default(client, db):
     dept = _make_dept(db)
-    _make_user(db, "aadmin8", Role.SUPER_ADMIN, dept.id)
+    _make_user(db, "aadmin_default_model", Role.SUPER_ADMIN, dept.id)
     db.commit()
-    token = _login(client, "aadmin8")
+    token = _login(client, "aadmin_default_model")
 
     r1 = client.post("/api/admin/models", headers=_auth(token), json=_model_payload(
         name="默认模型1", is_default=True
@@ -189,9 +191,9 @@ def test_super_admin_can_list_departments(client, db):
     _make_dept(db, "部门X")
     _make_dept(db, "部门Y")
     dept = _make_dept(db, "管理部门")
-    _make_user(db, "aadmin9", Role.SUPER_ADMIN, dept.id)
+    _make_user(db, "aadmin_list_departments", Role.SUPER_ADMIN, dept.id)
     db.commit()
-    token = _login(client, "aadmin9")
+    token = _login(client, "aadmin_list_departments")
 
     resp = client.get("/api/admin/departments", headers=_auth(token))
     assert resp.status_code == 200
@@ -202,9 +204,9 @@ def test_super_admin_can_list_departments(client, db):
 
 def test_dept_admin_can_list_departments(client, db):
     dept = _make_dept(db)
-    _make_user(db, "adept2", Role.DEPT_ADMIN, dept.id)
+    _make_user(db, "adept_list_departments", Role.DEPT_ADMIN, dept.id)
     db.commit()
-    token = _login(client, "adept2")
+    token = _login(client, "adept_list_departments")
 
     resp = client.get("/api/admin/departments", headers=_auth(token))
     assert resp.status_code == 200
@@ -212,9 +214,9 @@ def test_dept_admin_can_list_departments(client, db):
 
 def test_employee_cannot_list_departments(client, db):
     dept = _make_dept(db)
-    _make_user(db, "aemp2", Role.EMPLOYEE, dept.id)
+    _make_user(db, "aemp_list_departments", Role.EMPLOYEE, dept.id)
     db.commit()
-    token = _login(client, "aemp2")
+    token = _login(client, "aemp_list_departments")
 
     resp = client.get("/api/admin/departments", headers=_auth(token))
     assert resp.status_code == 403

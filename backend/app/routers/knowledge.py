@@ -73,12 +73,38 @@ def _sanitize_title(raw: str) -> str:
     return raw or "未命名文档"
 
 
-def _display_title(entry: KnowledgeEntry) -> str:
-    """统一前端/接口展示标题来源优先级。"""
-    for candidate in (entry.title, entry.ai_title, entry.source_file):
-        normalized = _sanitize_title(candidate or "")
-        if normalized and normalized != "未命名文档":
-            return normalized
+def _display_title(entry: KnowledgeEntry, understanding: dict | None = None) -> str:
+    """统一前端/接口展示标题——唯一主口径。
+
+    优先级：
+    1. 用户显式标题（entry.title 且非文件名原值）
+    2. understanding profile 的 display_title
+    3. AI 标题（entry.ai_title）
+    4. 清洗后文件名
+    5. "未命名文档"
+    """
+    # 1. 用户显式标题
+    user_title = _sanitize_title(entry.title or "")
+    source_file_cleaned = _sanitize_title(entry.source_file or "")
+    if user_title and user_title != "未命名文档" and user_title != source_file_cleaned:
+        return user_title
+
+    # 2. understanding profile display_title
+    if understanding:
+        ud_title = understanding.get("understanding_display_title") or ""
+        if ud_title and ud_title != "未命名文档":
+            return ud_title
+
+    # 3. AI 标题
+    ai = _sanitize_title(entry.ai_title or "")
+    if ai and ai != "未命名文档":
+        return ai
+
+    # 4. 清洗后文件名
+    if source_file_cleaned and source_file_cleaned != "未命名文档":
+        return source_file_cleaned
+
+    # 5. fallback
     return "未命名文档"
 
 
@@ -147,7 +173,36 @@ _ONLYOFFICE_EXTS = {
 }
 
 
-def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None) -> dict:
+def _get_understanding_profile(db: Session, knowledge_id: int) -> dict:
+    """获取文档理解 profile 字段（用于 API 返回）。"""
+    from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
+    profile = (
+        db.query(KnowledgeUnderstandingProfile)
+        .filter(KnowledgeUnderstandingProfile.knowledge_id == knowledge_id)
+        .first()
+    )
+    if not profile:
+        return {}
+    return {
+        "understanding_display_title": profile.display_title,
+        "understanding_document_type": profile.document_type,
+        "understanding_permission_domain": profile.permission_domain,
+        "understanding_desensitization_level": profile.desensitization_level,
+        "understanding_contains_sensitive_data": profile.contains_sensitive_data,
+        "understanding_content_tags": profile.content_tags,
+        "understanding_summary_short": profile.summary_short,
+        "understanding_summary_search": profile.summary_search,
+        "understanding_status": profile.understanding_status,
+        "understanding_data_type_hits": profile.data_type_hits,
+        "understanding_visibility_recommendation": profile.visibility_recommendation,
+        "understanding_suggested_tags": profile.suggested_tags,
+        "understanding_title_confidence": profile.title_confidence,
+        "understanding_title_source": profile.title_source,
+        "understanding_summary_sensitivity_mode": profile.summary_sensitivity_mode,
+    }
+
+
+def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None, db: Session | None = None) -> dict:
     ext = (e.file_ext or "").lower()
     creator_department = getattr(getattr(e, "creator", None), "department", None)
     folder_obj = getattr(e, "folder", None)
@@ -157,9 +212,13 @@ def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None
         _folder_name = folder_name_map.get(e.folder_id)
         if _folder_name == "我的知识":
             _is_in_my_knowledge = True
-    return {
+
+    # 文档理解 profile
+    understanding = _get_understanding_profile(db, e.id) if db else {}
+
+    result = {
         "id": e.id,
-        "title": _display_title(e),
+        "title": _display_title(e, understanding),
         "raw_title": e.title,
         "content": e.content[:300] + ("..." if len(e.content) > 300 else ""),
         "category": e.category,
@@ -228,6 +287,8 @@ def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None
         "can_retry_classification": e.classification_status in ("failed", "pending", "needs_review", None),
         "created_at": e.created_at.isoformat(),
     }
+    result.update(understanding)
+    return result
 
 
 def _knowledge_visibility_scope(e: KnowledgeEntry) -> dict:
@@ -323,7 +384,7 @@ def create_knowledge(
 
 
 async def _bg_post_upload(entry_id: int, content: str, filename: str, file_type: str, saved_path: str):
-    """后台执行 AI 命名 + 文档渲染 + 清理，不阻塞上传响应。"""
+    """后台执行文档理解流水线 + 文档渲染 + 清理，不阻塞上传响应。"""
     import logging
     _logger = logging.getLogger(__name__)
     from app.database import SessionLocal
@@ -340,22 +401,50 @@ async def _bg_post_upload(entry_id: int, content: str, filename: str, file_type:
         except Exception as e:
             _logger.warning(f"Doc render failed (will retry via job): {e}")
 
-        # AI 智能命名
+        # ── 统一文档理解流水线（替代原 AI 命名）──────────────────────────
         try:
-            from app.services.knowledge_namer import auto_name
-            naming_result = await auto_name(content, filename, file_type, db=bg_db)
-            entry.ai_title = naming_result["title"]
-            entry.ai_summary = naming_result["summary"]
-            entry.ai_tags = naming_result["tags"]
-            entry.quality_score = naming_result["quality_score"]
-            if naming_result["tags"].get("industry"):
-                entry.industry_tags = naming_result["tags"]["industry"]
-            if naming_result["tags"].get("platform"):
-                entry.platform_tags = naming_result["tags"]["platform"]
-            if naming_result["tags"].get("topic"):
-                entry.topic_tags = naming_result["tags"]["topic"]
+            from app.services.knowledge_understanding import understand_document
+            profile = await understand_document(
+                knowledge_id=entry.id,
+                content=content,
+                filename=filename,
+                file_type=file_type,
+                db=bg_db,
+            )
+            # 向后兼容：同步更新主表的 ai_title/ai_summary/ai_tags/quality_score
+            if profile.display_title:
+                entry.ai_title = profile.display_title
+            if profile.summary_short:
+                entry.ai_summary = profile.summary_short
+            if profile.content_tags:
+                tags = profile.content_tags
+                entry.ai_tags = {
+                    "industry": [tags.get("industry_or_domain_tag", "")] if tags.get("industry_or_domain_tag") else [],
+                    "platform": [],
+                    "topic": [tags.get("scenario_tag", "")] if tags.get("scenario_tag") else [],
+                }
+                if tags.get("industry_or_domain_tag"):
+                    entry.industry_tags = list(set((entry.industry_tags or []) + [tags["industry_or_domain_tag"]]))
+                if tags.get("scenario_tag"):
+                    entry.topic_tags = list(set((entry.topic_tags or []) + [tags["scenario_tag"]]))
         except Exception as e:
-            _logger.warning(f"AI naming failed: {e}")
+            _logger.warning(f"Document understanding failed, falling back to AI naming: {e}")
+            # 降级到原 AI 命名
+            try:
+                from app.services.knowledge_namer import auto_name
+                naming_result = await auto_name(content, filename, file_type, db=bg_db)
+                entry.ai_title = naming_result["title"]
+                entry.ai_summary = naming_result["summary"]
+                entry.ai_tags = naming_result["tags"]
+                entry.quality_score = naming_result["quality_score"]
+                if naming_result["tags"].get("industry"):
+                    entry.industry_tags = naming_result["tags"]["industry"]
+                if naming_result["tags"].get("platform"):
+                    entry.platform_tags = naming_result["tags"]["platform"]
+                if naming_result["tags"].get("topic"):
+                    entry.topic_tags = naming_result["tags"]["topic"]
+            except Exception as e2:
+                _logger.warning(f"AI naming fallback also failed: {e2}")
 
         bg_db.commit()
     except Exception as e:
@@ -438,6 +527,7 @@ def _create_entry_from_file(
     if entry.doc_render_status in ("failed", "pending"):
         db.add(KnowledgeJob(knowledge_id=entry.id, job_type="render", trigger_source="upload"))
     db.add(KnowledgeJob(knowledge_id=entry.id, job_type="classify", trigger_source="upload"))
+    db.add(KnowledgeJob(knowledge_id=entry.id, job_type="understand", trigger_source="upload"))
     entry.classification_status = "pending"
 
     return entry, content, file_type
@@ -630,7 +720,7 @@ def list_knowledge(
         ).all()
         folder_name_map = {r.id: r.name for r in folder_rows}
 
-    return [_entry_dict(e, folder_name_map) for e in entries]
+    return [_entry_dict(e, folder_name_map, db=db) for e in entries]
 
 
 def _enrich_search_results_with_blocks(db: Session, best: dict) -> None:
@@ -1057,7 +1147,7 @@ def get_knowledge(
         _f = db.get(KnowledgeFolder, entry.folder_id)
         if _f:
             _fmap[entry.folder_id] = _f.name
-    result = _entry_dict(entry, _fmap)
+    result = _entry_dict(entry, _fmap, db=db)
     result["content"] = entry.content  # full content for detail view
     result["content_html"] = entry.content_html  # HTML for cloud doc editor
     return result
@@ -1281,7 +1371,7 @@ def review_knowledge(
         raise HTTPException(400, "action must be 'approve' or 'reject'")
 
     db.commit()
-    return _entry_dict(entry)
+    return _entry_dict(entry, db=db)
 
 
 @router.post("/{kid}/super-review")
@@ -1342,7 +1432,7 @@ def super_review_knowledge(
         raise HTTPException(400, "action must be 'approve' or 'reject'")
 
     db.commit()
-    return _entry_dict(entry)
+    return _entry_dict(entry, db=db)
 
 
 def can_edit_entry(entry: KnowledgeEntry, user: User, db: Session) -> bool:
@@ -1382,7 +1472,7 @@ def update_knowledge(
     if req.content_html is not None:
         entry.content_html = req.content_html
     db.commit()
-    return _entry_dict(entry)
+    return _entry_dict(entry, db=db)
 
 
 @router.delete("/{kid}")
@@ -1526,6 +1616,88 @@ def retry_classify(
     entry.classification_error = None
     db.commit()
     return {"ok": True, "job_id": job.id, "status": "queued"}
+
+
+@router.post("/{kid}/understand")
+def retry_understand(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """手动重跑文档理解流水线。"""
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    if user.role != Role.SUPER_ADMIN and entry.created_by != user.id:
+        raise HTTPException(403, "无权操作")
+
+    from app.models.knowledge_job import KnowledgeJob
+    job = KnowledgeJob(
+        knowledge_id=kid,
+        job_type="understand",
+        trigger_source="retry",
+    )
+    db.add(job)
+    db.commit()
+    return {"ok": True, "job_id": job.id, "status": "queued"}
+
+
+class UnderstandingProfileUpdate(BaseModel):
+    display_title: str | None = None
+    document_type: str | None = None
+    permission_domain: str | None = None
+    desensitization_level: str | None = None
+    content_tags: dict | None = None
+
+
+@router.patch("/{kid}/understanding")
+def patch_understanding_profile(
+    kid: int,
+    req: UnderstandingProfileUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """人工修正文档理解 profile（修正后标记 source=manual，不被后续自动覆盖）。"""
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    if not can_edit_entry(entry, user, db):
+        raise HTTPException(403, "无编辑权限")
+
+    from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
+    profile = (
+        db.query(KnowledgeUnderstandingProfile)
+        .filter(KnowledgeUnderstandingProfile.knowledge_id == kid)
+        .first()
+    )
+    if not profile:
+        raise HTTPException(404, "该文档尚无理解 profile，请先运行理解流水线")
+
+    import datetime
+    if req.display_title is not None:
+        profile.display_title = req.display_title
+        profile.title_source = "user"
+    if req.document_type is not None:
+        profile.document_type = req.document_type
+        profile.classification_source = "manual"
+    if req.permission_domain is not None:
+        profile.permission_domain = req.permission_domain
+    if req.desensitization_level is not None:
+        profile.desensitization_level = req.desensitization_level
+        profile.masking_source = "manual"
+    if req.content_tags is not None:
+        from app.data.sensitivity_rules import validate_content_tags
+        profile.content_tags = validate_content_tags(req.content_tags)
+        profile.tagging_source = "manual"
+    profile.updated_at = datetime.datetime.utcnow()
+    db.commit()
+
+    # 同步主表展示标题
+    if req.display_title is not None:
+        entry.ai_title = req.display_title
+        db.commit()
+
+    return _get_understanding_profile(db, kid)
 
 
 @router.post("/{kid}/refresh-from-lark")

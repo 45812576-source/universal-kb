@@ -209,9 +209,10 @@ class LLMGateway:
         use_native_tools = bool(tools and self.supports_function_calling(model_config))
 
         async with self._client.stream("POST", url, headers=headers, json=body) as resp:
-            if resp.status_code >= 400:
+            status_code = getattr(resp, "status_code", 200)
+            if status_code >= 400:
                 error_body = await resp.aread()
-                raise ValueError(f"LLM API error {resp.status_code}: {error_body.decode()[:300]}")
+                raise ValueError(f"LLM API error {status_code}: {error_body.decode()[:300]}")
 
             tool_calls_buf: dict[int, dict] = {}  # index → {id, name, arguments}
 

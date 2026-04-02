@@ -1,4 +1,4 @@
-"""知识处理任务模型：render（云文档转换）和 classify（自动分类）的异步 Job。"""
+"""知识处理任务模型：render（云文档转换）、classify（自动分类）、understand（文档理解）的异步 Job。"""
 import datetime
 
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
@@ -12,7 +12,7 @@ class KnowledgeJob(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     knowledge_id = Column(Integer, ForeignKey("knowledge_entries.id"), nullable=False, index=True)
-    # render | classify
+    # render | classify | understand
     job_type = Column(String(20), nullable=False, index=True)
     # queued | running | success | failed | partial_success
     status = Column(String(20), default="queued", nullable=False, index=True)

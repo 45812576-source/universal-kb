@@ -1,4 +1,5 @@
 """Shared test fixtures for the Universal KB backend."""
+import os
 import pytest
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,12 +8,14 @@ from sqlalchemy import create_engine, text, LargeBinary, event
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base, get_db
+from app.config import settings
 from app.models.user import User, Role, Department
 from app.models.skill import ModelConfig, Skill, SkillStatus, SkillMode, SkillVersion
 from app.services.auth_service import hash_password
 
 # Use an in-memory SQLite for speed; override as needed
 TEST_DB_URL = "sqlite:////tmp/test_universal_kb.db"
+TEST_UPLOAD_DIR = "/tmp/universal_kb_test_uploads"
 
 # SQLite 不支持 MySQL 的 LONGBLOB，编译时映射为 BLOB
 from sqlalchemy.dialects.mysql import LONGBLOB
@@ -39,6 +42,8 @@ def override_get_db():
 
 @pytest.fixture(scope="session", autouse=True)
 def setup_db():
+    os.makedirs(TEST_UPLOAD_DIR, exist_ok=True)
+    settings.UPLOAD_DIR = TEST_UPLOAD_DIR
     Base.metadata.create_all(bind=engine)
     yield
     Base.metadata.drop_all(bind=engine)
@@ -73,7 +78,7 @@ def db():
 
 @pytest.fixture
 def client():
-    from app.routers import auth, knowledge, knowledge_governance, user_workspace_config, mcp_server, admin
+    from app.routers import auth, knowledge, knowledge_governance, user_workspace_config, mcp_server, admin, conversations
 
     test_app = FastAPI(title="Universal KB Test API")
     test_app.add_middleware(
@@ -89,6 +94,7 @@ def client():
     test_app.include_router(user_workspace_config.router)
     test_app.include_router(mcp_server.router)
     test_app.include_router(admin.router)
+    test_app.include_router(conversations.router)
     test_app.dependency_overrides[get_db] = override_get_db
 
     with TestClient(test_app, raise_server_exceptions=True) as c:

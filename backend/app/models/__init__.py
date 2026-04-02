@@ -1,6 +1,7 @@
 from app.models.user import Department, Role, User  # noqa: F401
 from app.models.skill import ModelConfig, Skill, SkillMode, SkillStatus, SkillVersion, SkillSuggestion, SuggestionStatus, SkillAttribution, AttributionLevel  # noqa: F401
 from app.models.knowledge import KnowledgeEntry, KnowledgeStatus, KnowledgeRevision  # noqa: F401
+from app.models.knowledge_understanding import KnowledgeUnderstandingProfile  # noqa: F401
 from app.models.knowledge_share import KnowledgeShareLink  # noqa: F401
 from app.models.knowledge_governance import GovernanceObjective, GovernanceDepartmentMission, GovernanceKR, GovernanceRequiredElement, GovernanceResourceLibrary, GovernanceObjectType, GovernanceSuggestionTask, GovernanceFieldTemplate, GovernanceObject, GovernanceObjectFacet, GovernanceFeedbackEvent, GovernanceStrategyStat  # noqa: F401
 from app.models.knowledge_block import KnowledgeDocumentBlock, KnowledgeChunkMapping  # noqa: F401

@@ -192,6 +192,8 @@ def list_departments(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    if user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
+        raise HTTPException(403, "Insufficient permissions")
     return [
         {
             "id": d.id,
