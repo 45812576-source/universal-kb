@@ -80,7 +80,7 @@ def render_entry(db: Session, entry_id: int) -> dict:
     try:
         _update_phase("extracting")
         content_html = _do_render(entry, ext)
-        render_mode = _EXT_RENDER_MODE.get(ext, "text_fallback")
+        render_mode = _resolve_render_mode(entry, ext)
 
         _update_phase("rendering")
         if content_html:
@@ -130,7 +130,7 @@ def render_from_path(db: Session, entry: KnowledgeEntry, file_path: str) -> None
     try:
         from app.utils.file_parser import extract_html
         content_html = extract_html(file_path)
-        render_mode = _EXT_RENDER_MODE.get(ext, "text_fallback")
+        render_mode = _resolve_render_mode(entry, ext, file_path=file_path)
 
         if content_html:
             entry.content_html = content_html
@@ -184,3 +184,20 @@ def _render_from_content(content: str, ext: str) -> Optional[str]:
         return md_lib.markdown(content, extensions=["tables", "fenced_code", "nl2br", "sane_lists"])
     # 其余格式包装为 <p>
     return "\n".join(f"<p>{line or '<br>'}</p>" for line in content.split("\n"))
+
+
+def _resolve_render_mode(entry: KnowledgeEntry, ext: str, file_path: str | None = None) -> str:
+    if ext != ".pdf":
+        return _EXT_RENDER_MODE.get(ext, "text_fallback")
+
+    try:
+        from app.utils.file_parser import extract_text_result
+
+        if file_path:
+            result = extract_text_result(file_path)
+            if result.error:
+                entry.doc_render_error = result.error
+            return result.mode
+    except Exception:
+        pass
+    return _EXT_RENDER_MODE.get(ext, "pdf_fallback")

@@ -18,6 +18,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.models.knowledge import KnowledgeEntry, KnowledgeFolder
+from app.models.user import Department
 from app.models.knowledge_filing import KnowledgeFilingAction
 
 logger = logging.getLogger(__name__)
@@ -35,15 +36,21 @@ def _resolve_target_folder(
     """为单条文档决定归档目标。返回 {folder_id, confidence, reason, decision_source} 或 None。"""
     from app.services.system_folder_service import get_system_folder_for_taxonomy, get_system_folder_for_board
 
+    department = db.get(Department, entry.department_id) if entry.department_id else None
+    business_unit = (department.business_unit or "").strip() if department else None
+    if not business_unit:
+        return None
+
     # 策略1：taxonomy_code 精确匹配
     if entry.taxonomy_code and (entry.classification_confidence or 0) >= _LOW_CONFIDENCE:
-        fid = get_system_folder_for_taxonomy(db, entry.taxonomy_code)
+        fid = get_system_folder_for_taxonomy(db, entry.taxonomy_code, business_unit=business_unit)
         if fid:
             return {
                 "folder_id": fid,
                 "confidence": min(0.95, (entry.classification_confidence or 0.7)),
-                "reason": f"分类 {entry.taxonomy_code} 精确匹配系统目录",
+                "reason": f"{business_unit} 下分类 {entry.taxonomy_code} 精确匹配系统目录",
                 "decision_source": "taxonomy",
+                "business_unit": business_unit,
             }
 
     # 策略2：taxonomy_board 模糊匹配
@@ -55,12 +62,20 @@ def _resolve_target_folder(
                 KnowledgeEntry.taxonomy_board == entry.taxonomy_board,
                 KnowledgeEntry.folder_id.isnot(None),
                 KnowledgeEntry.id != entry.id,
+                KnowledgeEntry.department_id.isnot(None),
             )
             .limit(100)
             .all()
         )
         if same_board:
-            counter = Counter(fid for (fid,) in same_board if fid)
+            allowed_folder_ids = {
+                folder.id
+                for folder in db.query(KnowledgeFolder.id).filter(
+                    KnowledgeFolder.business_unit == business_unit,
+                    KnowledgeFolder.is_system == 1,
+                ).all()
+            }
+            counter = Counter(fid for (fid,) in same_board if fid in allowed_folder_ids)
             if counter:
                 top_fid, top_count = counter.most_common(1)[0]
                 conf = min(0.8, top_count / len(same_board))
@@ -68,18 +83,20 @@ def _resolve_target_folder(
                     return {
                         "folder_id": top_fid,
                         "confidence": round(conf, 2),
-                        "reason": f"同板块 {entry.taxonomy_board} 下 {top_count}/{len(same_board)} 篇文档归于此",
+                        "reason": f"{business_unit} 同板块 {entry.taxonomy_board} 下 {top_count}/{len(same_board)} 篇文档归于此",
                         "decision_source": "board_neighbors",
+                        "business_unit": business_unit,
                     }
 
         # 只有 board 不再直接自动落系统目录，改为待审 suggestion
-        board_fid = get_system_folder_for_board(db, entry.taxonomy_board)
+        board_fid = get_system_folder_for_board(db, entry.taxonomy_board, business_unit=business_unit)
         if board_fid:
             return {
                 "folder_id": board_fid,
                 "confidence": min(entry.classification_confidence or 0.0, 0.49),
-                "reason": f"仅识别到板块 {entry.taxonomy_board}，需人工确认",
+                "reason": f"仅识别到 {business_unit} 板块 {entry.taxonomy_board}，需人工确认",
                 "decision_source": "taxonomy_board_only",
+                "business_unit": business_unit,
             }
 
     return None
@@ -182,6 +199,9 @@ def auto_file_batch(
                     "taxonomy_code": entry.taxonomy_code,
                     "taxonomy_board": entry.taxonomy_board,
                     "classification_confidence": entry.classification_confidence,
+                    "department_id": entry.department_id,
+                    "business_unit": result.get("business_unit"),
+                    "ocr_used": (entry.doc_render_mode == "pdf_vision_ocr"),
                 },
                 status="pending",
             )

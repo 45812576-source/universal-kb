@@ -13,6 +13,7 @@ import pytest
 from app.data.knowledge_taxonomy import TAXONOMY
 from app.models.knowledge import KnowledgeEntry, KnowledgeFolder
 from app.models.knowledge_filing import KnowledgeFilingAction, KnowledgeFilingSuggestion
+from app.models.user import Department
 from app.models.user import Role
 from app.services.auto_filer import (
     auto_file_batch,
@@ -144,6 +145,21 @@ class TestSystemFolderTree:
         # 不存在的板块
         assert get_system_folder_for_board(db, "Z") is None
 
+    def test_system_tree_isolated_by_business_unit(self, db):
+        dept_cid = Department(name="CID部门", business_unit="CID")
+        dept_dic = Department(name="DIC部门", business_unit="DIC")
+        db.add_all([dept_cid, dept_dic])
+        db.flush()
+        user = _make_user(db, "sys_admin_bu", Role.SUPER_ADMIN, dept_cid.id)
+        db.commit()
+
+        mapping = ensure_system_folders(db, owner_id=user.id)
+        code = TAXONOMY[0]["code"]
+
+        assert f"CID:{code}" in mapping
+        assert f"DIC:{code}" in mapping
+        assert mapping[f"CID:{code}"] != mapping[f"DIC:{code}"]
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # B. 自动归档
@@ -254,6 +270,55 @@ class TestAutoFileSingle:
         db.commit()
 
         entry = _make_entry(db, user.id, title="无分类文档")
+        db.commit()
+
+        action = auto_file_single(db, entry, user_id=user.id)
+        assert action is None
+
+    def test_same_taxonomy_different_business_units_do_not_mix(self, db):
+        dept_cid = Department(name="CID部门", business_unit="CID")
+        dept_dic = Department(name="DIC部门", business_unit="DIC")
+        db.add_all([dept_cid, dept_dic])
+        db.flush()
+        user_cid = _make_user(db, "cid_user", Role.SUPER_ADMIN, dept_cid.id)
+        user_dic = _make_user(db, "dic_user", Role.SUPER_ADMIN, dept_dic.id)
+        db.commit()
+
+        mapping = ensure_system_folders(db, owner_id=user_cid.id)
+        code = TAXONOMY[0]["code"]
+
+        entry_cid = _make_entry(db, user_cid.id, title="CID文档", taxonomy_code=code, classification_confidence=0.9)
+        entry_cid.department_id = dept_cid.id
+        entry_dic = _make_entry(db, user_dic.id, title="DIC文档", taxonomy_code=code, classification_confidence=0.9)
+        entry_dic.department_id = dept_dic.id
+        db.commit()
+
+        action_cid = auto_file_single(db, entry_cid, user_id=user_cid.id)
+        action_dic = auto_file_single(db, entry_dic, user_id=user_dic.id)
+        db.commit()
+
+        assert action_cid is not None
+        assert action_dic is not None
+        assert entry_cid.folder_id == mapping[f"CID:{code}"]
+        assert entry_dic.folder_id == mapping[f"DIC:{code}"]
+        assert entry_cid.folder_id != entry_dic.folder_id
+
+    def test_missing_business_unit_does_not_auto_file(self, db):
+        dept = Department(name="未分配部门", business_unit=None)
+        db.add(dept)
+        db.flush()
+        user = _make_user(db, "no_bu_user", Role.SUPER_ADMIN, dept.id)
+        db.commit()
+
+        ensure_system_folders(db, owner_id=user.id)
+        entry = _make_entry(
+            db,
+            user.id,
+            title="无事业部文档",
+            taxonomy_code=TAXONOMY[0]["code"],
+            classification_confidence=0.9,
+        )
+        entry.department_id = dept.id
         db.commit()
 
         action = auto_file_single(db, entry, user_id=user.id)

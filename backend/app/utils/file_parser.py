@@ -1,10 +1,13 @@
 """Extract plain text from uploaded documents."""
-import os
 import base64
+import html
+import os
+import tempfile
+from dataclasses import dataclass
 
 
 def _call_kimi_vision(image_path: str) -> str:
-    """Call Kimi vision API (via 百炼 Coding Plan) to describe an image."""
+    """Call Kimi vision API (via 百炼 Coding Plan) to OCR/describe an image."""
     import openai
 
     api_key = os.environ.get("BAILIAN_API_KEY", "")
@@ -37,6 +40,141 @@ def _call_kimi_vision(image_path: str) -> str:
         max_tokens=2048,
     )
     return resp.choices[0].message.content or ""
+
+
+def _call_ark_vision(image_path: str) -> str:
+    """Call ARK-compatible vision endpoint when configured."""
+    import openai
+
+    api_key = os.environ.get("ARK_API_KEY", "")
+    base_url = os.environ.get("ARK_BASE_URL", "").strip()
+    model = os.environ.get("ARK_VISION_MODEL", "").strip()
+    if not api_key or not base_url or not model:
+        raise ValueError("ARK vision 环境变量未完整配置")
+
+    with open(image_path, "rb") as f:
+        b64_data = base64.b64encode(f.read()).decode("utf-8")
+
+    ext = os.path.splitext(image_path)[1].lower().lstrip(".")
+    mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                "webp": "image/webp", "bmp": "image/bmp"}
+    mime = mime_map.get(ext, "image/png")
+
+    client = openai.OpenAI(api_key=api_key, base_url=base_url)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64_data}"}},
+                    {"type": "text", "text": "请做 OCR 与版面理解，尽量逐段输出图片中的原文，不要编造。"},
+                ],
+            }
+        ],
+        max_tokens=4096,
+    )
+    return resp.choices[0].message.content or ""
+
+
+def _call_vision_ocr(image_path: str) -> str:
+    provider = os.environ.get("KNOWLEDGE_VISION_PROVIDER", "").strip().lower()
+    errors: list[str] = []
+    providers = [provider] if provider else ["bailian", "ark"]
+
+    for candidate in providers:
+        try:
+            if candidate == "ark":
+                return _call_ark_vision(image_path)
+            return _call_kimi_vision(image_path)
+        except Exception as exc:
+            errors.append(f"{candidate}:{exc}")
+    raise ValueError("视觉 OCR 调用失败: " + " | ".join(errors))
+
+
+@dataclass
+class ExtractionResult:
+    text: str
+    mode: str
+    error: str | None = None
+
+
+def _looks_like_meaningful_pdf_text(text: str) -> bool:
+    compact = "".join(text.split())
+    return len(compact) >= 40
+
+
+def _pdf_pages_to_images(file_path: str) -> list[str]:
+    import fitz
+
+    temp_dir = tempfile.mkdtemp(prefix="pdf-ocr-")
+    image_paths: list[str] = []
+    doc = fitz.open(file_path)
+    try:
+        for idx, page in enumerate(doc, start=1):
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            out = os.path.join(temp_dir, f"page-{idx}.png")
+            pix.save(out)
+            image_paths.append(out)
+    finally:
+        doc.close()
+    return image_paths
+
+
+def _extract_pdf_with_vision(file_path: str) -> ExtractionResult:
+    image_paths = _pdf_pages_to_images(file_path)
+    if not image_paths:
+        return ExtractionResult(text="", mode="pdf_fallback", error="pdf_page_render_failed")
+
+    texts: list[str] = []
+    errors: list[str] = []
+    try:
+        for image_path in image_paths:
+            try:
+                text = _call_vision_ocr(image_path).strip()
+                if text:
+                    texts.append(text)
+            except Exception as exc:
+                errors.append(str(exc))
+    finally:
+        for image_path in image_paths:
+            try:
+                os.unlink(image_path)
+            except OSError:
+                pass
+        try:
+            os.rmdir(os.path.dirname(image_paths[0]))
+        except OSError:
+            pass
+
+    combined = "\n\n".join(texts).strip()
+    if combined:
+        return ExtractionResult(text=combined, mode="pdf_vision_ocr", error=None)
+    return ExtractionResult(
+        text="",
+        mode="pdf_fallback",
+        error=("vision_ocr_failed: " + " | ".join(errors))[:500] if errors else "vision_ocr_failed",
+    )
+
+
+def extract_text_result(file_path: str) -> ExtractionResult:
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext == ".pdf":
+        import pdfplumber
+
+        texts = []
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    texts.append(t)
+        joined = "\n\n".join(texts).strip()
+        if _looks_like_meaningful_pdf_text(joined):
+            return ExtractionResult(text=joined, mode="pdf_text")
+        return _extract_pdf_with_vision(file_path)
+
+    return ExtractionResult(text=extract_text(file_path), mode="text")
 
 
 def _transcribe_funasr(audio_path: str) -> str:
@@ -230,6 +368,15 @@ def extract_html(file_path: str) -> str:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             text = f.read()
         return "\n".join(f"<p>{line or '<br>'}</p>" for line in text.split("\n"))
+
+    elif ext in (".pdf",):
+        result = extract_text_result(file_path)
+        if not result.text:
+            return ""
+        return "\n".join(
+            f"<p>{html.escape(line) if line else '<br>'}</p>"
+            for line in result.text.split("\n")
+        )
 
     else:
         # 其他格式（PDF/图片/音频等）：纯文本包装为 <p>

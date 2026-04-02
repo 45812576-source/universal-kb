@@ -17,6 +17,7 @@ class KnowledgeFolder(Base):
     parent_id = Column(Integer, ForeignKey("knowledge_folders.id"), nullable=True)
     created_by = Column(Integer, ForeignKey("users.id"))
     department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
+    business_unit = Column(String(100), nullable=True)
     sort_order = Column(Integer, default=0)
     # 系统归档树标记：True=基于 taxonomy 自动生成的系统目录，不可删除
     is_system = Column(Integer, default=0)               # 0=用户自建 1=系统归档树
@@ -169,6 +170,7 @@ class KnowledgeEntry(Base):
 
     creator = relationship("User", foreign_keys=[created_by])
     reviewer = relationship("User", foreign_keys=[reviewed_by])
+    folder = relationship("KnowledgeFolder", foreign_keys=[folder_id])
     revisions = relationship(
         "KnowledgeRevision",
         back_populates="knowledge",

@@ -146,6 +146,8 @@ _ONLYOFFICE_EXTS = {
 
 def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None) -> dict:
     ext = (e.file_ext or "").lower()
+    creator_department = getattr(getattr(e, "creator", None), "department", None)
+    folder_obj = getattr(e, "folder", None)
     _folder_name = None
     _is_in_my_knowledge = False
     if e.folder_id and folder_name_map:
@@ -160,6 +162,7 @@ def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None
         "category": e.category,
         "status": e.status.value,
         "department_id": e.department_id,
+        "business_unit": getattr(creator_department, "business_unit", None),
         "created_by": e.created_by,
         "reviewed_by": e.reviewed_by,
         "review_note": e.review_note,
@@ -212,6 +215,7 @@ def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None
         "classification_source": e.classification_source,
         "classified_at": e.classified_at.isoformat() if e.classified_at else None,
         "visibility_scope": _knowledge_visibility_scope(e),
+        "folder_business_unit": getattr(folder_obj, "business_unit", None),
         # 能力标志
         "can_open_onlyoffice": bool(e.oss_key and ext in _ONLYOFFICE_EXTS),
         "can_retry_render": e.doc_render_status in ("failed", "pending", None),
