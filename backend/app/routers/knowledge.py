@@ -2345,3 +2345,161 @@ def filing_ensure_system_tree(
     from app.services.system_folder_service import ensure_system_folders
     mapping = ensure_system_folders(db, owner_id=user.id)
     return {"ok": True, "nodes": len(mapping)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 文档理解确认（用户必须处理完才能继续使用知识库）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/understanding/pending-count")
+def understanding_pending_count(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """返回当前用户有多少条未确认的文档理解结果。前端用此接口决定是否弹出拦截。"""
+    from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
+
+    count = (
+        db.query(KnowledgeUnderstandingProfile)
+        .join(KnowledgeEntry, KnowledgeUnderstandingProfile.knowledge_id == KnowledgeEntry.id)
+        .filter(
+            KnowledgeEntry.created_by == user.id,
+            KnowledgeUnderstandingProfile.understanding_status.in_(["success", "partial"]),
+            KnowledgeUnderstandingProfile.confirmed_at.is_(None),
+        )
+        .count()
+    )
+    return {"pending_count": count}
+
+
+@router.get("/understanding/pending")
+def understanding_pending_list(
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """返回未确认的文档理解结果列表，供用户逐条审阅确认。"""
+    from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
+
+    profiles = (
+        db.query(KnowledgeUnderstandingProfile)
+        .join(KnowledgeEntry, KnowledgeUnderstandingProfile.knowledge_id == KnowledgeEntry.id)
+        .filter(
+            KnowledgeEntry.created_by == user.id,
+            KnowledgeUnderstandingProfile.understanding_status.in_(["success", "partial"]),
+            KnowledgeUnderstandingProfile.confirmed_at.is_(None),
+        )
+        .order_by(KnowledgeUnderstandingProfile.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    results = []
+    for p in profiles:
+        entry = db.get(KnowledgeEntry, p.knowledge_id)
+        results.append({
+            "profile_id": p.id,
+            "knowledge_id": p.knowledge_id,
+            "source_file": entry.source_file if entry else None,
+            "raw_title": p.raw_title,
+            "display_title": p.display_title,
+            "title_confidence": p.title_confidence,
+            "document_type": p.document_type,
+            "permission_domain": p.permission_domain,
+            "desensitization_level": p.desensitization_level,
+            "content_tags": p.content_tags,
+            "content_tag_confidences": p.content_tag_confidences,
+            "suggested_tags": p.suggested_tags,
+            "summary_short": p.summary_short,
+            "summary_search": p.summary_search,
+            "system_id": p.system_id,
+            "quality_score": entry.quality_score if entry else None,
+            "understanding_status": p.understanding_status,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+        })
+    return results
+
+
+class UnderstandingConfirmRequest(BaseModel):
+    """用户确认/修正文档理解结果。只需传想修改的字段，未传的保持 AI 结果。"""
+    title: str | None = None
+    document_type: str | None = None
+    summary_short: str | None = None
+    content_tags: dict | None = None
+
+
+@router.post("/understanding/{profile_id}/confirm")
+def understanding_confirm(
+    profile_id: int,
+    body: UnderstandingConfirmRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """用户确认一条文档理解结果，可同时修正字段。"""
+    import datetime as _dt
+    from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
+
+    profile = db.get(KnowledgeUnderstandingProfile, profile_id)
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+
+    entry = db.get(KnowledgeEntry, profile.knowledge_id)
+    if not entry or entry.created_by != user.id:
+        raise HTTPException(403, "只能确认自己上传的文档")
+
+    if profile.confirmed_at:
+        return {"ok": True, "message": "已确认过"}
+
+    # 记录用户修正
+    corrections = {}
+    if body.title is not None and body.title != profile.display_title:
+        corrections["title"] = {"from": profile.display_title, "to": body.title}
+        profile.display_title = body.title
+        profile.title_source = "user"
+        entry.ai_title = body.title
+    if body.document_type is not None and body.document_type != profile.document_type:
+        corrections["document_type"] = {"from": profile.document_type, "to": body.document_type}
+        profile.document_type = body.document_type
+        profile.classification_source = "manual"
+    if body.summary_short is not None and body.summary_short != profile.summary_short:
+        corrections["summary_short"] = {"from": profile.summary_short, "to": body.summary_short}
+        profile.summary_short = body.summary_short
+        entry.ai_summary = body.summary_short
+    if body.content_tags is not None and body.content_tags != profile.content_tags:
+        corrections["content_tags"] = {"from": profile.content_tags, "to": body.content_tags}
+        from app.data.sensitivity_rules import validate_content_tags
+        profile.content_tags = validate_content_tags(body.content_tags)
+        profile.tagging_source = "manual"
+
+    profile.confirmed_at = _dt.datetime.utcnow()
+    profile.confirmed_by = user.id
+    profile.user_corrections = corrections if corrections else None
+
+    db.commit()
+    return {"ok": True, "corrections": len(corrections)}
+
+
+@router.post("/understanding/confirm-batch")
+def understanding_confirm_batch(
+    profile_ids: list[int],
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """批量确认：用户审阅后全部接受 AI 结果（无修正）。"""
+    import datetime as _dt
+    from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
+
+    confirmed = 0
+    for pid in profile_ids:
+        profile = db.get(KnowledgeUnderstandingProfile, pid)
+        if not profile or profile.confirmed_at:
+            continue
+        entry = db.get(KnowledgeEntry, profile.knowledge_id)
+        if not entry or entry.created_by != user.id:
+            continue
+        profile.confirmed_at = _dt.datetime.utcnow()
+        profile.confirmed_by = user.id
+        confirmed += 1
+
+    db.commit()
+    return {"ok": True, "confirmed": confirmed}

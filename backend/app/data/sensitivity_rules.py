@@ -61,7 +61,7 @@ DATA_TYPE_REGISTRY: dict[str, dict[str, Any]] = {
     },
     "passport_number": {
         "label": "护照号",
-        "pattern": re.compile(r"[A-Z][A-Z0-9]{5,9}"),
+        "pattern": re.compile(r"(?:护照[号码]*|passport\s*(?:no|number)?)\s*[:：]?\s*([A-Z][A-Z0-9]{5,9})"),
         "keywords": ["护照号", "passport"],
         "default_mask_action": "full_mask",
         "default_desensitization_level": "D3",
@@ -846,3 +846,44 @@ def get_summary_sensitivity_mode(
     elif level_num >= 1:
         return "masked"
     return "raw"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 8. 文档类型缩写码 + 系统编号生成
+# ════════════════════════════════════════════════════════════════════════════════
+
+DOCTYPE_CODES: dict[str, str] = {
+    "contract": "CTR",
+    "proposal": "PRP",
+    "report": "RPT",
+    "meeting_note": "MTG",
+    "sop": "SOP",
+    "policy": "POL",
+    "case_study": "CSE",
+    "customer_material": "CUS",
+    "finance_doc": "FIN",
+    "hr_doc": "HRD",
+    "training_material": "TRN",
+    "product_doc": "PRD",
+    "data_export": "DAT",
+    "form_template": "FRM",
+    "external_intel": "INT",
+    "media_plan": "MDP",
+    "creative_brief": "BRF",
+    "pitch_deck": "PIT",
+    "campaign_review": "CRV",
+    "vendor_material": "VND",
+    "legal_doc": "LGL",
+    "other": "OTH",
+}
+
+
+def generate_system_id(document_type: str, knowledge_id: int) -> str:
+    """生成语义化系统编号: {YYMMDD}_{DOCTYPE_CODE}_{hash6}"""
+    import datetime as _dt
+    import hashlib as _hl
+
+    date_part = _dt.datetime.utcnow().strftime("%y%m%d")
+    code = DOCTYPE_CODES.get(document_type, "OTH")
+    hash_part = _hl.md5(str(knowledge_id).encode()).hexdigest()[:6]
+    return f"{date_part}_{code}_{hash_part}"

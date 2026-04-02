@@ -43,16 +43,30 @@ class KnowledgeUnderstandingProfile(Base):
     # {subject_tag, object_tag, scenario_tag, action_tag, industry_or_domain_tag}
     suggested_tags = Column(JSON, default=list)
 
+    # ── 5维标签置信度 ────────────────────────────────────────────────────────
+    content_tag_confidences = Column(JSON, nullable=True)
+    # {subject_tag: 0.9, object_tag: 0.85, ...}
+
     # ── 摘要 ────────────────────────────────────────────────────────────────
-    summary_short = Column(String(200), nullable=True)
+    summary_short = Column(String(60), nullable=True)    # ≤50字 + 余量
     summary_search = Column(String(500), nullable=True)
+    summary_embedding = Column(String(500), nullable=True)  # 向量检索专用摘要（不脱敏）
     summary_sensitivity_mode = Column(String(20), nullable=True)  # raw/masked/abstracted
+
+    # ── 系统编号 ────────────────────────────────────────────────────────────
+    system_id = Column(String(30), unique=True, index=True, nullable=True)
 
     # ── 来源追踪 ────────────────────────────────────────────────────────────
     classification_source = Column(String(20), nullable=True)   # rule/llm/mixed/fallback
     tagging_source = Column(String(20), nullable=True)
     masking_source = Column(String(20), nullable=True)
     summarization_source = Column(String(20), nullable=True)
+
+    # ── 用户确认 ──────────────────────────────────────────────────────────
+    confirmed_at = Column(DateTime, nullable=True)       # 用户确认时间，None=未确认
+    confirmed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # 用户确认时的修正内容（仅存用户改过的字段）
+    user_corrections = Column(JSON, nullable=True)
 
     # ── 流水线状态 ──────────────────────────────────────────────────────────
     understanding_status = Column(String(20), default="pending", nullable=False)

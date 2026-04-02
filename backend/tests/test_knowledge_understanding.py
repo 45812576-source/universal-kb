@@ -1,10 +1,12 @@
 """文档理解流水线收口测试。
 
-覆盖 4 大类：
+覆盖 6 大类：
 1. 标题体系 — 优先级链、乱码、中文、飞书、用户覆盖
 2. 标签体系 — document_type 枚举、taxonomy 映射、5维固定结构、建议标签
 3. 数据类型与脱敏 — 全类型命中、场景override、组合升档、D3/D4摘要
 4. 自动标签与摘要 — fallback路径、content_tags 完整、summary 不为空
+5. 系统编号 — generate_system_id 格式、唯一性、DOCTYPE_CODES 完整
+6. 确认机制 — API 端点、confirmed_at/confirmed_by、用户修正
 """
 import pytest
 
@@ -12,12 +14,14 @@ from app.data.sensitivity_rules import (
     COMBO_ESCALATION_RULES,
     CONTENT_TAG_VOCABULARY,
     DESENSITIZATION_LEVELS,
+    DOCTYPE_CODES,
     DOCUMENT_TYPES,
     PERMISSION_DOMAINS,
     TAXONOMY_DOCTYPE_MAP,
     check_taxonomy_doctype_conflict,
     compute_desensitization_level,
     detect_data_types,
+    generate_system_id,
     get_summary_sensitivity_mode,
     get_tag_fallback,
     infer_document_type,
@@ -455,3 +459,334 @@ class TestEnumCompleteness:
 
     def test_content_tag_vocabulary_count(self):
         assert len(CONTENT_TAG_VOCABULARY) == 5
+
+    def test_doctype_codes_covers_all_document_types(self):
+        """DOCTYPE_CODES 必须覆盖 DOCUMENT_TYPES 所有枚举"""
+        for dt in DOCUMENT_TYPES:
+            assert dt in DOCTYPE_CODES, f"DOCTYPE_CODES 缺少 {dt}"
+
+    def test_doctype_codes_unique(self):
+        """缩写码不可重复"""
+        codes = list(DOCTYPE_CODES.values())
+        assert len(codes) == len(set(codes))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 6. 系统编号
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestSystemId:
+    def test_format(self):
+        """格式为 YYMMDD_CODE_hash6"""
+        sid = generate_system_id("contract", 42)
+        parts = sid.split("_")
+        assert len(parts) == 3
+        assert len(parts[0]) == 6  # YYMMDD
+        assert parts[1] == "CTR"
+        assert len(parts[2]) == 6  # hash6
+
+    def test_unknown_type_fallback(self):
+        """未知类型回落到 OTH"""
+        sid = generate_system_id("nonexistent", 1)
+        assert "_OTH_" in sid
+
+    def test_different_ids_different_hash(self):
+        """不同 knowledge_id 产出不同 hash"""
+        s1 = generate_system_id("report", 1)
+        s2 = generate_system_id("report", 2)
+        assert s1 != s2
+
+    def test_all_types_produce_valid_id(self):
+        """每种 document_type 都能正常生成"""
+        for dt in DOCUMENT_TYPES:
+            sid = generate_system_id(dt, 100)
+            parts = sid.split("_")
+            assert len(parts) == 3
+            assert parts[1] in DOCTYPE_CODES.values()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 7. Pipeline 流水线（fallback 路径 + 新字段）
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestPipelineFallback:
+    """测试 _apply_fallback 和 _apply_llm_result 的新字段处理"""
+
+    def test_fallback_summary_short_max_50(self):
+        """fallback 摘要不超过 50 字"""
+        from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
+        from app.services.knowledge_understanding import _apply_fallback
+
+        profile = KnowledgeUnderstandingProfile(knowledge_id=1)
+        long_content = "这是一段很长的内容" * 20  # 180 字
+        _apply_fallback(profile, "test.pdf", long_content, "report")
+
+        assert len(profile.summary_short) <= 50
+        assert profile.summary_embedding is not None
+        assert profile.content_tag_confidences is not None
+        # 所有置信度应为 0.0（fallback）
+        for dim, conf in profile.content_tag_confidences.items():
+            assert conf == 0.0
+
+    def test_apply_llm_result_new_format_tags(self):
+        """LLM 返回带 confidence 的新格式标签正确解析"""
+        from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
+        from app.services.knowledge_understanding import _apply_llm_result
+
+        profile = KnowledgeUnderstandingProfile(knowledge_id=1)
+        llm_result = {
+            "title": "测试标题",
+            "title_confidence": 0.9,
+            "title_reason": "test",
+            "document_type": "report",
+            "permission_domain": "department",
+            "content_tags": {
+                "subject_tag": {"value": "投放团队", "confidence": 0.95},
+                "object_tag": {"value": "客户", "confidence": 0.8},
+                "scenario_tag": {"value": "投放优化", "confidence": 0.7},
+                "action_tag": {"value": "分析", "confidence": 0.6},
+                "industry_or_domain_tag": {"value": "电商", "confidence": 0.3},
+            },
+            "suggested_tags": ["ROI", "抖音"],
+            "summary_short": "测试摘要",
+            "summary_search": "检索摘要",
+            "summary_embedding": "向量摘要",
+            "data_type_validation": [],
+            "quality_score": 0.85,
+        }
+
+        _apply_llm_result(profile, llm_result, "report")
+
+        assert profile.content_tags["subject_tag"] == "投放团队"
+        assert profile.content_tag_confidences["subject_tag"] == 0.95
+        assert profile.content_tag_confidences["industry_or_domain_tag"] == 0.3
+        assert profile.summary_embedding == "向量摘要"
+
+    def test_apply_llm_result_old_format_tags_compat(self):
+        """兼容旧格式标签（纯字符串，无 confidence）"""
+        from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
+        from app.services.knowledge_understanding import _apply_llm_result
+
+        profile = KnowledgeUnderstandingProfile(knowledge_id=1)
+        llm_result = {
+            "title": "测试标题",
+            "title_confidence": 0.8,
+            "document_type": "report",
+            "permission_domain": "department",
+            "content_tags": {
+                "subject_tag": "投放团队",
+                "object_tag": "客户",
+                "scenario_tag": "投放优化",
+                "action_tag": "分析",
+                "industry_or_domain_tag": "电商",
+            },
+            "summary_short": "摘要",
+            "summary_search": "",
+            "summary_embedding": "",
+            "data_type_validation": [],
+        }
+
+        _apply_llm_result(profile, llm_result, None)
+        assert profile.content_tags["subject_tag"] == "投放团队"
+        # 旧格式默认 confidence 为 0.5
+        assert profile.content_tag_confidences["subject_tag"] == 0.5
+
+    def test_apply_llm_result_data_type_validation_removes_false_positives(self):
+        """LLM 校验剔除规则层误报"""
+        from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
+        from app.services.knowledge_understanding import _apply_llm_result
+
+        profile = KnowledgeUnderstandingProfile(knowledge_id=1)
+        profile.data_type_hits = [
+            {"type": "passport_number", "label": "护照号", "count": 1, "samples": ["AB12345"]},
+            {"type": "phone_number", "label": "手机号", "count": 2, "samples": ["13812345678"]},
+        ]
+
+        llm_result = {
+            "title": "测试",
+            "title_confidence": 0.8,
+            "document_type": "report",
+            "permission_domain": "department",
+            "content_tags": {},
+            "summary_short": "",
+            "summary_search": "",
+            "summary_embedding": "",
+            "data_type_validation": [
+                {"type": "passport_number", "rule_hit": True, "actually_present": False, "reason": "产品编号不是护照"},
+                {"type": "phone_number", "rule_hit": True, "actually_present": True, "reason": "确实是手机号"},
+            ],
+        }
+
+        _apply_llm_result(profile, llm_result, None)
+        remaining_types = [h["type"] for h in profile.data_type_hits]
+        assert "passport_number" not in remaining_types
+        assert "phone_number" in remaining_types
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 8. 长文档阈值常量
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestLongDocThreshold:
+    def test_threshold_exists(self):
+        from app.services.knowledge_understanding import _LONG_DOC_THRESHOLD
+        assert _LONG_DOC_THRESHOLD == 3000
+
+    def test_prompts_exist(self):
+        from app.services.knowledge_understanding import _CHUNK_MAP_PROMPT, _REDUCE_PROMPT
+        assert "{chunk_text}" in _CHUNK_MAP_PROMPT
+        assert "{chunk_summaries}" in _REDUCE_PROMPT
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 9. 确认机制 API 测试
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestConfirmationAPI:
+    """测试 /understanding/pending-count, /pending, /confirm 端点"""
+
+    def _setup(self, db, client):
+        """创建用户、entry、profile"""
+        from tests.conftest import _make_dept, _make_user, _login, _auth
+        from app.models.knowledge import KnowledgeEntry
+        from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
+
+        dept = _make_dept(db)
+        user = _make_user(db, username="confirm_tester", dept_id=dept.id)
+        db.commit()
+        token = _login(client, "confirm_tester")
+
+        # 创建一条 entry + 未确认的 profile
+        entry = KnowledgeEntry(
+            title="测试文档",
+            content="测试内容",
+            created_by=user.id,
+            department_id=dept.id,
+        )
+        db.add(entry)
+        db.flush()
+
+        profile = KnowledgeUnderstandingProfile(
+            knowledge_id=entry.id,
+            understanding_status="success",
+            display_title="AI生成标题",
+            document_type="report",
+            summary_short="AI生成摘要",
+            content_tags={
+                "subject_tag": "投放团队",
+                "object_tag": "客户",
+                "scenario_tag": "投放优化",
+                "action_tag": "分析",
+                "industry_or_domain_tag": "电商",
+            },
+        )
+        db.add(profile)
+        db.commit()
+        return user, entry, profile, token
+
+    def test_pending_count(self, db, client):
+        from tests.conftest import _auth
+        _, _, _, token = self._setup(db, client)
+
+        resp = client.get("/api/knowledge/understanding/pending-count", headers=_auth(token))
+        assert resp.status_code == 200
+        assert resp.json()["pending_count"] == 1
+
+    def test_pending_list(self, db, client):
+        from tests.conftest import _auth
+        _, _, profile, token = self._setup(db, client)
+
+        resp = client.get("/api/knowledge/understanding/pending", headers=_auth(token))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["profile_id"] == profile.id
+        assert data[0]["display_title"] == "AI生成标题"
+        assert data[0]["summary_short"] == "AI生成摘要"
+
+    def test_confirm_no_correction(self, db, client):
+        from tests.conftest import _auth
+        _, _, profile, token = self._setup(db, client)
+
+        resp = client.post(
+            f"/api/knowledge/understanding/{profile.id}/confirm",
+            json={},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["corrections"] == 0
+
+        # 确认后 pending_count 为 0
+        resp2 = client.get("/api/knowledge/understanding/pending-count", headers=_auth(token))
+        assert resp2.json()["pending_count"] == 0
+
+    def test_confirm_with_correction(self, db, client):
+        from tests.conftest import _auth
+        _, _, profile, token = self._setup(db, client)
+
+        resp = client.post(
+            f"/api/knowledge/understanding/{profile.id}/confirm",
+            json={"title": "用户修改的标题", "summary_short": "用户写的摘要"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["corrections"] == 2
+
+        # 验证修正已写入
+        db.refresh(profile)
+        assert profile.display_title == "用户修改的标题"
+        assert profile.summary_short == "用户写的摘要"
+        assert profile.title_source == "user"
+        assert profile.user_corrections is not None
+        assert "title" in profile.user_corrections
+
+    def test_confirm_batch(self, db, client):
+        from tests.conftest import _make_dept, _make_user, _login, _auth
+        from app.models.knowledge import KnowledgeEntry
+        from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
+
+        dept = _make_dept(db, name="批量部")
+        user = _make_user(db, username="batch_tester", dept_id=dept.id)
+        db.commit()
+        token = _login(client, "batch_tester")
+
+        pids = []
+        for i in range(3):
+            entry = KnowledgeEntry(
+                title=f"文档{i}", content=f"内容{i}",
+                created_by=user.id, department_id=dept.id,
+            )
+            db.add(entry)
+            db.flush()
+            p = KnowledgeUnderstandingProfile(
+                knowledge_id=entry.id,
+                understanding_status="success",
+                display_title=f"标题{i}",
+            )
+            db.add(p)
+            db.flush()
+            pids.append(p.id)
+        db.commit()
+
+        resp = client.post(
+            "/api/knowledge/understanding/confirm-batch",
+            json=pids,
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["confirmed"] == 3
+
+        # 确认后全部清零
+        resp2 = client.get("/api/knowledge/understanding/pending-count", headers=_auth(token))
+        assert resp2.json()["pending_count"] == 0
+
+    def test_double_confirm_idempotent(self, db, client):
+        from tests.conftest import _auth
+        _, _, profile, token = self._setup(db, client)
+
+        # 第一次确认
+        client.post(f"/api/knowledge/understanding/{profile.id}/confirm", json={}, headers=_auth(token))
+        # 第二次确认应该幂等
+        resp = client.post(f"/api/knowledge/understanding/{profile.id}/confirm", json={}, headers=_auth(token))
+        assert resp.status_code == 200
+        assert resp.json()["message"] == "已确认过"

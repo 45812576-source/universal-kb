@@ -1006,7 +1006,40 @@ async def upload_and_chat(
             from app.services.knowledge_service import submit_knowledge
             kb_entry = submit_knowledge(kb_db, kb_entry)
             kb_db.commit()
-            return kb_entry.id
+
+            # 同步跑文档理解，产出分类/命名/摘要供前端弹窗确认
+            understanding_result = None
+            try:
+                from app.services.knowledge_understanding import understand_document
+                profile = await understand_document(
+                    knowledge_id=kb_entry.id,
+                    content=file_text,
+                    filename=file.filename or "",
+                    file_type="",
+                    db=kb_db,
+                )
+                if profile and profile.understanding_status in ("success", "partial"):
+                    # 向后兼容：同步主表
+                    if profile.display_title:
+                        kb_entry.ai_title = profile.display_title
+                    if profile.summary_short:
+                        kb_entry.ai_summary = profile.summary_short
+                    kb_db.commit()
+
+                    understanding_result = {
+                        "profile_id": profile.id,
+                        "display_title": profile.display_title,
+                        "document_type": profile.document_type,
+                        "summary_short": profile.summary_short,
+                        "content_tags": profile.content_tags,
+                        "desensitization_level": profile.desensitization_level,
+                        "system_id": profile.system_id,
+                        "quality_score": profile.title_confidence,
+                    }
+            except Exception as _ue:
+                _logging.getLogger(__name__).warning(f"Chat upload understanding failed: {_ue}")
+
+            return {"entry_id": kb_entry.id, "understanding": understanding_result}
         except Exception as e:
             kb_db.rollback()
             _logging.getLogger(__name__).warning(f"KB auto-save failed: {e}")
@@ -1039,7 +1072,9 @@ async def upload_and_chat(
         result = await skill_engine.execute(db, conv, user_text, user_id=user.id, active_skill_ids=parsed_skill_ids)
     except ValueError as e:
         raise HTTPException(503, str(e))
-    kb_entry_id = (await kb_task) if kb_task else None
+    kb_result = (await kb_task) if kb_task else None
+    kb_entry_id = kb_result["entry_id"] if isinstance(kb_result, dict) else None
+    understanding = kb_result.get("understanding") if isinstance(kb_result, dict) else None
 
     response, guide_meta = result
 
@@ -1084,6 +1119,7 @@ async def upload_and_chat(
         "skill_name": skill_name,
         "classification": cls_result.to_dict() if cls_result else None,
         "filename": file.filename,
+        "understanding": understanding,
     }
 
 

@@ -1,4 +1,10 @@
-"""AI 智能命名服务：根据文件内容自动生成标题、摘要、标签和质量评分。"""
+"""AI 智能命名服务：根据文件内容自动生成标题、摘要、标签和质量评分。
+
+.. deprecated::
+    此模块功能已由 knowledge_understanding.py 统一文档理解流水线完全覆盖。
+    新代码请使用 services.knowledge_understanding.understand_document()。
+    本模块保留仅为向后兼容，将在后续版本删除。
+"""
 from __future__ import annotations
 
 import json
