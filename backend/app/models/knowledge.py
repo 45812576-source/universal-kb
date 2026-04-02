@@ -158,6 +158,7 @@ class KnowledgeEntry(Base):
     lark_doc_url = Column(String(500), nullable=True)         # 原始飞书链接
     lark_sync_interval = Column(Integer, default=0)           # 同步间隔（分钟），0=不同步
     lark_last_synced_at = Column(Integer, default=0)          # 上次同步时间戳
+    external_edit_mode = Column(String(50), nullable=True)    # detached_copy / linked_readonly
     sync_status = Column(String(20), default="idle", nullable=True)   # idle/syncing/ok/error
     sync_error = Column(Text, nullable=True)                  # 同步失败原因
 

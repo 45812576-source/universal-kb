@@ -208,6 +208,9 @@ def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None
         "lark_doc_token": e.lark_doc_token,
         "lark_sync_interval": e.lark_sync_interval,
         "lark_last_synced_at": e.lark_last_synced_at,
+        "external_edit_mode": e.external_edit_mode,
+        "source_origin_label": "飞书" if e.source_type == "lark_doc" else None,
+        "can_refresh_from_source": bool(e.source_type == "lark_doc" and e.lark_doc_url),
         # 分类状态
         "classification_status": e.classification_status,
         "classification_error": e.classification_error,
@@ -1348,18 +1351,18 @@ def retry_classify(
     return {"ok": True, "job_id": job.id, "status": "queued"}
 
 
-@router.post("/{kid}/sync")
-async def manual_sync(
+@router.post("/{kid}/refresh-from-lark")
+async def refresh_from_lark(
     kid: int,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """手动触发飞书文档同步，仅对 source_type=lark_doc 有效。"""
+    """手动用飞书最新内容覆盖工作台副本，仅对 source_type=lark_doc 有效。"""
     entry = db.get(KnowledgeEntry, kid)
     if not entry:
         raise HTTPException(404, "Knowledge entry not found")
     if entry.source_type != "lark_doc":
-        raise HTTPException(400, "此知识条目不是飞书文档，无法同步")
+        raise HTTPException(400, "此知识条目不是飞书导入副本，无法刷新")
     if user.role != Role.SUPER_ADMIN and entry.created_by != user.id:
         raise HTTPException(403, "无权操作")
 
@@ -1380,7 +1383,16 @@ async def manual_sync(
         entry.sync_status = "error"
         entry.sync_error = str(e)[:500]
         db.commit()
-        raise HTTPException(502, f"飞书同步失败: {e}")
+        raise HTTPException(502, f"飞书刷新失败: {e}")
+
+
+@router.post("/{kid}/sync")
+async def manual_sync(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    return await refresh_from_lark(kid, db, user)
 
 
 # ── 飞书文档导入 ──────────────────────────────────────────────────────
@@ -1435,6 +1447,12 @@ async def import_from_lark(
         "lark_doc_token": entry.lark_doc_token,
         "sync_interval": entry.lark_sync_interval,
         "source_type": entry.source_type,
+        "folder_id": entry.folder_id,
+        "folder_name": db.get(KnowledgeFolder, entry.folder_id).name if entry.folder_id else None,
+        "doc_render_status": entry.doc_render_status,
+        "doc_render_mode": entry.doc_render_mode,
+        "external_edit_mode": entry.external_edit_mode,
+        "lark_doc_url": entry.lark_doc_url,
     }
 
 
@@ -1463,6 +1481,9 @@ async def batch_import_from_lark(
                 "ok": True,
                 "id": entry.id,
                 "title": entry.title,
+                "doc_render_status": entry.doc_render_status,
+                "doc_render_mode": entry.doc_render_mode,
+                "external_edit_mode": entry.external_edit_mode,
             })
         except Exception as e:
             results.append({

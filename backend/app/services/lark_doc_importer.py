@@ -34,6 +34,15 @@ _EXPORT_EXT_MAP = {
     "file": None,   # 云空间文件直接下载，不走导出
 }
 
+_LARK_RENDER_MODE_MAP = {
+    "docx": "lark_doc_import",
+    "doc": "lark_doc_import",
+    "sheet": "lark_sheet_import",
+    "sheets": "lark_sheet_import",
+    "file": "lark_file_import",
+    "base": "lark_file_import",
+}
+
 
 class LarkDocImporter:
 
@@ -81,6 +90,7 @@ class LarkDocImporter:
             wiki_title = node.get("title", "")
 
         # 3. 确定导出格式
+        raw_doc_type = doc_type
         file_ext_str = _EXPORT_EXT_MAP.get(doc_type, "docx")
         if file_ext_str is None:
             file_ext_str = "docx"  # fallback
@@ -100,13 +110,18 @@ class LarkDocImporter:
 
             # 5.5 生成 content_html
             content_html = None
-            doc_render_mode = "text_fallback"
+            doc_render_mode = _LARK_RENDER_MODE_MAP.get(raw_doc_type, "lark_doc_import")
             try:
                 content_html = extract_html(tmp_path)
-                if content_html:
-                    doc_render_mode = "converted_html"
             except Exception as e:
                 logger.warning(f"extract_html failed for lark doc: {e}")
+            if not content_html and content:
+                content_html = "\n".join(f"<p>{line or '<br>'}</p>" for line in content.split("\n"))
+            if raw_doc_type in ("file", "base") and not content_html:
+                content_html = (
+                    "<p>该飞书文件已导入为工作台副本，但暂未解析出结构化正文。</p>"
+                    "<p>你仍可在此补充编辑，或下载原文件查看。</p>"
+                )
 
             # 6. 上传到 OSS
             oss_key = generate_oss_key(ext)
@@ -149,12 +164,13 @@ class LarkDocImporter:
             lark_doc_token=token,
             lark_doc_type=doc_type,
             lark_doc_url=url,
-            lark_sync_interval=sync_interval,
+            lark_sync_interval=0,
             lark_last_synced_at=int(time.time()),
+            external_edit_mode="detached_copy",
             # 云文档渲染状态
-            doc_render_status="ready" if content_html else "pending",
+            doc_render_status="ready",
             doc_render_mode=doc_render_mode,
-            last_rendered_at=datetime.datetime.utcnow() if content_html else None,
+            last_rendered_at=datetime.datetime.utcnow(),
             source_uri=url,
             # 同步状态
             sync_status="ok",
@@ -202,6 +218,7 @@ class LarkDocImporter:
 
         token = entry.lark_doc_token
         doc_type = entry.lark_doc_type or "docx"
+        raw_doc_type = doc_type
 
         if not token:
             return {"updated": False, "error": "missing lark_doc_token"}
@@ -247,10 +264,12 @@ class LarkDocImporter:
                 # 更新 content_html
                 try:
                     new_html = extract_html(tmp_path)
+                    if not new_html and new_content:
+                        new_html = "\n".join(f"<p>{line or '<br>'}</p>" for line in new_content.split("\n"))
                     if new_html:
                         entry.content_html = new_html
                         entry.doc_render_status = "ready"
-                        entry.doc_render_mode = "converted_html"
+                        entry.doc_render_mode = _LARK_RENDER_MODE_MAP.get(raw_doc_type, "lark_doc_import")
                 except Exception as e:
                     logger.warning(f"extract_html failed during sync for entry {entry.id}: {e}")
 
@@ -282,6 +301,8 @@ class LarkDocImporter:
             "updated": True,
             "content_changed": content_changed,
             "entry_id": entry.id,
+            "doc_render_status": entry.doc_render_status,
+            "doc_render_mode": entry.doc_render_mode,
         }
 
 
