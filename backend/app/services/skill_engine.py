@@ -469,10 +469,10 @@ class SkillEngine:
     ) -> str:
         """Retrieve relevant knowledge chunks from Milvus and format as context.
 
-        Access control:
-        - 自己创建的 chunk → 原文注入
-        - 已全局审批的 chunk → 原文注入
-        - 他人的且未全局发布 → 脱敏版注入（只传递认知，不暴露具体数据）
+        Access control（按脱敏级别动态决定）：
+        - 自己创建 or D0 → 原文注入
+        - 已审批 + D1以下 → 原文注入
+        - 其余 → 按文档脱敏级别动态脱敏后注入
 
         二阶段召回：粗召回 top_20 → LLM 精排 top_5
         """
@@ -540,6 +540,24 @@ class SkillEngine:
                 except Exception as e:
                     logger.warning(f"Failed to load project knowledge ids: {e}")
 
+        # 批量预查文档脱敏级别（从 KnowledgeUnderstandingProfile）
+        doc_levels: dict[int, str] = {}
+        doc_data_type_hits: dict[int, list[dict]] = {}
+        if db:
+            try:
+                from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
+                kid_set = {h["knowledge_id"] for h in hits}
+                profiles = (
+                    db.query(KnowledgeUnderstandingProfile)
+                    .filter(KnowledgeUnderstandingProfile.knowledge_id.in_(kid_set))
+                    .all()
+                )
+                for p in profiles:
+                    doc_levels[p.knowledge_id] = p.desensitization_level or "D1"
+                    doc_data_type_hits[p.knowledge_id] = p.data_type_hits or []
+            except Exception as e:
+                logger.warning(f"Failed to load doc desensitization levels: {e}")
+
         parts = []
         seen_ids: set[int] = set()
         for h in hits:
@@ -551,19 +569,28 @@ class SkillEngine:
             chunk_owner = h.get("created_by", 0)
             is_own = user_id and chunk_owner == user_id
             is_approved = kid in approved_ids
+            doc_level = doc_levels.get(kid, "D1")
 
-            if is_own or is_approved:
-                # 原文注入
+            if is_own or doc_level == "D0":
+                # 自己创建的 or 公开文档 → 原文注入
+                parts.append(f"[相关知识]\n{h['text']}")
+            elif is_approved and doc_level <= "D1":
+                # 已审批 + 低敏感 → 原文注入
                 parts.append(f"[相关知识]\n{h['text']}")
             else:
-                # 脱敏版注入：只传递认知，不暴露具体数据
-                desensitized = h.get("desensitized_text", "").strip()
-                if not desensitized:
-                    # 脱敏版缺失时用规则兜底
-                    from app.services.vector_service import _desensitize_rule
-                    desensitized = _desensitize_rule(h["text"])
-                if desensitized:
-                    parts.append(f"[参考认知（已脱敏）]\n{desensitized}")
+                # 需要脱敏：按级别动态执行
+                try:
+                    from app.services.text_masker import mask_text
+                    type_hits = doc_data_type_hits.get(kid)
+                    masked_text, _ = mask_text(h["text"], level=doc_level, data_type_hits=type_hits)
+                except Exception:
+                    # fallback 到预存脱敏版
+                    masked_text = h.get("desensitized_text", "").strip()
+                    if not masked_text:
+                        from app.services.vector_service import _desensitize_rule
+                        masked_text = _desensitize_rule(h["text"])
+                if masked_text:
+                    parts.append(f"[参考知识（已脱敏）]\n{masked_text}")
 
         return "\n\n---\n\n".join(parts)
 

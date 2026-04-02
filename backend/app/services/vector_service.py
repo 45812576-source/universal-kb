@@ -114,51 +114,13 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str
 # ─── Desensitisation ─────────────────────────────────────────────────────────
 
 def _desensitize_chunks_llm(chunks: list[str], db=None) -> list[str]:
-    """Batch-desensitize chunks via DeepSeek (lite model).
-    Falls back to rule-based desensitization on failure.
-    """
-    from app.services.llm_gateway import llm_gateway
-
+    """使用 text_masker 以 D2 级别预脱敏，fallback 到规则兜底。"""
     try:
-        config = llm_gateway.resolve_config(db, "knowledge.search")
-    except Exception:
+        from app.services.text_masker import mask_text
+        return [mask_text(c, level="D2")[0] for c in chunks]
+    except Exception as e:
+        logger.warning(f"text_masker desensitize failed, fallback to rules: {e}")
         return [_desensitize_rule(c) for c in chunks]
-
-    results = []
-    for chunk in chunks:
-        try:
-            prompt = (
-                "你是知识脱敏助手。将下面的文本转换为通用认知：\n"
-                "- 保留方法论、行业趋势、思维框架、通用洞察\n"
-                "- 具体公司名/品牌名 → 「某品牌」「某公司」\n"
-                "- 具体数字/金额/百分比 → 「一定比例」「若干」\n"
-                "- 人名/联系方式 → 删除\n"
-                "- 保持核心信息的可用性，不要改变原有结构\n"
-                "- 直接输出脱敏后的文本，不要加解释\n\n"
-                f"原文：\n{chunk}"
-            )
-            import httpx
-            import os
-            api_key = os.getenv(config["api_key_env"], "")
-            resp = httpx.post(
-                f"{config['api_base']}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": config["model_id"],
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 1000,
-                    "temperature": 0.3,
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            text = resp.json()["choices"][0]["message"]["content"].strip()
-            results.append(text)
-        except Exception as e:
-            logger.warning(f"LLM desensitize failed for chunk, fallback to rules: {e}")
-            results.append(_desensitize_rule(chunk))
-
-    return results
 
 
 def _desensitize_rule(text: str) -> str:

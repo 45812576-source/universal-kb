@@ -790,3 +790,98 @@ class TestConfirmationAPI:
         resp = client.post(f"/api/knowledge/understanding/{profile.id}/confirm", json={}, headers=_auth(token))
         assert resp.status_code == 200
         assert resp.json()["message"] == "已确认过"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 10. TextMasker 文本脱敏引擎
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TestTextMasker:
+    """text_masker.mask_text() 精准文本脱敏测试"""
+
+    def test_d0_no_masking(self):
+        """D0 级别不脱敏，原样返回"""
+        from app.services.text_masker import mask_text
+        text = "联系人张三，手机 13812345678，合同金额¥500,000.00"
+        result, replacements = mask_text(text, level="D0")
+        assert result == text
+        assert replacements == []
+
+    def test_d1_only_high_sensitivity(self):
+        """D1 只脱敏 D2+ 类型（如客户名、合同号），不脱敏 D1 类型（如手机号、金额）"""
+        from app.services.text_masker import mask_text
+        # phone_number 是 D1 类型，D1 级别下不应被脱敏
+        text = "手机号 13812345678"
+        result, _ = mask_text(text, level="D1")
+        assert "138" in result and "5678" in result  # D1 类型不脱敏
+
+    def test_d3_masks_all(self):
+        """D3 脱敏所有非 keep 类型"""
+        from app.services.text_masker import mask_text
+        text = "手机号 13812345678，邮箱 test@example.com"
+        result, replacements = mask_text(text, level="D3")
+        assert "13812345678" not in result
+        assert "test@example.com" not in result
+        assert len(replacements) >= 2
+
+    def test_phone_partial_mask(self):
+        """手机号 partial_mask → 138****5678"""
+        from app.services.text_masker import mask_text
+        text = "联系电话 13812345678 请查收"
+        result, replacements = mask_text(text, level="D2")
+        assert "138****5678" in result
+        assert any(r["type"] == "phone_number" for r in replacements)
+
+    def test_amount_range_mask(self):
+        """金额 range_mask → 约XX万元"""
+        from app.services.text_masker import mask_text
+        text = "合同总额为¥500,000.00元"
+        result, _ = mask_text(text, level="D2")
+        assert "500,000" not in result
+        assert "约" in result or "万元" in result
+
+    def test_email_partial_mask(self):
+        """邮箱 partial_mask → 首字母+***@domain"""
+        from app.services.text_masker import mask_text
+        text = "邮箱 zhangsan@company.com"
+        result, _ = mask_text(text, level="D2")
+        assert "zhangsan" not in result
+        assert "@company.com" in result
+
+    def test_no_sensitive_data_unchanged(self):
+        """无敏感数据的文本原样返回"""
+        from app.services.text_masker import mask_text
+        text = "这是一篇关于投放策略的培训材料，介绍了ROI优化方法论。"
+        result, replacements = mask_text(text, level="D3")
+        assert result == text
+        assert replacements == []
+
+    def test_api_key_full_mask(self):
+        """API密钥 full_mask → [已脱敏]"""
+        from app.services.text_masker import mask_text
+        text = "配置 API key: sk-abcdefghijklmnopqrstuvwxyz"
+        result, _ = mask_text(text, level="D2")
+        assert "sk-abcdefghijklmnopqrstuvwxyz" not in result
+        assert "[已脱敏]" in result
+
+    def test_id_card_full_mask(self):
+        """身份证号 full_mask"""
+        from app.services.text_masker import mask_text
+        text = "身份证号 110101199901011234"
+        result, _ = mask_text(text, level="D2")
+        assert "110101199901011234" not in result
+
+    def test_with_predetected_hits(self):
+        """传入预识别 data_type_hits 时跳过检测"""
+        from app.services.text_masker import mask_text
+        text = "手机 13812345678"
+        hits = [{"type": "phone_number", "label": "手机号码", "count": 1, "samples": ["13812345678"]}]
+        result, _ = mask_text(text, level="D2", data_type_hits=hits)
+        assert "138****5678" in result
+
+    def test_internal_url_masked(self):
+        """内网URL在D2级别被脱敏"""
+        from app.services.text_masker import mask_text
+        text = "后台地址 http://192.168.1.100:8080/admin"
+        result, _ = mask_text(text, level="D2")
+        assert "192.168.1.100" not in result
