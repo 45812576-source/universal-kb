@@ -1,8 +1,9 @@
 """系统归档树服务：基于 taxonomy 分类树自动生成系统文件夹。
 
 系统归档树与用户自建树并存：
-- is_system=1: 系统目录，基于 taxonomy 自动生成，不可删除
 - is_system=0: 用户自建目录
+- is_system=1: 系统目录，基于 taxonomy 自动生成，不可删除
+- is_system=2: 治理目录，基于 GovernanceObjective 目标树生成
 
 自动归档默认写入系统归档树。
 """
@@ -184,3 +185,125 @@ def get_system_folder_for_board(db: Session, board: str, business_unit: str | No
         q = q.filter(KnowledgeFolder.business_unit == business_unit)
     f = q.first()
     return f.id if f else None
+
+
+def ensure_governance_folders(db: Session, owner_id: int = 1) -> dict[str, int]:
+    """从治理目标树生成目录（is_system=2）。
+
+    层级：Objective → DepartmentMission → KR → RequiredElement → ResourceLibrary
+    幂等操作：已存在的不重建。
+    """
+    from app.models.knowledge_governance import (
+        GovernanceDepartmentMission,
+        GovernanceKR,
+        GovernanceObjective,
+        GovernanceRequiredElement,
+        GovernanceResourceLibrary,
+    )
+
+    code_to_folder: dict[str, int] = {}
+
+    def _ensure_folder(
+        name: str,
+        parent_id: int | None,
+        tag: str,
+        business_unit: str | None = None,
+    ) -> int:
+        """幂等创建一个治理目录节点，用 name+parent_id+is_system=2 去重。"""
+        existing = (
+            db.query(KnowledgeFolder)
+            .filter(
+                KnowledgeFolder.is_system == 2,
+                KnowledgeFolder.name == name,
+                KnowledgeFolder.parent_id == parent_id if parent_id else KnowledgeFolder.parent_id.is_(None),
+            )
+            .first()
+        )
+        if existing:
+            return existing.id
+        folder = KnowledgeFolder(
+            name=name,
+            parent_id=parent_id,
+            created_by=owner_id,
+            is_system=2,
+            business_unit=business_unit,
+            taxonomy_code=tag,
+        )
+        db.add(folder)
+        db.flush()
+        return folder.id
+
+    # 顶层治理目录根节点
+    root_id = _ensure_folder("治理目录", None, "governance_root")
+
+    # L0: GovernanceObjective（公司层）
+    objectives = (
+        db.query(GovernanceObjective)
+        .filter(GovernanceObjective.parent_id.is_(None), GovernanceObjective.is_active == True)
+        .order_by(GovernanceObjective.sort_order)
+        .all()
+    )
+    for obj in objectives:
+        obj_folder_id = _ensure_folder(obj.name, root_id, f"obj:{obj.code}")
+        code_to_folder[f"objective:{obj.code}"] = obj_folder_id
+
+        # L1: DepartmentMission
+        missions = (
+            db.query(GovernanceDepartmentMission)
+            .filter(GovernanceDepartmentMission.objective_id == obj.id)
+            .order_by(GovernanceDepartmentMission.id)
+            .all()
+        )
+        for mission in missions:
+            mission_folder_id = _ensure_folder(mission.name, obj_folder_id, f"mission:{mission.code}")
+            code_to_folder[f"mission:{mission.code}"] = mission_folder_id
+
+            # L2: KR
+            krs = (
+                db.query(GovernanceKR)
+                .filter(GovernanceKR.mission_id == mission.id)
+                .order_by(GovernanceKR.sort_order)
+                .all()
+            )
+            for kr in krs:
+                kr_folder_id = _ensure_folder(kr.name, mission_folder_id, f"kr:{kr.code}")
+                code_to_folder[f"kr:{kr.code}"] = kr_folder_id
+
+                # L3: RequiredElement
+                elements = (
+                    db.query(GovernanceRequiredElement)
+                    .filter(GovernanceRequiredElement.kr_id == kr.id)
+                    .order_by(GovernanceRequiredElement.sort_order)
+                    .all()
+                )
+                for element in elements:
+                    element_folder_id = _ensure_folder(element.name, kr_folder_id, f"element:{element.code}")
+                    code_to_folder[f"element:{element.code}"] = element_folder_id
+
+                    # L4: ResourceLibrary（叶子）
+                    for lib_code in (element.required_library_codes or []):
+                        lib = (
+                            db.query(GovernanceResourceLibrary)
+                            .filter(GovernanceResourceLibrary.code == lib_code)
+                            .first()
+                        )
+                        if lib:
+                            lib_folder_id = _ensure_folder(lib.name, element_folder_id, f"library:{lib.code}")
+                            code_to_folder[f"library:{lib.code}"] = lib_folder_id
+
+        # 直属资源库（不经过 mission/kr 路径的）
+        direct_libraries = (
+            db.query(GovernanceResourceLibrary)
+            .filter(GovernanceResourceLibrary.objective_id == obj.id)
+            .order_by(GovernanceResourceLibrary.id)
+            .all()
+        )
+        for lib in direct_libraries:
+            lib_key = f"library:{lib.code}"
+            if lib_key not in code_to_folder:
+                lib_folder_id = _ensure_folder(lib.name, obj_folder_id, f"library:{lib.code}")
+                code_to_folder[lib_key] = lib_folder_id
+
+    db.commit()
+    logger.info(f"Governance folder tree ensured: {len(code_to_folder)} nodes")
+    return code_to_folder

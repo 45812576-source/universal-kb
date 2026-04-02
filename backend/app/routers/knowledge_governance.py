@@ -26,12 +26,14 @@ from app.models.project import Project
 from app.models.task import Task
 from app.models.user import Role, User
 from app.services.knowledge_governance_service import (
+    compute_collaboration_baseline,
     create_or_update_governance_suggestion_for_entry,
     create_or_update_governance_suggestion_for_table,
     ensure_governance_defaults,
     ensure_governance_object,
     record_governance_feedback,
 )
+from app.services.system_folder_service import ensure_governance_folders
 
 router = APIRouter(prefix="/api/knowledge-governance", tags=["knowledge-governance"])
 
@@ -768,7 +770,30 @@ def seed_governance_defaults(
 ):
     _require_admin(user)
     ensure_governance_defaults(db, created_by=user.id)
+    # seed 完后自动重建治理目录
+    try:
+        ensure_governance_folders(db, owner_id=user.id)
+    except Exception:
+        pass
     return {"ok": True, "seeded": True, "message": "默认蓝图已同步"}
+
+
+@router.post("/rebuild-folders")
+def rebuild_governance_folders(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _require_admin(user)
+    code_to_folder = ensure_governance_folders(db, owner_id=user.id)
+    return {"ok": True, "folder_count": len(code_to_folder), "mapping": code_to_folder}
+
+
+@router.get("/collaboration-baseline")
+def get_collaboration_baseline(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    return compute_collaboration_baseline(db)
 
 
 @router.post("/objectives")
@@ -793,6 +818,11 @@ def create_governance_objective(
     db.add(item)
     db.commit()
     db.refresh(item)
+    # 目标树变更后自动重建治理目录
+    try:
+        ensure_governance_folders(db, owner_id=user.id)
+    except Exception:
+        pass
     return _objective_dict(item)
 
 
@@ -825,6 +855,11 @@ def create_resource_library(
     db.add(item)
     db.commit()
     db.refresh(item)
+    # 资源库变更后自动重建治理目录
+    try:
+        ensure_governance_folders(db, owner_id=user.id)
+    except Exception:
+        pass
     return _resource_library_dict(item)
 
 

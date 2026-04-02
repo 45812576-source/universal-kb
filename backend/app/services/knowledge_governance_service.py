@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.models.knowledge import KnowledgeEntry
 from app.models.business import BusinessTable
 from app.models.knowledge_governance import (
+    GovernanceBaselineSnapshot,
     GovernanceFeedbackEvent,
     GovernanceDepartmentMission,
     GovernanceFieldTemplate,
@@ -21,6 +22,160 @@ from app.models.knowledge_governance import (
     GovernanceObjectFacet,
 )
 from app.models.user import Department
+
+
+def compute_collaboration_baseline(db: Session) -> dict[str, Any]:
+    """聚合协同基线数据：按 ResourceLibrary 和 ObjectType 维度。"""
+    libraries = db.query(GovernanceResourceLibrary).filter(GovernanceResourceLibrary.is_active == True).all()
+    object_types = db.query(GovernanceObjectType).all()
+
+    import datetime as _dt
+
+    from sqlalchemy import func as _func
+
+    library_summaries = []
+    for lib in libraries:
+        # 关联文档数（用 func.count 避免 ORM 加载全字段）
+        doc_count = (
+            db.query(_func.count(KnowledgeEntry.id))
+            .filter(KnowledgeEntry.resource_library_id == lib.id)
+            .scalar() or 0
+        )
+        # 关联数据表数
+        table_count = (
+            db.query(_func.count(BusinessTable.id))
+            .filter(BusinessTable.resource_library_id == lib.id)
+            .scalar() or 0
+        )
+        # 字段覆盖率
+        obj_type = db.query(GovernanceObjectType).filter(GovernanceObjectType.code == lib.object_type).first()
+        field_templates = []
+        filled_count = 0
+        required_count = 0
+        if obj_type:
+            field_templates = (
+                db.query(GovernanceFieldTemplate)
+                .filter(GovernanceFieldTemplate.object_type_id == obj_type.id)
+                .order_by(GovernanceFieldTemplate.sort_order)
+                .all()
+            )
+            required_count = sum(1 for ft in field_templates if ft.is_required)
+            # 通过 facet 的 field_values 统计有值的必填字段数
+            facets = (
+                db.query(GovernanceObjectFacet)
+                .filter(GovernanceObjectFacet.resource_library_id == lib.id)
+                .all()
+            )
+            required_keys = {ft.field_key for ft in field_templates if ft.is_required}
+            if facets and required_keys:
+                filled_keys = set()
+                for facet in facets:
+                    fv = facet.field_values or {}
+                    for k, v in fv.items():
+                        if k in required_keys and v:
+                            filled_keys.add(k)
+                filled_count = len(filled_keys)
+
+        field_coverage = round(filled_count / max(required_count, 1), 4)
+
+        # 最近更新时间
+        latest_updated_at = (
+            db.query(_func.max(KnowledgeEntry.updated_at))
+            .filter(KnowledgeEntry.resource_library_id == lib.id)
+            .scalar()
+        )
+        last_updated = latest_updated_at.isoformat() if latest_updated_at else None
+
+        # 更新周期达标率
+        cycle_days = {"realtime": 1, "daily": 1, "weekly": 7, "monthly": 30, "manual": 999}
+        expected_days = cycle_days.get(lib.default_update_cycle or "manual", 999)
+        if last_updated and expected_days < 999:
+            from datetime import datetime as _datetime
+            try:
+                last_dt = _datetime.fromisoformat(last_updated)
+                age_days = (_dt.datetime.utcnow() - last_dt).days
+                update_compliance = 1.0 if age_days <= expected_days else round(max(0, 1 - (age_days - expected_days) / max(expected_days, 1)), 4)
+            except Exception:
+                update_compliance = None
+        else:
+            update_compliance = None
+
+        library_summaries.append({
+            "library_id": lib.id,
+            "library_code": lib.code,
+            "library_name": lib.name,
+            "objective_id": lib.objective_id,
+            "object_type": lib.object_type,
+            "doc_count": doc_count,
+            "table_count": table_count,
+            "field_coverage": field_coverage,
+            "required_field_count": required_count,
+            "filled_field_count": filled_count,
+            "consumer_departments": lib.consumer_departments or [],
+            "dependency_library_codes": lib.dependency_library_codes or [],
+            "default_update_cycle": lib.default_update_cycle,
+            "last_updated": last_updated,
+            "update_compliance": update_compliance,
+            "field_templates": [
+                {
+                    "field_key": ft.field_key,
+                    "field_label": ft.field_label,
+                    "is_required": ft.is_required,
+                    "visibility_mode": ft.visibility_mode,
+                    "update_cycle": ft.update_cycle,
+                }
+                for ft in field_templates
+            ],
+        })
+
+    # ObjectType 维度聚合
+    object_type_summaries = []
+    for ot in object_types:
+        dimension_count = len(ot.dimension_schema or [])
+        facet_count = (
+            db.query(GovernanceObjectFacet)
+            .join(GovernanceResourceLibrary, GovernanceObjectFacet.resource_library_id == GovernanceResourceLibrary.id)
+            .filter(GovernanceResourceLibrary.object_type == ot.code)
+            .count()
+        )
+        # 跨部门共用对象数
+        cross_dept_count = (
+            db.query(GovernanceObject)
+            .filter(
+                GovernanceObject.object_type_id == ot.id,
+                GovernanceObject.lifecycle_status == "active",
+            )
+            .count()
+        )
+        object_type_summaries.append({
+            "object_type_id": ot.id,
+            "object_type_code": ot.code,
+            "object_type_name": ot.name,
+            "dimension_count": dimension_count,
+            "dimension_schema": ot.dimension_schema or [],
+            "facet_count": facet_count,
+            "active_object_count": cross_dept_count,
+        })
+
+    # 全局汇总
+    total_libraries = len(library_summaries)
+    avg_field_coverage = round(
+        sum(ls["field_coverage"] for ls in library_summaries) / max(total_libraries, 1), 4
+    )
+    compliant = [ls for ls in library_summaries if ls["update_compliance"] is not None and ls["update_compliance"] >= 0.8]
+    update_compliance_rate = round(len(compliant) / max(total_libraries, 1), 4)
+    total_cross_dept_objects = sum(ots["active_object_count"] for ots in object_type_summaries)
+
+    return {
+        "summary": {
+            "total_libraries": total_libraries,
+            "avg_field_coverage": avg_field_coverage,
+            "update_compliance_rate": update_compliance_rate,
+            "total_cross_dept_objects": total_cross_dept_objects,
+        },
+        "libraries": library_summaries,
+        "object_types": object_type_summaries,
+    }
 
 
 KEYWORD_RULES = [
@@ -269,6 +424,16 @@ def ensure_governance_defaults(db: Session, created_by: int | None = None) -> No
             library.classification_hints = {"objective_code": objective.code}
             library.is_active = True
 
+    # dimension_schema 定义每种对象类型的多维视角
+    _dimension_schemas: dict[str, list[str]] = {
+        "customer": ["基本信息", "合作历史", "商务关系", "服务需求"],
+        "sop_ticket": ["流程定义", "执行记录", "SLA监控"],
+        "case": ["背景", "执行过程", "结果", "复盘"],
+        "external_intel": ["来源", "时效", "影响评估", "行动建议"],
+        "skill_material": ["岗位要求", "能力模型", "培训资料", "考核标准"],
+        "knowledge_asset": ["元数据", "内容摘要", "关联关系"],
+    }
+
     builtin_object_types = [
         ("customer", "客户", ["customer_name", "owner", "stage", "source", "next_action"], ["read", "edit", "skill_read"]),
         ("sop_ticket", "SOP/工单", ["process_name", "owner", "sla", "status"], ["read", "edit"]),
@@ -278,18 +443,21 @@ def ensure_governance_defaults(db: Session, created_by: int | None = None) -> No
         ("knowledge_asset", "知识资产", ["owner", "effective_date"], ["read", "edit"]),
     ]
     for code, name, baseline_fields, modes in builtin_object_types:
+        dimension_schema = _dimension_schemas.get(code, [])
         exists = db.query(GovernanceObjectType).filter(GovernanceObjectType.code == code).first()
         if not exists:
             db.add(
                 GovernanceObjectType(
                     code=code,
                     name=name,
+                    dimension_schema=dimension_schema,
                     baseline_fields=baseline_fields,
                     default_consumption_modes=modes,
                 )
             )
             continue
         exists.name = name
+        exists.dimension_schema = dimension_schema
         exists.baseline_fields = baseline_fields
         exists.default_consumption_modes = modes
     db.commit()
@@ -364,11 +532,43 @@ def _seed_field_templates(db: Session) -> None:
     db.commit()
 
 
+def _kr_specs_for_category(category: str | None) -> list[tuple[str, str, str, str, str]]:
+    """根据部门 category（前台/中台/后台）返回差异化 KR 模板。
+
+    返回 (code, name, description, metric_definition, target_value)。
+    """
+    if category == "前台":
+        return [
+            ("kr_customer_growth", "客户增长率", "提升新客户开发速度与签约转化", "新客户增长率", "季度+15%"),
+            ("kr_customer_retention", "客户留存率", "提升客户续签与复购率", "客户留存率", "年度≥85%"),
+            ("kr_signal_capture", "外部信号捕获", "提升市场信号采集和快速响应能力", "情报捕获时效", "≤48h"),
+        ]
+    elif category == "中台":
+        return [
+            ("kr_case_reuse", "案例复用率", "提升可复用案例与方法论沉淀", "案例复用率", "季度≥30%"),
+            ("kr_methodology_deposit", "方法论沉淀率", "推动通用方法论文档化与结构化", "方法论沉淀率", "季度+5篇"),
+            ("kr_cross_dept_delivery", "跨部门交付效率", "提升跨部门协同交付速度", "交付周期缩短率", "季度-10%"),
+        ]
+    elif category == "后台":
+        return [
+            ("kr_process_compliance", "流程合规率", "确保关键流程100%合规执行", "流程合规率", "月度≥98%"),
+            ("kr_data_accuracy", "数据准确率", "提升核心数据准确性", "数据准确率", "月度≥99%"),
+            ("kr_service_response", "服务响应时效", "缩短内部服务响应时间", "平均响应时长", "≤4h"),
+        ]
+    # 默认通用
+    return [
+        ("kr_resource_efficiency", "资源运转效率", "提升资源利用率与协同效率", "资源使用效率", "季度提升"),
+        ("kr_case_reuse", "案例复用率", "提升可复用案例与经验沉淀", "案例复用率", "季度≥20%"),
+        ("kr_signal_capture", "外部信号捕获", "提升外部信号采集和策略反应速度", "情报捕获时效", "≤72h"),
+    ]
+
+
 def _seed_department_kr_templates(db: Session, created_by: int | None = None) -> None:
     departments = db.query(Department).all()
     objective_map = {item.code: item for item in db.query(GovernanceObjective).all()}
     for dept in departments:
         dept_key = (dept.name or f"dept_{dept.id}").strip().lower().replace(" ", "_")
+        category = getattr(dept, "category", None)
         mission = (
             db.query(GovernanceDepartmentMission)
             .filter(GovernanceDepartmentMission.department_id == dept.id)
@@ -387,12 +587,9 @@ def _seed_department_kr_templates(db: Session, created_by: int | None = None) ->
             db.add(mission)
             db.flush()
 
-        kr_specs = [
-            ("kr_resource_efficiency", "资源运转效率", "提升资源利用率与协同效率", "资源使用效率"),
-            ("kr_case_reuse", "案例复用率", "提升可复用案例与经验沉淀", "案例复用率"),
-            ("kr_signal_capture", "外部信号捕获", "提升外部信号采集和策略反应速度", "情报捕获时效"),
-        ]
-        for idx, (code, name, desc, metric) in enumerate(kr_specs):
+        kr_specs = _kr_specs_for_category(category)
+        for idx, (code, name, desc, metric, *rest) in enumerate(kr_specs):
+            target_value = rest[0] if rest else None
             kr = (
                 db.query(GovernanceKR)
                 .filter(
@@ -409,6 +606,7 @@ def _seed_department_kr_templates(db: Session, created_by: int | None = None) ->
                     code=code,
                     description=desc,
                     metric_definition=metric,
+                    target_value=target_value,
                     owner_role=dept.name,
                     sort_order=idx,
                 )

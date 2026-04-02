@@ -112,6 +112,8 @@ class GovernanceResourceLibrary(Base):
     field_schema = Column(JSON, default=list)
     consumption_scenarios = Column(JSON, default=list)
     collaboration_baseline = Column(JSON, default=dict)
+    consumer_departments = Column(JSON, default=list)  # 消费该资源库的部门 ID 列表
+    dependency_library_codes = Column(JSON, default=list)  # 上下游依赖的资源库 code 列表
     classification_hints = Column(JSON, default=dict)
     is_active = Column(Boolean, default=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
@@ -247,6 +249,19 @@ class GovernanceObject(Base):
     object_payload = Column(JSON, default=dict)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
+class GovernanceBaselineSnapshot(Base):
+    """基线变更历史快照，记录 ResourceLibrary 协同基线的每次变更。"""
+    __tablename__ = "governance_baseline_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    library_id = Column(Integer, ForeignKey("governance_resource_libraries.id"), nullable=False)
+    changed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    change_type = Column(String(50), nullable=False)  # field_update | consumer_change | dependency_change | cycle_change
+    old_value = Column(JSON, default=dict)
+    new_value = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
 class GovernanceObjectFacet(Base):
