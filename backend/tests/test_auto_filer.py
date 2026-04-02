@@ -179,7 +179,7 @@ class TestAutoFileSingle:
         assert action.created_by == user.id
 
     def test_taxonomy_board_fallback_to_board_root(self, db):
-        """B2: 只有 taxonomy_board，无同板块历史 → 归到板块根目录。"""
+        """B2: 只有 taxonomy_board，无同板块历史 → 生成低置信度建议，不直接归档。"""
         dept = _make_dept(db)
         user = _make_user(db, "filer2", Role.SUPER_ADMIN, dept.id)
         db.commit()
@@ -191,11 +191,8 @@ class TestAutoFileSingle:
         db.commit()
 
         action = auto_file_single(db, entry, user_id=user.id)
-        db.commit()
-
-        assert action is not None
-        assert entry.folder_id == board_root_id
-        assert action.confidence == 0.3  # 低置信度
+        assert action is None
+        assert entry.folder_id is None
 
     def test_taxonomy_board_uses_history_distribution(self, db):
         """B2b: 只有 taxonomy_board，但同板块有已归档文档 → 使用历史分布。"""
@@ -227,9 +224,8 @@ class TestAutoFileSingle:
         action = auto_file_single(db, entry, user_id=user.id)
         db.commit()
 
-        assert action is not None
-        assert action.decision_source == "board_neighbors"
-        assert entry.folder_id == target_folder
+        assert action is None
+        assert entry.folder_id is None
 
     def test_already_has_folder_id_skips(self, db):
         """B3: 已有 folder_id → 跳过，返回 None。"""

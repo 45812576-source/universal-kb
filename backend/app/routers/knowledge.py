@@ -27,27 +27,56 @@ router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
 
 # ── 标题清洗 ─────────────────────────────────────────────────────────────────
 
+def _repair_mojibake(raw: str) -> str:
+    """尽量修复常见 UTF-8/latin1/gbk 链路导致的中文乱码。"""
+    if not raw:
+        return raw
+
+    candidates = [raw]
+    seen = {raw}
+    for src, dst in (
+        ("latin1", "utf-8"),
+        ("cp1252", "utf-8"),
+        ("latin1", "gb18030"),
+        ("cp1252", "gb18030"),
+    ):
+        try:
+            fixed = raw.encode(src).decode(dst)
+        except (UnicodeEncodeError, UnicodeDecodeError, LookupError):
+            continue
+        if fixed and fixed not in seen:
+            candidates.append(fixed)
+            seen.add(fixed)
+
+    def _score(text: str) -> tuple[int, int, int]:
+        cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+        bad = sum(text.count(mark) for mark in ("Ã", "Â", "å", "æ", "ä", "�"))
+        controls = sum(1 for ch in text if ord(ch) < 32 and ch not in "\t\n\r")
+        return (cjk, -bad, -controls)
+
+    return max(candidates, key=_score)
+
+
 def _sanitize_title(raw: str) -> str:
     """清洗文件名 / 标题：修复编码、去控制字符、去扩展名。"""
     if not raw:
         return "未命名文档"
-    # 尝试修复 latin1 误编码的 UTF-8
-    try:
-        if any(ord(c) > 127 for c in raw):
-            fixed = raw.encode("latin1").decode("utf-8")
-            if fixed != raw:
-                raw = fixed
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        pass
-    # 去控制字符
+    raw = _repair_mojibake(raw)
     raw = re.sub(r"[\x00-\x1f\x7f]", "", raw)
-    # 去文件扩展名
     name, ext = os.path.splitext(raw)
     if ext and len(ext) <= 6:
         raw = name
-    # strip 空白
-    raw = raw.strip()
+    raw = re.sub(r"\s+", " ", raw).strip()
     return raw or "未命名文档"
+
+
+def _display_title(entry: KnowledgeEntry) -> str:
+    """统一前端/接口展示标题来源优先级。"""
+    for candidate in (entry.title, entry.ai_title, entry.source_file):
+        normalized = _sanitize_title(candidate or "")
+        if normalized and normalized != "未命名文档":
+            return normalized
+    return "未命名文档"
 
 
 # ── "我的知识" 个人根目录 ────────────────────────────────────────────────────
@@ -125,7 +154,8 @@ def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None
             _is_in_my_knowledge = True
     return {
         "id": e.id,
-        "title": e.title,
+        "title": _display_title(e),
+        "raw_title": e.title,
         "content": e.content[:300] + ("..." if len(e.content) > 300 else ""),
         "category": e.category,
         "status": e.status.value,
@@ -181,11 +211,26 @@ def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None
         "classification_confidence": e.classification_confidence,
         "classification_source": e.classification_source,
         "classified_at": e.classified_at.isoformat() if e.classified_at else None,
+        "visibility_scope": _knowledge_visibility_scope(e),
         # 能力标志
         "can_open_onlyoffice": bool(e.oss_key and ext in _ONLYOFFICE_EXTS),
         "can_retry_render": e.doc_render_status in ("failed", "pending", None),
         "can_retry_classification": e.classification_status in ("failed", "pending", "needs_review", None),
         "created_at": e.created_at.isoformat(),
+    }
+
+
+def _knowledge_visibility_scope(e: KnowledgeEntry) -> dict:
+    if e.status == KnowledgeStatus.APPROVED:
+        return {
+            "scope": "approved_global",
+            "reason": "approved",
+        }
+    return {
+        "scope": "owner_or_dept_only",
+        "reason": "pending_or_unapproved",
+        "owner_id": e.created_by,
+        "department_id": e.department_id,
     }
 
 

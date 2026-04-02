@@ -24,8 +24,8 @@ logger = logging.getLogger(__name__)
 
 # 高置信度阈值：直接归档
 _HIGH_CONFIDENCE = 0.6
-# 低置信度：归到板块根目录
-_LOW_CONFIDENCE = 0.3
+# 低于此阈值不允许直接归档
+_LOW_CONFIDENCE = 0.6
 
 
 def _resolve_target_folder(
@@ -36,7 +36,7 @@ def _resolve_target_folder(
     from app.services.system_folder_service import get_system_folder_for_taxonomy, get_system_folder_for_board
 
     # 策略1：taxonomy_code 精确匹配
-    if entry.taxonomy_code:
+    if entry.taxonomy_code and (entry.classification_confidence or 0) >= _LOW_CONFIDENCE:
         fid = get_system_folder_for_taxonomy(db, entry.taxonomy_code)
         if fid:
             return {
@@ -72,14 +72,14 @@ def _resolve_target_folder(
                         "decision_source": "board_neighbors",
                     }
 
-        # fallback: 板块根目录
+        # 只有 board 不再直接自动落系统目录，改为待审 suggestion
         board_fid = get_system_folder_for_board(db, entry.taxonomy_board)
         if board_fid:
             return {
                 "folder_id": board_fid,
-                "confidence": 0.3,
-                "reason": f"板块 {entry.taxonomy_board} 根目录（低置信度）",
-                "decision_source": "taxonomy",
+                "confidence": min(entry.classification_confidence or 0.0, 0.49),
+                "reason": f"仅识别到板块 {entry.taxonomy_board}，需人工确认",
+                "decision_source": "taxonomy_board_only",
             }
 
     return None
@@ -150,7 +150,7 @@ def auto_file_batch(
             stats["skipped"] += 1
             continue
 
-        if result["confidence"] >= _HIGH_CONFIDENCE:
+        if result["confidence"] >= _HIGH_CONFIDENCE and entry.taxonomy_code:
             # 高置信度：直接归档（inline，避免 _resolve_target_folder 重复调用）
             old_folder_id = entry.folder_id
             entry.folder_id = result["folder_id"]
@@ -176,7 +176,13 @@ def auto_file_batch(
                 suggested_folder_path=result.get("reason", ""),
                 confidence=result["confidence"],
                 reason=result["reason"],
-                based_on={"decision_source": result["decision_source"], "batch_id": batch_id},
+                based_on={
+                    "decision_source": result["decision_source"],
+                    "batch_id": batch_id,
+                    "taxonomy_code": entry.taxonomy_code,
+                    "taxonomy_board": entry.taxonomy_board,
+                    "classification_confidence": entry.classification_confidence,
+                },
                 status="pending",
             )
             db.add(suggestion)

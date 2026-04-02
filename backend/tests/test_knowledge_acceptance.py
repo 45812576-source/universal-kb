@@ -58,6 +58,22 @@ def test_upload_chinese_title_no_garble(client, token, db):
     assert body["title"] != body["source_file"]
 
 
+def test_upload_mojibake_filename_recovers_title(client, token, db):
+    content = b"# Hello\ntest content"
+    files = {"file": ("Ã¤ÂºÂºÃ¤ÂºÂÃ¦ÂÂÃ¤Â»Â¶Ã§ÂÂ.md", io.BytesIO(content), "text/markdown")}
+    data = {
+        "title": "Ã¤ÂºÂºÃ¤ÂºÂÃ¦ÂÂÃ¤Â»Â¶Ã§ÂÂ",
+        "category": "experience",
+        "industry_tags": "[]",
+        "platform_tags": "[]",
+        "topic_tags": "[]",
+    }
+    resp = client.post("/api/knowledge/upload", files=files, data=data, headers=_auth(token))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["title"] == "人事文件生"
+
+
 # ─── Test 2: 创建空白文档默认进 personal folder ────────────────────────────
 
 def test_create_blank_doc_enters_my_knowledge(client, token, db):
@@ -183,3 +199,23 @@ def test_render_failed_entry_still_visible(client, token, db, employee_setup):
     assert body["doc_render_status"] == "failed"
     assert body["doc_render_error"] == "模拟转换失败"
     assert body["content"] == "正文内容仍在"
+
+
+def test_visibility_scope_present_in_response(client, token, db, employee_setup):
+    user, dept = employee_setup
+    entry = KnowledgeEntry(
+        title="权限说明测试",
+        content="正文",
+        category="experience",
+        status=KnowledgeStatus.PENDING,
+        created_by=user.id,
+        department_id=dept.id,
+        source_type="manual",
+    )
+    db.add(entry)
+    db.commit()
+
+    resp = client.get(f"/api/knowledge/{entry.id}", headers=_auth(token))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["visibility_scope"]["scope"] == "owner_or_dept_only"
