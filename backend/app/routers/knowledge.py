@@ -1095,18 +1095,18 @@ def _folder_dict(f: KnowledgeFolder) -> dict:
     }
 
 
-@router.get(“/folders”)
+@router.get("/folders")
 def list_folders(
     owner_only: bool = False,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    “””返回文件夹列表（扁平列表，前端自行构建树）。
+    """返回文件夹列表（扁平列表，前端自行构建树）。
 
     规则：
-    - owner_only=true：只返回当前用户自己创建的文件夹（”我的知识”视图）
+    - owner_only=true：只返回当前用户自己创建的文件夹（"我的知识"视图）
     - owner_only=false（默认）：用户自建 + 系统归档树 + 可见文档所在文件夹
-    “””
+    """
     if owner_only:
         folders = (
             db.query(KnowledgeFolder)
