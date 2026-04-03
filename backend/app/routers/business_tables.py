@@ -1,6 +1,6 @@
 """Business tables management API."""
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -868,6 +868,145 @@ def create_blank_table(
     db.commit()
     db.refresh(bt)
     return {"id": bt.id, "table_name": bt.table_name, "display_name": bt.display_name}
+
+
+# ─── Upload CSV/Excel ─────────────────────────────────────────────────────────
+
+@router.post("/upload-file")
+async def upload_file_as_table(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Upload a CSV or Excel file to create a new data table with data."""
+    import re, time, io
+
+    filename = file.filename or "upload"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext not in ("csv", "xlsx", "xls"):
+        raise HTTPException(400, "仅支持 .csv / .xlsx / .xls 格式")
+
+    content = await file.read()
+    if len(content) > 50 * 1024 * 1024:
+        raise HTTPException(400, "文件不能超过 50MB")
+
+    # Parse file into DataFrame
+    import pandas as pd
+    try:
+        if ext == "csv":
+            df = pd.read_csv(io.BytesIO(content))
+        else:
+            df = pd.read_excel(io.BytesIO(content))
+    except Exception as e:
+        raise HTTPException(400, f"文件解析失败: {e}")
+
+    if df.empty or len(df.columns) == 0:
+        raise HTTPException(400, "文件为空或无有效列")
+
+    # Sanitize column names
+    clean_cols = []
+    for col in df.columns:
+        c = str(col).strip()
+        if not c:
+            c = f"col_{len(clean_cols)}"
+        clean_cols.append(c)
+    df.columns = clean_cols
+
+    # Generate table name
+    display_name = filename.rsplit(".", 1)[0]
+    base = re.sub(r"[^a-z0-9\u4e00-\u9fff]", "_", display_name.strip().lower())
+    base = re.sub(r"_+", "_", base).strip("_")[:30] or "table"
+    table_name = f"usr_{base}_{int(time.time()) % 100000}"
+
+    # Infer MySQL types from pandas dtypes
+    col_defs = [
+        "  `id` INT AUTO_INCREMENT PRIMARY KEY",
+        "  `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP",
+        "  `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    ]
+    field_meta = []
+    for col in clean_cols:
+        dtype = str(df[col].dtype)
+        if "int" in dtype:
+            mysql_type, field_type = "BIGINT", "number"
+        elif "float" in dtype:
+            mysql_type, field_type = "DOUBLE", "number"
+        elif "datetime" in dtype:
+            mysql_type, field_type = "DATETIME", "date"
+        elif "bool" in dtype:
+            mysql_type, field_type = "TINYINT(1)", "checkbox"
+        else:
+            mysql_type, field_type = "TEXT", "text"
+        safe_col = re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fff]", "_", col)
+        col_defs.append(f"  `{safe_col}` {mysql_type} NULL")
+        field_meta.append({"name": col, "field_type": field_type, "options": [], "nullable": True, "comment": ""})
+
+    ddl = (
+        f"CREATE TABLE IF NOT EXISTS `{table_name}` (\n"
+        + ",\n".join(col_defs)
+        + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+    try:
+        db.execute(text(ddl))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"建表失败: {e}")
+
+    # Insert data in batches
+    inserted = 0
+    safe_cols = [re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fff]", "_", c) for c in clean_cols]
+    col_list = ", ".join(f"`{c}`" for c in safe_cols)
+    batch_size = 500
+    import math
+    df = df.where(pd.notnull(df), None)
+
+    for start in range(0, len(df), batch_size):
+        batch = df.iloc[start:start + batch_size]
+        placeholders = []
+        params = {}
+        for row_idx, (_, row) in enumerate(batch.iterrows()):
+            row_ph = []
+            for col_idx, col in enumerate(clean_cols):
+                key = f"v_{start + row_idx}_{col_idx}"
+                val = row[col]
+                if val is None:
+                    params[key] = None
+                elif isinstance(val, float) and math.isnan(val):
+                    params[key] = None
+                else:
+                    params[key] = val
+                row_ph.append(f":{key}")
+            placeholders.append(f"({', '.join(row_ph)})")
+        insert_sql = f"INSERT INTO `{table_name}` ({col_list}) VALUES {', '.join(placeholders)}"
+        try:
+            db.execute(text(insert_sql), params)
+            db.commit()
+            inserted += len(batch)
+        except Exception:
+            db.rollback()
+
+    # Register in BusinessTable
+    rules = {"row_scope": "private", "column_scope": "private", "field_meta": field_meta}
+    bt = BusinessTable(
+        table_name=table_name,
+        display_name=display_name,
+        description=f"从 {filename} 导入，共 {inserted} 行",
+        ddl_sql=ddl,
+        validation_rules=rules,
+        owner_id=user.id,
+    )
+    db.add(bt)
+    db.commit()
+    db.refresh(bt)
+    return {
+        "id": bt.id,
+        "table_name": bt.table_name,
+        "display_name": bt.display_name,
+        "rows_inserted": inserted,
+        "columns": len(clean_cols),
+    }
 
 
 # ─── Column management APIs ───────────────────────────────────────────────────
