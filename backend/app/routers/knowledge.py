@@ -330,13 +330,11 @@ def _knowledge_visibility_scope(e: KnowledgeEntry) -> dict:
 
 
 def _apply_knowledge_visibility(query, user: User):
-    if user.role == Role.EMPLOYEE:
-        return query.filter(
-            or_(
-                KnowledgeEntry.created_by == user.id,
-                KnowledgeEntry.status == KnowledgeStatus.APPROVED,
-            )
-        )
+    """整理视图可见性：每个人只管自己的文件。
+
+    所有角色（包括 SUPER_ADMIN）都只看到自己创建的 + 已审批通过的文档。
+    管理员查看全局数据请走 knowledge_admin / knowledge_governance 路由。
+    """
     if user.role == Role.DEPT_ADMIN:
         return query.filter(
             or_(
@@ -345,7 +343,13 @@ def _apply_knowledge_visibility(query, user: User):
                 KnowledgeEntry.status == KnowledgeStatus.APPROVED,
             )
         )
-    return query
+    # SUPER_ADMIN / EMPLOYEE 统一：只看自己的 + 已审批的
+    return query.filter(
+        or_(
+            KnowledgeEntry.created_by == user.id,
+            KnowledgeEntry.status == KnowledgeStatus.APPROVED,
+        )
+    )
 
 
 def _can_view_entry(entry: KnowledgeEntry, user: User) -> bool:
