@@ -543,6 +543,8 @@ class SkillEngine:
         # 批量预查文档脱敏级别（从 KnowledgeUnderstandingProfile）
         doc_levels: dict[int, str] = {}
         doc_data_type_hits: dict[int, list[dict]] = {}
+        # 已发布 Skill 的已审知识引用集合
+        published_ref_ids: set[int] | None = None
         if db:
             try:
                 from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
@@ -558,6 +560,19 @@ class SkillEngine:
             except Exception as e:
                 logger.warning(f"Failed to load doc desensitization levels: {e}")
 
+            # 已发布 Skill：加载已审知识引用集合
+            if skill and hasattr(skill, 'status') and str(getattr(skill.status, 'value', skill.status)) == 'published':
+                try:
+                    from app.models.skill_knowledge_ref import SkillKnowledgeReference
+                    published_ref_ids = {
+                        r.knowledge_id for r in
+                        db.query(SkillKnowledgeReference.knowledge_id)
+                        .filter(SkillKnowledgeReference.skill_id == skill.id)
+                        .all()
+                    }
+                except Exception as e:
+                    logger.warning(f"Failed to load published skill knowledge refs: {e}")
+
         parts = []
         seen_ids: set[int] = set()
         for h in hits:
@@ -565,6 +580,14 @@ class SkillEngine:
             if kid in seen_ids:
                 continue
             seen_ids.add(kid)
+
+            # 已发布 Skill 运行时召回约束：不在已审集合中的 D2+ 文件跳过
+            if published_ref_ids is not None and kid not in published_ref_ids:
+                doc_level = doc_levels.get(kid, "D1")
+                if doc_level >= "D2":
+                    logger.info(f"Skill {skill.id}: 跳过未审知识 {kid}（{doc_level}）")
+                    continue
+                # D0/D1 低风险，正常处理
 
             chunk_owner = h.get("created_by", 0)
             is_own = user_id and chunk_owner == user_id

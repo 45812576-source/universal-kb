@@ -1711,6 +1711,16 @@ def update_status(
                     f"发布要求至少 200 行（请补充完整的指令内容，或为 Skill 绑定工具）",
                 )
 
+        # 知识引用安全校验
+        from app.services.skill_knowledge_checker import validate_skill_knowledge_references
+        kr_result = validate_skill_knowledge_references(skill_id, user.id, db)
+        if kr_result.get("blocked"):
+            raise HTTPException(400, {
+                "blocked": True,
+                "reasons": kr_result["block_reasons"],
+                "risk_summary": kr_result.get("risk_summary", {}),
+            })
+
     # EMPLOYEE / DEPT_ADMIN 申请发布 → 转为审核中，创建审批单等超管审批
     if status == SkillStatus.PUBLISHED.value and user.role in (Role.EMPLOYEE, Role.DEPT_ADMIN):
         if scope is not None:
@@ -1743,6 +1753,8 @@ def update_status(
             approval_id = approval.id
         else:
             approval_id = existing_approval.id
+        # 保存知识引用快照
+        _save_knowledge_reference_snapshot(skill_id, user.id, kr_result, db)
         db.commit()
         # 异步触发安全扫描（不阻塞提交流程）
         import asyncio
@@ -1774,9 +1786,61 @@ def update_status(
     # SUPER_ADMIN 直接发布时生成 SkillPolicy
     if status == SkillStatus.PUBLISHED.value:
         _ensure_skill_policy(skill_id, user, db)
+        # 写入知识引用快照
+        _save_knowledge_reference_snapshot(skill_id, user.id, kr_result, db)
 
     db.commit()
     return {"id": skill_id, "status": status, "scope": skill.scope}
+
+
+# ── 知识引用安全检查 ─────────────────────────────────────────────────────────
+
+@router.post("/{skill_id}/publish-precheck")
+def publish_precheck(
+    skill_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """发布前知识引用安全校验。"""
+    from app.services.skill_knowledge_checker import validate_skill_knowledge_references
+    result = validate_skill_knowledge_references(skill_id, user.id, db)
+    return result
+
+
+@router.get("/{skill_id}/knowledge-references")
+def get_knowledge_references(
+    skill_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """查询 Skill 已审知识引用列表。"""
+    from app.models.skill_knowledge_ref import SkillKnowledgeReference
+    refs = (
+        db.query(SkillKnowledgeReference)
+        .filter(SkillKnowledgeReference.skill_id == skill_id)
+        .order_by(SkillKnowledgeReference.created_at.desc())
+        .all()
+    )
+    return {
+        "skill_id": skill_id,
+        "references": [
+            {
+                "id": r.id,
+                "knowledge_id": r.knowledge_id,
+                "folder_path": r.folder_path,
+                "snapshot_desensitization_level": r.snapshot_desensitization_level,
+                "snapshot_data_type_hits": r.snapshot_data_type_hits,
+                "snapshot_document_type": r.snapshot_document_type,
+                "snapshot_permission_domain": r.snapshot_permission_domain,
+                "snapshot_mask_rules": r.snapshot_mask_rules,
+                "mask_rule_source": r.mask_rule_source,
+                "manager_scope_ok": r.manager_scope_ok,
+                "publish_version": r.publish_version,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in refs
+        ],
+    }
 
 
 class BatchPublishRequest(BaseModel):
@@ -1826,6 +1890,40 @@ def batch_publish(
     db.commit()
     ok_count = sum(1 for r in results if r["ok"])
     return {"published": ok_count, "total": len(req.skill_ids), "results": results}
+
+
+def _save_knowledge_reference_snapshot(skill_id: int, user_id: int, kr_result: dict, db) -> None:
+    """将 precheck 结果写入 SkillKnowledgeReference 快照。"""
+    from app.models.skill_knowledge_ref import SkillKnowledgeReference
+    refs = kr_result.get("references", [])
+    if not refs:
+        return
+    # 获取当前最大 publish_version
+    max_ver = (
+        db.query(SkillKnowledgeReference.publish_version)
+        .filter(SkillKnowledgeReference.skill_id == skill_id)
+        .order_by(SkillKnowledgeReference.publish_version.desc())
+        .first()
+    )
+    new_ver = (max_ver[0] + 1) if max_ver else 1
+    for ref in refs:
+        db.add(SkillKnowledgeReference(
+            skill_id=skill_id,
+            knowledge_id=ref["knowledge_id"],
+            snapshot_desensitization_level=ref.get("desensitization_level"),
+            snapshot_data_type_hits=ref.get("data_type_hits", []),
+            snapshot_document_type=ref.get("document_type"),
+            snapshot_permission_domain=ref.get("permission_domain"),
+            snapshot_mask_rules=[
+                {"data_type": r.get("data_type"), "mask_action": r.get("mask_action")}
+                for r in ref.get("effective_mask_rules", [])
+            ],
+            mask_rule_source=ref.get("mask_rule_source"),
+            folder_id=ref.get("folder_id"),
+            folder_path=ref.get("folder_path"),
+            manager_scope_ok=ref.get("manager_scope_ok", False),
+            publish_version=new_ver,
+        ))
 
 
 def _ensure_skill_policy(skill_id: int, user: User, db) -> None:

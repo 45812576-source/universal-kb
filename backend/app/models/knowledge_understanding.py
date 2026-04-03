@@ -68,6 +68,10 @@ class KnowledgeUnderstandingProfile(Base):
     # 用户确认时的修正内容（仅存用户改过的字段）
     user_corrections = Column(JSON, nullable=True)
 
+    # ── 脱敏规则版本 & 纠错状态 ──────────────────────────────────────────────
+    mask_rule_version = Column(Integer, nullable=True)
+    correction_status = Column(String(20), nullable=True)  # pending_correction / corrected / null
+
     # ── 流水线状态 ──────────────────────────────────────────────────────────
     understanding_status = Column(String(20), default="pending", nullable=False)
     # pending/running/success/partial/failed
