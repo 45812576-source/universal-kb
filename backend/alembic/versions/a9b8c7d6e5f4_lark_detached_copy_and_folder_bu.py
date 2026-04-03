@@ -1,7 +1,7 @@
 """add folder business_unit and lark detached copy mode
 
 Revision ID: a9b8c7d6e5f4
-Revises: z7a8b9c0d1e3_approval_type_expansion
+Revises: z7a8b9c0d1e3
 Create Date: 2026-04-02 23:10:00.000000
 
 """
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "a9b8c7d6e5f4"
-down_revision: Union[str, Sequence[str], None] = "z7a8b9c0d1e3_approval_type_expansion"
+down_revision: Union[str, Sequence[str], None] = "z7a8b9c0d1e3"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
