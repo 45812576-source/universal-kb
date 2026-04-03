@@ -1,13 +1,13 @@
 """add view_state and view_invalid_reason to table_views
 
-Revision ID: a1b2c3d4e5f6
+Revision ID: a1b2c3d4e5f9
 Revises: z7a8b9c0d1e3
 Create Date: 2026-04-01
 """
 from alembic import op
 import sqlalchemy as sa
 
-revision = "a1b2c3d4e5f6"
+revision = "a1b2c3d4e5f9"
 down_revision = "z7a8b9c0d1e3"
 branch_labels = None
 depends_on = None
