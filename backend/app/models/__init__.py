@@ -4,6 +4,8 @@ from app.models.knowledge import KnowledgeEntry, KnowledgeStatus, KnowledgeRevis
 from app.models.knowledge_understanding import KnowledgeUnderstandingProfile  # noqa: F401
 from app.models.knowledge_share import KnowledgeShareLink  # noqa: F401
 from app.models.knowledge_governance import GovernanceObjective, GovernanceDepartmentMission, GovernanceKR, GovernanceRequiredElement, GovernanceResourceLibrary, GovernanceObjectType, GovernanceSuggestionTask, GovernanceFieldTemplate, GovernanceObject, GovernanceObjectFacet, GovernanceFeedbackEvent, GovernanceStrategyStat  # noqa: F401
+from app.models.knowledge_admin import KnowledgeFolderGrant, KnowledgeFolderAuditLog, KnowledgeRerunJob  # noqa: F401
+from app.models.knowledge_tag import KnowledgeTag, KnowledgeTagRelation  # noqa: F401
 from app.models.knowledge_block import KnowledgeDocumentBlock, KnowledgeChunkMapping  # noqa: F401
 from app.models.knowledge_filing import KnowledgeFilingSuggestion, KnowledgeFilingAction  # noqa: F401
 from app.models.knowledge_doc import KnowledgeDoc, KnowledgeDocSnapshot, KnowledgeDocComment  # noqa: F401

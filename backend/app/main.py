@@ -209,6 +209,7 @@ from app.models import permission  # noqa: F401
 from app.models import opencode  # noqa: F401
 from app.models import sandbox as sandbox_models  # noqa: F401
 from app.models import knowledge_job  # noqa: F401
+from app.models import skill_knowledge_ref  # noqa: F401
 
 from app.routers import auth, admin, skills, knowledge, conversations  # noqa: E402
 from app.routers import business_tables, data_tables, audit, skill_suggestions, contributions  # noqa: E402
@@ -232,6 +233,10 @@ from app.routers import skill_memos  # noqa: E402
 from app.routers import data_assets  # noqa: E402
 from app.routers import collab  # noqa: E402
 from app.routers import knowledge_governance  # noqa: E402
+from app.routers import knowledge_admin  # noqa: E402
+from app.routers import knowledge_tags  # noqa: E402
+from app.routers import knowledge_health  # noqa: E402
+from app.routers import knowledge_mask_feedback  # noqa: E402
 app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(skills.router)
@@ -270,6 +275,10 @@ app.include_router(skill_memos.router)
 app.include_router(data_assets.router)
 app.include_router(collab.router)
 app.include_router(knowledge_governance.router)
+app.include_router(knowledge_admin.router)
+app.include_router(knowledge_tags.router)
+app.include_router(knowledge_health.router)
+app.include_router(knowledge_mask_feedback.router)
 
 # 头像静态文件服务
 _avatar_dir = Path("./uploads/avatars")
