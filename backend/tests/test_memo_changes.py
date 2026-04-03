@@ -19,6 +19,29 @@ from app.models.user import Role
 from app.models.tool import ToolType
 
 
+def _attach_sandbox_report_for_tool(db, approval_request_id, tester_id, tool_id):
+    """为工具审批请求创建沙盒测试报告并关联。"""
+    from app.models.sandbox import SandboxTestSession, SandboxTestReport
+    from app.models.permission import ApprovalRequest
+    session = SandboxTestSession(
+        target_type="tool", target_id=tool_id, tester_id=tester_id,
+    )
+    db.add(session)
+    db.flush()
+    report = SandboxTestReport(
+        session_id=session.id, target_type="tool", target_id=tool_id,
+        tester_id=tester_id, approval_eligible=True, report_hash="testhash",
+    )
+    db.add(report)
+    db.flush()
+    req = db.get(ApprovalRequest, approval_request_id)
+    req.security_scan_result = {
+        "sandbox_test_report_id": report.id,
+        "report_hash": report.report_hash,
+    }
+    db.commit()
+
+
 # ─── 复用 SSE 解析 ────────────────────────────────────────────────────────────
 
 def _parse_sse(text: str) -> list[dict]:
@@ -926,6 +949,9 @@ class TestApprovalToolTargetDetail:
         assert appr is not None
         appr_id = appr["id"]
 
+        # 关联沙盒测试报告（审批通过 tool_publish 需要）
+        _attach_sandbox_report_for_tool(db, appr_id, super_adm.id, tool.id)
+
         # 部门管理员通过 → super_pending
         act1 = client.post(
             f"/api/approvals/{appr_id}/actions",
@@ -1020,6 +1046,9 @@ class TestApprovalToolTargetDetail:
         appr = next((a for a in approvals["items"] if a["target_id"] == tool.id), None)
         assert appr is not None
         assert appr["stage"] == "dept_pending"
+
+        # 关联沙盒测试报告（审批通过 tool_publish 需要）
+        _attach_sandbox_report_for_tool(db, appr["id"], super_adm.id, tool.id)
 
         act = client.post(
             f"/api/approvals/{appr['id']}/actions",

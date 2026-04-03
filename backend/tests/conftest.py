@@ -12,6 +12,7 @@ from app.database import Base, get_db
 from app.config import settings
 from app.models.user import User, Role, Department
 from app.models.skill import ModelConfig, Skill, SkillStatus, SkillMode, SkillVersion
+import app.models.sandbox  # noqa: F401 — ensure sandbox tables exist in test DB
 from app.services.auth_service import hash_password
 
 # Use an in-memory SQLite for speed; override as needed
@@ -100,6 +101,7 @@ def client():
         tasks, projects, permissions, skill_policies, approvals,
         handoff, output_schemas, sandbox, sandbox_interactive,
         skill_memos, collab, knowledge_admin, knowledge_tags,
+        dev_studio,
     )
 
     test_app = FastAPI(title="Universal KB Test API")
@@ -147,6 +149,7 @@ def client():
     test_app.include_router(collab.router)
     test_app.include_router(knowledge_admin.router)
     test_app.include_router(knowledge_tags.router)
+    test_app.include_router(dev_studio.router)
     test_app.dependency_overrides[get_db] = override_get_db
 
     with TestClient(test_app, raise_server_exceptions=True) as c:

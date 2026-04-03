@@ -36,6 +36,7 @@ import pytest
 from tests.conftest import _make_dept, _make_user, _make_skill, _login, _auth
 from app.models.user import Role
 from app.models.permission import (
+    ApprovalRequest,
     DataDomain, DataScopePolicy, GlobalDataMask, HandoffSchemaCache,
     HandoffTemplate, HandoffTemplateType, MaskAction, PolicyResourceType,
     PolicyTargetType, Position, RoleMaskOverride, RoleOutputMask,
@@ -44,6 +45,35 @@ from app.models.permission import (
 )
 from app.services.permission_engine import PermissionEngine
 from app.services.handoff_engine import HandoffEngine
+
+
+def _attach_sandbox_report(db, approval_request_id, tester_id, target_type="skill", target_id=1):
+    """为审批请求创建沙盒测试报告并关联。"""
+    from app.models.sandbox import SandboxTestSession, SandboxTestReport
+    session = SandboxTestSession(
+        target_type=target_type,
+        target_id=target_id,
+        tester_id=tester_id,
+    )
+    db.add(session)
+    db.flush()
+    report = SandboxTestReport(
+        session_id=session.id,
+        target_type=target_type,
+        target_id=target_id,
+        tester_id=tester_id,
+        approval_eligible=True,
+        report_hash="testhash123",
+    )
+    db.add(report)
+    db.flush()
+    req = db.get(ApprovalRequest, approval_request_id)
+    req.security_scan_result = {
+        "sandbox_test_report_id": report.id,
+        "report_hash": report.report_hash,
+    }
+    db.commit()
+    return report
 
 
 # ─── 共用 Fixture ─────────────────────────────────────────────────────────────
@@ -617,6 +647,7 @@ class TestApprovalFlow:
             "request_type": "skill_publish", "target_id": 1, "target_type": "skill"
         }, headers=emp_headers)
         rid = r.json()["id"]
+        _attach_sandbox_report(db, rid, admin.id, target_type="skill", target_id=1)
         resp = client.post(f"/api/approvals/{rid}/actions", json={
             "action": "approve", "comment": "通过"
         }, headers=admin_headers)
@@ -669,6 +700,7 @@ class TestApprovalFlow:
         admin, admin_headers = _make_admin(db, client)
         r = client.post("/api/approvals", json={"request_type": "skill_publish"}, headers=emp_headers)
         rid = r.json()["id"]
+        _attach_sandbox_report(db, rid, admin.id, target_type="skill", target_id=1)
         client.post(f"/api/approvals/{rid}/actions", json={"action": "approve"}, headers=admin_headers)
         resp = client.post(f"/api/approvals/{rid}/actions", json={"action": "reject"}, headers=admin_headers)
         assert resp.status_code == 400

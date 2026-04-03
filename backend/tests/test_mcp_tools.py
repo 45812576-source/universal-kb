@@ -384,6 +384,20 @@ class TestApprovalInstallHook:
         )
         db.add(tool)
         db.flush()
+        # 创建沙盒测试报告（审批通过需要关联）
+        from app.models.sandbox import SandboxTestSession, SandboxTestReport
+        session = SandboxTestSession(
+            target_type="tool", target_id=tool.id, tester_id=sa.id,
+        )
+        db.add(session)
+        db.flush()
+        report = SandboxTestReport(
+            session_id=session.id, target_type="tool", target_id=tool.id,
+            tester_id=sa.id, approval_eligible=True, report_hash="testhash",
+        )
+        db.add(report)
+        db.flush()
+
         req = ApprovalRequest(
             request_type=ApprovalRequestType.TOOL_PUBLISH,
             target_id=tool.id,
@@ -391,6 +405,10 @@ class TestApprovalInstallHook:
             requester_id=emp.id,
             status=ApprovalStatus.PENDING,
             stage=stage,
+            security_scan_result={
+                "sandbox_test_report_id": report.id,
+                "report_hash": report.report_hash,
+            },
         )
         db.add(req)
         db.commit()
@@ -449,6 +467,20 @@ class TestApprovalInstallHook:
         )
         db.add(tool)
         db.flush()
+        # 创建沙盒测试报告（审批通过需要关联）
+        from app.models.sandbox import SandboxTestSession, SandboxTestReport
+        session = SandboxTestSession(
+            target_type="tool", target_id=tool.id, tester_id=sa.id,
+        )
+        db.add(session)
+        db.flush()
+        report = SandboxTestReport(
+            session_id=session.id, target_type="tool", target_id=tool.id,
+            tester_id=sa.id, approval_eligible=True, report_hash="testhash",
+        )
+        db.add(report)
+        db.flush()
+
         req = ApprovalRequest(
             request_type=ApprovalRequestType.TOOL_PUBLISH,
             target_id=tool.id,
@@ -456,6 +488,10 @@ class TestApprovalInstallHook:
             requester_id=emp.id,
             status=ApprovalStatus.PENDING,
             stage="dept_pending",
+            security_scan_result={
+                "sandbox_test_report_id": report.id,
+                "report_hash": report.report_hash,
+            },
         )
         db.add(req)
         db.commit()

@@ -172,7 +172,7 @@ class TestPEVOrchestrator:
 
         event_types = [e["event"] for e in events]
         assert "pev_start" in event_types
-        assert "pev_plan" in event_types
+        assert "pev_plan_ready" in event_types
         assert "pev_step_start" in event_types
         assert "pev_step_result" in event_types
         assert "pev_done" in event_types

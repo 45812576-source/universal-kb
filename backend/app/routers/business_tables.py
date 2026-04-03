@@ -296,7 +296,7 @@ async def generate_from_existing(
 def apply_schema(
     req: ApplySchemaRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
 ):
     """Confirm: execute DDL, register table, optionally create Skill."""
     from app.services.schema_generator import schema_generator
