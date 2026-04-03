@@ -282,8 +282,8 @@ def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None
         "ai_summary": e.ai_summary,
         "ai_tags": e.ai_tags,
         "quality_score": e.quality_score,
-        # 云文档渲染状态
-        "doc_render_status": e.doc_render_status,
+        # 云文档渲染状态（无文件的手动文档不需要渲染，修正历史 pending 数据）
+        "doc_render_status": None if (e.doc_render_status == "pending" and not e.oss_key) else e.doc_render_status,
         "doc_render_error": e.doc_render_error,
         "doc_render_mode": e.doc_render_mode,
         # 来源与同步
@@ -417,6 +417,7 @@ def create_knowledge(
         source_type="manual",
         capture_mode="manual_form",
         folder_id=folder_id,
+        doc_render_status=None,
     )
     db.add(entry)
     db.flush()
