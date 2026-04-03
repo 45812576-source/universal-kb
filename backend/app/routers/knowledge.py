@@ -784,10 +784,14 @@ def list_knowledge(
     doc_render_status: str = None,
     classification_status: str = None,
     unfiled: bool = False,
+    owner_only: bool = False,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    q = _apply_knowledge_visibility(db.query(KnowledgeEntry), user)
+    if owner_only:
+        q = db.query(KnowledgeEntry).filter(KnowledgeEntry.created_by == user.id)
+    else:
+        q = _apply_knowledge_visibility(db.query(KnowledgeEntry), user)
 
     if status:
         q = q.filter(KnowledgeEntry.status == status)
@@ -1091,17 +1095,27 @@ def _folder_dict(f: KnowledgeFolder) -> dict:
     }
 
 
-@router.get("/folders")
+@router.get(“/folders”)
 def list_folders(
+    owner_only: bool = False,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """返回文件夹列表（扁平列表，前端自行构建树）。
+    “””返回文件夹列表（扁平列表，前端自行构建树）。
 
     规则：
-    - 用户自建目录：只返回当前用户自己的
-    - 系统归档树：所有用户 always visible，保证自动归档后的文档不会“消失”
-    """
+    - owner_only=true：只返回当前用户自己创建的文件夹（”我的知识”视图）
+    - owner_only=false（默认）：用户自建 + 系统归档树 + 可见文档所在文件夹
+    “””
+    if owner_only:
+        folders = (
+            db.query(KnowledgeFolder)
+            .filter(KnowledgeFolder.created_by == user.id)
+            .order_by(KnowledgeFolder.sort_order, KnowledgeFolder.id)
+            .all()
+        )
+        return [_folder_dict(f) for f in folders]
+
     visible_folder_ids = {
         folder_id
         for (folder_id,) in _apply_knowledge_visibility(
