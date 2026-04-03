@@ -75,22 +75,23 @@ def db_session():
 
 @pytest.fixture(autouse=True)
 def seed_workspace_users(db_session):
-    dept = _make_dept(db_session, name="工作台测试部门")
+    import uuid as _uuid
+    dept = _make_dept(db_session, name=f"工作台测试部门_{_uuid.uuid4().hex[:6]}")
     admin = _make_user(
         db_session,
-        username="workspace_admin",
+        username=f"workspace_admin_{_uuid.uuid4().hex[:6]}",
         role=Role.SUPER_ADMIN,
         dept_id=dept.id,
     )
     employee = _make_user(
         db_session,
-        username="workspace_employee",
+        username=f"workspace_employee_{_uuid.uuid4().hex[:6]}",
         role=Role.EMPLOYEE,
         dept_id=dept.id,
     )
     _make_model_config(db_session)
-    _make_skill(db_session, user_id=admin.id, name="个人技能")
-    _make_tool(db_session, user_id=admin.id, name="personal_tool")
+    _make_skill(db_session, user_id=admin.id)
+    _make_tool(db_session, user_id=admin.id)
     db_session.commit()
     return {"dept": dept, "admin": admin, "employee": employee}
 

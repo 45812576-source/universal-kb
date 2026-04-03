@@ -64,14 +64,18 @@ def clean_tables():
     yield
     db = TestingSessionLocal()
     try:
-        db.execute(text("PRAGMA foreign_keys = OFF"))
-        for table in reversed(Base.metadata.sorted_tables):
+        # SQLite: PRAGMA 必须在自动提交模式或独立事务中执行
+        conn = db.connection()
+        conn.execute(text("PRAGMA foreign_keys = OFF"))
+        for table in Base.metadata.sorted_tables:
             try:
-                db.execute(table.delete())
+                conn.execute(table.delete())
             except Exception:
-                db.rollback()
-        db.execute(text("PRAGMA foreign_keys = ON"))
+                pass
+        conn.execute(text("PRAGMA foreign_keys = ON"))
         db.commit()
+    except Exception:
+        db.rollback()
     finally:
         db.close()
 
@@ -87,7 +91,16 @@ def db():
 
 @pytest.fixture
 def client():
-    from app.routers import auth, knowledge, knowledge_governance, user_workspace_config, mcp_server, admin, conversations, data_assets
+    from app.routers import (
+        auth, knowledge, knowledge_governance, user_workspace_config,
+        mcp_server, admin, conversations, data_assets,
+        skills, business_tables, data_tables, audit, skill_suggestions,
+        contributions, table_views, tools, files, intel, lark,
+        web_apps, workspaces, skill_market, mcp_tokens, drafts,
+        tasks, projects, permissions, skill_policies, approvals,
+        handoff, output_schemas, sandbox, sandbox_interactive,
+        skill_memos, collab, knowledge_admin, knowledge_tags,
+    )
 
     test_app = FastAPI(title="Universal KB Test API")
     test_app.add_middleware(
@@ -98,13 +111,42 @@ def client():
         allow_headers=["*"],
     )
     test_app.include_router(auth.router)
+    test_app.include_router(admin.router)
+    test_app.include_router(skills.router)
     test_app.include_router(knowledge.router)
     test_app.include_router(knowledge_governance.router)
     test_app.include_router(data_assets.router)
     test_app.include_router(user_workspace_config.router)
     test_app.include_router(mcp_server.router)
-    test_app.include_router(admin.router)
+    test_app.include_router(mcp_tokens.router)
     test_app.include_router(conversations.router)
+    test_app.include_router(business_tables.router)
+    test_app.include_router(table_views.router)
+    test_app.include_router(data_tables.router)
+    test_app.include_router(audit.router)
+    test_app.include_router(skill_suggestions.router)
+    test_app.include_router(contributions.router)
+    test_app.include_router(tools.router)
+    test_app.include_router(files.router)
+    test_app.include_router(intel.router)
+    test_app.include_router(lark.router)
+    test_app.include_router(web_apps.router)
+    test_app.include_router(workspaces.router)
+    test_app.include_router(skill_market.router)
+    test_app.include_router(drafts.router)
+    test_app.include_router(tasks.router)
+    test_app.include_router(projects.router)
+    test_app.include_router(permissions.router)
+    test_app.include_router(skill_policies.router)
+    test_app.include_router(approvals.router)
+    test_app.include_router(handoff.router)
+    test_app.include_router(output_schemas.router)
+    test_app.include_router(sandbox.router)
+    test_app.include_router(sandbox_interactive.router)
+    test_app.include_router(skill_memos.router)
+    test_app.include_router(collab.router)
+    test_app.include_router(knowledge_admin.router)
+    test_app.include_router(knowledge_tags.router)
     test_app.dependency_overrides[get_db] = override_get_db
 
     with TestClient(test_app, raise_server_exceptions=True) as c:
@@ -151,7 +193,9 @@ def _make_model_config(db):
     return mc
 
 
-def _make_skill(db, user_id, name="测试Skill", status=SkillStatus.PUBLISHED):
+def _make_skill(db, user_id, name=None, status=SkillStatus.PUBLISHED):
+    if name is None:
+        name = f"测试Skill_{uuid.uuid4().hex[:8]}"
     skill = Skill(
         name=name,
         description="用于测试",
@@ -223,7 +267,9 @@ def _make_intel_entry(db, source_id=None, title="测试情报", status=IntelEntr
     return entry
 
 
-def _make_tool(db, user_id, name="test_tool", tool_type=ToolType.BUILTIN):
+def _make_tool(db, user_id, name=None, tool_type=ToolType.BUILTIN):
+    if name is None:
+        name = f"test_tool_{uuid.uuid4().hex[:8]}"
     tool = ToolRegistry(
         name=name,
         display_name=f"工具-{name}",

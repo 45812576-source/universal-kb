@@ -17,13 +17,24 @@ def _make_conv(skill_id=None):
     return conv
 
 
+def _make_mock_db():
+    """创建 mock db，确保 query 链返回空结果（避免 _check_model_grant 误判）。"""
+    db = MagicMock()
+    mock_chain = MagicMock()
+    mock_chain.filter.return_value = mock_chain
+    mock_chain.first.return_value = None
+    mock_chain.all.return_value = []
+    db.query.return_value = mock_chain
+    return db
+
+
 # ─── prepare: InputEvaluator early return ─────────────────────────────────────
 
 class TestPrepareInputEvaluator:
     @pytest.mark.asyncio
     async def test_missing_required_input_triggers_early_return(self):
         engine = _make_engine()
-        db = MagicMock()
+        db = _make_mock_db()
         conv = _make_conv()
 
         skill = MagicMock()
@@ -59,7 +70,7 @@ class TestPrepareInputEvaluator:
     @pytest.mark.asyncio
     async def test_sufficient_inputs_pass_through(self):
         engine = _make_engine()
-        db = MagicMock()
+        db = _make_mock_db()
         conv = _make_conv()
 
         with patch.object(engine, "_match_skill", return_value=None), \
@@ -76,7 +87,7 @@ class TestPrepareRuleEngine:
     @pytest.mark.asyncio
     async def test_structured_mode_rule_engine_hit_early_returns(self):
         engine = _make_engine()
-        db = MagicMock()
+        db = _make_mock_db()
         conv = _make_conv()
 
         skill = MagicMock()
@@ -110,7 +121,7 @@ class TestPrepareRuleEngine:
     async def test_rule_engine_none_falls_through(self):
         """rule_engine 返回 None 时继续正常流程。"""
         engine = _make_engine()
-        db = MagicMock()
+        db = _make_mock_db()
         conv = _make_conv()
 
         skill = MagicMock()
@@ -145,6 +156,7 @@ class TestContextCompaction:
     @pytest.mark.asyncio
     async def test_compact_triggered_above_threshold(self):
         engine = _make_engine()
+        db = _make_mock_db()
         # 制造 context_window=1000，消息填满 90% (>85%)
         model_config = {"context_window": 1000}
         # 每个 message 约 500 chars → token ≈ 250，3 条共 750 tokens > 850 threshold
@@ -162,7 +174,7 @@ class TestContextCompaction:
 
         with patch.object(engine, "_summarize_history",
                           new=AsyncMock(return_value="前期对话摘要：用户讨论了营销策略...")):
-            result = await engine._compact_if_needed(messages, model_config)
+            result = await engine._compact_if_needed(db, messages, model_config)
 
         # 结果中应包含摘要消息
         contents = [m.get("content", "") for m in result]
@@ -173,19 +185,21 @@ class TestContextCompaction:
     @pytest.mark.asyncio
     async def test_compact_not_triggered_below_threshold(self):
         engine = _make_engine()
+        db = _make_mock_db()
         model_config = {"context_window": 32000}
         messages = [
             {"role": "system", "content": "指令"},
             {"role": "user", "content": "你好"},
             {"role": "assistant", "content": "你好！"},
         ]
-        result = await engine._compact_if_needed(messages, model_config)
+        result = await engine._compact_if_needed(db, messages, model_config)
         # 未超阈值，原样返回
         assert result == messages
 
     @pytest.mark.asyncio
     async def test_compact_failure_returns_original(self):
         engine = _make_engine()
+        db = _make_mock_db()
         model_config = {"context_window": 100}
         messages = [
             {"role": "system", "content": "S"},
@@ -195,7 +209,7 @@ class TestContextCompaction:
         ]
         with patch.object(engine, "_summarize_history",
                           new=AsyncMock(side_effect=Exception("LLM 不可用"))):
-            result = await engine._compact_if_needed(messages, model_config)
+            result = await engine._compact_if_needed(db, messages, model_config)
         # 失败降级：返回原始消息
         assert result == messages
 
