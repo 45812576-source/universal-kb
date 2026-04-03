@@ -1,9 +1,8 @@
-import datetime
-
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import relationship
 
 from app.database import Base
+from app.utils.time_utils import utcnow
 
 
 class KnowledgeShareLink(Base):
@@ -19,11 +18,11 @@ class KnowledgeShareLink(Base):
     last_accessed_at = Column(DateTime, nullable=True)
     access_count = Column(Integer, default=0, nullable=False)
     note = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
     updated_at = Column(
         DateTime,
-        default=datetime.datetime.utcnow,
-        onupdate=datetime.datetime.utcnow,
+        default=utcnow,
+        onupdate=utcnow,
     )
 
     knowledge = relationship("KnowledgeEntry")

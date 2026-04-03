@@ -1,4 +1,5 @@
 from app.models.knowledge import KnowledgeEntry, KnowledgeStatus, ReviewStage
+from app.models.knowledge import KnowledgeFolder
 from app.models.user import Role
 from tests.conftest import _auth, _login, _make_dept, _make_user
 
@@ -60,3 +61,61 @@ def test_super_admin_can_see_all_statuses(client, db):
     titles = _titles(resp)
     assert "超管看待审" in titles
     assert "超管看通过" in titles
+
+
+def test_employee_list_visible_entry_detail_is_also_accessible(client, db):
+    dept = _make_dept(db, "矩阵部门E")
+    owner = _make_user(db, "matrix_emp_owner2", Role.EMPLOYEE, dept.id)
+    other = _make_user(db, "matrix_emp_other2", Role.EMPLOYEE, dept.id)
+    approved = KnowledgeEntry(
+        title="别人的已通过详情一致",
+        content="x",
+        category="experience",
+        status=KnowledgeStatus.APPROVED,
+        review_stage=ReviewStage.APPROVED,
+        created_by=other.id,
+        department_id=dept.id,
+    )
+    db.add_all([approved])
+    db.commit()
+
+    token = _login(client, "matrix_emp_owner2")
+    list_resp = client.get("/api/knowledge", headers=_auth(token))
+    assert list_resp.status_code == 200
+    ids = [item["id"] for item in list_resp.json()]
+    assert approved.id in ids
+
+    detail_resp = client.get(f"/api/knowledge/{approved.id}", headers=_auth(token))
+    assert detail_resp.status_code == 200
+
+
+def test_list_folders_includes_visible_system_folder_for_entry(client, db):
+    dept = _make_dept(db, "矩阵部门F")
+    owner = _make_user(db, "matrix_emp_owner3", Role.EMPLOYEE, dept.id)
+    other = _make_user(db, "matrix_emp_other3", Role.EMPLOYEE, dept.id)
+    system_folder = KnowledgeFolder(
+        name="系统归档节点",
+        parent_id=None,
+        created_by=other.id,
+        is_system=1,
+    )
+    db.add(system_folder)
+    db.flush()
+    approved = KnowledgeEntry(
+        title="系统目录文档",
+        content="x",
+        category="experience",
+        status=KnowledgeStatus.APPROVED,
+        review_stage=ReviewStage.APPROVED,
+        created_by=other.id,
+        department_id=dept.id,
+        folder_id=system_folder.id,
+    )
+    db.add(approved)
+    db.commit()
+
+    token = _login(client, "matrix_emp_owner3")
+    resp = client.get("/api/knowledge/folders", headers=_auth(token))
+    assert resp.status_code == 200
+    folder_ids = {item["id"] for item in resp.json()}
+    assert system_folder.id in folder_ids

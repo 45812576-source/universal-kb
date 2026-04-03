@@ -1,11 +1,12 @@
 import datetime
 import enum
 
-from sqlalchemy import BigInteger, Column, DateTime, Enum, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, Enum, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import relationship
 
 from app.database import Base
+from app.utils.time_utils import utcnow
 
 
 class KnowledgeFolder(Base):
@@ -23,7 +24,7 @@ class KnowledgeFolder(Base):
     is_system = Column(Integer, default=0)               # 0=用户自建 1=系统归档树
     taxonomy_board = Column(String(10), nullable=True)    # A/B/C/D/E/F 对应知识大类
     taxonomy_code = Column(String(50), nullable=True)     # 完整分类编码
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
     children = relationship(
         "KnowledgeFolder",
@@ -162,6 +163,10 @@ class KnowledgeEntry(Base):
     sync_status = Column(String(20), default="idle", nullable=True)   # idle/syncing/ok/error
     sync_error = Column(Text, nullable=True)                  # 同步失败原因
 
+    # ── 知识管理后台 V1.5 ─────────────────────────────────────────────────────
+    system_title_prefix = Column(String(100), nullable=True)    # 系统编号前缀
+    manual_title_locked = Column(Boolean, default=False)         # 用户锁定标题
+
     # ── 知识治理底座锚点 ──────────────────────────────────────────────────────
     governance_objective_id = Column(Integer, ForeignKey("governance_objectives.id"), nullable=True)
     resource_library_id = Column(Integer, ForeignKey("governance_resource_libraries.id"), nullable=True)
@@ -173,11 +178,11 @@ class KnowledgeEntry(Base):
     governance_confidence = Column(Float, nullable=True)
     governance_note = Column(Text, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
     updated_at = Column(
         DateTime,
-        default=datetime.datetime.utcnow,
-        onupdate=datetime.datetime.utcnow,
+        default=utcnow,
+        onupdate=utcnow,
     )
 
     creator = relationship("User", foreign_keys=[created_by])
@@ -200,7 +205,7 @@ class KnowledgeRevision(Base):
     diff_content = Column(Text, nullable=True)   # 与上一版本的 diff
     version = Column(Integer, nullable=False, default=1)
     visibility = Column(String(50), default="super_admin_only")
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
     knowledge = relationship("KnowledgeEntry", back_populates="revisions")
 
@@ -213,7 +218,7 @@ class KnowledgeEditGrant(Base):
     entry_id = Column(Integer, ForeignKey("knowledge_entries.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     granted_by = Column(Integer, ForeignKey("users.id"), nullable=False)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
     entry = relationship("KnowledgeEntry")
     user = relationship("User", foreign_keys=[user_id])

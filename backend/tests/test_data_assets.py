@@ -6,6 +6,7 @@
 - data_assets API endpoints (目录/表列表/详情/移动/画像/绑定/同步)
 - field_profiler 基本逻辑
 """
+from app.utils.time_utils import utcnow
 import pytest
 from tests.conftest import _make_user, _make_dept, _make_skill, _make_model_config, _login, _auth
 from app.models.user import Role
@@ -69,7 +70,7 @@ class TestDataFolderModel:
         f = _make_folder(db, "归档测试")
         f.is_archived = True
         db.commit()
-        assert db.query(DataFolder).get(f.id).is_archived is True
+        assert db.get(DataFolder, f.id).is_archived is True
 
 
 class TestTableFieldModel:
@@ -100,7 +101,7 @@ class TestTableFieldModel:
         )
         db.add(tf)
         db.commit()
-        loaded = db.query(TableField).get(tf.id)
+        loaded = db.get(TableField, tf.id)
         assert loaded.enum_values == ["待跟进", "已签约", "已流失"]
         assert loaded.enum_source == "source_declared"
 
@@ -124,18 +125,17 @@ class TestTableSyncJobModel:
     def test_sync_job_lifecycle(self, db):
         admin, _ = _setup_admin(db)
         bt = _make_business_table(db, "sj_life", "生命周期测试", admin.id)
-        import datetime
         job = TableSyncJob(
             table_id=bt.id, source_type="lark_bitable", job_type="full_sync",
-            status="running", started_at=datetime.datetime.utcnow(),
+            status="running", started_at=utcnow(),
         )
         db.add(job)
         db.flush()
         job.status = "success"
-        job.finished_at = datetime.datetime.utcnow()
+        job.finished_at = utcnow()
         job.stats = {"inserted": 100, "updated": 5}
         db.commit()
-        loaded = db.query(TableSyncJob).get(job.id)
+        loaded = db.get(TableSyncJob, job.id)
         assert loaded.status == "success"
         assert loaded.stats["inserted"] == 100
 
@@ -218,7 +218,7 @@ class TestFolderAPI:
         assert r2.status_code == 200
         child_id = r2.json()["id"]
         # Verify via folder tree
-        child = db.query(DataFolder).get(child_id)
+        child = db.get(DataFolder, child_id)
         assert child.parent_id == parent_id
 
     def test_rename_folder(self, client, db):

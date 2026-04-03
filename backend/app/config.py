@@ -1,7 +1,10 @@
+from pydantic import ConfigDict
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
+    model_config = ConfigDict(env_file=".env", extra="ignore")
+
     DATABASE_URL: str = "mysql+pymysql://root@localhost:3306/universal_kb"
     JWT_SECRET: str = "change-me-in-production"
     JWT_ALGORITHM: str = "HS256"
@@ -43,10 +46,5 @@ class Settings(BaseSettings):
     BAILIAN_QUOTA_5H: int = 6000    # 每 5 小时最多请求数
     BAILIAN_QUOTA_7D: int = 45000   # 每 7 天最多请求数
     BAILIAN_QUOTA_30D: int = 90000  # 每订阅月最多请求数
-
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
-
 
 settings = Settings()

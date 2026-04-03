@@ -6,6 +6,7 @@ from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import relationship
 
 from app.database import Base
+from app.utils.time_utils import utcnow
 
 
 class VisibilityLevel(str, enum.Enum):
@@ -25,7 +26,7 @@ class DataOwnership(Base):
         Enum(VisibilityLevel, values_callable=lambda obj: [e.value for e in obj]),
         default=VisibilityLevel.DETAIL,
     )
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
 
 class BusinessTable(Base):
@@ -60,11 +61,11 @@ class BusinessTable(Base):
     governance_element_id = Column(Integer, ForeignKey("governance_required_elements.id"), nullable=True)
     governance_status = Column(String(20), default="ungoverned")
     governance_note = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
     updated_at = Column(
         DateTime,
-        default=datetime.datetime.utcnow,
-        onupdate=datetime.datetime.utcnow,
+        default=utcnow,
+        onupdate=utcnow,
     )
 
     owner = relationship("User", foreign_keys=[owner_id])
@@ -82,7 +83,7 @@ class AuditLog(Base):
     old_values = Column(JSON)
     new_values = Column(JSON)
     sql_executed = Column(Text)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
 
 class SkillDataQuery(Base):
@@ -153,11 +154,22 @@ class DataFolder(Base):
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     sort_order = Column(Integer, default=0)
     is_archived = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
-    parent = relationship("DataFolder", remote_side="DataFolder.id", foreign_keys=[parent_id])
-    children = relationship("DataFolder", foreign_keys=[parent_id])
+    parent = relationship(
+        "DataFolder",
+        remote_side="DataFolder.id",
+        foreign_keys=[parent_id],
+        back_populates="children",
+        overlaps="children",
+    )
+    children = relationship(
+        "DataFolder",
+        foreign_keys=[parent_id],
+        back_populates="parent",
+        overlaps="parent",
+    )
 
 
 class TableField(Base):

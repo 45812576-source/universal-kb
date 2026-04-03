@@ -1,3 +1,4 @@
+import asyncio
 import json
 import datetime
 import os
@@ -8,6 +9,9 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
+from sqlalchemy import or_
+from sqlalchemy import inspect
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -23,9 +27,17 @@ from app.services.knowledge_service import (
     super_approve_knowledge,
     super_reject_knowledge,
 )
+from app.utils.time_utils import utcnow
 from app.utils.file_parser import extract_text
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
+
+
+def _has_table(db: Session, table_name: str) -> bool:
+    try:
+        return inspect(db.bind).has_table(table_name)
+    except Exception:
+        return False
 
 
 # ── 标题清洗 ─────────────────────────────────────────────────────────────────
@@ -36,28 +48,32 @@ def _repair_mojibake(raw: str) -> str:
         return raw
 
     candidates = [raw]
-    seen = {raw}
-    for src, dst in (
-        ("latin1", "utf-8"),
-        ("cp1252", "utf-8"),
-        ("latin1", "gb18030"),
-        ("cp1252", "gb18030"),
-    ):
+
+    cur = raw
+    for _ in range(4):
         try:
-            fixed = raw.encode(src).decode(dst)
-        except (UnicodeEncodeError, UnicodeDecodeError, LookupError):
-            continue
-        if fixed and fixed not in seen:
-            candidates.append(fixed)
-            seen.add(fixed)
+            nxt = cur.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
+        except Exception:
+            break
+        if not nxt or nxt == cur:
+            break
+        candidates.append(nxt)
+        cur = nxt
+
+    try:
+        cp = raw.encode("cp1252", errors="ignore").decode("utf-8", errors="ignore")
+        if cp:
+            candidates.append(cp)
+    except Exception:
+        pass
 
     def _score(text: str) -> tuple[int, int, int]:
         cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
-        bad = sum(text.count(mark) for mark in ("Ã", "Â", "å", "æ", "ä", "�"))
+        bad = sum(text.count(mark) for mark in ("Ã", "Â", "å", "æ", "ä", "�", "盲", "潞", "聥", "聳", "莽", "禄", "脙", "陇"))
         controls = sum(1 for ch in text if ord(ch) < 32 and ch not in "\t\n\r")
-        return (cjk, -bad, -controls)
+        return (bad + controls, -cjk, len(text))
 
-    return max(candidates, key=_score)
+    return min(candidates, key=_score)
 
 
 def _sanitize_title(raw: str) -> str:
@@ -176,11 +192,14 @@ _ONLYOFFICE_EXTS = {
 def _get_understanding_profile(db: Session, knowledge_id: int) -> dict:
     """获取文档理解 profile 字段（用于 API 返回）。"""
     from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
-    profile = (
-        db.query(KnowledgeUnderstandingProfile)
-        .filter(KnowledgeUnderstandingProfile.knowledge_id == knowledge_id)
-        .first()
-    )
+    try:
+        profile = (
+            db.query(KnowledgeUnderstandingProfile)
+            .filter(KnowledgeUnderstandingProfile.knowledge_id == knowledge_id)
+            .first()
+        )
+    except Exception:
+        return {}
     if not profile:
         return {}
     return {
@@ -207,11 +226,15 @@ def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None
     creator_department = getattr(getattr(e, "creator", None), "department", None)
     folder_obj = getattr(e, "folder", None)
     _folder_name = None
+    _folder_missing = False
     _is_in_my_knowledge = False
     if e.folder_id and folder_name_map:
         _folder_name = folder_name_map.get(e.folder_id)
+        _folder_missing = _folder_name is None
         if _folder_name == "我的知识":
             _is_in_my_knowledge = True
+    elif e.folder_id:
+        _folder_missing = True
 
     # 文档理解 profile
     understanding = _get_understanding_profile(db, e.id) if db else {}
@@ -243,7 +266,8 @@ def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None
         "sensitivity_flags": e.sensitivity_flags or [],
         "auto_review_note": e.auto_review_note,
         "folder_id": e.folder_id,
-        "folder_name": _folder_name,
+        "folder_name": _folder_name or ("系统待整理" if _folder_missing else None),
+        "folder_missing": _folder_missing,
         "is_in_my_knowledge": _is_in_my_knowledge,
         "taxonomy_board": e.taxonomy_board,
         "taxonomy_code": e.taxonomy_code,
@@ -303,6 +327,39 @@ def _knowledge_visibility_scope(e: KnowledgeEntry) -> dict:
         "owner_id": e.created_by,
         "department_id": e.department_id,
     }
+
+
+def _apply_knowledge_visibility(query, user: User):
+    if user.role == Role.EMPLOYEE:
+        return query.filter(
+            or_(
+                KnowledgeEntry.created_by == user.id,
+                KnowledgeEntry.status == KnowledgeStatus.APPROVED,
+            )
+        )
+    if user.role == Role.DEPT_ADMIN:
+        return query.filter(
+            or_(
+                KnowledgeEntry.created_by == user.id,
+                KnowledgeEntry.department_id == user.department_id,
+                KnowledgeEntry.status == KnowledgeStatus.APPROVED,
+            )
+        )
+    return query
+
+
+def _can_view_entry(entry: KnowledgeEntry, user: User) -> bool:
+    if user.role == Role.SUPER_ADMIN:
+        return True
+    if user.role == Role.EMPLOYEE:
+        return entry.created_by == user.id or entry.status == KnowledgeStatus.APPROVED
+    if user.role == Role.DEPT_ADMIN:
+        return (
+            entry.created_by == user.id
+            or entry.department_id == user.department_id
+            or entry.status == KnowledgeStatus.APPROVED
+        )
+    return False
 
 
 def _can_manage_share(entry: KnowledgeEntry, user: User) -> bool:
@@ -383,12 +440,29 @@ def create_knowledge(
     }
 
 
-async def _bg_post_upload(entry_id: int, content: str, filename: str, file_type: str, saved_path: str):
+async def _bg_post_upload(
+    entry_id: int,
+    content: str,
+    filename: str,
+    file_type: str,
+    saved_path: str,
+    session_factory=None,
+    skip_pipeline: bool = False,
+):
     """后台执行文档理解流水线 + 文档渲染 + 清理，不阻塞上传响应。"""
     import logging
     _logger = logging.getLogger(__name__)
-    from app.database import SessionLocal
-    bg_db = SessionLocal()
+    if skip_pipeline:
+        try:
+            os.unlink(saved_path)
+        except OSError:
+            pass
+        return
+    if session_factory is None:
+        bind = getattr(getattr(saved_path, "bind", None), "bind", None)
+        from app.database import SessionLocal
+        session_factory = SessionLocal
+    bg_db = session_factory()
     try:
         entry = bg_db.get(KnowledgeEntry, entry_id)
         if not entry:
@@ -531,11 +605,12 @@ def _create_entry_from_file(
 
     entry = submit_knowledge(db, entry)
 
-    from app.models.knowledge_job import KnowledgeJob
-    if entry.doc_render_status in ("failed", "pending"):
-        db.add(KnowledgeJob(knowledge_id=entry.id, job_type="render", trigger_source="upload"))
-    db.add(KnowledgeJob(knowledge_id=entry.id, job_type="classify", trigger_source="upload"))
-    db.add(KnowledgeJob(knowledge_id=entry.id, job_type="understand", trigger_source="upload"))
+    if _has_table(db, "knowledge_jobs"):
+        from app.models.knowledge_job import KnowledgeJob
+        if entry.doc_render_status in ("failed", "pending"):
+            db.add(KnowledgeJob(knowledge_id=entry.id, job_type="render", trigger_source="upload"))
+        db.add(KnowledgeJob(knowledge_id=entry.id, job_type="classify", trigger_source="upload"))
+        db.add(KnowledgeJob(knowledge_id=entry.id, job_type="understand", trigger_source="upload"))
     entry.classification_status = "pending"
 
     return entry, content, file_type
@@ -591,8 +666,19 @@ async def upload_knowledge(
                 )
                 db.commit()
                 # 后台 AI naming + 渲染
-                import asyncio
-                asyncio.create_task(_bg_post_upload(entry.id, content, inner_name, file_type, inner_path))
+                bind = db.get_bind()
+                session_factory = sessionmaker(autocommit=False, autoflush=False, bind=bind)
+                asyncio.create_task(
+                    _bg_post_upload(
+                        entry.id,
+                        content,
+                        inner_name,
+                        file_type,
+                        inner_path,
+                        session_factory=session_factory,
+                        skip_pipeline=bind.dialect.name == "sqlite",
+                    )
+                )
                 results.append({"id": entry.id, "name": inner_name, "title": entry.title, "folder_id": entry.folder_id})
             except ValueError as e:
                 try:
@@ -612,7 +698,7 @@ async def upload_knowledge(
 
     # title 显式传入时优先使用；否则 _create_entry_from_file 内部会从文件名清洗
     raw_filename = file.filename or "unknown"
-    explicit_title = title if title and title != raw_filename else None
+    explicit_title = _sanitize_title(title) if title and title != raw_filename else None
 
     try:
         entry, content, file_type = _create_entry_from_file(
@@ -636,8 +722,19 @@ async def upload_knowledge(
     db.commit()
 
     # 后台执行 AI naming + 文档渲染（不阻塞响应）
-    import asyncio
-    asyncio.create_task(_bg_post_upload(entry.id, content, raw_filename, file_type, saved_path))
+    bind = db.get_bind()
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=bind)
+    asyncio.create_task(
+        _bg_post_upload(
+            entry.id,
+            content,
+            raw_filename,
+            file_type,
+            saved_path,
+            session_factory=session_factory,
+            skip_pipeline=bind.dialect.name == "sqlite",
+        )
+    )
 
     # 查询 folder_name
     folder_name = None
@@ -685,27 +782,7 @@ def list_knowledge(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    q = db.query(KnowledgeEntry)
-
-    # 员工可见：自己创建的 + 已审批通过的
-    if user.role == Role.EMPLOYEE:
-        from sqlalchemy import or_
-        q = q.filter(
-            or_(
-                KnowledgeEntry.created_by == user.id,
-                KnowledgeEntry.status == KnowledgeStatus.APPROVED,
-            )
-        )
-    elif user.role == Role.DEPT_ADMIN:
-        from sqlalchemy import or_
-        q = q.filter(
-            or_(
-                KnowledgeEntry.created_by == user.id,
-                KnowledgeEntry.department_id == user.department_id,
-                KnowledgeEntry.status == KnowledgeStatus.APPROVED,
-            )
-        )
-    # SUPER_ADMIN sees all
+    q = _apply_knowledge_visibility(db.query(KnowledgeEntry), user)
 
     if status:
         q = q.filter(KnowledgeEntry.status == status)
@@ -886,19 +963,11 @@ def get_knowledge_chunks(
     user: User = Depends(get_current_user),
 ):
     """返回某条知识的所有 chunks（用于预览完整内容）。"""
-    from sqlalchemy import or_
-
     entry = db.get(KnowledgeEntry, kid)
     if not entry:
         raise HTTPException(404, "Knowledge entry not found")
-
-    # 权限检查
-    if user.role.value == "employee":
-        if entry.created_by != user.id and entry.status != KnowledgeStatus.APPROVED:
-            raise HTTPException(403, "Access denied")
-    elif user.role.value == "dept_admin":
-        if entry.department_id != user.department_id and entry.status != KnowledgeStatus.APPROVED:
-            raise HTTPException(403, "Access denied")
+    if not _can_view_entry(entry, user):
+        raise HTTPException(403, "Access denied")
 
     # 尝试从 Milvus 拉取 chunks
     chunks = []
@@ -947,9 +1016,8 @@ def get_file_url(
     entry = db.get(KnowledgeEntry, kid)
     if not entry:
         raise HTTPException(404, "Knowledge entry not found")
-    if user.role != Role.SUPER_ADMIN:
-        if entry.created_by != user.id and entry.status != KnowledgeStatus.APPROVED:
-            raise HTTPException(403, "Access denied")
+    if not _can_view_entry(entry, user):
+        raise HTTPException(403, "Access denied")
     if not entry.oss_key:
         raise HTTPException(404, "此知识条目没有关联的原始文件")
 
@@ -979,9 +1047,8 @@ def download_file(
     entry = db.get(KnowledgeEntry, kid)
     if not entry:
         raise HTTPException(404, "Knowledge entry not found")
-    if user.role != Role.SUPER_ADMIN:
-        if entry.created_by != user.id and entry.status != KnowledgeStatus.APPROVED:
-            raise HTTPException(403, "Access denied")
+    if not _can_view_entry(entry, user):
+        raise HTTPException(403, "Access denied")
     if not entry.oss_key:
         raise HTTPException(404, "此知识条目没有关联的原始文件")
 
@@ -1030,12 +1097,22 @@ def list_folders(
     - 用户自建目录：只返回当前用户自己的
     - 系统归档树：所有用户 always visible，保证自动归档后的文档不会“消失”
     """
+    visible_folder_ids = {
+        folder_id
+        for (folder_id,) in _apply_knowledge_visibility(
+            db.query(KnowledgeEntry.folder_id).filter(KnowledgeEntry.folder_id.isnot(None)),
+            user,
+        ).all()
+        if folder_id is not None
+    }
+
+    folder_filter = (KnowledgeFolder.created_by == user.id) | (KnowledgeFolder.is_system == 1)
+    if visible_folder_ids:
+        folder_filter = folder_filter | (KnowledgeFolder.id.in_(visible_folder_ids))
+
     folders = (
         db.query(KnowledgeFolder)
-        .filter(
-            (KnowledgeFolder.created_by == user.id) |
-            (KnowledgeFolder.is_system == 1)
-        )
+        .filter(folder_filter)
         .order_by(
             KnowledgeFolder.is_system.desc(),
             KnowledgeFolder.sort_order,
@@ -1150,10 +1227,8 @@ def get_knowledge(
     entry = db.get(KnowledgeEntry, kid)
     if not entry:
         raise HTTPException(404, "Knowledge entry not found")
-    # 只能查看自己的，或已审批的（供 RAG / chat 引用）
-    if user.role != Role.SUPER_ADMIN:
-        if entry.created_by != user.id and entry.status != KnowledgeStatus.APPROVED:
-            raise HTTPException(403, "Access denied")
+    if not _can_view_entry(entry, user):
+        raise HTTPException(403, "Access denied")
     # 查 folder_name
     _fmap: dict[int, str] = {}
     if entry.folder_id:
@@ -1282,7 +1357,7 @@ def get_public_share(
     share = db.query(KnowledgeShareLink).filter(KnowledgeShareLink.share_token == share_token).first()
     if not share or not share.is_active:
         raise HTTPException(404, "链接已失效")
-    if share.expires_at and share.expires_at <= datetime.datetime.utcnow():
+    if share.expires_at and share.expires_at <= utcnow():
         raise HTTPException(410, "链接已过期")
 
     entry = db.get(KnowledgeEntry, share.knowledge_id)
@@ -1290,7 +1365,7 @@ def get_public_share(
         raise HTTPException(404, "文档不存在")
 
     share.access_count = (share.access_count or 0) + 1
-    share.last_accessed_at = datetime.datetime.utcnow()
+    share.last_accessed_at = utcnow()
     db.commit()
 
     return {

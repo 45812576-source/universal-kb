@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import bcrypt
 from jose import jwt, JWTError
@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models.user import User
+from app.utils.time_utils import utcnow
 
 
 def verify_password(plain: str, hashed: str) -> bool:
@@ -17,7 +18,7 @@ def hash_password(plain: str) -> str:
 
 
 def create_token(user_id: int, role: str) -> str:
-    expire = datetime.utcnow() + timedelta(minutes=settings.JWT_EXPIRE_MINUTES)
+    expire = utcnow() + timedelta(minutes=settings.JWT_EXPIRE_MINUTES)
     return jwt.encode(
         {"sub": str(user_id), "role": role, "exp": expire},
         settings.JWT_SECRET,

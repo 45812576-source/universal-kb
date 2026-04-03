@@ -4,7 +4,6 @@
 """
 from __future__ import annotations
 
-import datetime
 import logging
 import os
 import tempfile
@@ -13,6 +12,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.models.knowledge import KnowledgeEntry
+from app.utils.time_utils import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,7 @@ def render_entry(db: Session, entry_id: int) -> dict:
 
         _update_phase("persisting")
         entry.doc_render_error = None
-        entry.last_rendered_at = datetime.datetime.utcnow()
+        entry.last_rendered_at = utcnow()
 
         # 渲染成功后生成 document blocks
         try:
@@ -115,7 +115,7 @@ def render_entry(db: Session, entry_id: int) -> dict:
         logger.warning(f"Doc render failed for entry {entry_id}: {e}")
         entry.doc_render_status = "failed"
         entry.doc_render_error = str(e)[:500]
-        entry.last_rendered_at = datetime.datetime.utcnow()
+        entry.last_rendered_at = utcnow()
         db.commit()
         return {"ok": False, "error": str(e), "status": "failed"}
 
@@ -144,13 +144,13 @@ def render_from_path(db: Session, entry: KnowledgeEntry, file_path: str) -> None
             entry.doc_render_mode = "text_fallback"
 
         entry.doc_render_error = None
-        entry.last_rendered_at = datetime.datetime.utcnow()
+        entry.last_rendered_at = utcnow()
 
     except Exception as e:
         logger.warning(f"Doc render from path failed for entry {entry.id}: {e}")
         entry.doc_render_status = "failed"
         entry.doc_render_error = str(e)[:500]
-        entry.last_rendered_at = datetime.datetime.utcnow()
+        entry.last_rendered_at = utcnow()
 
 
 def _do_render(entry: KnowledgeEntry, ext: str) -> Optional[str]:

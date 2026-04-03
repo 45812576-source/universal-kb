@@ -4,11 +4,11 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from datetime import datetime
 
 import oss2
 
 from app.config import settings
+from app.utils.time_utils import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ def _get_bucket() -> oss2.Bucket:
 
 def generate_oss_key(ext: str, prefix: str = "knowledge") -> str:
     """生成 OSS 对象路径：{prefix}/{year}/{month}/{uuid}.{ext}"""
-    now = datetime.utcnow()
+    now = utcnow()
     clean_ext = ext.lstrip(".")
     return f"{prefix}/{now.year}/{now.month:02d}/{uuid.uuid4()}.{clean_ext}"
 
