@@ -579,16 +579,21 @@ class SkillEngine:
                 parts.append(f"[相关知识]\n{h['text']}")
             else:
                 # 需要脱敏：按级别动态执行
+                masked_text = None
                 try:
                     from app.services.text_masker import mask_text
                     type_hits = doc_data_type_hits.get(kid)
-                    masked_text, _ = mask_text(h["text"], level=doc_level, data_type_hits=type_hits)
+                    result_text, replacements = mask_text(h["text"], level=doc_level, data_type_hits=type_hits)
+                    # 有实际替换才用 mask_text 结果，否则 fallback 到预存脱敏版
+                    if replacements:
+                        masked_text = result_text
                 except Exception:
-                    # fallback 到预存脱敏版
+                    pass
+                if not masked_text:
                     masked_text = h.get("desensitized_text", "").strip()
-                    if not masked_text:
-                        from app.services.vector_service import _desensitize_rule
-                        masked_text = _desensitize_rule(h["text"])
+                if not masked_text:
+                    from app.services.vector_service import _desensitize_rule
+                    masked_text = _desensitize_rule(h["text"])
                 if masked_text:
                     parts.append(f"[参考知识（已脱敏）]\n{masked_text}")
 

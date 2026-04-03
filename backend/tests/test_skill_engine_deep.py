@@ -249,7 +249,11 @@ class TestKnowledgeInjection:
             "score": 0.9, "created_by": 99,
             "desensitized_text": "[已脱敏：他人知识，仅供参考方法论]",
         }]
-        db.query.return_value.filter.return_value.all.return_value = []  # no approved
+        # db.query 被调多次：approved entries 查询 + profile 查询
+        # 用 side_effect 让每次 query 链都返回空
+        mock_chain = MagicMock()
+        mock_chain.filter.return_value.all.return_value = []
+        db.query.return_value = mock_chain
 
         with patch("app.services.vector_service.search_knowledge", return_value=fake_hits), \
              patch.object(engine, "_rerank_hits_with_llm", new=AsyncMock(return_value=fake_hits)):
