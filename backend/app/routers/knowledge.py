@@ -7,7 +7,7 @@ import secrets
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import or_
 from sqlalchemy import inspect
@@ -1263,9 +1263,12 @@ def get_knowledge(
 @router.post("/{kid}/share-links")
 def create_share_link(
     kid: int,
+    access_scope: str = Body("public_readonly", embed=True),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    if access_scope not in ("public_readonly", "public_editable"):
+        raise HTTPException(400, "access_scope 仅支持 public_readonly 或 public_editable")
     entry = db.get(KnowledgeEntry, kid)
     if not entry:
         raise HTTPException(404, "Knowledge entry not found")
@@ -1282,6 +1285,10 @@ def create_share_link(
         .first()
     )
     if existing:
+        if existing.access_scope != access_scope:
+            existing.access_scope = access_scope
+            db.commit()
+            db.refresh(existing)
         return _share_dict(existing)
 
     share = KnowledgeShareLink(
@@ -1289,7 +1296,7 @@ def create_share_link(
         share_token=secrets.token_urlsafe(24),
         created_by=user.id,
         is_active=True,
-        access_scope="public_readonly",
+        access_scope=access_scope,
     )
     db.add(share)
     db.commit()
@@ -1341,9 +1348,12 @@ def disable_share_link(
 @router.post("/{kid}/share-links/regenerate")
 def regenerate_share_link(
     kid: int,
+    access_scope: str = Body("public_readonly", embed=True),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    if access_scope not in ("public_readonly", "public_editable"):
+        raise HTTPException(400, "access_scope 仅支持 public_readonly 或 public_editable")
     entry = db.get(KnowledgeEntry, kid)
     if not entry:
         raise HTTPException(404, "Knowledge entry not found")
@@ -1360,7 +1370,7 @@ def regenerate_share_link(
         share_token=secrets.token_urlsafe(24),
         created_by=user.id,
         is_active=True,
-        access_scope="public_readonly",
+        access_scope=access_scope,
     )
     db.add(share)
     db.commit()
@@ -1401,6 +1411,38 @@ def get_public_share(
             "expires_at": share.expires_at.isoformat() if share.expires_at else None,
         },
     }
+
+
+class PublicShareSaveRequest(BaseModel):
+    content_html: str
+
+
+@router.put("/public/share/{share_token}")
+def save_public_share(
+    share_token: str,
+    req: PublicShareSaveRequest,
+    db: Session = Depends(get_db),
+):
+    share = db.query(KnowledgeShareLink).filter(KnowledgeShareLink.share_token == share_token).first()
+    if not share or not share.is_active:
+        raise HTTPException(404, "链接已失效")
+    if share.expires_at and share.expires_at <= utcnow():
+        raise HTTPException(410, "链接已过期")
+    if share.access_scope != "public_editable":
+        raise HTTPException(403, "该链接无编辑权限")
+
+    entry = db.get(KnowledgeEntry, share.knowledge_id)
+    if not entry:
+        raise HTTPException(404, "文档不存在")
+
+    entry.content_html = req.content_html
+    # 从 HTML 中提取纯文本作为 content
+    import re as _re
+    entry.content = _re.sub(r"<[^>]+>", "", req.content_html).strip()
+    entry.updated_at = utcnow()
+    db.commit()
+
+    return {"ok": True}
 
 
 @router.post("/{kid}/review")

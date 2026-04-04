@@ -131,3 +131,69 @@ def test_regenerate_invalidates_old_token_and_returns_new_one(client, db, share_
 
     new_resp = client.get(f"/api/knowledge/public/share/{second['share_token']}")
     assert new_resp.status_code == 200
+
+
+def test_create_editable_share_link(client, db, share_setup):
+    token = _login(client, "share_owner")
+    entry = share_setup["entry"]
+
+    resp = client.post(
+        f"/api/knowledge/{entry.id}/share-links",
+        headers=_auth(token),
+        json={"access_scope": "public_editable"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["access_scope"] == "public_editable"
+
+
+def test_switch_share_scope_updates_existing(client, db, share_setup):
+    token = _login(client, "share_owner")
+    entry = share_setup["entry"]
+
+    first = client.post(f"/api/knowledge/{entry.id}/share-links", headers=_auth(token)).json()
+    assert first["access_scope"] == "public_readonly"
+
+    second = client.post(
+        f"/api/knowledge/{entry.id}/share-links",
+        headers=_auth(token),
+        json={"access_scope": "public_editable"},
+    ).json()
+    assert second["share_token"] == first["share_token"]
+    assert second["access_scope"] == "public_editable"
+
+
+def test_public_editable_share_allows_save(client, db, share_setup):
+    token = _login(client, "share_owner")
+    entry = share_setup["entry"]
+
+    share_resp = client.post(
+        f"/api/knowledge/{entry.id}/share-links",
+        headers=_auth(token),
+        json={"access_scope": "public_editable"},
+    )
+    share_token = share_resp.json()["share_token"]
+
+    save_resp = client.put(
+        f"/api/knowledge/public/share/{share_token}",
+        json={"content_html": "<p>编辑后的内容</p>"},
+    )
+    assert save_resp.status_code == 200
+    assert save_resp.json()["ok"] is True
+
+    get_resp = client.get(f"/api/knowledge/public/share/{share_token}")
+    assert get_resp.json()["content_html"] == "<p>编辑后的内容</p>"
+
+
+def test_public_readonly_share_rejects_save(client, db, share_setup):
+    token = _login(client, "share_owner")
+    entry = share_setup["entry"]
+
+    share_resp = client.post(f"/api/knowledge/{entry.id}/share-links", headers=_auth(token))
+    share_token = share_resp.json()["share_token"]
+
+    save_resp = client.put(
+        f"/api/knowledge/public/share/{share_token}",
+        json={"content_html": "<p>不应该保存</p>"},
+    )
+    assert save_resp.status_code == 403
