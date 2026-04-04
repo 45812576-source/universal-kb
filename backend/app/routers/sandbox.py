@@ -1066,12 +1066,13 @@ async def knowledge_confirm(
             entry_id = existing.id
         else:
             from app.models.knowledge import KnowledgeStatus
+            from app.models.user import get_system_user_id
             entry = KnowledgeEntry(
                 title=title,
                 content=content,
                 category=category,
                 status=KnowledgeStatus.APPROVED,
-                created_by=user.id,
+                created_by=get_system_user_id(db),
                 source_type="skill_preflight",
                 source_file=item.filename,
                 taxonomy_board=item.target_board or None,

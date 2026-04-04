@@ -69,3 +69,25 @@ class User(Base):
         if not managed:
             return set()
         return managed.get_all_descendant_ids(db)
+
+
+# ── 系统用户 ──────────────────────────────────────────────────────────────────
+
+SYSTEM_USERNAME = "_system"
+
+
+def get_system_user_id(db) -> int:
+    """返回系统用户 ID，不存在则自动创建。"""
+    sys_user = db.query(User).filter(User.username == SYSTEM_USERNAME).first()
+    if sys_user:
+        return sys_user.id
+    sys_user = User(
+        username=SYSTEM_USERNAME,
+        password_hash="!locked",
+        display_name="系统",
+        role=Role.EMPLOYEE,
+        is_active=False,
+    )
+    db.add(sys_user)
+    db.flush()
+    return sys_user.id

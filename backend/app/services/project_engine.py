@@ -629,6 +629,9 @@ class ProjectEngine:
             db.commit()
         else:
             # 创建新条目
+            from app.models.user import get_system_user_id
+            system_uid = get_system_user_id(db)
+
             entry = KnowledgeEntry(
                 title=f"{project.name} · 项目对话日志",
                 content=summary_text,
@@ -637,7 +640,7 @@ class ProjectEngine:
                 source_file=str(project.id),
                 capture_mode="chat_delegate_confirmed",
                 department_id=project.department_id,
-                created_by=project.created_by if hasattr(project, "created_by") else None,
+                created_by=system_uid,
                 visibility_scope="project",
             )
             db.add(entry)
