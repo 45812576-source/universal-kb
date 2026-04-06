@@ -357,6 +357,86 @@ def record_governance_feedback(
     stat.last_event_at = event.created_at
 
 
+# ── 隐式反馈信号 ─────────────────────────────────────────────────────────────
+
+# 信号类型 → 奖励值
+_IMPLICIT_SIGNAL_REWARDS = {
+    "employee_confirm": 0.5,    # 员工确认 AI 分类正确
+    "employee_correct": -0.3,   # 员工纠正 AI 分类（对旧分类负向）
+    "search_click": 0.1,        # 搜索点击（隐式认可当前分类质量）
+}
+
+
+def record_implicit_feedback(
+    db: Session,
+    entry_id: int,
+    signal_type: str,
+    user_id: int | None = None,
+    new_classification: dict[str, Any] | None = None,
+) -> None:
+    """记录隐式反馈信号：员工确认/纠错/搜索点击。
+
+    Args:
+        entry_id: 知识条目 ID
+        signal_type: employee_confirm | employee_correct | search_click
+        user_id: 操作用户 ID
+        new_classification: 纠正时的新分类信息（含 objective_code, library_code）
+    """
+    entry = db.get(KnowledgeEntry, entry_id)
+    if not entry:
+        return
+
+    reward = _IMPLICIT_SIGNAL_REWARDS.get(signal_type, 0)
+
+    # 对当前分类策略记录反馈
+    if entry.governance_objective_id and entry.resource_library_id:
+        objective = db.get(GovernanceObjective, entry.governance_objective_id)
+        library = db.get(GovernanceResourceLibrary, entry.resource_library_id)
+        if objective and library:
+            key = _strategy_key(
+                strategy_group="keyword_rule",
+                subject_type="knowledge",
+                objective_code=objective.code,
+                library_code=library.code,
+                department_id=entry.department_id,
+                business_line=None,
+            )
+            record_governance_feedback(
+                db,
+                subject_type="knowledge",
+                subject_id=entry_id,
+                strategy_key=key,
+                event_type=signal_type,
+                reward=reward,
+                created_by=user_id,
+                note=f"隐式信号: {signal_type}",
+            )
+
+    # 纠正时：对新分类记录正向反馈
+    if signal_type == "employee_correct" and new_classification:
+        new_obj_code = new_classification.get("objective_code")
+        new_lib_code = new_classification.get("library_code")
+        if new_obj_code and new_lib_code:
+            new_key = _strategy_key(
+                strategy_group="keyword_rule",
+                subject_type="knowledge",
+                objective_code=new_obj_code,
+                library_code=new_lib_code,
+                department_id=entry.department_id,
+                business_line=None,
+            )
+            record_governance_feedback(
+                db,
+                subject_type="knowledge",
+                subject_id=entry_id,
+                strategy_key=new_key,
+                event_type="employee_correct_target",
+                reward=0.5,
+                created_by=user_id,
+                note=f"纠正目标: {new_obj_code}/{new_lib_code}",
+            )
+
+
 def ensure_governance_defaults(db: Session, created_by: int | None = None) -> None:
     from app.routers.knowledge_governance import DEFAULT_BLUEPRINT
 

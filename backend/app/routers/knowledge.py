@@ -616,6 +616,7 @@ def _create_entry_from_file(
             db.add(KnowledgeJob(knowledge_id=entry.id, job_type="render", trigger_source="upload"))
         db.add(KnowledgeJob(knowledge_id=entry.id, job_type="classify", trigger_source="upload"))
         db.add(KnowledgeJob(knowledge_id=entry.id, job_type="understand", trigger_source="upload"))
+        db.add(KnowledgeJob(knowledge_id=entry.id, job_type="governance_classify", trigger_source="upload"))
     entry.classification_status = "pending"
 
     return entry, content, file_type

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -11,6 +12,10 @@ from sqlalchemy.orm import Session
 from app.models.skill import ModelConfig, ModelAssignment
 
 logger = logging.getLogger(__name__)
+
+# ── 重试配置 ─────────────────────────────────────────────────────────────────
+_RETRYABLE_STATUS_CODES = {429, 502, 503}
+_RETRY_DELAYS = [1.0, 2.0, 4.0]  # 指数退避（最多 3 次重试）
 
 # ── 调用点注册表 ──────────────────────────────────────────────────────────────
 # 每个 slot 对应系统中一个独立的 AI 调用场景，可在 admin 前端绑定不同模型。
@@ -54,6 +59,10 @@ SLOT_REGISTRY: dict[str, dict] = {
     "sandbox.preflight_gen":      {"name": "Preflight 用例生成", "category": "沙箱", "desc": "为 Preflight 测试自动生成测试用例", "fallback": "lite"},
     "sandbox.preflight_exec":     {"name": "Preflight 执行", "category": "沙箱", "desc": "Preflight 测试中实际执行 Skill 的 LLM 调用", "fallback": "preflight_exec"},
     "sandbox.preflight_score":    {"name": "Preflight 评分", "category": "沙箱", "desc": "Preflight 测试中对每条回复进行质量评分", "fallback": "preflight_score"},
+    # ── 其他 ──
+    # ── 治理 ──
+    "governance.classify":        {"name": "治理分类", "category": "治理", "desc": "LLM fallback：关键词规则置信度不足时用 LLM 做治理分类", "fallback": "lite"},
+    "governance.suggest":         {"name": "治理建议生成", "category": "治理", "desc": "基于补充资料生成增量治理骨架/策略", "fallback": "lite"},
     # ── 其他 ──
     "input.evaluate":             {"name": "输入评估", "category": "其他", "desc": "评估用户输入是否有效/是否需要澄清", "fallback": "lite"},
     "input.process":              {"name": "输入处理", "category": "其他", "desc": "预处理用户输入（意图识别、实体提取等）", "fallback": "default"},
@@ -143,19 +152,39 @@ class LLMGateway:
 
         当 tools 非空且模型支持 function calling 时，native tool_calls 会被序列化后追加到
         content 尾部（```tool_call 格式），与文本 fallback 保持兼容。
+
+        重试策略：ConnectTimeout/ReadTimeout/429/502/503 → 指数退避最多 3 次。
         """
         url, headers, body = self._build_request(model_config, messages, temperature, max_tokens, tools=tools)
         t0 = time.monotonic()
-        for _attempt in range(2):  # 最多重试 1 次（应对复用连接被服务端关闭的 ConnectTimeout）
+        last_exc: Exception | None = None
+        resp = None
+        for _attempt in range(len(_RETRY_DELAYS) + 1):
             try:
                 resp = await self._client.post(url, headers=headers, json=body)
+                if resp.status_code in _RETRYABLE_STATUS_CODES and _attempt < len(_RETRY_DELAYS):
+                    delay = _RETRY_DELAYS[_attempt]
+                    logger.warning(
+                        f"LLM HTTP {resp.status_code} on attempt {_attempt+1}, "
+                        f"retrying in {delay}s... [{model_config.get('model_id')}]"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
                 break
-            except httpx.ConnectTimeout:
-                if _attempt == 0:
-                    logger.warning(f"LLM ConnectTimeout on attempt {_attempt+1}, retrying once...")
+            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as e:
+                last_exc = e
+                if _attempt < len(_RETRY_DELAYS):
+                    delay = _RETRY_DELAYS[_attempt]
+                    logger.warning(
+                        f"LLM {type(e).__name__} on attempt {_attempt+1}, "
+                        f"retrying in {delay}s... [{model_config.get('model_id')}]"
+                    )
+                    await asyncio.sleep(delay)
                     continue
                 raise
-        logger.info(f"LLM call [{model_config.get('model_id')}] took {time.monotonic()-t0:.1f}s")
+        if resp is None:
+            raise last_exc or RuntimeError("LLM call failed after retries")
+        elapsed = time.monotonic() - t0
         resp.raise_for_status()
         data = resp.json()
         msg = data["choices"][0]["message"]
@@ -179,6 +208,12 @@ class LLMGateway:
             "output_tokens": raw_usage.get("completion_tokens") or raw_usage.get("output_tokens") or 0,
             "model_id": model_config.get("model_id", ""),
         }
+        # L2: 结构化 LLM 审计日志（含 token 用量）
+        logger.info(
+            "llm_audit model=%s elapsed=%.1fs in_tokens=%d out_tokens=%d tool_calls=%d",
+            model_config.get("model_id", "?"), elapsed,
+            usage["input_tokens"], usage["output_tokens"], len(native_tool_calls),
+        )
         return content, usage
 
     async def chat_stream(self, model_config: dict, messages: list[dict],
@@ -208,49 +243,83 @@ class LLMGateway:
         # 若模型不支持 function calling，tools 已被 _build_request 忽略
         use_native_tools = bool(tools and self.supports_function_calling(model_config))
 
-        async with self._client.stream("POST", url, headers=headers, json=body) as resp:
-            status_code = getattr(resp, "status_code", 200)
-            if status_code >= 400:
-                error_body = await resp.aread()
-                raise ValueError(f"LLM API error {status_code}: {error_body.decode()[:300]}")
+        # Streaming 连接级重试：仅在连接阶段重试，一旦开始接收 chunk 则不重试
+        last_exc: Exception | None = None
+        for _attempt in range(len(_RETRY_DELAYS) + 1):
+            try:
+                async with self._client.stream("POST", url, headers=headers, json=body) as resp:
+                    status_code = getattr(resp, "status_code", 200)
+                    if status_code in _RETRYABLE_STATUS_CODES and _attempt < len(_RETRY_DELAYS):
+                        error_body = await resp.aread()
+                        delay = _RETRY_DELAYS[_attempt]
+                        logger.warning(
+                            f"LLM stream HTTP {status_code} on attempt {_attempt+1}, "
+                            f"retrying in {delay}s... [{model_config.get('model_id')}] "
+                            f"body={error_body.decode()[:200]}"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    if status_code >= 400:
+                        error_body = await resp.aread()
+                        raise ValueError(f"LLM API error {status_code}: {error_body.decode()[:300]}")
 
-            tool_calls_buf: dict[int, dict] = {}  # index → {id, name, arguments}
+                    tool_calls_buf: dict[int, dict] = {}  # index → {id, name, arguments}
 
-            async for line in resp.aiter_lines():
-                if not line.startswith("data: ") or line == "data: [DONE]":
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: ") or line == "data: [DONE]":
+                            continue
+                        try:
+                            chunk = json.loads(line[6:])
+                            choice = chunk["choices"][0]
+                            delta = choice.get("delta", {})
+                            finish_reason = choice.get("finish_reason")
+
+                            # thinking block
+                            if reasoning := delta.get("reasoning_content"):
+                                yield ("thinking", reasoning)
+
+                            # normal content
+                            if content := delta.get("content"):
+                                yield ("content", content)
+
+                            # native tool_calls delta accumulation
+                            if use_native_tools:
+                                for tc in delta.get("tool_calls") or []:
+                                    idx = tc.get("index", 0)
+                                    buf = tool_calls_buf.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                                    if tc.get("id"):
+                                        buf["id"] = tc["id"]
+                                    if fn := tc.get("function"):
+                                        buf["name"] += fn.get("name", "")
+                                        buf["arguments"] += fn.get("arguments", "")
+
+                                if finish_reason == "tool_calls" and tool_calls_buf:
+                                    for buf in tool_calls_buf.values():
+                                        yield ("tool_call", buf)
+                                    tool_calls_buf.clear()
+
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"LLM stream chunk parse error: {e}, raw={line[:200]}")
+                            continue
+                        except KeyError as e:
+                            logger.warning(f"LLM stream chunk missing key: {e}, raw={line[:200]}")
+                            continue
+                    return  # 正常完成，退出重试循环
+
+            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as e:
+                last_exc = e
+                if _attempt < len(_RETRY_DELAYS):
+                    delay = _RETRY_DELAYS[_attempt]
+                    logger.warning(
+                        f"LLM stream {type(e).__name__} on attempt {_attempt+1}, "
+                        f"retrying in {delay}s... [{model_config.get('model_id')}]"
+                    )
+                    await asyncio.sleep(delay)
                     continue
-                try:
-                    chunk = json.loads(line[6:])
-                    choice = chunk["choices"][0]
-                    delta = choice.get("delta", {})
-                    finish_reason = choice.get("finish_reason")
+                raise
 
-                    # thinking block
-                    if reasoning := delta.get("reasoning_content"):
-                        yield ("thinking", reasoning)
-
-                    # normal content
-                    if content := delta.get("content"):
-                        yield ("content", content)
-
-                    # native tool_calls delta accumulation
-                    if use_native_tools:
-                        for tc in delta.get("tool_calls") or []:
-                            idx = tc.get("index", 0)
-                            buf = tool_calls_buf.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                            if tc.get("id"):
-                                buf["id"] = tc["id"]
-                            if fn := tc.get("function"):
-                                buf["name"] += fn.get("name", "")
-                                buf["arguments"] += fn.get("arguments", "")
-
-                        if finish_reason == "tool_calls" and tool_calls_buf:
-                            for buf in tool_calls_buf.values():
-                                yield ("tool_call", buf)
-                            tool_calls_buf.clear()
-
-                except (json.JSONDecodeError, KeyError):
-                    continue
+        if last_exc:
+            raise last_exc
 
     def get_lite_config(self) -> dict:
         """Lightweight LLM config for intent/input checks (skill matching, rerank, etc.).
@@ -317,6 +386,10 @@ class LLMGateway:
             "max_tokens": mc.max_tokens,
             "temperature": mc.temperature,
         }
+
+    async def close(self):
+        """关闭底层 httpx 连接池，用于优雅关机。"""
+        await self._client.aclose()
 
     def resolve_config(self, db: Session, slot_key: str, model_config_id: int = None) -> dict:
         """按调用点解析模型配置。

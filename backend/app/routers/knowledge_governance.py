@@ -10,7 +10,9 @@ from app.dependencies import get_current_user
 from app.models.business import BusinessTable
 from app.models.knowledge import KnowledgeEntry
 from app.models.knowledge_governance import (
+    GovernanceBaselineSnapshot,
     GovernanceDepartmentMission,
+    GovernanceExperiment,
     GovernanceFieldTemplate,
     GovernanceKR,
     GovernanceObject,
@@ -498,6 +500,8 @@ def _suggestion_dict(item: GovernanceSuggestionTask) -> dict:
         "suggested_payload": item.suggested_payload or {},
         "reason": item.reason,
         "confidence": item.confidence,
+        "auto_applied": getattr(item, "auto_applied", False) or False,
+        "candidates_payload": getattr(item, "candidates_payload", None),
         "created_at": item.created_at.isoformat() if item.created_at else None,
     }
 
@@ -868,9 +872,13 @@ def list_governance_suggestions(
     subject_type: str | None = None,
     subject_id: int | None = None,
     status: str | None = None,
+    role_mode: str | None = None,  # dept_admin: 只返回本部门 + 低于阈值的
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    from app.config import settings
+    threshold = getattr(settings, "GOVERNANCE_AUTO_APPLY_THRESHOLD", 85)
+
     q = db.query(GovernanceSuggestionTask)
     if subject_type:
         q = q.filter(GovernanceSuggestionTask.subject_type == subject_type)
@@ -878,8 +886,56 @@ def list_governance_suggestions(
         q = q.filter(GovernanceSuggestionTask.subject_id == subject_id)
     if status:
         q = q.filter(GovernanceSuggestionTask.status == status)
+
+    # 部门管理员模式：只返回本部门低置信度项
+    if role_mode == "dept_admin" and user.department_id:
+        q = q.filter(GovernanceSuggestionTask.confidence < threshold)
+        # 过滤本部门的 subject
+        dept_entry_ids = [
+            eid for (eid,) in db.query(KnowledgeEntry.id).filter(
+                KnowledgeEntry.department_id == user.department_id
+            ).all()
+        ]
+        if dept_entry_ids:
+            q = q.filter(
+                GovernanceSuggestionTask.subject_id.in_(dept_entry_ids),
+                GovernanceSuggestionTask.subject_type == "knowledge",
+            )
+        else:
+            return []
+
     items = q.order_by(GovernanceSuggestionTask.created_at.desc()).all()
-    return [_suggestion_dict(item) for item in items]
+    result = []
+    for item in items:
+        d = _suggestion_dict(item)
+        # 附加同策略最近 5 条已采纳决策
+        if item.suggested_payload and isinstance(item.suggested_payload, dict):
+            meta = item.suggested_payload.get("reinforcement_meta", {})
+            strategy_key = meta.get("strategy_key", "") if isinstance(meta, dict) else ""
+            if strategy_key:
+                similar = (
+                    db.query(GovernanceSuggestionTask)
+                    .filter(
+                        GovernanceSuggestionTask.status == "applied",
+                        GovernanceSuggestionTask.id != item.id,
+                    )
+                    .order_by(GovernanceSuggestionTask.resolved_at.desc())
+                    .limit(5)
+                    .all()
+                )
+                d["similar_decisions"] = [
+                    {
+                        "id": s.id,
+                        "subject_type": s.subject_type,
+                        "subject_id": s.subject_id,
+                        "confidence": s.confidence,
+                        "reason": s.reason,
+                        "resolved_at": s.resolved_at.isoformat() if s.resolved_at else None,
+                    }
+                    for s in similar
+                ]
+        result.append(d)
+    return result
 
 
 @router.post("/suggestions")
@@ -1675,3 +1731,807 @@ def generate_governance_suggestion_for_business_table(
     if not task:
         return {"ok": True, "created": False, "message": "未命中治理建议规则"}
     return {"ok": True, "created": True, "suggestion": _suggestion_dict(task)}
+
+
+# ── 阈值模拟 API ─────────────────────────────────────────────────────────────
+
+
+class SimulateThresholdRequest(BaseModel):
+    current_threshold: int = Field(85, ge=1, le=99)
+    candidate_threshold: int = Field(70, ge=1, le=99)
+
+
+@router.post("/simulate-threshold")
+def simulate_threshold(
+    req: SimulateThresholdRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """输入 current/candidate 阈值 → 用历史 suggestion 数据模拟 auto_pass_rate、human_review_volume、error_rate。"""
+    _require_admin(user)
+
+    # 拿所有有 confidence 的 suggestion（含已决策的）
+    all_suggestions = db.query(GovernanceSuggestionTask).filter(
+        GovernanceSuggestionTask.confidence > 0,
+    ).all()
+
+    if not all_suggestions:
+        return {
+            "current": {"auto_pass_rate": 0, "human_review_volume": 0, "error_rate": 0},
+            "candidate": {"auto_pass_rate": 0, "human_review_volume": 0, "error_rate": 0},
+            "total_samples": 0,
+        }
+
+    total = len(all_suggestions)
+    # 已拒绝的视为"错误"样本
+    rejected_ids = {s.id for s in all_suggestions if s.status == "rejected"}
+
+    def _simulate(threshold: int) -> dict:
+        auto_pass = [s for s in all_suggestions if s.confidence >= threshold]
+        human_review = [s for s in all_suggestions if s.confidence < threshold]
+        # 错误率 = 自动通过中被拒绝的比例
+        auto_errors = len([s for s in auto_pass if s.id in rejected_ids])
+        return {
+            "auto_pass_rate": round(len(auto_pass) / total * 100, 1) if total else 0,
+            "human_review_volume": len(human_review),
+            "error_rate": round(auto_errors / max(len(auto_pass), 1) * 100, 1),
+        }
+
+    return {
+        "current": _simulate(req.current_threshold),
+        "candidate": _simulate(req.candidate_threshold),
+        "total_samples": total,
+    }
+
+
+# ── 灰度实验 API ─────────────────────────────────────────────────────────────
+
+
+class CreateExperimentRequest(BaseModel):
+    name: str
+    department_ids: list[int] = []
+    threshold: int = Field(ge=1, le=99)
+    duration_days: int = Field(7, ge=1, le=90)
+
+
+@router.post("/experiments")
+def create_experiment(
+    req: CreateExperimentRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """创建灰度实验。"""
+    _require_admin(user)
+    from app.config import settings
+    baseline = getattr(settings, "GOVERNANCE_AUTO_APPLY_THRESHOLD", 85)
+
+    exp = GovernanceExperiment(
+        name=req.name,
+        department_ids=req.department_ids,
+        threshold=req.threshold,
+        baseline_threshold=baseline,
+        duration_days=req.duration_days,
+        status="running",
+        created_by=user.id,
+    )
+    db.add(exp)
+    db.commit()
+    db.refresh(exp)
+    return _experiment_dict(exp)
+
+
+@router.get("/experiments")
+def list_experiments(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _require_admin(user)
+    items = db.query(GovernanceExperiment).order_by(GovernanceExperiment.created_at.desc()).all()
+    return [_experiment_dict(e) for e in items]
+
+
+@router.get("/experiments/{exp_id}")
+def get_experiment(
+    exp_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _require_admin(user)
+    exp = db.get(GovernanceExperiment, exp_id)
+    if not exp:
+        raise HTTPException(404, "实验不存在")
+
+    # 计算实时指标
+    d = _experiment_dict(exp)
+    if exp.status == "running":
+        d["live_metrics"] = _compute_experiment_metrics(db, exp)
+    return d
+
+
+@router.post("/experiments/{exp_id}/apply")
+def apply_experiment(
+    exp_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """全量应用实验结论。"""
+    _require_admin(user)
+    exp = db.get(GovernanceExperiment, exp_id)
+    if not exp:
+        raise HTTPException(404, "实验不存在")
+    exp.status = "applied"
+    exp.ended_at = datetime.datetime.utcnow()
+    exp.result_payload = _compute_experiment_metrics(db, exp)
+    db.commit()
+    return {"ok": True, "message": f"实验已应用，建议将全局阈值更新为 {exp.threshold}"}
+
+
+@router.post("/experiments/{exp_id}/cancel")
+def cancel_experiment(
+    exp_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _require_admin(user)
+    exp = db.get(GovernanceExperiment, exp_id)
+    if not exp:
+        raise HTTPException(404, "实验不存在")
+    exp.status = "cancelled"
+    exp.ended_at = datetime.datetime.utcnow()
+    db.commit()
+    return {"ok": True}
+
+
+def _experiment_dict(exp: GovernanceExperiment) -> dict:
+    return {
+        "id": exp.id,
+        "name": exp.name,
+        "department_ids": exp.department_ids or [],
+        "threshold": exp.threshold,
+        "baseline_threshold": exp.baseline_threshold,
+        "duration_days": exp.duration_days,
+        "status": exp.status,
+        "started_at": exp.started_at.isoformat() if exp.started_at else None,
+        "ended_at": exp.ended_at.isoformat() if exp.ended_at else None,
+        "result_payload": exp.result_payload,
+        "created_by": exp.created_by,
+        "created_at": exp.created_at.isoformat() if exp.created_at else None,
+    }
+
+
+def _compute_experiment_metrics(db: Session, exp: GovernanceExperiment) -> dict:
+    """计算实验期间的指标（实验组 vs 对照组）。"""
+    from sqlalchemy import and_
+    start = exp.started_at or exp.created_at
+
+    # 实验组：指定部门在实验期间的 suggestions
+    dept_entry_ids = []
+    if exp.department_ids:
+        dept_entry_ids = [
+            eid for (eid,) in db.query(KnowledgeEntry.id).filter(
+                KnowledgeEntry.department_id.in_(exp.department_ids)
+            ).all()
+        ]
+
+    base_q = db.query(GovernanceSuggestionTask).filter(
+        GovernanceSuggestionTask.created_at >= start,
+        GovernanceSuggestionTask.subject_type == "knowledge",
+    )
+
+    if dept_entry_ids:
+        experiment_q = base_q.filter(GovernanceSuggestionTask.subject_id.in_(dept_entry_ids))
+        control_q = base_q.filter(~GovernanceSuggestionTask.subject_id.in_(dept_entry_ids))
+    else:
+        experiment_q = base_q
+        control_q = base_q.filter(False)  # 无对照组
+
+    exp_items = experiment_q.all()
+    ctrl_items = control_q.all()
+
+    def _metrics(items, threshold):
+        total = len(items)
+        if not total:
+            return {"total": 0, "auto_pass_rate": 0, "human_review": 0, "rejected": 0}
+        auto = len([s for s in items if s.confidence >= threshold])
+        rejected = len([s for s in items if s.status == "rejected"])
+        return {
+            "total": total,
+            "auto_pass_rate": round(auto / total * 100, 1),
+            "human_review": total - auto,
+            "rejected": rejected,
+        }
+
+    return {
+        "experiment_group": _metrics(exp_items, exp.threshold),
+        "control_group": _metrics(ctrl_items, exp.baseline_threshold),
+        "days_elapsed": (datetime.datetime.utcnow() - start).days if start else 0,
+    }
+
+
+# ── 审核统计 API ─────────────────────────────────────────────────────────────
+
+
+@router.get("/my-review-stats")
+def my_review_stats(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """本月审核数、AI 学习条数、下月预估减少量。"""
+    from sqlalchemy import func, extract
+
+    now = datetime.datetime.utcnow()
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    # 本月该用户审核数
+    reviewed_count = db.query(func.count(GovernanceSuggestionTask.id)).filter(
+        GovernanceSuggestionTask.resolved_by == user.id,
+        GovernanceSuggestionTask.resolved_at >= month_start,
+    ).scalar() or 0
+
+    # 本月 AI 自动生效数（auto_applied）
+    auto_applied_count = db.query(func.count(GovernanceSuggestionTask.id)).filter(
+        GovernanceSuggestionTask.auto_applied == True,
+        GovernanceSuggestionTask.created_at >= month_start,
+    ).scalar() or 0
+
+    # 上月人审数（用于估算下月减少）
+    last_month_start = (month_start - datetime.timedelta(days=1)).replace(day=1)
+    last_month_reviewed = db.query(func.count(GovernanceSuggestionTask.id)).filter(
+        GovernanceSuggestionTask.resolved_by == user.id,
+        GovernanceSuggestionTask.resolved_at >= last_month_start,
+        GovernanceSuggestionTask.resolved_at < month_start,
+    ).scalar() or 0
+
+    # 预估下月减少：如果本月 AI 学习了更多，下月人审应该更少
+    estimated_reduction = max(0, last_month_reviewed - reviewed_count) if last_month_reviewed > 0 else auto_applied_count // 3
+
+    return {
+        "reviewed_this_month": reviewed_count,
+        "ai_learned_this_month": auto_applied_count,
+        "last_month_reviewed": last_month_reviewed,
+        "estimated_reduction_next_month": estimated_reduction,
+    }
+
+
+# ── 策略影响预估 API ─────────────────────────────────────────────────────────
+
+
+@router.get("/strategy-stats/{stat_id}/impact")
+def strategy_stat_impact(
+    stat_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """返回冻结影响范围 + AI 推荐替代规则。"""
+    _require_admin(user)
+    stat = db.get(GovernanceStrategyStat, stat_id)
+    if not stat:
+        raise HTTPException(404, "策略不存在")
+
+    # 计算冻结影响范围：该策略关联了多少 pending suggestions
+    affected_count = db.query(GovernanceSuggestionTask).filter(
+        GovernanceSuggestionTask.status == "pending",
+    ).count()
+
+    # 找同组的替代策略（success_rate 最高的）
+    alternatives = (
+        db.query(GovernanceStrategyStat)
+        .filter(
+            GovernanceStrategyStat.strategy_group == stat.strategy_group,
+            GovernanceStrategyStat.id != stat.id,
+            GovernanceStrategyStat.is_frozen == False,
+            GovernanceStrategyStat.total_count >= 5,
+        )
+        .order_by(GovernanceStrategyStat.success_count.desc())
+        .limit(3)
+        .all()
+    )
+
+    return {
+        "strategy_id": stat.id,
+        "strategy_key": stat.strategy_key,
+        "is_frozen": stat.is_frozen,
+        "affected_pending_count": affected_count,
+        "total_historical": stat.total_count,
+        "reject_rate": round((stat.reject_count or 0) / max(stat.total_count, 1) * 100, 1),
+        "alternatives": [
+            {
+                "id": a.id,
+                "strategy_key": a.strategy_key,
+                "success_rate": round((a.success_count or 0) / max(a.total_count, 1) * 100, 1),
+                "total_count": a.total_count,
+                "library_code": a.library_code,
+            }
+            for a in alternatives
+        ],
+    }
+
+
+# ── 基线版本化 API ───────────────────────────────────────────────────────────
+
+
+class BaselineInitRequest(BaseModel):
+    seed_materials: list[dict] = []  # 先导资料（术语表、分类体系等）
+    org_context: dict = {}  # 组织架构上下文
+
+
+@router.post("/baseline/init")
+def baseline_init(
+    req: BaselineInitRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """初始化基线：AI 用先导资料生成骨架 → 创建 v0.1 snapshot (未确认) → 返回预览。"""
+    _require_admin(user)
+    from app.services.governance_engine import create_baseline_snapshot
+
+    snapshot = create_baseline_snapshot(
+        db,
+        version_type="init",
+        created_by=user.id,
+        auto_confirm=False,
+    )
+    # 如果有 seed_materials，保存到 snapshot_data
+    if req.seed_materials or req.org_context:
+        data = snapshot.snapshot_data or {}
+        data["seed_materials"] = req.seed_materials
+        data["org_context"] = req.org_context
+        snapshot.snapshot_data = data
+
+    db.commit()
+    db.refresh(snapshot)
+    return _baseline_dict(snapshot)
+
+
+@router.post("/baseline/{snapshot_id}/confirm")
+def baseline_confirm(
+    snapshot_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """确认基线快照，使其成为当前 active 版本。"""
+    _require_admin(user)
+    from app.services.governance_engine import confirm_baseline
+
+    try:
+        snapshot = confirm_baseline(db, snapshot_id, user.id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    db.commit()
+    return _baseline_dict(snapshot)
+
+
+@router.get("/baseline/versions")
+def baseline_versions(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """列出所有基线版本。"""
+    items = (
+        db.query(GovernanceBaselineSnapshot)
+        .filter(GovernanceBaselineSnapshot.version.isnot(None))
+        .order_by(GovernanceBaselineSnapshot.created_at.desc())
+        .all()
+    )
+    return [_baseline_dict(s) for s in items]
+
+
+@router.get("/baseline/{snapshot_id}")
+def baseline_detail(
+    snapshot_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """基线快照详情。"""
+    snapshot = db.get(GovernanceBaselineSnapshot, snapshot_id)
+    if not snapshot:
+        raise HTTPException(404, "基线版本不存在")
+    return _baseline_dict(snapshot)
+
+
+@router.get("/baseline/{snapshot_id}/diff")
+def baseline_diff(
+    snapshot_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """与上一版本对比。"""
+    from app.services.governance_engine import compute_baseline_diff
+    return compute_baseline_diff(db, snapshot_id)
+
+
+def _baseline_dict(s: GovernanceBaselineSnapshot) -> dict:
+    return {
+        "id": s.id,
+        "version": s.version,
+        "version_type": s.version_type,
+        "change_type": s.change_type,
+        "snapshot_data": s.snapshot_data,
+        "stats_data": s.stats_data,
+        "is_active": s.is_active or False,
+        "confirmed_by": s.confirmed_by,
+        "confirmed_at": s.confirmed_at.isoformat() if s.confirmed_at else None,
+        "changed_by": s.changed_by,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+    }
+
+
+# ── 缺口检测与补入 API ───────────────────────────────────────────────────────
+
+
+@router.get("/gaps/detected")
+def list_detected_gaps(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """返回当前检测到的领域缺口和覆盖缺口。"""
+    _require_admin(user)
+    from app.services.governance_gap_detector import detect_domain_gaps, detect_coverage_gaps
+    return {
+        "domain_gaps": detect_domain_gaps(db),
+        "coverage_gaps": detect_coverage_gaps(db),
+    }
+
+
+class GapDefineScopeRequest(BaseModel):
+    library_code: str
+    domain_keywords: list[str] = []
+    description: str = ""
+
+
+@router.post("/gap/define-scope")
+def gap_define_scope(
+    req: GapDefineScopeRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """定义缺口范围（哪个资源库、领域关键词）。"""
+    _require_admin(user)
+    library = db.query(GovernanceResourceLibrary).filter(
+        GovernanceResourceLibrary.code == req.library_code,
+    ).first()
+    if not library:
+        raise HTTPException(404, f"资源库 '{req.library_code}' 不存在")
+
+    from sqlalchemy import func
+    total = db.query(func.count(KnowledgeEntry.id)).filter(
+        KnowledgeEntry.resource_library_id == library.id,
+    ).scalar() or 0
+    aligned = db.query(func.count(KnowledgeEntry.id)).filter(
+        KnowledgeEntry.resource_library_id == library.id,
+        KnowledgeEntry.governance_status == "aligned",
+    ).scalar() or 0
+
+    return {
+        "library_code": req.library_code,
+        "library_name": library.name,
+        "domain_keywords": req.domain_keywords,
+        "total_entries": total,
+        "aligned_entries": aligned,
+        "coverage_rate": round(aligned / max(total, 1) * 100, 1),
+    }
+
+
+class GapImportMaterialsRequest(BaseModel):
+    library_code: str
+    terminology: list[dict] = []  # 术语表 [{term, definition, category}]
+    sample_entry_ids: list[int] = []  # 样本文档 ID
+    correct_classifications: list[dict] = []  # 正确分类标注
+
+
+@router.post("/gap/import-materials")
+def gap_import_materials(
+    req: GapImportMaterialsRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """上传补充资料。保存为 suggestion payload 供 generate-strategy 使用。"""
+    _require_admin(user)
+    library = db.query(GovernanceResourceLibrary).filter(
+        GovernanceResourceLibrary.code == req.library_code,
+    ).first()
+    if not library:
+        raise HTTPException(404, f"资源库 '{req.library_code}' 不存在")
+
+    # 验证 sample entries 存在
+    valid_samples = []
+    for eid in req.sample_entry_ids:
+        entry = db.get(KnowledgeEntry, eid)
+        if entry:
+            valid_samples.append({
+                "id": entry.id,
+                "title": entry.title or entry.ai_title or "",
+                "content_preview": (entry.content or "")[:200],
+            })
+
+    task = GovernanceSuggestionTask(
+        subject_type="knowledge",
+        subject_id=0,
+        task_type="gap_import",
+        status="pending",
+        resource_library_id=library.id,
+        reason=f"缺口补入资料已导入: {library.name}",
+        confidence=0,
+        suggested_payload={
+            "library_code": req.library_code,
+            "terminology": req.terminology,
+            "sample_entries": valid_samples,
+            "correct_classifications": req.correct_classifications,
+            "imported_by": user.id,
+        },
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return {"ok": True, "suggestion_id": task.id, "samples_found": len(valid_samples)}
+
+
+class GapGenerateStrategyRequest(BaseModel):
+    suggestion_id: int  # gap_import suggestion 的 ID
+
+
+@router.post("/gap/generate-strategy")
+async def gap_generate_strategy(
+    req: GapGenerateStrategyRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """AI 基于补充资料生成增量 keyword rules / 分类 prompt 片段。"""
+    _require_admin(user)
+    task = db.get(GovernanceSuggestionTask, req.suggestion_id)
+    if not task or task.task_type != "gap_import":
+        raise HTTPException(404, "未找到对应的补入资料")
+
+    payload = task.suggested_payload or {}
+    terminology = payload.get("terminology", [])
+    samples = payload.get("sample_entries", [])
+    library_code = payload.get("library_code", "")
+
+    # 用 LLM 生成策略
+    import json
+    from app.services.llm_gateway import llm_gateway
+
+    prompt = f"""你是知识治理策略生成助手。基于以下补充资料，为资源库 "{library_code}" 生成增量分类规则。
+
+## 补充术语
+{json.dumps(terminology, ensure_ascii=False)}
+
+## 样本文档
+{json.dumps(samples, ensure_ascii=False)}
+
+## 输出格式（JSON）
+```json
+{{
+  "new_keyword_rules": [
+    {{
+      "keywords": ["关键词1", "关键词2"],
+      "confidence": 80,
+      "reason": "规则描述"
+    }}
+  ],
+  "classification_hints": {{
+    "domain_description": "该领域的特征描述",
+    "key_indicators": ["指标1", "指标2"]
+  }}
+}}
+```
+只输出 JSON。"""
+
+    try:
+        config = llm_gateway.resolve_config(db, "governance.suggest")
+        response, _usage = await llm_gateway.chat(
+            config,
+            [{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=1024,
+        )
+        text = response.strip()
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0]
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0]
+
+        generated = json.loads(text.strip())
+    except Exception as e:
+        generated = {"error": str(e), "new_keyword_rules": [], "classification_hints": {}}
+
+    # 更新 suggestion payload
+    payload["generated_strategy"] = generated
+    task.suggested_payload = payload
+    task.task_type = "gap_strategy_ready"
+    db.commit()
+
+    return {"ok": True, "generated": generated}
+
+
+class GapVerifyRequest(BaseModel):
+    suggestion_id: int
+    duration_days: int = 3
+
+
+@router.post("/gap/verify")
+def gap_verify(
+    req: GapVerifyRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """灰度验证：标记为验证中。实际验证通过 governance_classify 自动执行。"""
+    _require_admin(user)
+    task = db.get(GovernanceSuggestionTask, req.suggestion_id)
+    if not task:
+        raise HTTPException(404, "未找到对应策略")
+
+    payload = task.suggested_payload or {}
+    payload["verify_started_at"] = datetime.datetime.utcnow().isoformat()
+    payload["verify_duration_days"] = req.duration_days
+    task.suggested_payload = payload
+    task.task_type = "gap_verifying"
+    db.commit()
+
+    return {"ok": True, "message": f"灰度验证已启动，预计 {req.duration_days} 天后出结果"}
+
+
+class GapMergeRequest(BaseModel):
+    suggestion_id: int
+
+
+@router.post("/gap/merge")
+def gap_merge(
+    req: GapMergeRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """合入基线：将生成的策略合入分类 hints + 创建新基线版本。"""
+    _require_admin(user)
+    task = db.get(GovernanceSuggestionTask, req.suggestion_id)
+    if not task:
+        raise HTTPException(404, "未找到对应策略")
+
+    payload = task.suggested_payload or {}
+    generated = payload.get("generated_strategy", {})
+    library_code = payload.get("library_code")
+
+    # 将 classification_hints 写入资源库
+    if library_code and generated.get("classification_hints"):
+        library = db.query(GovernanceResourceLibrary).filter(
+            GovernanceResourceLibrary.code == library_code,
+        ).first()
+        if library:
+            hints = library.classification_hints or {}
+            hints.update(generated["classification_hints"])
+            library.classification_hints = hints
+
+    # 创建基线快照 version +0.1
+    from app.services.governance_engine import create_baseline_snapshot
+    snapshot = create_baseline_snapshot(
+        db,
+        version_type="gap_fill",
+        created_by=user.id,
+        auto_confirm=True,
+    )
+
+    task.status = "applied"
+    task.task_type = "gap_merged"
+    task.resolved_by = user.id
+    task.resolved_at = datetime.datetime.utcnow()
+    db.commit()
+
+    return {
+        "ok": True,
+        "new_baseline_version": snapshot.version,
+        "merged_library": library_code,
+    }
+
+
+# ── 跨公司迁移 API ───────────────────────────────────────────────────────────
+
+
+class MigrationExportRequest(BaseModel):
+    anonymize: bool = True
+
+
+@router.post("/migration/export")
+def migration_export(
+    req: MigrationExportRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """导出当前治理骨架 JSON（可脱敏）。"""
+    _require_admin(user)
+    from app.services.governance_migration import export_skeleton
+    return export_skeleton(db, anonymize=req.anonymize)
+
+
+class MigrationMatchRequest(BaseModel):
+    exported: dict  # export_skeleton 的返回值
+    target_context: dict = {}  # 目标公司上下文 {industry, size, departments, ...}
+
+
+@router.post("/migration/match")
+def migration_match(
+    req: MigrationMatchRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """AI 匹配骨架项的适用性。"""
+    _require_admin(user)
+    from app.services.governance_migration import match_skeleton
+    matched = match_skeleton(db, req.exported, req.target_context)
+    return {"matched": matched}
+
+
+class MigrationImportRequest(BaseModel):
+    exported: dict
+    matched: list[dict]
+
+
+@router.post("/migration/import")
+def migration_import(
+    req: MigrationImportRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """根据匹配结果导入骨架。"""
+    _require_admin(user)
+    from app.services.governance_migration import import_skeleton
+    stats = import_skeleton(db, req.exported, req.matched, user_id=user.id)
+    db.commit()
+    return stats
+
+
+@router.get("/migration/status")
+def migration_status(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """查看当前迁移状态：adaptation / gap_fix 待处理数。"""
+    _require_admin(user)
+
+    adaptation_count = db.query(GovernanceSuggestionTask).filter(
+        GovernanceSuggestionTask.task_type == "migration_adapt",
+        GovernanceSuggestionTask.status == "pending",
+    ).count()
+
+    gap_count = db.query(GovernanceSuggestionTask).filter(
+        GovernanceSuggestionTask.task_type == "gap_fix",
+        GovernanceSuggestionTask.status == "pending",
+    ).count()
+
+    return {
+        "pending_adaptations": adaptation_count,
+        "pending_gaps": gap_count,
+        "total_pending": adaptation_count + gap_count,
+    }
+
+
+# ── 隐式反馈端点 ─────────────────────────────────────────────────────────────
+
+
+class ImplicitFeedbackRequest(BaseModel):
+    entry_id: int
+    signal_type: str = Field(..., pattern="^(employee_confirm|employee_correct|search_click)$")
+    new_classification: dict | None = None  # 纠正时的新分类 {objective_code, library_code}
+
+
+@router.post("/implicit-feedback")
+def post_implicit_feedback(
+    req: ImplicitFeedbackRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """记录隐式反馈信号：员工确认/纠错/搜索点击。"""
+    from app.services.knowledge_governance_service import record_implicit_feedback
+
+    entry = db.get(KnowledgeEntry, req.entry_id)
+    if not entry:
+        raise HTTPException(404, "知识条目不存在")
+
+    record_implicit_feedback(
+        db,
+        entry_id=req.entry_id,
+        signal_type=req.signal_type,
+        user_id=user.id,
+        new_classification=req.new_classification,
+    )
+    db.commit()
+    return {"ok": True}

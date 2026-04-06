@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     ARK_API_KEY: str = ""  # 火山引擎 ARK，备用 provider
     LEMONDATA_API_KEY: str = ""  # LemonData，受限模型（需管理员授权）
 
+    # ── 治理自动化 ───────────────────────────────────────────────────────
+    GOVERNANCE_AUTO_APPLY_THRESHOLD: int = 85  # 置信度 >= 此值自动生效
+    GOVERNANCE_LLM_ENABLED: bool = True  # 关键词规则不足时是否走 LLM fallback
+
     # 百炼用量超限后自动切换到 ARK（由外部监控脚本或管理接口写入）
     BAILIAN_FALLBACK_TO_ARK: bool = False
 

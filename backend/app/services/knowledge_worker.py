@@ -124,6 +124,31 @@ def _run_classify_job(db: Session, job: KnowledgeJob, entry: KnowledgeEntry) -> 
             job.status = "queued"
 
 
+def _run_governance_classify_job(db: Session, job: KnowledgeJob, entry: KnowledgeEntry) -> None:
+    """执行单个 governance_classify job。"""
+    from app.services.governance_engine import process_governance_classify
+
+    try:
+        ok = process_governance_classify(db, entry)
+        if ok:
+            job.status = "success"
+        else:
+            job.error_type = "no_result"
+            job.error_message = "治理分类未返回结果"
+            if job.attempt_count >= job.max_attempts:
+                job.status = "failed"
+            else:
+                job.status = "queued"
+    except Exception as e:
+        logger.warning(f"[KnowledgeWorker] governance_classify job {job.id} error: {e}")
+        job.error_type = "governance_classify_error"
+        job.error_message = str(e)[:500]
+        if job.attempt_count >= job.max_attempts:
+            job.status = "failed"
+        else:
+            job.status = "queued"
+
+
 def process_knowledge_jobs():
     """扫描并执行一批 queued 的 knowledge jobs。由 scheduler 周期调用。"""
     db = SessionLocal()
@@ -160,6 +185,8 @@ def process_knowledge_jobs():
                     _run_classify_job(db, job, entry)
                 elif job.job_type == "understand":
                     _run_understand_job(db, job, entry)
+                elif job.job_type == "governance_classify":
+                    _run_governance_classify_job(db, job, entry)
                 else:
                     job.status = "failed"
                     job.error_message = f"unknown job_type: {job.job_type}"
@@ -172,6 +199,55 @@ def process_knowledge_jobs():
             db.commit()
     except Exception:
         logger.exception("[KnowledgeWorker] batch processing error")
+    finally:
+        db.close()
+
+
+def backfill_ungoverned():
+    """补偿任务：扫描 governance_status IS NULL 或 ungoverned 且无 queued governance_classify job 的条目。
+
+    每批最多 20 条，由 scheduler 周期调用（如每 10 分钟一次）。
+    """
+    db = SessionLocal()
+    try:
+        from sqlalchemy import or_, and_
+
+        # 已有 queued/running governance_classify job 的条目
+        subq = (
+            db.query(KnowledgeJob.knowledge_id)
+            .filter(
+                KnowledgeJob.job_type == "governance_classify",
+                KnowledgeJob.status.in_(["queued", "running"]),
+            )
+            .subquery()
+        )
+
+        entries = (
+            db.query(KnowledgeEntry.id)
+            .filter(
+                or_(
+                    KnowledgeEntry.governance_status.is_(None),
+                    KnowledgeEntry.governance_status == "ungoverned",
+                ),
+                KnowledgeEntry.content.isnot(None),
+                KnowledgeEntry.id.notin_(subq),
+            )
+            .limit(20)
+            .all()
+        )
+
+        if entries:
+            logger.info(f"[KnowledgeWorker] backfill: creating governance_classify jobs for {len(entries)} entries")
+            for (eid,) in entries:
+                job = KnowledgeJob(
+                    knowledge_id=eid,
+                    job_type="governance_classify",
+                    trigger_source="scheduled",
+                )
+                db.add(job)
+            db.commit()
+    except Exception:
+        logger.exception("[KnowledgeWorker] governance backfill error")
     finally:
         db.close()
 

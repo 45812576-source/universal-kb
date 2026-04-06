@@ -1,15 +1,57 @@
 import asyncio
+import logging
 import os
+import uuid
 from pathlib import Path
-from fastapi import FastAPI
+from contextvars import ContextVar
+
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
+
+# ── L1: 请求追踪 ID（线程/协程安全） ─────────────────────────────────────────
+request_id_var: ContextVar[str] = ContextVar("request_id", default="")
+
+
+class _RequestIdFilter(logging.Filter):
+    """L1: 将 request_id 注入每条日志记录，便于结构化追踪。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id_var.get("")  # type: ignore[attr-defined]
+        return True
+
+
+# 配置根 logger：注入 request_id
+_handler = logging.StreamHandler()
+_handler.setFormatter(
+    logging.Formatter(
+        "%(asctime)s %(levelname)s [%(name)s] [rid=%(request_id)s] %(message)s"
+    )
+)
+_handler.addFilter(_RequestIdFilter())
+logging.root.addHandler(_handler)
+logging.root.setLevel(logging.INFO)
 
 app = FastAPI(title="Universal KB API", version="0.1.0")
 
 _default_origins = ["http://localhost:3000", "http://localhost:5173", "http://localhost:5023"]
 _extra = os.getenv("FRONTEND_ORIGIN", "")
 _allowed_origins = _default_origins + [o.strip() for o in _extra.split(",") if o.strip()]
+
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    """为每个请求生成/传播 X-Request-ID，存入 ContextVar 供下游日志使用。"""
+
+    async def dispatch(self, request: Request, call_next):
+        rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:16]
+        request_id_var.set(rid)
+        response: Response = await call_next(request)
+        response.headers["X-Request-ID"] = rid
+        return response
+
+
+app.add_middleware(RequestIdMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -189,6 +231,7 @@ async def startup_event():
         from app.services.knowledge_worker import (
             process_knowledge_jobs,
             backfill_unclassified,
+            backfill_ungoverned,
             backfill_failed_renders,
         )
         upstream_scheduler.add_job(process_knowledge_jobs, "interval", seconds=30, id="knowledge_job_worker")
@@ -196,6 +239,48 @@ async def startup_event():
         upstream_scheduler.add_job(backfill_unclassified, "interval", minutes=10, id="knowledge_backfill_classify")
         # 每 10 分钟补偿渲染失败条目
         upstream_scheduler.add_job(backfill_failed_renders, "interval", minutes=10, id="knowledge_backfill_render")
+        # 每 10 分钟补齐未治理条目
+        upstream_scheduler.add_job(backfill_ungoverned, "interval", minutes=10, id="knowledge_backfill_governance")
+
+        # 基线自动快照（每日一次）：当日 ≥10 条 auto-apply 时创建
+        def _run_auto_snapshot():
+            db = SessionLocal()
+            try:
+                from app.services.governance_engine import auto_snapshot_on_round
+                auto_snapshot_on_round(db)
+            except Exception as ex:
+                import logging
+                logging.getLogger(__name__).warning(f"Auto snapshot failed: {ex}")
+            finally:
+                db.close()
+
+        # 基线偏离检测（每日一次）
+        def _run_deviation_check():
+            db = SessionLocal()
+            try:
+                from app.services.governance_engine import detect_baseline_deviation
+                detect_baseline_deviation(db)
+            except Exception as ex:
+                import logging
+                logging.getLogger(__name__).warning(f"Baseline deviation check failed: {ex}")
+            finally:
+                db.close()
+
+        # 缺口检测（每日一次）
+        def _run_gap_detection():
+            db = SessionLocal()
+            try:
+                from app.services.governance_gap_detector import run_gap_detection
+                run_gap_detection(db)
+            except Exception as ex:
+                import logging
+                logging.getLogger(__name__).warning(f"Gap detection failed: {ex}")
+            finally:
+                db.close()
+
+        upstream_scheduler.add_job(_run_gap_detection, "cron", hour=4, minute=30, id="governance_gap_detection")
+        upstream_scheduler.add_job(_run_auto_snapshot, "cron", hour=2, minute=30, id="governance_auto_snapshot")
+        upstream_scheduler.add_job(_run_deviation_check, "cron", hour=3, minute=30, id="governance_deviation_check")
 
         upstream_scheduler.start()
     except Exception as e:

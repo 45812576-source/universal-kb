@@ -176,6 +176,8 @@ class GovernanceSuggestionTask(Base):
     suggested_payload = Column(JSON, default=dict)
     reason = Column(Text, nullable=True)
     confidence = Column(Integer, default=0)  # 0-100
+    auto_applied = Column(Boolean, default=False)  # 是否由引擎自动生效
+    candidates_payload = Column(JSON, nullable=True)  # top-2 候选 + 证据（供人审时展示）
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     resolved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     resolved_note = Column(Text, nullable=True)
@@ -252,15 +254,46 @@ class GovernanceObject(Base):
 
 
 class GovernanceBaselineSnapshot(Base):
-    """基线变更历史快照，记录 ResourceLibrary 协同基线的每次变更。"""
+    """基线版本快照：记录治理体系的全量骨架 + 统计指标。
+
+    每次重大变更（初始化、治理轮次完成、增量迭代）都会创建一个版本。
+    """
     __tablename__ = "governance_baseline_snapshots"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    library_id = Column(Integer, ForeignKey("governance_resource_libraries.id"), nullable=False)
+    library_id = Column(Integer, ForeignKey("governance_resource_libraries.id"), nullable=True)  # 兼容旧用法，新版本可为 NULL
     changed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
-    change_type = Column(String(50), nullable=False)  # field_update | consumer_change | dependency_change | cycle_change
+    change_type = Column(String(50), nullable=False)  # field_update | consumer_change | dependency_change | cycle_change | init | governance_round | steady_state | incremental | gap_fill
+
+    # ── Phase 3 新增字段 ──────────────────────────────────────────────────────
+    version = Column(String(20), nullable=True)  # 语义化版本号：v0.1, v0.2, v1.0, v1.1
+    version_type = Column(String(30), nullable=True)  # init | governance_round | steady_state | incremental | gap_fill
+    snapshot_data = Column(JSON, nullable=True)  # 全量骨架快照（objectives, libraries, object_types, strategies）
+    stats_data = Column(JSON, nullable=True)  # 统计指标（分类覆盖率、置信度分布、缺口数）
+    confirmed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    confirmed_at = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=False)  # 当前激活的基线版本
+
     old_value = Column(JSON, default=dict)
     new_value = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class GovernanceExperiment(Base):
+    """灰度实验：在指定部门以候选阈值运行 N 天，对比自动通过率/人审量/误判率。"""
+    __tablename__ = "governance_experiments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(200), nullable=False)
+    department_ids = Column(JSON, default=list)  # 灰度覆盖的部门 ID 列表
+    threshold = Column(Integer, nullable=False)  # 候选阈值
+    baseline_threshold = Column(Integer, nullable=False)  # 对照组阈值（当前全局值）
+    duration_days = Column(Integer, default=7)
+    status = Column(String(20), default="running")  # running | completed | applied | cancelled
+    started_at = Column(DateTime, default=datetime.datetime.utcnow)
+    ended_at = Column(DateTime, nullable=True)
+    result_payload = Column(JSON, nullable=True)  # 实验结论指标
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
