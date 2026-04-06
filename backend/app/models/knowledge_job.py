@@ -11,8 +11,12 @@ class KnowledgeJob(Base):
     __tablename__ = "knowledge_jobs"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    knowledge_id = Column(Integer, ForeignKey("knowledge_entries.id"), nullable=False, index=True)
-    # render | classify | understand
+    knowledge_id = Column(Integer, ForeignKey("knowledge_entries.id"), nullable=True, index=True)
+    # "knowledge" | "business_table"
+    subject_type = Column(String(30), default="knowledge", nullable=False, index=True)
+    # 通用主体 ID（与 subject_type 配合使用）
+    subject_id = Column(Integer, nullable=True, index=True)
+    # render | classify | understand | governance_classify
     job_type = Column(String(20), nullable=False, index=True)
     # queued | running | success | failed | partial_success
     status = Column(String(20), default="queued", nullable=False, index=True)

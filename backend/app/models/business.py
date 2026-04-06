@@ -60,6 +60,7 @@ class BusinessTable(Base):
     governance_kr_id = Column(Integer, ForeignKey("governance_krs.id"), nullable=True)
     governance_element_id = Column(Integer, ForeignKey("governance_required_elements.id"), nullable=True)
     governance_status = Column(String(20), default="ungoverned")
+    governance_confidence = Column(Float, nullable=True)
     governance_note = Column(Text, nullable=True)
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(

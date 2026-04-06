@@ -232,6 +232,7 @@ async def startup_event():
             process_knowledge_jobs,
             backfill_unclassified,
             backfill_ungoverned,
+            backfill_ungoverned_tables,
             backfill_failed_renders,
         )
         upstream_scheduler.add_job(process_knowledge_jobs, "interval", seconds=30, id="knowledge_job_worker")
@@ -241,6 +242,8 @@ async def startup_event():
         upstream_scheduler.add_job(backfill_failed_renders, "interval", minutes=10, id="knowledge_backfill_render")
         # 每 10 分钟补齐未治理条目
         upstream_scheduler.add_job(backfill_ungoverned, "interval", minutes=10, id="knowledge_backfill_governance")
+        # 每 10 分钟补齐未治理数据表
+        upstream_scheduler.add_job(backfill_ungoverned_tables, "interval", minutes=10, id="knowledge_backfill_governance_tables")
 
         # 基线自动快照（每日一次）：当日 ≥10 条 auto-apply 时创建
         def _run_auto_snapshot():

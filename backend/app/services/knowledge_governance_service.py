@@ -369,42 +369,57 @@ _IMPLICIT_SIGNAL_REWARDS = {
 
 def record_implicit_feedback(
     db: Session,
-    entry_id: int,
-    signal_type: str,
+    entry_id: int | None = None,
+    signal_type: str = "",
     user_id: int | None = None,
     new_classification: dict[str, Any] | None = None,
+    *,
+    subject_type: str = "knowledge",
+    subject_id: int | None = None,
 ) -> None:
     """记录隐式反馈信号：员工确认/纠错/搜索点击。
 
     Args:
-        entry_id: 知识条目 ID
+        entry_id: 知识条目 ID（向后兼容）
         signal_type: employee_confirm | employee_correct | search_click
         user_id: 操作用户 ID
         new_classification: 纠正时的新分类信息（含 objective_code, library_code）
+        subject_type: "knowledge" | "business_table"
+        subject_id: 通用主体 ID（优先于 entry_id）
     """
-    entry = db.get(KnowledgeEntry, entry_id)
-    if not entry:
+    # 兼容旧调用方式
+    effective_id = subject_id or entry_id
+    if not effective_id:
+        return
+
+    if subject_type == "business_table":
+        subject = db.get(BusinessTable, effective_id)
+    else:
+        subject = db.get(KnowledgeEntry, effective_id)
+    if not subject:
         return
 
     reward = _IMPLICIT_SIGNAL_REWARDS.get(signal_type, 0)
+    dept_id = getattr(subject, "department_id", None)
+    strategy_group = "table_rule" if subject_type == "business_table" else "keyword_rule"
 
     # 对当前分类策略记录反馈
-    if entry.governance_objective_id and entry.resource_library_id:
-        objective = db.get(GovernanceObjective, entry.governance_objective_id)
-        library = db.get(GovernanceResourceLibrary, entry.resource_library_id)
+    if subject.governance_objective_id and subject.resource_library_id:
+        objective = db.get(GovernanceObjective, subject.governance_objective_id)
+        library = db.get(GovernanceResourceLibrary, subject.resource_library_id)
         if objective and library:
             key = _strategy_key(
-                strategy_group="keyword_rule",
-                subject_type="knowledge",
+                strategy_group=strategy_group,
+                subject_type=subject_type,
                 objective_code=objective.code,
                 library_code=library.code,
-                department_id=entry.department_id,
+                department_id=dept_id,
                 business_line=None,
             )
             record_governance_feedback(
                 db,
-                subject_type="knowledge",
-                subject_id=entry_id,
+                subject_type=subject_type,
+                subject_id=effective_id,
                 strategy_key=key,
                 event_type=signal_type,
                 reward=reward,
@@ -418,17 +433,17 @@ def record_implicit_feedback(
         new_lib_code = new_classification.get("library_code")
         if new_obj_code and new_lib_code:
             new_key = _strategy_key(
-                strategy_group="keyword_rule",
-                subject_type="knowledge",
+                strategy_group=strategy_group,
+                subject_type=subject_type,
                 objective_code=new_obj_code,
                 library_code=new_lib_code,
-                department_id=entry.department_id,
+                department_id=dept_id,
                 business_line=None,
             )
             record_governance_feedback(
                 db,
-                subject_type="knowledge",
-                subject_id=entry_id,
+                subject_type=subject_type,
+                subject_id=effective_id,
                 strategy_key=new_key,
                 event_type="employee_correct_target",
                 reward=0.5,

@@ -1,4 +1,4 @@
-"""治理自动化引擎测试：Phase 1 + Phase 3 + Phase 4 + Phase 5 核心功能验证。"""
+"""治理自动化引擎测试：Phase 1 + Phase 3 + Phase 4 + Phase 5 核心功能验证 + 数据表治理。"""
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -9,6 +9,7 @@ from tests.conftest import (
     _make_model_config,
 )
 from app.models.user import Role
+from app.models.business import BusinessTable
 from app.models.knowledge import KnowledgeEntry
 from app.models.knowledge_job import KnowledgeJob
 from app.models.knowledge_governance import (
@@ -665,5 +666,217 @@ def test_missing_items_link_to_gap_flow():
             for t in gap_tasks
         )
         assert found, "missing item should create gap_fix suggestion"
+    finally:
+        db.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 6: 数据表治理统一到新引擎
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _make_table(db, dept_id, display_name="客户管理表", table_name="usr_customer_001", description="CRM 客户数据表"):
+    bt = BusinessTable(
+        table_name=table_name,
+        display_name=display_name,
+        description=description,
+        department_id=dept_id,
+        governance_status="ungoverned",
+    )
+    db.add(bt)
+    db.flush()
+    return bt
+
+
+def _seed_table_governance_defaults(db):
+    """创建数据表治理骨架：objective + library + object_type。"""
+    obj = db.query(GovernanceObjective).filter_by(code="business_line_execution").first()
+    if not obj:
+        obj = GovernanceObjective(
+            name="业务执行", code="business_line_execution", level="company",
+        )
+        db.add(obj)
+        db.flush()
+
+    ot = db.query(GovernanceObjectType).filter_by(code="customer").first()
+    if not ot:
+        ot = GovernanceObjectType(code="customer", name="客户资产")
+        db.add(ot)
+        db.flush()
+
+    lib = db.query(GovernanceResourceLibrary).filter_by(code="biz_customer_repo").first()
+    if not lib:
+        lib = GovernanceResourceLibrary(
+            objective_id=obj.id, name="客户资源库", code="biz_customer_repo",
+            object_type="customer", governance_mode="ab_fusion",
+        )
+        db.add(lib)
+        db.flush()
+    return obj, lib, ot
+
+
+@patch("app.services.governance_engine._llm_classify_table", return_value=None)
+@patch("app.config.settings")
+def test_table_high_confidence_auto_applies(_mock_settings, _mock_llm):
+    """数据表命中客户关键词 → 自动 aligned（阈值降到 80 以覆盖 bandit 后置信度）。"""
+    _mock_settings.GOVERNANCE_AUTO_APPLY_THRESHOLD = 80
+    _mock_settings.GOVERNANCE_LLM_ENABLED = False
+    db = TestingSessionLocal()
+    try:
+        dept = _make_dept(db)
+        _seed_table_governance_defaults(db)
+        # display_name 含 "客户"，命中 biz_customer_repo 规则（base_confidence=84）
+        bt = _make_table(db, dept.id, display_name="客户CRM管理表", description="客户线索商机管理")
+        db.commit()
+
+        from app.services.governance_engine import process_governance_classify_subject
+        ok = process_governance_classify_subject(db, "business_table", bt)
+        db.commit()
+
+        assert ok is True
+        db.refresh(bt)
+        assert bt.governance_status == "aligned"
+        assert bt.governance_confidence is not None
+        assert bt.governance_confidence > 0.7
+
+        # 应有一条 auto_applied suggestion
+        suggestions = db.query(GovernanceSuggestionTask).filter(
+            GovernanceSuggestionTask.subject_type == "business_table",
+            GovernanceSuggestionTask.subject_id == bt.id,
+            GovernanceSuggestionTask.auto_applied == True,
+        ).all()
+        assert len(suggestions) == 1
+        assert suggestions[0].status == "applied"
+    finally:
+        db.close()
+
+
+@patch("app.services.knowledge_worker.SessionLocal", TestingSessionLocal)
+def test_table_backfill_creates_jobs():
+    """存量 ungoverned 数据表 → governance_classify job 被创建。"""
+    db = TestingSessionLocal()
+    try:
+        dept = _make_dept(db)
+        bt1 = _make_table(db, dept.id, display_name="表1", table_name="usr_t1_001")
+        bt2 = _make_table(db, dept.id, display_name="表2", table_name="usr_t2_001")
+        bt2.governance_status = None
+        db.commit()
+
+        from app.services.knowledge_worker import backfill_ungoverned_tables
+        backfill_ungoverned_tables()
+
+        db.expire_all()
+        jobs = db.query(KnowledgeJob).filter(
+            KnowledgeJob.subject_type == "business_table",
+            KnowledgeJob.job_type == "governance_classify",
+        ).all()
+        job_table_ids = {j.subject_id for j in jobs}
+        assert bt1.id in job_table_ids
+        assert bt2.id in job_table_ids
+    finally:
+        db.close()
+
+
+def test_table_create_triggers_governance_job(client, db):
+    """创建数据表 → governance_classify job 存在。"""
+    dept = _make_dept(db)
+    user = _make_user(db, username="table_creator", role=Role.EMPLOYEE, dept_id=dept.id)
+    db.commit()
+
+    from tests.conftest import _login, _auth
+    token = _login(client, "table_creator")
+
+    resp = client.post(
+        "/api/business-tables/create-blank",
+        json={
+            "display_name": "测试客户表",
+            "description": "测试用",
+            "fields": [{"name": "name", "field_type": "text", "nullable": True, "comment": ""}],
+            "row_scope": "private",
+            "column_scope": "private",
+        },
+        headers=_auth(token),
+    )
+    if resp.status_code == 200:
+        data = resp.json()
+        table_id = data.get("id")
+        if table_id:
+            jobs = db.query(KnowledgeJob).filter(
+                KnowledgeJob.subject_type == "business_table",
+                KnowledgeJob.subject_id == table_id,
+                KnowledgeJob.job_type == "governance_classify",
+            ).all()
+            assert len(jobs) >= 1
+
+
+def test_baseline_stats_include_tables():
+    """基线统计包含数据表。"""
+    db = TestingSessionLocal()
+    try:
+        dept = _make_dept(db)
+        _seed_governance_defaults(db)
+
+        # 创建一些 aligned 数据表
+        for i in range(2):
+            bt = BusinessTable(
+                table_name=f"usr_stat_{i}", display_name=f"统计表{i}",
+                department_id=dept.id, governance_status="aligned",
+            )
+            db.add(bt)
+        # 创建一个 ungoverned 数据表
+        bt_ung = BusinessTable(
+            table_name="usr_stat_ung", display_name="未治理表",
+            department_id=dept.id, governance_status="ungoverned",
+        )
+        db.add(bt_ung)
+        db.commit()
+
+        from app.services.governance_engine import _collect_stats_data
+        stats = _collect_stats_data(db)
+
+        assert stats["total_tables"] >= 3
+        assert stats["aligned_tables"] >= 2
+        assert stats["ungoverned_tables"] >= 1
+    finally:
+        db.close()
+
+
+@patch("app.services.governance_engine._llm_classify_table", return_value=None)
+def test_coverage_gaps_include_tables(_mock_llm):
+    """缺口检测包含数据表。"""
+    db = TestingSessionLocal()
+    try:
+        dept = _make_dept(db)
+        obj, lib, ot = _seed_table_governance_defaults(db)
+
+        # 创建属于 library 但 ungoverned 的数据表
+        for i in range(3):
+            bt = BusinessTable(
+                table_name=f"usr_gap_{i}", display_name=f"缺口表{i}",
+                department_id=dept.id,
+                resource_library_id=lib.id,
+                governance_status="ungoverned",
+            )
+            db.add(bt)
+        db.commit()
+
+        from app.services.governance_gap_detector import auto_fix_deterministic
+        gap = {
+            "gap_type": "low_alignment",
+            "library_id": lib.id,
+            "library_code": lib.code,
+        }
+        result = auto_fix_deterministic(db, gap)
+        db.commit()
+
+        assert result is True
+
+        # 应创建 business_table 类型的 governance_classify jobs
+        jobs = db.query(KnowledgeJob).filter(
+            KnowledgeJob.subject_type == "business_table",
+            KnowledgeJob.job_type == "governance_classify",
+            KnowledgeJob.trigger_source == "gap_fix",
+        ).all()
+        assert len(jobs) >= 3
     finally:
         db.close()

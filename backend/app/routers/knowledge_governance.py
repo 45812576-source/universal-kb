@@ -2508,9 +2508,11 @@ def migration_status(
 
 
 class ImplicitFeedbackRequest(BaseModel):
-    entry_id: int
+    entry_id: int | None = None
     signal_type: str = Field(..., pattern="^(employee_confirm|employee_correct|search_click)$")
     new_classification: dict | None = None  # 纠正时的新分类 {objective_code, library_code}
+    subject_type: str = "knowledge"  # "knowledge" | "business_table"
+    subject_id: int | None = None
 
 
 @router.post("/implicit-feedback")
@@ -2522,16 +2524,26 @@ def post_implicit_feedback(
     """记录隐式反馈信号：员工确认/纠错/搜索点击。"""
     from app.services.knowledge_governance_service import record_implicit_feedback
 
-    entry = db.get(KnowledgeEntry, req.entry_id)
-    if not entry:
-        raise HTTPException(404, "知识条目不存在")
+    effective_id = req.subject_id or req.entry_id
+    if not effective_id:
+        raise HTTPException(400, "需要提供 entry_id 或 subject_id")
+
+    if req.subject_type == "business_table":
+        subject = db.get(BusinessTable, effective_id)
+        if not subject:
+            raise HTTPException(404, "数据表不存在")
+    else:
+        subject = db.get(KnowledgeEntry, effective_id)
+        if not subject:
+            raise HTTPException(404, "知识条目不存在")
 
     record_implicit_feedback(
         db,
-        entry_id=req.entry_id,
         signal_type=req.signal_type,
         user_id=user.id,
         new_classification=req.new_classification,
+        subject_type=req.subject_type,
+        subject_id=effective_id,
     )
     db.commit()
     return {"ok": True}

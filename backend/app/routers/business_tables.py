@@ -721,6 +721,14 @@ async def sync_bitable(
     db.commit()
     db.refresh(bt)
 
+    # 触发治理分类 job
+    from app.models.knowledge_job import KnowledgeJob
+    db.add(KnowledgeJob(
+        subject_type="business_table", subject_id=bt.id,
+        job_type="governance_classify", trigger_source="upload",
+    ))
+    db.commit()
+
     return {"ok": True, "table_name": safe_name, "id": bt.id, "inserted": inserted, "total_fields": len(fields)}
 
 
@@ -867,6 +875,15 @@ def create_blank_table(
     db.add(bt)
     db.commit()
     db.refresh(bt)
+
+    # 触发治理分类 job
+    from app.models.knowledge_job import KnowledgeJob
+    db.add(KnowledgeJob(
+        subject_type="business_table", subject_id=bt.id,
+        job_type="governance_classify", trigger_source="upload",
+    ))
+    db.commit()
+
     return {"id": bt.id, "table_name": bt.table_name, "display_name": bt.display_name}
 
 
@@ -1000,6 +1017,15 @@ async def upload_file_as_table(
     db.add(bt)
     db.commit()
     db.refresh(bt)
+
+    # 触发治理分类 job
+    from app.models.knowledge_job import KnowledgeJob
+    db.add(KnowledgeJob(
+        subject_type="business_table", subject_id=bt.id,
+        job_type="governance_classify", trigger_source="upload",
+    ))
+    db.commit()
+
     return {
         "id": bt.id,
         "table_name": bt.table_name,

@@ -124,12 +124,26 @@ def _run_classify_job(db: Session, job: KnowledgeJob, entry: KnowledgeEntry) -> 
             job.status = "queued"
 
 
-def _run_governance_classify_job(db: Session, job: KnowledgeJob, entry: KnowledgeEntry) -> None:
-    """执行单个 governance_classify job。"""
-    from app.services.governance_engine import process_governance_classify
+def _run_governance_classify_job(db: Session, job: KnowledgeJob, entry: KnowledgeEntry | None) -> None:
+    """执行单个 governance_classify job，根据 subject_type 加载对应模型。"""
+    from app.services.governance_engine import process_governance_classify, process_governance_classify_subject
 
     try:
-        ok = process_governance_classify(db, entry)
+        if job.subject_type == "business_table":
+            from app.models.business import BusinessTable
+            table = db.get(BusinessTable, job.subject_id)
+            if not table:
+                job.status = "failed"
+                job.error_message = "business_table not found"
+                return
+            ok = process_governance_classify_subject(db, "business_table", table)
+        else:
+            if not entry:
+                job.status = "failed"
+                job.error_message = "knowledge entry not found"
+                return
+            ok = process_governance_classify(db, entry)
+
         if ok:
             job.status = "success"
         else:
@@ -166,12 +180,18 @@ def process_knowledge_jobs():
         logger.info(f"[KnowledgeWorker] processing {len(jobs)} jobs")
 
         for job in jobs:
-            entry = db.get(KnowledgeEntry, job.knowledge_id)
-            if not entry:
-                job.status = "failed"
-                job.error_message = "knowledge entry not found"
-                db.commit()
-                continue
+            # governance_classify 对 business_table 不需要 KnowledgeEntry
+            entry = None
+            if job.subject_type == "business_table" and job.job_type == "governance_classify":
+                pass  # entry 由 _run_governance_classify_job 内部加载
+            else:
+                kid = job.knowledge_id or job.subject_id
+                entry = db.get(KnowledgeEntry, kid) if kid else None
+                if not entry:
+                    job.status = "failed"
+                    job.error_message = "knowledge entry not found"
+                    db.commit()
+                    continue
 
             job.status = "running"
             job.attempt_count += 1
@@ -390,5 +410,57 @@ def backfill_failed_renders():
             db.commit()
     except Exception:
         logger.exception("[KnowledgeWorker] render backfill error")
+    finally:
+        db.close()
+
+
+def backfill_ungoverned_tables():
+    """补偿任务：扫描 governance_status IS NULL 或 ungoverned 的数据表，创建 governance_classify job。
+
+    每批最多 20 条，由 scheduler 周期调用。
+    """
+    db = SessionLocal()
+    try:
+        from sqlalchemy import or_
+        from app.models.business import BusinessTable
+
+        # 已有 queued/running governance_classify job（business_table 类型）的条目
+        subq = (
+            db.query(KnowledgeJob.subject_id)
+            .filter(
+                KnowledgeJob.subject_type == "business_table",
+                KnowledgeJob.job_type == "governance_classify",
+                KnowledgeJob.status.in_(["queued", "running"]),
+            )
+            .subquery()
+        )
+
+        tables = (
+            db.query(BusinessTable.id)
+            .filter(
+                or_(
+                    BusinessTable.governance_status.is_(None),
+                    BusinessTable.governance_status == "ungoverned",
+                ),
+                BusinessTable.is_archived == False,
+                BusinessTable.id.notin_(subq),
+            )
+            .limit(20)
+            .all()
+        )
+
+        if tables:
+            logger.info(f"[KnowledgeWorker] backfill: creating governance_classify jobs for {len(tables)} tables")
+            for (tid,) in tables:
+                job = KnowledgeJob(
+                    subject_type="business_table",
+                    subject_id=tid,
+                    job_type="governance_classify",
+                    trigger_source="scheduled",
+                )
+                db.add(job)
+            db.commit()
+    except Exception:
+        logger.exception("[KnowledgeWorker] table governance backfill error")
     finally:
         db.close()

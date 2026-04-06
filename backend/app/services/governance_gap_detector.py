@@ -13,6 +13,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.models.business import BusinessTable
 from app.models.knowledge import KnowledgeEntry
 from app.models.knowledge_governance import (
     GovernanceBaselineSnapshot,
@@ -82,14 +83,28 @@ def detect_coverage_gaps(db: Session) -> list[dict[str, Any]]:
 
     gaps = []
     for lib in libraries:
-        total = db.query(func.count(KnowledgeEntry.id)).filter(
+        entry_total = db.query(func.count(KnowledgeEntry.id)).filter(
             KnowledgeEntry.resource_library_id == lib.id,
         ).scalar() or 0
 
-        aligned = db.query(func.count(KnowledgeEntry.id)).filter(
+        entry_aligned = db.query(func.count(KnowledgeEntry.id)).filter(
             KnowledgeEntry.resource_library_id == lib.id,
             KnowledgeEntry.governance_status == "aligned",
         ).scalar() or 0
+
+        table_total = db.query(func.count(BusinessTable.id)).filter(
+            BusinessTable.resource_library_id == lib.id,
+            BusinessTable.is_archived == False,
+        ).scalar() or 0
+
+        table_aligned = db.query(func.count(BusinessTable.id)).filter(
+            BusinessTable.resource_library_id == lib.id,
+            BusinessTable.governance_status == "aligned",
+            BusinessTable.is_archived == False,
+        ).scalar() or 0
+
+        total = entry_total + table_total
+        aligned = entry_aligned + table_aligned
 
         if total < 3:
             # 资源库内容太少，标为覆盖缺口
@@ -149,14 +164,12 @@ def auto_fix_deterministic(db: Session, gap: dict[str, Any]) -> bool:
         .all()
     )
 
-    if not entries:
-        return False
-
-    # 检查是否已有 queued job
+    # 检查是否已有 queued job（知识条目）
     existing_ids = {
         eid for (eid,) in db.query(KnowledgeJob.knowledge_id).filter(
             KnowledgeJob.job_type == "governance_classify",
             KnowledgeJob.status.in_(["queued", "running"]),
+            KnowledgeJob.subject_type == "knowledge",
         ).all()
     }
 
@@ -165,6 +178,36 @@ def auto_fix_deterministic(db: Session, gap: dict[str, Any]) -> bool:
         if eid not in existing_ids:
             db.add(KnowledgeJob(
                 knowledge_id=eid,
+                job_type="governance_classify",
+                trigger_source="gap_fix",
+            ))
+            created += 1
+
+    # 同时处理属于该库但 ungoverned 的数据表
+    tables = (
+        db.query(BusinessTable.id)
+        .filter(
+            BusinessTable.resource_library_id == library_id,
+            BusinessTable.governance_status.in_(["ungoverned", None]),
+            BusinessTable.is_archived == False,
+        )
+        .limit(20)
+        .all()
+    )
+
+    existing_table_ids = {
+        tid for (tid,) in db.query(KnowledgeJob.subject_id).filter(
+            KnowledgeJob.subject_type == "business_table",
+            KnowledgeJob.job_type == "governance_classify",
+            KnowledgeJob.status.in_(["queued", "running"]),
+        ).all()
+    }
+
+    for (tid,) in tables:
+        if tid not in existing_table_ids:
+            db.add(KnowledgeJob(
+                subject_type="business_table",
+                subject_id=tid,
                 job_type="governance_classify",
                 trigger_source="gap_fix",
             ))

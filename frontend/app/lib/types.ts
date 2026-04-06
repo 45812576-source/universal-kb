@@ -161,6 +161,7 @@ export interface BusinessTable {
   ddl_sql: string;
   validation_rules: Record<string, { max?: number; min?: number; enum?: string[] }>;
   workflow: { stages?: string[]; field?: string };
+  governance_confidence?: number | null;
   created_at: string;
   columns?: { name: string; type: string; nullable: boolean; comment: string }[];
 }
