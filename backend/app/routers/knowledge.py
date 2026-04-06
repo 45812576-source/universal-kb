@@ -286,6 +286,9 @@ def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None
         "doc_render_status": None if (e.doc_render_status == "pending" and not e.oss_key) else e.doc_render_status,
         "doc_render_error": e.doc_render_error,
         "doc_render_mode": e.doc_render_mode,
+        # AI 结构化笔记
+        "ai_notes_status": e.ai_notes_status,
+        "ai_notes_error": e.ai_notes_error,
         # 来源与同步
         "source_uri": e.source_uri,
         "sync_status": e.sync_status,
@@ -306,7 +309,7 @@ def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None
         "visibility_scope": _knowledge_visibility_scope(e),
         "folder_business_unit": getattr(folder_obj, "business_unit", None),
         # 能力标志
-        "can_open_onlyoffice": bool(e.oss_key and ext in _ONLYOFFICE_EXTS),
+        "can_open_onlyoffice": bool(e.oss_key and (ext in _ONLYOFFICE_EXTS or (ext == ".pdf" and e.docx_oss_key))),
         "can_retry_render": e.doc_render_status in ("failed", "pending", None),
         "can_retry_classification": e.classification_status in ("failed", "pending", "needs_review", None),
         "created_at": e.created_at.isoformat(),
@@ -616,8 +619,10 @@ def _create_entry_from_file(
             db.add(KnowledgeJob(knowledge_id=entry.id, job_type="render", trigger_source="upload"))
         db.add(KnowledgeJob(knowledge_id=entry.id, job_type="classify", trigger_source="upload"))
         db.add(KnowledgeJob(knowledge_id=entry.id, job_type="understand", trigger_source="upload"))
+        db.add(KnowledgeJob(knowledge_id=entry.id, job_type="ai_notes", trigger_source="upload"))
         db.add(KnowledgeJob(knowledge_id=entry.id, job_type="governance_classify", trigger_source="upload"))
     entry.classification_status = "pending"
+    entry.ai_notes_status = "pending"
 
     return entry, content, file_type
 
@@ -1258,7 +1263,45 @@ def get_knowledge(
     result = _entry_dict(entry, _fmap, db=db)
     result["content"] = entry.content  # full content for detail view
     result["content_html"] = entry.content_html  # HTML for cloud doc editor
+    result["ai_notes_html"] = entry.ai_notes_html  # AI 结构化笔记 HTML
     return result
+
+
+@router.put("/{kid}/ai-notes")
+def save_ai_notes(
+    kid: int,
+    ai_notes_html: str = Body(..., embed=True),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """用户编辑 AI 笔记后保存。"""
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    entry.ai_notes_html = ai_notes_html
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/{kid}/retry-ai-notes")
+def retry_ai_notes(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """重新生成 AI 笔记。"""
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    entry.ai_notes_status = "pending"
+    entry.ai_notes_error = None
+    entry.ai_notes_html = None
+
+    if _has_table(db, "knowledge_jobs"):
+        from app.models.knowledge_job import KnowledgeJob
+        db.add(KnowledgeJob(knowledge_id=entry.id, job_type="ai_notes", trigger_source="retry"))
+    db.commit()
+    return {"ok": True, "ai_notes_status": "pending"}
 
 
 @router.post("/{kid}/share-links")

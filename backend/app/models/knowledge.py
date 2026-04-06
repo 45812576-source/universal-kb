@@ -79,6 +79,7 @@ class KnowledgeEntry(Base):
     file_type = Column(String(50), nullable=True)      # MIME 类型 (application/pdf 等)
     file_ext = Column(String(20), nullable=True)       # 文件扩展名 (.pdf, .docx 等)
     file_size = Column(BigInteger, nullable=True)      # 文件大小 (bytes)
+    docx_oss_key = Column(String(500), nullable=True)   # PDF 转换后的 DOCX 文件 OSS 路径
 
     # ── AI 智能命名 ──────────────────────────────────────────────────────────
     ai_title = Column(String(500), nullable=True)      # AI 生成的标题
@@ -149,6 +150,11 @@ class KnowledgeEntry(Base):
     doc_render_error = Column(Text, nullable=True)            # 转换失败原因
     doc_render_mode = Column(String(30), nullable=True)       # native_html/converted_html/onlyoffice/pdf_fallback/text_fallback
     last_rendered_at = Column(DateTime, nullable=True)         # 最近渲染完成时间
+
+    # ── AI 结构化笔记 ──────────────────────────────────────────────────────────
+    ai_notes_html = Column(Text, nullable=True)               # AI 结构化笔记 HTML
+    ai_notes_status = Column(String(20), nullable=True)       # pending/processing/ready/failed
+    ai_notes_error = Column(Text, nullable=True)              # 笔记生成失败原因
 
     # ── 统一来源 ──────────────────────────────────────────────────────────────
     source_uri = Column(String(500), nullable=True)           # 统一来源 URI

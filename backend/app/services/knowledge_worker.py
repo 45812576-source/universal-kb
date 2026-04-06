@@ -39,6 +39,53 @@ def _run_render_job(db: Session, job: KnowledgeJob, entry: KnowledgeEntry) -> No
             job.status = "queued"  # 还有重试机会，放回队列
 
 
+def _run_ai_notes_job(db: Session, job: KnowledgeJob, entry: KnowledgeEntry) -> None:
+    """执行单个 ai_notes job。"""
+    from app.services.ai_notes_generator import generate_ai_notes
+
+    try:
+        entry.ai_notes_status = "processing"
+        db.flush()
+
+        loop = asyncio.new_event_loop()
+        html = loop.run_until_complete(
+            generate_ai_notes(
+                knowledge_id=entry.id,
+                content=entry.content or "",
+                filename=entry.source_file or entry.title or "",
+                file_ext=entry.file_ext or "",
+                db=db,
+            )
+        )
+        loop.close()
+    except Exception as e:
+        logger.warning(f"[KnowledgeWorker] ai_notes job {job.id} error: {e}")
+        entry.ai_notes_status = "failed"
+        entry.ai_notes_error = str(e)[:500]
+        job.error_type = "ai_notes_error"
+        job.error_message = str(e)[:500]
+        if job.attempt_count >= job.max_attempts:
+            job.status = "failed"
+        else:
+            job.status = "queued"
+        return
+
+    if html:
+        entry.ai_notes_html = html
+        entry.ai_notes_status = "ready"
+        entry.ai_notes_error = None
+        job.status = "success"
+    else:
+        entry.ai_notes_status = "failed"
+        entry.ai_notes_error = "AI 笔记生成返回空结果"
+        job.error_type = "empty_result"
+        job.error_message = "AI 笔记生成返回空结果"
+        if job.attempt_count >= job.max_attempts:
+            job.status = "failed"
+        else:
+            job.status = "queued"
+
+
 def _run_understand_job(db: Session, job: KnowledgeJob, entry: KnowledgeEntry) -> None:
     """执行单个 understand job。"""
     from app.services.knowledge_understanding import understand_document
@@ -205,6 +252,8 @@ def process_knowledge_jobs():
                     _run_classify_job(db, job, entry)
                 elif job.job_type == "understand":
                     _run_understand_job(db, job, entry)
+                elif job.job_type == "ai_notes":
+                    _run_ai_notes_job(db, job, entry)
                 elif job.job_type == "governance_classify":
                     _run_governance_classify_job(db, job, entry)
                 else:
