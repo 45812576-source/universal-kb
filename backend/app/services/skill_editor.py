@@ -12,6 +12,25 @@ from app.services.llm_gateway import llm_gateway
 
 logger = logging.getLogger(__name__)
 
+
+def _try_parse_json(raw: str) -> dict | None:
+    """M15: 健壮的 JSON 解析，支持 code block 包裹和 fallback 提取。"""
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-z]*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r'\{[\s\S]+\}', cleaned)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+        return None
+
+
 _EDIT_SYSTEM = """你是 Skill 编辑助手。根据用户的修改指令，对 Skill 进行精准修改。
 
 ## 当前 Skill 结构
@@ -84,13 +103,23 @@ class SkillEditor:
             max_tokens=4000,
         )
 
-        # Strip markdown code blocks if present
-        cleaned = result.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```[a-z]*\n?", "", cleaned)
-            cleaned = re.sub(r"\n?```$", "", cleaned)
-
-        proposed = json.loads(cleaned)
+        # M15: JSON 解析 fallback + 重试
+        proposed = _try_parse_json(result)
+        if proposed is None:
+            # 重试一次
+            logger.warning("skill_editor: JSON 解析失败，重试一次")
+            result, _ = await llm_gateway.chat(
+                model_config=model_config,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": instruction + "\n\n请只返回纯JSON，不要包含任何其他内容。"},
+                ],
+                temperature=0.1,
+                max_tokens=4000,
+            )
+            proposed = _try_parse_json(result)
+            if proposed is None:
+                raise ValueError("LLM 返回内容无法解析为 JSON")
 
         # Build diff: only fields that changed
         diff = {}
@@ -228,15 +257,26 @@ class SkillEditor:
             max_tokens=4000,
         )
 
-        cleaned = result.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```[a-z]*\n?", "", cleaned)
-            cleaned = re.sub(r"\n?```$", "", cleaned)
-
-        proposed = json.loads(cleaned)
+        # M15: JSON 解析 fallback (同 apply_edit)
+        proposed = _try_parse_json(result)
+        if proposed is None:
+            logger.warning("skill_editor.iterate: JSON 解析失败，重试一次")
+            result, _ = await llm_gateway.chat(
+                model_config=model_config,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": f"请根据以下意见生成改进版本，只返回纯JSON：\n\n{suggestion_text}"},
+                ],
+                temperature=0.1,
+                max_tokens=4000,
+            )
+            proposed = _try_parse_json(result)
+            if proposed is None:
+                raise ValueError("LLM 返回内容无法解析为 JSON")
 
         diff = {}
-        for field in ("system_prompt", "variables", "knowledge_tags", "data_queries"):
+        # M17: 包含 required_inputs 在 diff 中
+        for field in ("system_prompt", "variables", "required_inputs", "knowledge_tags", "data_queries"):
             old_val = current.get(field)
             new_val = proposed.get(field)
             if old_val != new_val:

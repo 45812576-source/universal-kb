@@ -45,12 +45,48 @@ _TOOL_KEYWORDS = re.compile(r"(调用|获取数据|API|查询|计算|执行|搜�
 _TEMPLATE_KEYWORDS = re.compile(r"(固定格式|模板|输出格式|表格格式|JSON格式|Markdown格式)", re.IGNORECASE)
 
 
+def _validate_lifecycle(stage: str) -> str:
+    """L8: 校验 lifecycle_stage 值合法性。"""
+    if stage not in VALID_LIFECYCLE_STAGES:
+        raise ValueError(f"非法 lifecycle_stage: {stage!r}")
+    return stage
+
+
+def _validate_task_status(status: str) -> str:
+    """L8: 校验 task status 值合法性。"""
+    if status not in VALID_TASK_STATUSES:
+        raise ValueError(f"非法 task status: {status!r}")
+    return status
+
+
 def _new_id(prefix: str = "task") -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
 
 def _now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
+
+
+class OptimisticLockError(Exception):
+    """Raised when a memo was modified concurrently."""
+
+
+def _save_memo_payload(db: Session, memo: SkillMemo, payload: dict) -> None:
+    """M18: Atomically update memo_payload with optimistic version check."""
+    old_version = memo.version
+    rows = (
+        db.query(SkillMemo)
+        .filter(SkillMemo.id == memo.id, SkillMemo.version == old_version)
+        .update(
+            {"memo_payload": payload, "version": old_version + 1},
+            synchronize_session="fetch",
+        )
+    )
+    if rows == 0:
+        db.rollback()
+        raise OptimisticLockError(
+            f"SkillMemo {memo.id} was modified concurrently (expected version {old_version})"
+        )
 
 
 def _empty_payload() -> dict:
@@ -549,7 +585,7 @@ def start_task(db: Session, skill_id: int, task_id: str, user_id: int) -> dict:
     if not target_task:
         return {"ok": False, "error": "Task not found"}
 
-    target_task["status"] = "in_progress"
+    target_task["status"] = _validate_task_status("in_progress")
     target_task["started_at"] = _now_iso()
     payload["current_task_id"] = task_id
 
@@ -557,7 +593,7 @@ def start_task(db: Session, skill_id: int, task_id: str, user_id: int) -> dict:
     if memo.lifecycle_stage in ("analysis", "planning"):
         memo.lifecycle_stage = "editing"
 
-    memo.memo_payload = payload
+    _save_memo_payload(db, memo, payload)
     memo.updated_by = user_id
     memo.status_summary = f"正在进行：{target_task['title']}"
     db.commit()
@@ -665,7 +701,7 @@ def complete_from_save(
     # 推进生命周期
     _advance_lifecycle(memo, payload)
 
-    memo.memo_payload = payload
+    _save_memo_payload(db, memo, payload)
     memo.status_summary = f"已完成{target_task['title']}。" + (f"下一步：{next_task['title']}" if next_task else "所有编辑任务已完成。")
     db.commit()
 
@@ -708,7 +744,7 @@ def direct_test(db: Session, skill_id: int, user_id: int) -> dict:
     })
 
     memo.lifecycle_stage = "testing"
-    memo.memo_payload = payload
+    _save_memo_payload(db, memo, payload)
     memo.status_summary = "已进入测试流程。"
     memo.updated_by = user_id
     db.commit()
@@ -804,7 +840,7 @@ def record_test_result(
     if generated_task_ids:
         payload["current_task_id"] = generated_task_ids[0]
 
-    memo.memo_payload = payload
+    _save_memo_payload(db, memo, payload)
     if user_id:
         memo.updated_by = user_id
     db.commit()
@@ -879,7 +915,7 @@ def adopt_feedback(
     if memo.lifecycle_stage in ("ready_to_submit", "completed"):
         memo.lifecycle_stage = "editing"
 
-    memo.memo_payload = payload
+    _save_memo_payload(db, memo, payload)
     memo.status_summary = f"已采纳反馈：{summary[:50]}"
     memo.updated_by = user_id
     db.commit()
@@ -920,9 +956,9 @@ def _advance_lifecycle(memo: SkillMemo, payload: dict) -> None:
     all_non_test_done = all(t["status"] in ("done", "skipped") for t in non_test_tasks) if non_test_tasks else True
 
     if memo.lifecycle_stage == "editing" and all_non_test_done:
-        memo.lifecycle_stage = "awaiting_test"
+        memo.lifecycle_stage = _validate_lifecycle("awaiting_test")
     elif memo.lifecycle_stage == "fixing":
         fix_tasks = [t for t in tasks if t["type"] == "fix_after_test"]
         all_fixes_done = all(t["status"] in ("done", "skipped") for t in fix_tasks) if fix_tasks else True
         if all_fixes_done:
-            memo.lifecycle_stage = "awaiting_test"
+            memo.lifecycle_stage = _validate_lifecycle("awaiting_test")

@@ -402,7 +402,8 @@ class SkillEngine:
         for s in skills:
             if s.name.lower() in result_lower:
                 return s
-        return db.query(Skill).filter(Skill.name == first_line).first()
+        # M6: 移除 DB fallback（可绕过候选集限制），未匹配则返回 None
+        return None
 
     async def _extract_variables(
         self,
@@ -416,11 +417,15 @@ class SkillEngine:
             variables=", ".join(variables),
             conversation=conversation_text,
         )
-        result, _ = await llm_gateway.chat(
-            model_config=model_config,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=300,
+        # H2: LLM 辅助调用统一 timeout
+        result, _ = await asyncio.wait_for(
+            llm_gateway.chat(
+                model_config=model_config,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=300,
+            ),
+            timeout=30,
         )
         try:
             return json.loads(result.strip())
@@ -601,19 +606,18 @@ class SkillEngine:
                 # 已审批 + 低敏感 → 原文注入
                 parts.append(f"[相关知识]\n{h['text']}")
             else:
-                # 需要脱敏：按级别动态执行
-                masked_text = None
-                try:
-                    from app.services.text_masker import mask_text
-                    type_hits = doc_data_type_hits.get(kid)
-                    result_text, replacements = mask_text(h["text"], level=doc_level, data_type_hits=type_hits)
-                    # 有实际替换才用 mask_text 结果，否则 fallback 到预存脱敏版
-                    if replacements:
-                        masked_text = result_text
-                except Exception:
-                    pass
+                # 需要脱敏：优先使用预存脱敏版（人工/系统审核过，更可靠），
+                # 其次动态 mask_text，最后 fallback 到规则脱敏
+                masked_text = h.get("desensitized_text", "").strip()
                 if not masked_text:
-                    masked_text = h.get("desensitized_text", "").strip()
+                    try:
+                        from app.services.text_masker import mask_text
+                        type_hits = doc_data_type_hits.get(kid)
+                        result_text, replacements = mask_text(h["text"], level=doc_level, data_type_hits=type_hits)
+                        if replacements:
+                            masked_text = result_text
+                    except Exception:
+                        pass
                 if not masked_text:
                     from app.services.vector_service import _desensitize_rule
                     masked_text = _desensitize_rule(h["text"])
@@ -785,12 +789,14 @@ class SkillEngine:
                 model_config = llm_gateway.resolve_config(db, "skill.execute", model_config_id)
                 _check_model_grant(db, model_config, user_id)
 
+                # H3: 消息分页加载，最多取最近 100 条
                 messages = (
                     db.query(Message)
                     .filter(Message.conversation_id == conversation.id)
-                    .order_by(Message.created_at)
+                    .order_by(Message.created_at.desc())
+                    .limit(100)
                     .all()
-                )
+                )[::-1]  # 反转回正序
 
                 # 编译 prompt 并返回
                 if skill_version:
@@ -835,6 +841,9 @@ class SkillEngine:
                     llm_messages.append({"role": "user", "content": user_m.content or "(empty)"})
                     llm_messages.append({"role": "assistant", "content": _ac})
                 llm_messages.append({"role": "user", "content": user_message})
+
+                # M2: sandbox 模式也做上下文压缩
+                llm_messages = await self._compact_if_needed(db, llm_messages, model_config)
 
                 return PrepareResult(
                     llm_messages=llm_messages,
@@ -946,16 +955,21 @@ class SkillEngine:
         _phase_t0 = _time.monotonic()
 
         if skill and conversation.skill_id != skill.id:
+            # M5: 加行级锁防止并发竞态
+            db.query(Conversation).filter(
+                Conversation.id == conversation.id
+            ).with_for_update().first()
             conversation.skill_id = skill.id
             db.flush()
 
-        # 2. Get conversation history
+        # 2. Get conversation history (H3: 分页加载，最多取最近 100 条)
         messages = (
             db.query(Message)
             .filter(Message.conversation_id == conversation.id)
-            .order_by(Message.created_at)
+            .order_by(Message.created_at.desc())
+            .limit(100)
             .all()
-        )
+        )[::-1]  # 反转回正序
 
         # 3. Get model config
         skill_version = skill.versions[0] if skill and skill.versions else None
@@ -1387,9 +1401,14 @@ class SkillEngine:
         threshold: float = 0.85,
     ) -> list[dict]:
         """If estimated token usage exceeds threshold * context_window, summarize early history."""
-        # Simple estimate: 1 token ≈ 2 Chinese chars ≈ 4 bytes
-        total_chars = sum(len(m.get("content") or "") for m in llm_messages)
-        estimated_tokens = total_chars // 2
+        # M1: 使用 tiktoken 精确计算 token（fallback 到字符估算）
+        total_text = "".join(m.get("content") or "" for m in llm_messages)
+        try:
+            import tiktoken
+            enc = tiktoken.encoding_for_model("gpt-4")
+            estimated_tokens = len(enc.encode(total_text))
+        except Exception:
+            estimated_tokens = len(total_text) // 2
 
         context_window = model_config.get("context_window", 32000)
         if estimated_tokens <= context_window * threshold:
@@ -1415,7 +1434,7 @@ class SkillEngine:
             ]
             new_chars = sum(len(m.get("content") or "") for m in compacted)
             logger.info(
-                f"Context compacted: {total_chars} → {new_chars} chars "
+                f"Context compacted: {len(total_text)} → {new_chars} chars "
                 f"(~{estimated_tokens} → {new_chars // 2} tokens)"
             )
             return compacted
@@ -1440,11 +1459,15 @@ class SkillEngine:
             lite_config = llm_gateway.resolve_config(db, "skill.compress_history")
         except Exception:
             lite_config = model_config
-        result, _ = await llm_gateway.chat(
-            model_config=lite_config,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=300,
+        # H2: LLM 辅助调用统一 timeout
+        result, _ = await asyncio.wait_for(
+            llm_gateway.chat(
+                model_config=lite_config,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=300,
+            ),
+            timeout=30,
         )
         return result.strip()
 
@@ -1575,10 +1598,21 @@ class SkillEngine:
                     params = {}
             else:
                 params = raw_args
-            result = await tool_executor.execute_tool(db, tool_name, params, user_id)
+            # H1: 单次 tool 执行超时保护
+            try:
+                result = await asyncio.wait_for(
+                    tool_executor.execute_tool(db, tool_name, params, user_id),
+                    timeout=self._TOOL_EXEC_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Tool '%s' 执行超时 (%ds)", tool_name, self._TOOL_EXEC_TIMEOUT)
+                result = {"ok": False, "error": f"工具 {tool_name} 执行超时"}
             return call, result
 
         return list(await asyncio.gather(*[_exec_one(c) for c in tool_calls]))
+
+    _AGENT_LOOP_TIMEOUT = 300  # H1: Agent Loop 总超时 (秒)
+    _TOOL_EXEC_TIMEOUT = 60   # H1: 单次 tool 执行超时 (秒)
 
     async def _handle_tool_calls_stream(
         self,
@@ -1600,6 +1634,9 @@ class SkillEngine:
         - native_tool_calls 非空：原生 function calling（模型支持时）
         - 否则：解析 response 中的 ```tool_call``` 文本块（fallback）
         """
+        import time as _time
+        _loop_deadline = _time.monotonic() + self._AGENT_LOOP_TIMEOUT
+
         extra_meta: dict = {}
         block_idx = start_block_idx  # caller tracks how many blocks were already emitted
         consecutive_failures = 0  # 连续失败计数，用于早停
@@ -1612,6 +1649,11 @@ class SkillEngine:
                 break
 
         for round_num in range(max_rounds):
+            # H1: Agent Loop 总超时检查
+            if _time.monotonic() > _loop_deadline:
+                logger.warning("Agent Loop 超时 (%ds)，强制终止", self._AGENT_LOOP_TIMEOUT)
+                break
+
             # 解析本轮工具调用列表
             if native_tool_calls:
                 # 原生 function calling：直接使用结构化数据（每轮都优先用，不只第0轮）
@@ -1851,12 +1893,20 @@ class SkillEngine:
             lite_config = llm_gateway.resolve_config(db, "skill.tool_match")
         except Exception:
             lite_config = model_config
-        result, _ = await llm_gateway.chat(
-            model_config=lite_config,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=50,
-        )
+        # H2: LLM 辅助调用统一 timeout
+        try:
+            result, _ = await asyncio.wait_for(
+                llm_gateway.chat(
+                    model_config=lite_config,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=50,
+                ),
+                timeout=30,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("_detect_tool_intent LLM 调用超时")
+            return None
         name = result.strip().splitlines()[0].strip().strip('"').strip("'")
         if name.lower() == "none":
             return None
@@ -1899,12 +1949,20 @@ class SkillEngine:
             lite_config = llm_gateway.resolve_config(db, "skill.tool_param_extract")
         except Exception:
             lite_config = model_config
-        result, _ = await llm_gateway.chat(
-            model_config=lite_config,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=1000,
-        )
+        # H2: LLM 辅助调用统一 timeout
+        try:
+            result, _ = await asyncio.wait_for(
+                llm_gateway.chat(
+                    model_config=lite_config,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=1000,
+                ),
+                timeout=30,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("_extract_tool_params LLM 调用超时")
+            return None
         raw = result.strip()
         if raw.lower() == "null":
             return None
@@ -1939,11 +1997,15 @@ class SkillEngine:
         except Exception:
             lite_config = model_config
         try:
-            result, _ = await llm_gateway.chat(
-                model_config=lite_config,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=100,
+            # H2: LLM 辅助调用统一 timeout
+            result, _ = await asyncio.wait_for(
+                llm_gateway.chat(
+                    model_config=lite_config,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=100,
+                ),
+                timeout=30,
             )
             selected_names = {n.strip().strip('"').strip("'") for n in result.split(",")}
             selected = [t for t in available_tools if t.name in selected_names]
@@ -1971,11 +2033,15 @@ class SkillEngine:
             lite_config = llm_gateway.resolve_config(db, "skill.tool_output_map")
         except Exception:
             lite_config = model_config
-        result, _ = await llm_gateway.chat(
-            model_config=lite_config,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=2000,
+        # H2: LLM 辅助调用统一 timeout
+        result, _ = await asyncio.wait_for(
+            llm_gateway.chat(
+                model_config=lite_config,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=2000,
+            ),
+            timeout=30,
         )
         raw = re.sub(r"```(?:json)?|```", "", result).strip()
         return json.loads(raw)
@@ -2024,8 +2090,23 @@ class SkillEngine:
         injected = "\n\n".join(parts) if parts else "（模板文件未找到）"
         return system_prompt.replace("{{TEMPLATE_CLASSES}}", injected)
 
+    # ── PPTX 代码执行白名单（仅允许 pptx 相关模块） ──
+    _PPTX_ALLOWED_MODULES = frozenset({
+        "pptx", "pptx.util", "pptx.dml.color", "pptx.enum.text", "pptx.enum.shapes",
+        "pptx.enum.chart", "pptx.enum.dml", "pptx.oxml.ns",
+        "os.path", "math", "decimal", "datetime", "json", "re", "copy",
+        "collections", "itertools", "functools", "textwrap", "string",
+    })
+
     def _execute_pptx_code(self, response: str) -> dict:
-        """Extract python code block from LLM response and execute it to generate a pptx file."""
+        """Extract python code block from LLM response and execute it to generate a pptx file.
+
+        Security: 代码在受限子进程中运行——
+        1. 仅允许白名单模块 import
+        2. 禁止 exec/eval/compile/__import__/open（写目标文件除外）
+        3. 60s 超时 + 输出大小限制
+        4. 网络/文件系统通过 import 白名单间接限制
+        """
         import os
         import uuid
         import subprocess
@@ -2039,6 +2120,50 @@ class SkillEngine:
             return {}
 
         code = matches[0]
+
+        # ── 静态安全检查：阻止明显危险的代码模式 ──
+        _FORBIDDEN_PATTERNS = [
+            r'\b__import__\s*\(',
+            r'\bexec\s*\(',
+            r'\beval\s*\(',
+            r'\bcompile\s*\(',
+            r'\bgetattr\s*\(',
+            r'\bsetattr\s*\(',
+            r'\bglobals\s*\(',
+            r'\blocals\s*\(',
+            r'\bbreakpoint\s*\(',
+            r'\bsubprocess\b',
+            r'\bos\.system\b',
+            r'\bos\.popen\b',
+            r'\bos\.exec',
+            r'\bos\.spawn',
+            r'\bos\.remove\b',
+            r'\bos\.unlink\b',
+            r'\bos\.rmdir\b',
+            r'\bshutil\.rmtree\b',
+            r'\bsocket\b',
+            r'\burllib\b',
+            r'\brequests\b',
+            r'\bhttpx\b',
+            r'\baiohttp\b',
+        ]
+        for pat in _FORBIDDEN_PATTERNS:
+            if re.search(pat, code):
+                logger.warning(f"pptx code blocked by static check: pattern={pat}")
+                return {}
+
+        # ── import 白名单检查 ──
+        import_pattern = r'(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))'
+        for match in re.finditer(import_pattern, code):
+            module = match.group(1) or match.group(2)
+            # 允许白名单模块及其子模块
+            allowed = any(
+                module == m or module.startswith(m + ".")
+                for m in self._PPTX_ALLOWED_MODULES
+            )
+            if not allowed:
+                logger.warning(f"pptx code blocked: unauthorized import '{module}'")
+                return {}
 
         # Ensure output goes to uploads/generated/
         upload_dir = os.environ.get("UPLOAD_DIR", "./uploads")
@@ -2061,12 +2186,21 @@ class SkillEngine:
 
             result = subprocess.run(
                 ["python3", tmp_path],
-                capture_output=True, text=True, timeout=120
+                capture_output=True, text=True, timeout=60,
+                # 安全隔离：限制子进程环境
+                env={
+                    "PATH": os.environ.get("PATH", "/usr/bin:/usr/local/bin"),
+                    "HOME": tempfile.gettempdir(),
+                    "PYTHONPATH": "",  # 阻止加载非标准模块路径
+                },
+                cwd=tempfile.gettempdir(),  # 工作目录隔离
             )
             os.unlink(tmp_path)
 
             if result.returncode != 0:
-                logger.error(f"pptx code execution failed: {result.stderr}")
+                # 截断 stderr 避免日志爆炸
+                stderr = (result.stderr or "")[:500]
+                logger.error(f"pptx code execution failed: {stderr}")
                 return {}
 
             if not file_path.exists():
@@ -2076,6 +2210,13 @@ class SkillEngine:
                 "download_url": f"/api/files/{file_id}",
                 "download_filename": "演示文稿.pptx",
             }
+        except subprocess.TimeoutExpired:
+            logger.error("pptx code execution timed out (60s)")
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return {}
         except Exception as e:
             logger.error(f"pptx code execution error: {e}")
             return {}

@@ -6,7 +6,6 @@ import importlib
 import inspect
 import json
 import logging
-import subprocess
 import time
 from typing import Any
 
@@ -17,6 +16,16 @@ from sqlalchemy.orm import Session
 from app.models.tool import ToolRegistry, ToolType
 
 logger = logging.getLogger(__name__)
+
+# ── 安全：Builtin 工具模块白名单前缀 ────────────────────────────────────────
+_ALLOWED_MODULE_PREFIXES = ("app.tools.",)
+
+def _validate_module_path(module_path: str) -> None:
+    """校验模块路径在白名单内，防止任意代码执行。"""
+    if not any(module_path.startswith(p) for p in _ALLOWED_MODULE_PREFIXES):
+        raise PermissionError(
+            f"模块 '{module_path}' 不在允许列表中，仅允许 {_ALLOWED_MODULE_PREFIXES} 前缀"
+        )
 
 
 async def _check_manifest_preconditions(
@@ -122,6 +131,7 @@ class ToolExecutor:
         tool_name: str,
         params: dict,
         user_id: int | None = None,
+        skill_id: int | None = None,
     ) -> dict:
         """Unified entry point. Returns {"ok": bool, "result": Any, "error": str, "duration_ms": int, "phases": list}."""
         tool = db.query(ToolRegistry).filter(
@@ -131,6 +141,27 @@ class ToolExecutor:
 
         if not tool:
             return {"ok": False, "error": f"工具 '{tool_name}' 不存在或已停用", "phases": []}
+
+        # ── 权限检查：用户必须有权调用该工具 ────────────────────────────────
+        if user_id is not None:
+            from app.models.user import User
+            user = db.get(User, user_id)
+            if user:
+                from app.models.tool import SkillTool
+                # 工具必须绑定到当前 Skill（如有），否则仅 SUPER_ADMIN 可直接调用
+                if skill_id is not None:
+                    bound = db.query(SkillTool).filter(
+                        SkillTool.skill_id == skill_id,
+                        SkillTool.tool_id == tool.id,
+                    ).first()
+                    if not bound:
+                        from app.models.user import Role
+                        if user.role != Role.SUPER_ADMIN:
+                            return {
+                                "ok": False,
+                                "error": f"工具 '{tool_name}' 未绑定到当前 Skill，无权调用",
+                                "phases": ["permission_denied"],
+                            }
 
         phases = []
 
@@ -165,7 +196,7 @@ class ToolExecutor:
         start_ms = int(time.monotonic() * 1000)
         try:
             if tool.tool_type == ToolType.BUILTIN:
-                result = await self._execute_builtin(tool, params, db=db, user_id=user_id)
+                result = await self._execute_builtin(tool, params, db=db, user_id=user_id, timeout_s=timeout_s)
             elif tool.tool_type == ToolType.HTTP:
                 result = await self._execute_http(tool, params, timeout_s=timeout_s)
             elif tool.tool_type == ToolType.MCP:
@@ -175,10 +206,20 @@ class ToolExecutor:
 
             phases.append("executed")
             duration_ms = int(time.monotonic() * 1000) - start_ms
+            # L2: 结构化审计日志
+            logger.info(
+                "tool_audit ok=true tool=%s type=%s user_id=%s skill_id=%s duration_ms=%d",
+                tool_name, tool.tool_type.value if tool.tool_type else "?",
+                user_id, skill_id, duration_ms,
+            )
             return {"ok": True, "result": result, "duration_ms": duration_ms, "phases": phases}
         except Exception as e:
             duration_ms = int(time.monotonic() * 1000) - start_ms
-            logger.error(f"Tool '{tool_name}' execution failed: {e}")
+            logger.error(
+                "tool_audit ok=false tool=%s type=%s user_id=%s skill_id=%s duration_ms=%d error=%s",
+                tool_name, tool.tool_type.value if tool.tool_type else "?",
+                user_id, skill_id, duration_ms, str(e)[:200],
+            )
             return {"ok": False, "error": str(e), "duration_ms": duration_ms, "phases": phases}
 
     async def _execute_builtin(
@@ -187,21 +228,23 @@ class ToolExecutor:
         params: dict,
         db: Session | None = None,
         user_id: int | None = None,
+        timeout_s: int = 60,
     ) -> Any:
         """Dynamically import and call a Python builtin tool.
 
-        Injects db/user_id when the tool function accepts them,
-        so existing tools (ppt_generator, excel_generator) are unaffected.
+        安全措施：
+        - 模块路径白名单校验（仅允许 app.tools.* 前缀）
+        - 不再 reload 已加载模块（线程安全 + 防磁盘恶意文件）
+        - 统一 timeout 包裹
         """
         config = tool.config or {}
         module_path = config.get("module", f"app.tools.{tool.name}")
         func_name = config.get("function", "execute")
 
-        import sys
-        if module_path in sys.modules:
-            module = importlib.reload(sys.modules[module_path])
-        else:
-            module = importlib.import_module(module_path)
+        # 安全校验：模块路径必须在白名单内
+        _validate_module_path(module_path)
+
+        module = importlib.import_module(module_path)
         func = getattr(module, func_name)
 
         # Build kwargs — inject db/user_id only if the function declares them
@@ -213,9 +256,14 @@ class ToolExecutor:
             kwargs["user_id"] = user_id
 
         if asyncio.iscoroutinefunction(func):
-            return await func(**kwargs)
+            return await asyncio.wait_for(func(**kwargs), timeout=timeout_s)
         else:
-            return func(**kwargs)
+            # 同步函数放到线程池，避免阻塞事件循环，同时支持超时
+            loop = asyncio.get_running_loop()
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: func(**kwargs)),
+                timeout=timeout_s,
+            )
 
     async def _execute_http(self, tool: ToolRegistry, params: dict, timeout_s: int = 60) -> Any:
         """Call an external HTTP API."""

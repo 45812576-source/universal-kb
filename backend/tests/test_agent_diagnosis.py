@@ -182,21 +182,22 @@ class TestInputEvaluatorLoopBehavior:
     def test_max_clarify_guard_in_prepare(self):
         """prepare() 中：消息数 > max_clarify_msgs 时应跳过 InputEvaluator，不再追问。
 
-        max_clarify_msgs = n_required * 2 + 2 = 4*2+2 = 10
-        当 len(messages) > 10 时，即使 score 很低也不应追问。
+        max_clarify_msgs = n_required * 2 = 4*2 = 8
+        当 len(messages) > 8 时，即使 score 很低也不应追问。
         """
         engine = SkillEngine()
         skill_version = _make_skill_version(required_inputs=self.REQUIRED)
         skill = _make_skill(versions=[skill_version])
 
-        # 构造 11 条消息（超过上限10）
+        # 构造 11 条消息（超过上限8）
         messages = _make_messages([
             ("user", f"消息{i}") for i in range(11)
         ])
 
         db = MagicMock()
         db.get.return_value = skill
-        db.query.return_value.filter.return_value.order_by.return_value.all.return_value = messages
+        # H3: prepare() 现在使用 .order_by(...).limit(100).all()[::-1]
+        db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = messages
         db.query.return_value.filter.return_value.first.return_value = None
 
         conv = MagicMock()
@@ -551,7 +552,8 @@ class TestSkillCompatibility:
         db = MagicMock()
         db.get.return_value = skill
         msgs = messages or []
-        db.query.return_value.filter.return_value.order_by.return_value.all.return_value = msgs
+        # H3: prepare() 使用 .order_by(...).limit(100).all()[::-1]
+        db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = msgs
         db.query.return_value.filter.return_value.first.return_value = None
         return db
 
@@ -595,7 +597,7 @@ class TestSkillCompatibility:
     def test_evaluator_called_only_within_message_limit(self):
         """prepare 中 InputEvaluator 只在 len(messages) <= max_clarify 时调用。
 
-        n_required=2 → max_clarify = 2*2+2 = 6
+        n_required=2 → max_clarify = 2*2 = 4
         messages=7 条时不应调用 InputEvaluator。
         """
         engine = SkillEngine()
@@ -606,7 +608,7 @@ class TestSkillCompatibility:
         skill_version = _make_skill_version(required_inputs=required)
         skill = _make_skill(versions=[skill_version])
 
-        # 7条消息 > max_clarify=6
+        # 7条消息 > max_clarify=4
         messages = [_msg("user", f"msg{i}") for i in range(7)]
         db = self._make_db(skill=skill, messages=messages)
         conv = self._make_conv(skill_id=skill.id)
@@ -637,7 +639,7 @@ class TestSkillCompatibility:
         )
 
     def test_evaluator_called_within_message_limit(self):
-        """messages=3 条时（< max_clarify=6），应调用 InputEvaluator。"""
+        """messages=3 条时（< max_clarify=4），应调用 InputEvaluator。"""
         engine = SkillEngine()
         required = [
             {"key": "a", "label": "A", "desc": "描述A"},

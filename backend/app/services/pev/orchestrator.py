@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import time as _time
 from typing import AsyncIterator, Any
 
 from sqlalchemy.orm import Session
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_RETRIES = 2
 _DEFAULT_REPLAN_BUDGET = 1
+_PEV_GLOBAL_TIMEOUT = 600  # H8: PEV Job 全局超时 (秒)
 
 
 class PEVOrchestrator:
@@ -31,6 +33,7 @@ class PEVOrchestrator:
         job: PEVJob,
     ) -> AsyncIterator[dict]:
         """执行完整 PEV 循环，yield SSE 事件 dict。"""
+        _deadline = _time.monotonic() + _PEV_GLOBAL_TIMEOUT
         max_retries = (job.config or {}).get("max_retries", _DEFAULT_MAX_RETRIES)
         skip_verify = (job.config or {}).get("skip_verify", False)
         replan_budget = (job.config or {}).get("replan_budget", _DEFAULT_REPLAN_BUDGET)
@@ -100,94 +103,65 @@ class PEVOrchestrator:
         job.status = PEVJobStatus.EXECUTING
         db.commit()
 
-        # 重新读取 steps（已持久化的 ORM 对象）
-        steps = (
-            db.query(PEVStep)
-            .filter(PEVStep.job_id == job.id)
-            .order_by(PEVStep.order_index)
-            .all()
-        )
-
         context: dict = dict(job.context or {})
+        _replan_triggered = True  # 首次进入也需要查询 steps
 
-        for step in steps:
-            job.current_step_index = step.order_index
-            db.commit()
+        while _replan_triggered:
+            _replan_triggered = False
+            # (重新)读取待执行 steps
+            steps = (
+                db.query(PEVStep)
+                .filter(PEVStep.job_id == job.id, PEVStep.status.in_([PEVStepStatus.PENDING, PEVStepStatus.RUNNING]))
+                .order_by(PEVStep.order_index)
+                .all()
+            )
 
-            # 重试循环
-            retry_count = 0
-            step_passed = False
-            last_verify_result = None
+            for step in steps:
+                # H8: PEV 全局超时检查
+                if _time.monotonic() > _deadline:
+                    logger.warning("PEV Job %s 全局超时 (%ds)", job.id, _PEV_GLOBAL_TIMEOUT)
+                    for ev in self._fail(db, job, f"任务执行超时（{_PEV_GLOBAL_TIMEOUT}s）"):
+                        yield ev
+                    return
 
-            while retry_count <= max_retries:
-                # 解析 $ref 输入
-                resolved_inputs = resolve_inputs(step.input_spec or {}, context)
-
-                # 注入重试建议
-                if retry_count > 0 and last_verify_result:
-                    suggestion = last_verify_result.get("suggestion", "")
-                    if suggestion:
-                        resolved_inputs["_retry_suggestion"] = suggestion
-
-                step.status = PEVStepStatus.RUNNING
-                step.retry_count = retry_count
+                job.current_step_index = step.order_index
                 db.commit()
 
-                if retry_count == 0:
-                    yield {
-                        "event": "pev_step_start",
-                        "data": {"step_key": step.step_key, "step_type": step.step_type},
-                    }
-                else:
-                    yield {
-                        "event": "pev_step_retry",
-                        "data": {
-                            "step_key": step.step_key,
-                            "retry": retry_count,
-                            "suggestion": resolved_inputs.get("_retry_suggestion", ""),
-                        },
-                    }
+                # 重试循环
+                retry_count = 0
+                step_passed = False
+                last_verify_result = None
 
-                # 执行
-                step_dict = {
-                    "step_key": step.step_key,
-                    "step_type": step.step_type,
-                    "description": step.description,
-                    "output_spec": step.output_spec,
-                    "verify_criteria": step.verify_criteria,
-                }
-                try:
-                    result = await execute_agent.execute_step(step_dict, resolved_inputs, job, db)
-                except Exception as e:
-                    result = {"ok": False, "data": None, "error": str(e)}
+                while retry_count <= max_retries:
+                    # 解析 $ref 输入
+                    resolved_inputs = resolve_inputs(step.input_spec or {}, context)
 
-                step.result = result
-                db.commit()
+                    # 注入重试建议
+                    if retry_count > 0 and last_verify_result:
+                        suggestion = last_verify_result.get("suggestion", "")
+                        if suggestion:
+                            resolved_inputs["_retry_suggestion"] = suggestion
 
-                yield {
-                    "event": "pev_step_result",
-                    "data": {
-                        "step_key": step.step_key,
-                        "ok": result.get("ok"),
-                        "error": result.get("error"),
-                    },
-                }
+                    step.status = PEVStepStatus.RUNNING
+                    step.retry_count = retry_count
+                    db.commit()
 
-                # ─── Phase 3: Verifying（每步）──────────────────────────────
-                # crawl/sub_task 类型：执行成功即视为通过，不做 LLM 语义校验
-                _no_llm_verify = step.step_type in ("crawl", "sub_task")
-                if skip_verify or _no_llm_verify or not result.get("ok"):
-                    if result.get("ok"):
-                        step.status = PEVStepStatus.PASSED
-                        step_passed = True
+                    if retry_count == 0:
+                        yield {
+                            "event": "pev_step_start",
+                            "data": {"step_key": step.step_key, "step_type": step.step_type},
+                        }
                     else:
-                        step.status = PEVStepStatus.FAILED
-                        last_verify_result = {"pass": False, "suggestion": result.get("error", "")}
-                    db.commit()
-                else:
-                    job.status = PEVJobStatus.VERIFYING
-                    db.commit()
+                        yield {
+                            "event": "pev_step_retry",
+                            "data": {
+                                "step_key": step.step_key,
+                                "retry": retry_count,
+                                "suggestion": resolved_inputs.get("_retry_suggestion", ""),
+                            },
+                        }
 
+                    # 执行
                     step_dict = {
                         "step_key": step.step_key,
                         "step_type": step.step_type,
@@ -195,65 +169,139 @@ class PEVOrchestrator:
                         "output_spec": step.output_spec,
                         "verify_criteria": step.verify_criteria,
                     }
-                    verify_result = await verify_agent.verify_step(step_dict, result, db)
-                    step.verify_result = verify_result
-                    last_verify_result = verify_result
+                    try:
+                        result = await execute_agent.execute_step(step_dict, resolved_inputs, job, db)
+                    except Exception as e:
+                        result = {"ok": False, "data": None, "error": str(e)}
 
-                    if verify_result.get("pass"):
-                        step.status = PEVStepStatus.PASSED
-                        step_passed = True
-                    else:
-                        step.status = PEVStepStatus.FAILED
-
-                    db.commit()
-                    job.status = PEVJobStatus.EXECUTING
+                    step.result = result
                     db.commit()
 
-                if step_passed:
-                    break
-
-                retry_count += 1
-
-            # 步骤最终失败（重试耗尽）
-            if not step_passed:
-                # 尝试 replan
-                if replan_budget > 0:
-                    replan_budget -= 1
                     yield {
-                        "event": "pev_replan",
+                        "event": "pev_step_result",
                         "data": {
                             "step_key": step.step_key,
-                            "remaining_replan_budget": replan_budget,
+                            "ok": result.get("ok"),
+                            "error": result.get("error"),
                         },
                     }
-                    try:
-                        new_plan = await plan_agent.replan(
-                            original_plan=job.plan or {},
-                            failed_step={"step_key": step.step_key, "description": step.description},
-                            verify_feedback=(last_verify_result or {}).get("suggestion", "步骤失败"),
-                            context=context,
-                            db=db,
-                        )
-                        # 更新 job plan 并重置后续 steps（简化：直接追加新 steps）
-                        job.plan = new_plan
-                        db.commit()
-                        # 标记当前步骤 skipped，继续后续新 steps
-                        step.status = PEVStepStatus.SKIPPED
-                        db.commit()
-                        continue
-                    except Exception as e:
-                        logger.error(f"Replan 失败: {e}")
 
-                # replan 耗尽或失败 → Job FAILED
-                for ev in self._fail(db, job, f"步骤 '{step.step_key}' 执行失败且无法恢复"):
-                    yield ev
-                return
+                    # ─── Verifying（每步）──────────────────────────────────
+                    _no_llm_verify = step.step_type in ("crawl", "sub_task")
+                    if skip_verify or _no_llm_verify or not result.get("ok"):
+                        if result.get("ok"):
+                            step.status = PEVStepStatus.PASSED
+                            step_passed = True
+                        else:
+                            step.status = PEVStepStatus.FAILED
+                            last_verify_result = {"pass": False, "suggestion": result.get("error", "")}
+                        db.commit()
+                    else:
+                        job.status = PEVJobStatus.VERIFYING
+                        db.commit()
 
-            # 步骤成功：写入 context
-            context[step.step_key] = result
-            job.context = dict(context)
-            job.completed_steps = (job.completed_steps or 0) + 1
-            db.commit()
+                        step_dict = {
+                            "step_key": step.step_key,
+                            "step_type": step.step_type,
+                            "description": step.description,
+                            "output_spec": step.output_spec,
+                            "verify_criteria": step.verify_criteria,
+                        }
+                        verify_result = await verify_agent.verify_step(step_dict, result, db)
+                        step.verify_result = verify_result
+                        last_verify_result = verify_result
+
+                        if verify_result.get("pass"):
+                            step.status = PEVStepStatus.PASSED
+                            step_passed = True
+                        else:
+                            step.status = PEVStepStatus.FAILED
+
+                        db.commit()
+                        job.status = PEVJobStatus.EXECUTING
+                        db.commit()
+
+                    if step_passed:
+                        break
+
+                    retry_count += 1
+
+                # 步骤最终失败（重试耗尽）
+                if not step_passed:
+                    # 尝试 replan
+                    if replan_budget > 0:
+                        replan_budget -= 1
+                        yield {
+                            "event": "pev_replan",
+                            "data": {
+                                "step_key": step.step_key,
+                                "remaining_replan_budget": replan_budget,
+                            },
+                        }
+                        try:
+                            new_plan = await plan_agent.replan(
+                                original_plan=job.plan or {},
+                                failed_step={"step_key": step.step_key, "description": step.description},
+                                verify_feedback=(last_verify_result or {}).get("suggestion", "步骤失败"),
+                                context=context,
+                                db=db,
+                            )
+                            # C6 fix: 标记当前步骤 skipped，删除后续未执行的 steps
+                            step.status = PEVStepStatus.SKIPPED
+                            db.query(PEVStep).filter(
+                                PEVStep.job_id == job.id,
+                                PEVStep.order_index > step.order_index,
+                                PEVStep.status == PEVStepStatus.PENDING,
+                            ).delete(synchronize_session="fetch")
+
+                            # 根据 new_plan 创建新 PEVStep ORM 记录
+                            new_raw_steps = new_plan.get("steps") or []
+                            try:
+                                new_sorted = topological_sort(new_raw_steps)
+                            except ValueError:
+                                new_sorted = new_raw_steps
+
+                            completed_keys = {s.step_key for s in steps if s.status == PEVStepStatus.PASSED}
+                            base_index = step.order_index + 1
+                            for idx, s in enumerate(new_sorted):
+                                sk = s.get("step_key", f"replan_step_{idx}")
+                                if sk in completed_keys:
+                                    continue
+                                new_step = PEVStep(
+                                    job_id=job.id,
+                                    order_index=base_index + idx,
+                                    step_key=sk,
+                                    step_type=s.get("step_type", "llm_generate"),
+                                    description=s.get("description", ""),
+                                    depends_on=s.get("depends_on") or [],
+                                    input_spec=s.get("input_spec") or {},
+                                    output_spec=s.get("output_spec") or {},
+                                    verify_criteria=s.get("verify_criteria", ""),
+                                )
+                                db.add(new_step)
+
+                            job.plan = new_plan
+                            job.total_steps = (job.completed_steps or 0) + len(new_sorted)
+                            db.commit()
+
+                            # 设置标志，跳出 for 循环后 while 会重新查询 pending steps
+                            _replan_triggered = True
+                            break  # 跳出 for step in steps，while 循环会重新遍历
+                        except Exception as e:
+                            logger.error(f"Replan 失败: {e}")
+
+                    if not _replan_triggered:
+                        # replan 耗尽或失败 → Job FAILED
+                        for ev in self._fail(db, job, f"步骤 '{step.step_key}' 执行失败且无法恢复"):
+                            yield ev
+                        return
+
+                else:
+                    # 步骤成功：写入 context
+                    context[step.step_key] = result
+                    job.context = dict(context)
+                    job.completed_steps = (job.completed_steps or 0) + 1
+                    db.commit()
 
         # ─── Phase 3: Final Verification ─────────────────────────────────────
         if not skip_verify:

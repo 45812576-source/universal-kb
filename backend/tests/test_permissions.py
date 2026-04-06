@@ -1176,14 +1176,14 @@ class TestHandoffValidation:
         # 没有连接记录
         assert engine.validate_connection(skill_a.id, skill_c.id, db) is False
 
-    def test_no_policy_defaults_allowed(self, db):
+    def test_no_policy_defaults_denied(self, db):
         engine = HandoffEngine()
         skill_user = _make_user_orig(db, "hoff_creator3", Role.SUPER_ADMIN)
         skill_a = _make_skill(db, skill_user.id, name="无policy上游")
         skill_b = _make_skill(db, skill_user.id, name="任意下游")
         db.commit()
-        # 上游无 policy → 宽松 → 允许
-        assert engine.validate_connection(skill_a.id, skill_b.id, db) is True
+        # H10: deny-by-default — 上游无 policy → 禁止 handoff
+        assert engine.validate_connection(skill_a.id, skill_b.id, db) is False
 
 
 # ─── TC-PERM-21  HandoffEngine — Schema 解析 ─────────────────────────────────
@@ -1330,19 +1330,25 @@ class TestHandoffPayload:
         engine = HandoffEngine()
         payload = {"client_name": "A", "budget_range": "100-200万"}
         policy = {"required_fields": ["client_name", "budget_range"], "forbidden_fields": []}
-        assert engine.validate_payload(payload, policy) is True
+        passed, diagnostics = engine.validate_payload(payload, policy)
+        assert passed is True
+        assert diagnostics == []
 
     def test_validate_payload_missing_required(self):
         engine = HandoffEngine()
         payload = {"client_name": "A"}
         policy = {"required_fields": ["client_name", "budget_range"], "forbidden_fields": []}
-        assert engine.validate_payload(payload, policy) is False
+        passed, diagnostics = engine.validate_payload(payload, policy)
+        assert passed is False
+        assert any("budget_range" in d for d in diagnostics)
 
     def test_validate_payload_forbidden_field(self):
         engine = HandoffEngine()
         payload = {"client_name": "A", "cost": 80000}  # cost 是禁止字段
         policy = {"required_fields": [], "forbidden_fields": ["cost"]}
-        assert engine.validate_payload(payload, policy) is False
+        passed, diagnostics = engine.validate_payload(payload, policy)
+        assert passed is False
+        assert any("cost" in d for d in diagnostics)
 
 
 # ─── TC-PERM-23~26  跨角色边界场景 ───────────────────────────────────────────

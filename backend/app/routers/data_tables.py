@@ -229,11 +229,13 @@ def _list_rows_new_policy(
 
     # 构建 SQL
     base_sql = f"SELECT * FROM `{table_name}`"
+    sql_params: dict = {}
 
-    # 行过滤
-    row_filter = build_row_filter_sql(policy, user, table_name)
+    # 行过滤（参数化）
+    row_filter, row_params = build_row_filter_sql(policy, user, table_name)
     if row_filter:
         base_sql += f" WHERE ({row_filter})"
+        sql_params.update(row_params)
 
     # 视图 config（filters + sorts）
     if view_id:
@@ -242,10 +244,10 @@ def _list_rows_new_policy(
         if view and view.table_id == bt.id:
             base_sql = _apply_view_config(base_sql, view.config or {})
 
-    count_result = db.execute(text(f"SELECT COUNT(*) FROM ({base_sql}) AS _t")).scalar()
+    count_result = db.execute(text(f"SELECT COUNT(*) FROM ({base_sql}) AS _t"), sql_params).scalar()
     rows_result = db.execute(
         text(base_sql + " LIMIT :limit OFFSET :offset"),
-        {"limit": page_size, "offset": offset},
+        {**sql_params, "limit": page_size, "offset": offset},
     )
     all_columns = list(rows_result.keys())
     rows = [_serialize_row(dict(zip(all_columns, row))) for row in rows_result.fetchall()]

@@ -138,41 +138,42 @@ class TestMergeAllowPolicies:
         # merge 不处理 none，这个由上层 resolve 处理
         pass
 
-    def test_fields_union(self):
-        """多组 allowlist 字段取并集。"""
+    def test_fields_intersection(self):
+        """H16: 多组 allowlist 字段取交集（最小权限）。"""
         p1 = _make_policy(field_access_mode="allowlist", allowed_field_ids=[1, 2])
         p2 = _make_policy(field_access_mode="allowlist", allowed_field_ids=[2, 3])
         result = _merge_allow_policies([p1, p2], [1, 2])
         assert result.field_access_mode == "allowlist"
-        assert result.visible_field_ids == {1, 2, 3}
+        assert result.visible_field_ids == {2}
 
-    def test_disclosure_takes_max(self):
-        """多组 disclosure 取最高。"""
+    def test_disclosure_takes_min(self):
+        """H16: 多组 disclosure 取最低（最严格）。"""
         p1 = _make_policy(disclosure_level="L1")
         p2 = _make_policy(disclosure_level="L3")
         p3 = _make_policy(disclosure_level="L2")
         result = _merge_allow_policies([p1, p2, p3], [1, 2, 3])
-        assert result.disclosure_level == "L3"
+        assert result.disclosure_level == "L1"
 
-    def test_row_access_takes_most_permissive(self):
-        """row_access_mode 取最宽松。"""
+    def test_row_access_takes_most_restrictive(self):
+        """H16: row_access_mode 取最严格（最小权限）。"""
         p1 = _make_policy(row_access_mode="owner")
         p2 = _make_policy(row_access_mode="all")
         result = _merge_allow_policies([p1, p2], [1, 2])
-        assert result.row_access_mode == "all"
+        assert result.row_access_mode == "owner"
 
-    def test_export_or(self):
-        """export 取 OR。"""
+    def test_export_and(self):
+        """H16: export 取 AND — 所有组都允许才允许。"""
         p1 = _make_policy(export_permission=False)
         p2 = _make_policy(export_permission=True)
         result = _merge_allow_policies([p1, p2], [1, 2])
-        assert result.export_permission is True
+        assert result.export_permission is False
 
-    def test_tool_takes_most_permissive(self):
+    def test_tool_takes_most_restrictive(self):
+        """H16: tool_permission_mode 取最严格。"""
         p1 = _make_policy(tool_permission_mode="deny")
         p2 = _make_policy(tool_permission_mode="readwrite")
         result = _merge_allow_policies([p1, p2], [1, 2])
-        assert result.tool_permission_mode == "readwrite"
+        assert result.tool_permission_mode == "deny"
 
     def test_multi_group_source(self):
         p1 = _make_policy()

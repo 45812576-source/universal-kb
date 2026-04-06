@@ -21,11 +21,22 @@ logger = logging.getLogger(__name__)
 def _parse_plan_json(raw: str) -> dict:
     """从 LLM 输出中提取 JSON 计划，支持 markdown 代码块包裹。"""
     cleaned = raw.strip()
-    # 去掉 markdown 代码块
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
+    # M26: 去掉所有 markdown 代码块标记（不只首尾）
+    cleaned = re.sub(r"```(?:json)?\s*\n?", "", cleaned)
     cleaned = cleaned.strip()
     return json.loads(cleaned)
+
+
+def _validate_step_keys(steps: list[dict]) -> None:
+    """M23: 校验 step_key 唯一性。"""
+    seen: set[str] = set()
+    for s in steps:
+        key = s.get("step_key", "")
+        if not key:
+            raise ValueError("PEV 计划中存在无 step_key 的步骤")
+        if key in seen:
+            raise ValueError(f"PEV 计划中 step_key 重复: {key}")
+        seen.add(key)
 
 
 def _context_summary(context: dict) -> str:
@@ -76,6 +87,7 @@ class PlanAgent:
         if not isinstance(plan.get("steps"), list):
             raise ValueError("PlanAgent 返回的计划缺少 steps 字段")
 
+        _validate_step_keys(plan["steps"])  # M23
         return plan
 
     async def replan(
@@ -121,6 +133,16 @@ class PlanAgent:
 
         if not isinstance(plan.get("steps"), list):
             raise ValueError("PlanAgent replan 缺少 steps 字段")
+
+        _validate_step_keys(plan["steps"])  # M23
+
+        # M24: 检查新 step_key 是否与已完成步骤冲突
+        completed_keys = set(context.keys()) if context else set()
+        for s in plan["steps"]:
+            if s["step_key"] in completed_keys:
+                raise ValueError(
+                    f"Replan step_key '{s['step_key']}' 与已完成步骤冲突"
+                )
 
         return plan
 

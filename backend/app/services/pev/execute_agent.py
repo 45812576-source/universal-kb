@@ -159,6 +159,15 @@ class ExecuteAgent:
             db.refresh(temp_source)
 
             count = await intel_collector.collect_crawler(db, temp_source)
+
+            # M25: 清理临时 IntelSource
+            try:
+                db.delete(temp_source)
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.warning(f"M25: 清理临时 IntelSource {temp_source.id} 失败")
+
             return {
                 "ok": True,
                 "data": {"new_entries": count, "url": url},
@@ -222,42 +231,45 @@ class ExecuteAgent:
         if suggestion:
             user_message = f"{user_message}\n\n[修正要求] {suggestion}"
 
-        # 创建临时 Conversation（不持久化到 DB，仅用于 skill_engine.execute 调用）
-        temp_conv = Conversation(
-            user_id=job.user_id,
-            skill_id=None,
-        )
-        # 通过 skill_name 找到 Skill
-        if skill_name:
-            from app.models.skill import Skill, SkillStatus
-            skill_obj = (
-                db.query(Skill)
-                .filter(Skill.name == skill_name, Skill.status == SkillStatus.PUBLISHED)
-                .first()
-            )
-            if skill_obj:
-                temp_conv.skill_id = skill_obj.id
-
-        db.add(temp_conv)
-        db.flush()
-
+        # H9: 使用独立 Session，避免 _execute_skill 的 rollback 影响 orchestrator 状态
+        from app.database import SessionLocal
+        skill_db = SessionLocal()
         try:
-            response, meta = await skill_engine.execute(
-                db, temp_conv, user_message,
+            temp_conv = Conversation(
                 user_id=job.user_id,
+                skill_id=None,
             )
-            return {
-                "ok": True,
-                "data": {"content": response, "meta": meta},
-                "error": None,
-            }
-        finally:
-            # 清理临时会话
+            if skill_name:
+                from app.models.skill import Skill, SkillStatus
+                skill_obj = (
+                    skill_db.query(Skill)
+                    .filter(Skill.name == skill_name, Skill.status == SkillStatus.PUBLISHED)
+                    .first()
+                )
+                if skill_obj:
+                    temp_conv.skill_id = skill_obj.id
+
+            skill_db.add(temp_conv)
+            skill_db.flush()
+
             try:
-                db.delete(temp_conv)
-                db.commit()
-            except Exception:
-                db.rollback()
+                response, meta = await skill_engine.execute(
+                    skill_db, temp_conv, user_message,
+                    user_id=job.user_id,
+                )
+                return {
+                    "ok": True,
+                    "data": {"content": response, "meta": meta},
+                    "error": None,
+                }
+            finally:
+                try:
+                    skill_db.delete(temp_conv)
+                    skill_db.commit()
+                except Exception:
+                    skill_db.rollback()
+        finally:
+            skill_db.close()
 
 
 execute_agent = ExecuteAgent()

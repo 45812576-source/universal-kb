@@ -141,6 +141,18 @@ def validate_skill_knowledge_references(
 
     entries = db.query(KnowledgeEntry).filter(or_(*tag_filters)).all() if tag_filters else []
 
+    # 批量预加载所有 profile（M32: 消除 N+1 查询）
+    entry_ids = [e.id for e in entries]
+    profiles_by_kid: dict[int, KnowledgeUnderstandingProfile] = {}
+    if entry_ids:
+        all_profiles = (
+            db.query(KnowledgeUnderstandingProfile)
+            .filter(KnowledgeUnderstandingProfile.knowledge_id.in_(entry_ids))
+            .all()
+        )
+        for p in all_profiles:
+            profiles_by_kid[p.knowledge_id] = p
+
     block_reasons: list[str] = []
     references: list[dict] = []
     high_sensitivity_count = 0
@@ -149,10 +161,7 @@ def validate_skill_knowledge_references(
     unconfirmed_count = 0
 
     for entry in entries:
-        # 查 KnowledgeUnderstandingProfile
-        profile = db.query(KnowledgeUnderstandingProfile).filter(
-            KnowledgeUnderstandingProfile.knowledge_id == entry.id
-        ).first()
+        profile = profiles_by_kid.get(entry.id)
 
         if not profile:
             missing_mask_config_count += 1

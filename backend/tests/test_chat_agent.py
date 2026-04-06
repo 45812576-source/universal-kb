@@ -81,23 +81,23 @@ class TestNativeFunctionCalling:
         }
 
     def _fake_stream(self, lines):
-        """返回一个 mock httpx.AsyncClient 实例，支持 async with client 和 async with client.stream(...) 两层嵌套。"""
+        """返回一个 mock context manager for gw._client.stream()。
+
+        兼容重试逻辑：每次调用 stream() 都返回新的 async context manager。
+        """
         _lines = lines
 
         class FakeResp:
+            status_code = 200
             async def aiter_lines(self):
                 for l in _lines:
                     yield l
+            async def aread(self):
+                return b""
             async def __aenter__(self): return self
             async def __aexit__(self, *a): pass
 
-        class FakeClient:
-            def stream(self, *a, **kw):
-                return FakeResp()
-            async def __aenter__(self): return self
-            async def __aexit__(self, *a): pass
-
-        return FakeClient()
+        return FakeResp()
 
     # ── 1a. tool_call 事件正确解析 ──
 
@@ -113,7 +113,7 @@ class TestNativeFunctionCalling:
         tools = [{"type": "function", "function": {"name": "doc_gen", "description": "生成文档", "parameters": {}}}]
 
         events = []
-        with patch("httpx.AsyncClient", return_value=self._fake_stream(lines)):
+        with patch.object(gw._client, "stream", side_effect=lambda *a, **kw: self._fake_stream(lines)):
             async for ctype, data in gw.chat_stream_typed(
                 model_config=self._model_cfg(), messages=[], tools=tools
             ):
@@ -139,7 +139,7 @@ class TestNativeFunctionCalling:
         tools = [{"type": "function", "function": {"name": "search", "description": "", "parameters": {}}}]
 
         events = []
-        with patch("httpx.AsyncClient", return_value=self._fake_stream(lines)):
+        with patch.object(gw._client, "stream", side_effect=lambda *a, **kw: self._fake_stream(lines)):
             async for ctype, data in gw.chat_stream_typed(
                 model_config=self._model_cfg(), messages=[], tools=tools
             ):
@@ -165,7 +165,7 @@ class TestNativeFunctionCalling:
         ]
 
         events = []
-        with patch("httpx.AsyncClient", return_value=self._fake_stream(lines)):
+        with patch.object(gw._client, "stream", side_effect=lambda *a, **kw: self._fake_stream(lines)):
             async for ctype, data in gw.chat_stream_typed(
                 model_config=self._model_cfg(), messages=[], tools=tools
             ):
@@ -187,7 +187,7 @@ class TestNativeFunctionCalling:
         ]
 
         events = []
-        with patch("httpx.AsyncClient", return_value=self._fake_stream(lines)):
+        with patch.object(gw._client, "stream", side_effect=lambda *a, **kw: self._fake_stream(lines)):
             async for ctype, data in gw.chat_stream_typed(
                 model_config=self._model_cfg(), messages=[]  # 不传 tools
             ):
@@ -237,7 +237,7 @@ class TestNativeFunctionCalling:
         tools = [{"type": "function", "function": {"name": "gen", "description": "", "parameters": {}}}]
 
         events = []
-        with patch("httpx.AsyncClient", return_value=self._fake_stream(lines)):
+        with patch.object(gw._client, "stream", side_effect=lambda *a, **kw: self._fake_stream(lines)):
             async for ctype, data in gw.chat_stream_typed(
                 model_config=self._model_cfg(), messages=[], tools=tools
             ):
@@ -403,7 +403,7 @@ class TestKnowledgeRerank:
 
         with patch("app.services.skill_engine.llm_gateway.chat",
                    new=AsyncMock(return_value=("0,3,5,7,9", {}))):
-            result = await engine._rerank_hits_with_llm("测试问题", hits, top_k=5)
+            result = await engine._rerank_hits_with_llm(MagicMock(), "测试问题", hits, top_k=5)
 
         assert len(result) == 5
         assert result[0]["knowledge_id"] == 0
@@ -416,7 +416,7 @@ class TestKnowledgeRerank:
         hits = self._hits(3)
 
         with patch("app.services.skill_engine.llm_gateway.chat") as mock_chat:
-            result = await engine._rerank_hits_with_llm("问题", hits, top_k=5)
+            result = await engine._rerank_hits_with_llm(MagicMock(), "问题", hits, top_k=5)
 
         mock_chat.assert_not_called()
         assert result == hits
@@ -429,7 +429,7 @@ class TestKnowledgeRerank:
 
         with patch("app.services.skill_engine.llm_gateway.chat",
                    new=AsyncMock(side_effect=Exception("API timeout"))):
-            result = await engine._rerank_hits_with_llm("问题", hits, top_k=4)
+            result = await engine._rerank_hits_with_llm(MagicMock(), "问题", hits, top_k=4)
 
         assert len(result) == 4
         assert result == hits[:4]
@@ -442,7 +442,7 @@ class TestKnowledgeRerank:
 
         with patch("app.services.skill_engine.llm_gateway.chat",
                    new=AsyncMock(return_value=("不知道", {}))):
-            result = await engine._rerank_hits_with_llm("问题", hits, top_k=3)
+            result = await engine._rerank_hits_with_llm(MagicMock(), "问题", hits, top_k=3)
 
         assert len(result) == 3
         assert result == hits[:3]
@@ -461,7 +461,8 @@ class TestKnowledgeRerank:
 
         mock_rerank.assert_called_once()
         call_args = mock_rerank.call_args
-        assert call_args[1].get("top_k") == 5 or call_args[0][2] == 5
+        # 新签名: _rerank_hits_with_llm(db, query, hits, top_k=5)
+        assert call_args[1].get("top_k") == 5 or call_args[0][3] == 5
 
     @pytest.mark.asyncio
     async def test_inject_knowledge_uses_top20_for_vector_search(self):
@@ -473,7 +474,8 @@ class TestKnowledgeRerank:
             with patch.object(engine, "_rerank_hits_with_llm", new=AsyncMock(return_value=[])):
                 await engine._inject_knowledge("query", skill=None)
 
-        mock_search.assert_called_once_with("query", top_k=20)
+        mock_search.assert_called_once()
+        assert mock_search.call_args[1].get("top_k") == 20 or mock_search.call_args[0][1] == 20
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -497,7 +499,7 @@ class TestSkillSwitchCache:
                    new=AsyncMock(return_value=("数据分析", {}))):
             with patch("app.services.skill_engine.llm_gateway.get_lite_config",
                        return_value={"model_id": "x", "api_base": "http://x", "api_key": "k", "max_tokens": 50}):
-                result = await engine._match_or_keep_skill(current, "帮我生成数据报表", [candidate])
+                result = await engine._match_or_keep_skill(MagicMock(), current, "帮我生成数据报表", [candidate])
         assert result is candidate
 
     @pytest.mark.asyncio
@@ -510,7 +512,7 @@ class TestSkillSwitchCache:
                    new=AsyncMock(return_value=("keep", {}))):
             with patch("app.services.skill_engine.llm_gateway.get_lite_config",
                        return_value={"model_id": "x", "api_base": "http://x", "api_key": "k", "max_tokens": 50}):
-                result = await engine._match_or_keep_skill(current, "帮我改一下这段文案的语气", [candidate])
+                result = await engine._match_or_keep_skill(MagicMock(), current, "帮我改一下这段文案的语气", [candidate])
         assert result is current
 
     @pytest.mark.asyncio
@@ -519,7 +521,7 @@ class TestSkillSwitchCache:
         engine = self._make_engine()
         current = MagicMock(); current.name = "文案撰写"; current.description = ""
         with patch("app.services.skill_engine.llm_gateway.chat") as mock_chat:
-            result = await engine._match_or_keep_skill(current, "任意消息", [])
+            result = await engine._match_or_keep_skill(MagicMock(), current, "任意消息", [])
         assert result is current
         mock_chat.assert_not_called()
 
@@ -533,7 +535,7 @@ class TestSkillSwitchCache:
                    new=AsyncMock(side_effect=Exception("network error"))):
             with patch("app.services.skill_engine.llm_gateway.get_lite_config",
                        return_value={"model_id": "x", "api_base": "http://x", "api_key": "k", "max_tokens": 50}):
-                result = await engine._match_or_keep_skill(current, "用户消息", [candidate])
+                result = await engine._match_or_keep_skill(MagicMock(), current, "用户消息", [candidate])
         assert result is current
 
     @pytest.mark.asyncio
@@ -569,7 +571,7 @@ class TestSkillSwitchCache:
             with patch("app.services.skill_engine.llm_gateway.get_config", return_value={"model_id": "x", "api_base": "http://x", "api_key_env": "K", "max_tokens": 100, "temperature": "0.7"}):
                 with patch("app.services.skill_engine.llm_gateway.get_lite_config", return_value={"model_id": "x", "api_base": "http://x", "api_key": "k", "max_tokens": 50, "temperature": "0.1"}):
                     with patch.object(engine, "_inject_knowledge", new=AsyncMock(return_value="")):
-                        with patch.object(engine, "_compact_if_needed", new=AsyncMock(side_effect=lambda msgs, _: msgs)):
+                        with patch.object(engine, "_compact_if_needed", new=AsyncMock(side_effect=lambda db, msgs, _: msgs)):
                             pass  # no switch_candidates since workspace_id=None, so _match_or_keep_skill not called
 
         # 无 workspace 无 switch_candidates 时不调用 _match_or_keep_skill
@@ -637,7 +639,7 @@ class TestSkillSwitchCache:
             with patch("app.services.skill_engine.llm_gateway.get_config", return_value=fake_config):
                 with patch("app.services.skill_engine.llm_gateway.get_lite_config", return_value=fake_config):
                     with patch.object(engine, "_inject_knowledge", new=AsyncMock(return_value="")):
-                        with patch.object(engine, "_compact_if_needed", new=AsyncMock(side_effect=lambda msgs, _: msgs)):
+                        with patch.object(engine, "_compact_if_needed", new=AsyncMock(side_effect=lambda db, msgs, _: msgs)):
                             with patch("app.services.skill_engine.llm_gateway.supports_function_calling", return_value=False):
                                 with patch("app.services.tool_executor.tool_executor.get_tools_for_skill", return_value=[]):
                                     await engine.prepare(mock_db, mock_conv, "帮我做数据分析", user_id=1)

@@ -82,7 +82,7 @@ def mask_text(
     replacements: list[dict] = []
     masked_text = text
 
-    # 按优先级排序：先处理有 pattern 的（精确匹配），再处理 keyword 的
+    # Phase 1: 有 pattern 的类型 — 精确位置匹配
     for dtype in active_types:
         spec = DATA_TYPE_REGISTRY.get(dtype)
         if not spec:
@@ -103,14 +103,45 @@ def mask_text(
                         "position": m.start(),
                     })
 
-    # 按位置倒序替换（避免偏移）
+    # 按位置倒序，使用精确位置切片替换（修复 str.replace 定位错误）
     replacements.sort(key=lambda r: r["position"], reverse=True)
     for r in replacements:
-        # 在当前 masked_text 中找到并替换第一个匹配
-        masked_text = masked_text.replace(r["original"], r["masked"], 1)
+        pos = r["position"]
+        orig_len = len(r["original"])
+        masked_text = masked_text[:pos] + r["masked"] + masked_text[pos + orig_len:]
 
-    # 对只有 keywords 没有 pattern 的类型，不做文本替换（无法精准定位）
-    # 但记录到替换记录中供审计
+    # Phase 2: 仅有 keywords 的类型 — 关键词定位替换
+    keyword_replacements: list[dict] = []
+    for dtype in active_types:
+        spec = DATA_TYPE_REGISTRY.get(dtype)
+        if not spec or spec.get("pattern"):
+            continue  # 已在 Phase 1 处理
+
+        action = spec.get("default_mask_action", "full_mask")
+        keywords = spec.get("keywords", [])
+        masked_val = _apply_text_mask("", action, dtype)
+
+        for kw in keywords:
+            # 查找所有出现位置，倒序替换
+            start = 0
+            positions = []
+            while True:
+                idx = masked_text.find(kw, start)
+                if idx == -1:
+                    break
+                positions.append(idx)
+                start = idx + len(kw)
+
+            for pos in reversed(positions):
+                keyword_replacements.append({
+                    "type": dtype,
+                    "original": kw,
+                    "masked": masked_val,
+                    "position": pos,
+                })
+                masked_text = masked_text[:pos] + masked_val + masked_text[pos + len(kw):]
+
+    replacements.extend(keyword_replacements)
     return masked_text, replacements
 
 

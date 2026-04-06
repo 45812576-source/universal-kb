@@ -90,8 +90,9 @@ class VerifyAgent:
             )
             return _parse_verify_json(raw)
         except Exception as e:
-            logger.warning(f"VerifyAgent._llm_verify 失败: {e}")
-            return {"pass": True, "score": 80, "issues": [], "suggestion": ""}
+            # H7: fail-closed — 验证异常时默认不通过，防止 LLM 宕机时所有验证自动通过
+            logger.warning(f"VerifyAgent._llm_verify 失败 (fail-closed): {e}")
+            return {"pass": False, "score": 0, "issues": [f"验证服务异常: {e}"], "suggestion": "验证服务暂不可用，请重试"}
 
     async def verify_step(
         self,
@@ -187,8 +188,9 @@ class VerifyAgent:
                 "summary": result_json.get("summary", ""),
             }
         except Exception as e:
-            logger.warning(f"VerifyAgent.verify_final 失败: {e}")
-            return {"pass": True, "score": 80, "issues": [], "summary": "验证服务暂时不可用"}
+            # H7: fail-closed — 最终验证异常时默认不通过
+            logger.warning(f"VerifyAgent.verify_final 失败 (fail-closed): {e}")
+            return {"pass": False, "score": 0, "issues": [f"最终验证服务异常: {e}"], "summary": "验证服务暂不可用，任务标记为失败"}
 
 
 verify_agent = VerifyAgent()

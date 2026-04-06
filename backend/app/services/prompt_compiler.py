@@ -2,6 +2,12 @@
 from __future__ import annotations
 
 import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+# L4: 编译后 prompt 大小上限 (字符数, ~32K tokens)
+_MAX_COMPILED_PROMPT_CHARS = 100_000
 
 
 def compile(
@@ -19,10 +25,11 @@ def compile(
     """
     result = system_prompt
 
-    # Variable substitution
+    # M3: 变量注入使用 XML tag 隔离，防止注入攻击
     for var, val in extracted_vars.items():
         if val:
-            result = result.replace("{" + var.strip("{}") + "}", str(val))
+            safe_val = f"<user_var name=\"{var.strip('{}')}\">{str(val)}</user_var>"
+            result = result.replace("{" + var.strip("{}") + "}", safe_val)
 
     # Inject upstream structured context
     if structured_context:
@@ -44,6 +51,13 @@ def compile(
             "- 所有必填字段都必须有值，不要返回 null\n"
             f"```json\n{schema_json}\n```"
         )
+
+    # L4: 编译后 prompt 大小检查
+    if len(result) > _MAX_COMPILED_PROMPT_CHARS:
+        logger.warning(
+            f"编译后 prompt 超过大小上限: {len(result)} chars (limit {_MAX_COMPILED_PROMPT_CHARS})"
+        )
+        result = result[:_MAX_COMPILED_PROMPT_CHARS]
 
     return result
 

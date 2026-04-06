@@ -42,6 +42,7 @@ class PolicyResult:
     row_access_mode: str = "none"        # all | owner | department | rule | none
     row_rule_json: dict = field(default_factory=dict)
     visible_field_ids: set[int] = field(default_factory=set)
+    blocked_field_ids: set[int] = field(default_factory=set)  # blocklist 模式下被屏蔽的字段
     field_access_mode: str = "all"       # all | allowlist | blocklist
     disclosure_level: str = "L0"         # L0-L4
     masking_rules: dict = field(default_factory=dict)
@@ -66,6 +67,20 @@ _DISCLOSURE_CAPS = {
 def check_disclosure_capability(level: str) -> dict:
     """返回该披露级别的能力集。"""
     return dict(_DISCLOSURE_CAPS.get(level, _DISCLOSURE_CAPS["L0"]))
+
+
+# ─── Masking 严格度排序（用于 H16 最小特权合并） ──────────────────────────────
+
+_MASK_TYPE_SEVERITY: dict[str, int] = {
+    "keep": 0,
+    "noise": 1,
+    "amount_range": 2,
+    "email_mask": 3,
+    "name_mask": 4,
+    "phone_mask": 5,
+    "id_mask": 6,
+    "full_mask": 7,
+}
 
 
 # ─── 角色组匹配 ──────────────────────────────────────────────────────────────
@@ -266,72 +281,91 @@ def _merge_allow_policies(
     policies: list[TablePermissionPolicy],
     role_group_ids: list[int],
 ) -> PolicyResult:
-    """合并多个 allow 策略：字段取并集，disclosure 取最高，export 取 OR。"""
+    """H16: 合并多个 allow 策略 — 最小权限交集原则。
+
+    角色×Skill 的权限范围是锁死的，多角色组合并时取交集（最严格），
+    而非并集膨胀。这确保添加角色组不会意外扩大权限。
+    """
     # row_access_mode: 优先级 all > department > owner > rule
     ROW_MODE_PRIORITY = {"all": 4, "department": 3, "owner": 2, "rule": 1, "none": 0}
-    best_row_mode = "none"
+    # H16: 初始化为最宽松，逐步收紧到最严格
+    best_row_mode = "all"
     best_row_rule = {}
-    merged_field_ids: set[int] = set()
-    merged_blocked_ids: set[int] | None = None  # blocklist 交集
-    best_disclosure = "L0"
+    merged_field_ids: set[int] | None = None  # allowlist 交集
+    merged_blocked_ids: set[int] = set()  # blocklist 并集
+    best_disclosure = "L4"  # H16: 从最高开始，取最低
     merged_masking: dict = {}
-    any_export = False
-    best_tool_mode = "deny"
+    all_export = True  # H16: AND — 所有组都允许才允许
+    best_tool_mode = "readwrite"  # H16: 从最宽开始，取最严
     field_access_mode = "all"
+    is_first = True
 
     TOOL_PRIORITY = {"readwrite": 3, "readonly": 2, "deny": 1}
 
     for p in policies:
-        # row_access_mode: 取最宽松
+        # H16: row_access_mode: 取最严格（最小权限）
         mode = p.row_access_mode or "none"
-        if ROW_MODE_PRIORITY.get(mode, 0) > ROW_MODE_PRIORITY.get(best_row_mode, 0):
+        if ROW_MODE_PRIORITY.get(mode, 0) < ROW_MODE_PRIORITY.get(best_row_mode, 0):
             best_row_mode = mode
             best_row_rule = p.row_rule_json or {}
 
-        # field: 并集 (allowlist) / 交集 (blocklist)
+        # H16: field allowlist 取交集 / blocklist 取并集
         fam = p.field_access_mode or "all"
         if fam == "allowlist":
+            allowed = set(p.allowed_field_ids or [])
             field_access_mode = "allowlist"
-            merged_field_ids.update(p.allowed_field_ids or [])
-        elif fam == "blocklist":
-            blocked = set(p.blocked_field_ids or [])
-            if merged_blocked_ids is None:
-                merged_blocked_ids = blocked
+            if merged_field_ids is None:
+                merged_field_ids = allowed
             else:
-                merged_blocked_ids &= blocked  # 交集 = 只有所有策略都 block 的才 block
+                merged_field_ids &= allowed  # 交集 = 只保留所有组都允许的
+        elif fam == "blocklist":
+            merged_blocked_ids |= set(p.blocked_field_ids or [])  # 并集 = 任一组 block 的都 block
 
-        # disclosure: 取最高
+        # H16: disclosure: 取最低（最严格）
         dl = p.disclosure_level or "L0"
-        if DISCLOSURE_ORDER.get(dl, 0) > DISCLOSURE_ORDER.get(best_disclosure, 0):
+        if DISCLOSURE_ORDER.get(dl, 0) < DISCLOSURE_ORDER.get(best_disclosure, 0):
             best_disclosure = dl
 
-        # masking: 后面的覆盖前面的
+        # masking: 取最严格的（保持不变，已是正确逻辑）
         if p.masking_rule_json:
-            merged_masking.update(p.masking_rule_json)
+            for mfield, mrule in p.masking_rule_json.items():
+                existing = merged_masking.get(mfield)
+                if existing is None:
+                    merged_masking[mfield] = mrule
+                else:
+                    new_type = mrule if isinstance(mrule, str) else mrule.get("type", "full_mask")
+                    old_type = existing if isinstance(existing, str) else existing.get("type", "full_mask")
+                    if _MASK_TYPE_SEVERITY.get(new_type, 0) > _MASK_TYPE_SEVERITY.get(old_type, 0):
+                        merged_masking[mfield] = mrule
 
-        # export: OR
-        if p.export_permission:
-            any_export = True
+        # H16: export: AND — 所有组都允许才允许
+        if not p.export_permission:
+            all_export = False
 
-        # tool: 取最宽松
+        # H16: tool: 取最严格
         tm = p.tool_permission_mode or "deny"
-        if TOOL_PRIORITY.get(tm, 0) > TOOL_PRIORITY.get(best_tool_mode, 0):
+        if TOOL_PRIORITY.get(tm, 0) < TOOL_PRIORITY.get(best_tool_mode, 0):
             best_tool_mode = tm
 
-    # 处理 blocklist → 转为 visible_field_ids（需要外部再过滤）
-    result_field_ids = merged_field_ids
-    if merged_blocked_ids is not None and field_access_mode != "allowlist":
+        is_first = False
+
+    # 处理 blocklist → 写入 blocked_field_ids 供字段过滤使用
+    result_field_ids = merged_field_ids or set()
+    result_blocked_ids: set[int] = set()
+    if merged_blocked_ids and field_access_mode != "allowlist":
         field_access_mode = "blocklist"
+        result_blocked_ids = merged_blocked_ids
 
     return PolicyResult(
         denied=False,
         row_access_mode=best_row_mode,
         row_rule_json=best_row_rule,
         visible_field_ids=result_field_ids,
+        blocked_field_ids=result_blocked_ids,
         field_access_mode=field_access_mode,
         disclosure_level=best_disclosure,
         masking_rules=merged_masking,
-        export_permission=any_export,
+        export_permission=all_export,
         tool_permission_mode=best_tool_mode,
         source="multi_group_merge" if len(policies) > 1 else ("view_policy" if policies[0].view_id else "table_policy"),
         matched_role_groups=role_group_ids,
@@ -355,8 +389,9 @@ def compute_visible_fields(
         allowed = policy.visible_field_ids
         return [f for f in fields if f.id in allowed]
     elif fam == "blocklist":
-        # blocklist 需要从 masking_rules 里提取 blocked_field_ids
-        # 或者调用方传入（在 merge 时已算好）
+        blocked = policy.blocked_field_ids
+        if blocked:
+            return [f for f in fields if f.id not in blocked]
         return list(fields)
     return list(fields)
 
@@ -468,26 +503,46 @@ def _apply_single_mask(val: str, mask_type: str) -> str:
     return "***"
 
 
+# ─── 安全：字段名白名单校验 ──────────────────────────────────────────────────
+
+_SAFE_FIELD_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
+
+def _validate_field_name(field_name: str) -> str:
+    """校验字段名仅含合法标识符字符，防止 SQL 注入。"""
+    if not _SAFE_FIELD_RE.match(field_name):
+        raise ValueError(f"非法字段名: '{field_name}'，仅允许字母/数字/下划线")
+    return field_name
+
+
 # ─── 行过滤 SQL 构建 ─────────────────────────────────────────────────────────
 
 def build_row_filter_sql(
     policy: PolicyResult,
     user: "User",
     table_name: str,
-) -> str | None:
-    """根据 row_access_mode 构建 WHERE 条件片段。返回 None 表示无需过滤（all）。"""
+) -> tuple[str | None, dict]:
+    """根据 row_access_mode 构建参数化 WHERE 条件。
+
+    Returns: (sql_fragment_with_placeholders, params_dict)
+        sql_fragment 使用 :param_name 占位符，调用方用 text(sql).bindparams(**params) 执行。
+        返回 (None, {}) 表示无需过滤（all）。
+    """
     mode = policy.row_access_mode
     if mode == "all":
-        return None
+        return None, {}
     if mode == "owner":
-        owner_field = policy.row_rule_json.get("owner_field", "owner_id")
-        return f"`{owner_field}` = {user.id}"
+        owner_field = _validate_field_name(
+            policy.row_rule_json.get("owner_field", "owner_id")
+        )
+        return f"`{owner_field}` = :_rf_owner_id", {"_rf_owner_id": user.id}
     if mode == "department":
-        dept_field = policy.row_rule_json.get("department_field", "department_id")
+        dept_field = _validate_field_name(
+            policy.row_rule_json.get("department_field", "department_id")
+        )
         dept_id = user.department_id or 0
-        return f"`{dept_field}` = {dept_id}"
+        return f"`{dept_field}` = :_rf_dept_id", {"_rf_dept_id": dept_id}
     if mode == "rule":
         # 自定义规则 — 暂不实现复杂 DSL，预留
-        return None
+        return None, {}
     # none — 不应走到这里（在 resolve 时已 deny）
-    return "1=0"
+    return "1=0", {}

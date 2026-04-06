@@ -1,8 +1,14 @@
 """$ref 引用解析 + 拓扑排序工具。"""
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# M28: 哨兵值，区分 context 中值为 None vs key 不存在
+_MISSING = object()
 
 
 def topological_sort(steps: list[dict]) -> list[dict]:
@@ -27,6 +33,9 @@ def topological_sort(steps: list[dict]) -> list[dict]:
             for dep in step.get("depends_on") or []:
                 if dep in key_to_step:
                     visit(dep)
+                else:
+                    # M27: 明确报告不存在的依赖
+                    logger.warning(f"拓扑排序: step '{key}' 依赖不存在的 step_key '{dep}'")
         temp_mark.discard(key)
         visited.add(key)
         if step:
@@ -71,9 +80,13 @@ def _resolve_str(value: str, context: dict) -> Any:
     step_key = m.group(1)
     field_path = m.group(2)  # 可能是 None 或 "field" 或 "a.b.c"
 
-    step_result = context.get(step_key)
+    # M28: 区分 context 中值为 None vs key 不存在
+    step_result = context.get(step_key, _MISSING)
+    if step_result is _MISSING:
+        logger.warning(f"$ref 解析: step_key '{step_key}' 不存在于 context 中")
+        return value  # key 不存在，原样返回
     if step_result is None:
-        return value  # 未找到时原样返回
+        return None  # 步骤存在但结果为 None，传递 None
 
     if field_path is None:
         return step_result

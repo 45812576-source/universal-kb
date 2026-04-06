@@ -171,15 +171,16 @@ class TestLLMVerify:
         assert result["score"] == 85
 
     @pytest.mark.asyncio
-    async def test_llm_verify_degrades_on_error(self):
-        """LLM 调用失败时降级为通过（不阻塞流程）。"""
+    async def test_llm_verify_fails_closed_on_error(self):
+        """H7: LLM 调用失败时 fail-closed（默认不通过），防止 LLM 宕机时所有验证自动通过。"""
         agent = VerifyAgent()
         with patch("app.services.pev.verify_agent.llm_gateway") as mock_gw:
             mock_gw.get_lite_config.return_value = {"model_id": "deepseek-chat", "max_tokens": 512}
             mock_gw.chat = AsyncMock(side_effect=Exception("API error"))
             result = await agent._llm_verify("描述", "标准", None, _mock_db())
 
-        assert result["pass"] is True  # 降级通过
+        assert result["pass"] is False  # H7: fail-closed
+        assert result["score"] == 0
 
     @pytest.mark.asyncio
     async def test_no_criteria_skips_llm(self):
@@ -224,7 +225,8 @@ class TestVerifyFinal:
         assert "圆满" in result["summary"]
 
     @pytest.mark.asyncio
-    async def test_verify_final_degrades_on_error(self):
+    async def test_verify_final_fails_closed_on_error(self):
+        """H7: 最终验证异常时 fail-closed。"""
         agent = VerifyAgent()
         job = MagicMock()
         job.goal = "目标"
@@ -236,4 +238,5 @@ class TestVerifyFinal:
 
             result = await agent.verify_final(job, {}, _mock_db())
 
-        assert result["pass"] is True  # 降级通过，不阻断完成
+        assert result["pass"] is False  # H7: fail-closed
+        assert result["score"] == 0

@@ -28,7 +28,7 @@ class HandoffEngine:
         db: Session,
     ) -> bool:
         """检查 upstream → downstream 连接是否在白名单中。
-        若上游 Skill 没有 policy，则默认允许（宽松策略）。
+        安全策略：deny-by-default，未配置 policy 的 Skill 不允许任何下游连接。
         """
         policy = (
             db.query(SkillPolicy)
@@ -36,7 +36,7 @@ class HandoffEngine:
             .first()
         )
         if not policy:
-            return True
+            return False  # deny-by-default: 未配置策略的 Skill 禁止 handoff
 
         connection = (
             db.query(SkillAgentConnection)
@@ -190,26 +190,33 @@ class HandoffEngine:
 
     # ── Payload 合规校验 ──────────────────────────────────────────────────────
 
-    def validate_payload(self, payload: dict, policy: dict | None) -> bool:
+    def validate_payload(
+        self, payload: dict, policy: dict | None
+    ) -> tuple[bool, list[str]]:
         """合规校验：检查必要字段存在、禁止字段不存在。
+
+        Returns:
+            (passed, diagnostics) — diagnostics 列出每个不通过的原因，
+            便于调用方向用户/日志输出具体失败点。
         policy 格式示例：
           {"required_fields": ["company_name"], "forbidden_fields": ["password"]}
         """
         if not policy:
-            return True
+            return True, []
 
         required = policy.get("required_fields") or []
         forbidden = policy.get("forbidden_fields") or []
+        diagnostics: list[str] = []
 
         for field in required:
             if field not in payload:
-                return False
+                diagnostics.append(f"缺少必填字段: {field}")
 
         for field in forbidden:
             if field in payload:
-                return False
+                diagnostics.append(f"包含禁止字段: {field}")
 
-        return True
+        return (len(diagnostics) == 0), diagnostics
 
 
 handoff_engine = HandoffEngine()

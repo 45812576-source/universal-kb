@@ -171,14 +171,23 @@ def _classify_user_input(message: str) -> list[dict]:
     if _P_CONSTRAINT.search(text):
         results.append({"type": "constraint", "content": text[:200]})
 
+    # M13: 正则预筛结果加 confidence，短文本匹配降权
+    # 如果文本较长(>50字)且只匹配了一个模式，可能是正则误匹配，标记低置信度
+    _specific_types = {"correction", "rejection", "scenario_shift"}
+    for r in results:
+        if r["type"] in _specific_types and len(text) > 50 and len(results) == 1:
+            r["confidence"] = "low"
+        else:
+            r["confidence"] = "high"
+
     # 如果没命中任何特殊模式，视为 new_fact
     non_noise_types = {"correction", "rejection", "scenario_shift", "file_rejection",
                        "file_reference", "execution_request", "confirm", "constraint"}
     if not any(r["type"] in non_noise_types for r in results):
         if len(text) > 5:
-            results.append({"type": "new_fact", "content": text[:300]})
+            results.append({"type": "new_fact", "content": text[:300], "confidence": "high"})
         else:
-            results.append({"type": "ambiguous_noise", "content": text[:100]})
+            results.append({"type": "ambiguous_noise", "content": text[:100], "confidence": "low"})
 
     return results
 
@@ -221,6 +230,11 @@ def _extract_session_state(
 
     state.total_user_rounds = len(user_msgs) + 1
 
+    # M12: 限制扫描窗口，避免 O(n²) 全量重建；只扫描最近 20 轮
+    _SCAN_WINDOW = 20
+    user_msgs_scan = user_msgs[-_SCAN_WINDOW:]
+    asst_msgs_scan = asst_msgs[-_SCAN_WINDOW:]
+
     # ── 第一遍：扫描历史建立基线状态 ──
 
     # 从第一条用户消息提取初始目标和场景
@@ -233,8 +247,8 @@ def _extract_session_state(
     # 场景识别（优先从全部用户文本中识别）
     state.scenario_type = _detect_scenario_from_text(all_user_text)
 
-    # 扫描历史 assistant 消息
-    for a in asst_msgs:
+    # 扫描历史 assistant 消息（M12: 仅扫描最近窗口）
+    for a in asst_msgs_scan:
         if "studio_summary" in a:
             state.has_outputted_summary = True
         if "studio_draft" in a or "studio_diff" in a:
@@ -247,17 +261,17 @@ def _extract_session_state(
             if qc not in state.asked_question_categories:
                 state.asked_question_categories.append(qc)
 
-    # 计算距上次 draft 轮数
+    # 计算距上次 draft 轮数（M12: 仅扫描最近窗口）
     if state.has_outputted_draft:
         count = 0
-        for a in reversed(asst_msgs):
+        for a in reversed(asst_msgs_scan):
             if "studio_draft" in a or "studio_diff" in a:
                 break
             count += 1
         state.rounds_since_draft = count
 
-    # 扫描所有用户消息提取事实
-    for um in user_msgs:
+    # 扫描用户消息提取事实（M12: 仅扫描最近窗口）
+    for um in user_msgs_scan:
         facts = _classify_user_input(um)
         for f in facts:
             if f["type"] == "new_fact":
@@ -757,10 +771,11 @@ def _build_system(
 
     memo_text = _build_memo_context(memo_context)
     state_text = _render_session_state(session_state) if session_state else "（首轮对话，尚无历史状态）"
+    # M14: 用 XML tag 包裹用户内容，防止 Skill 内容注入 system prompt 指令
     result = _STUDIO_SYSTEM.format(
-        editor_context=ctx,
+        editor_context=f"<user_content type=\"editor\">\n{ctx}\n</user_content>",
         memo_context=memo_text,
-        session_state_context=state_text,
+        session_state_context=f"<user_content type=\"session_state\">\n{state_text}\n</user_content>",
     )
 
     # 注入附属文件正文
@@ -935,17 +950,23 @@ async def run_stream(
 
     # ── 5. 流式调用 LLM ──
     full_content = ""
-    async for item in llm_gateway.chat_stream_typed(
-        model_config=model_config, messages=llm_messages, tools=None
-    ):
-        if isinstance(item, str):
-            yield item
-            continue
-        ctype, cdata = item
-        if ctype == "content":
-            full_content += cdata
-            yield ("content_block_delta", {"index": 0, "delta": {"text": cdata}})
-            yield ("delta", {"text": cdata})
+    try:
+        async for item in llm_gateway.chat_stream_typed(
+            model_config=model_config, messages=llm_messages, tools=None
+        ):
+            if isinstance(item, str):
+                yield item
+                continue
+            ctype, cdata = item
+            if ctype == "content":
+                full_content += cdata
+                yield ("content_block_delta", {"index": 0, "delta": {"text": cdata}})
+                yield ("delta", {"text": cdata})
+    except Exception as e:
+        # H20: LLM 流式调用异常优雅降级，发送 error event 而非直接崩溃
+        logger.error(f"[studio_agent] LLM streaming error: {e}")
+        yield ("error", {"message": f"AI 服务暂时不可用: {type(e).__name__}", "error_type": "server_error", "retryable": True})
+        return
 
     # ── 6. Post-process ──
     clean_text, events = _extract_events(full_content)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 
 from pymilvus import (
     Collection,
@@ -21,6 +22,14 @@ DIM = 1024  # BAAI/bge-m3 dense vector dimension
 
 _collection: Collection | None = None
 _embed_model = None
+_init_lock = threading.Lock()  # 防止并发初始化
+
+
+def _sanitize_milvus_str(value: str) -> str:
+    """转义 Milvus filter expression 中的字符串值，防止表达式注入。
+    Milvus 字符串值用双引号包裹，需要转义内部的双引号和反斜杠。
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 # ─── Embedding ────────────────────────────────────────────────────────────────
@@ -52,12 +61,44 @@ def _connect():
     connections.connect("default", host=settings.MILVUS_HOST, port=settings.MILVUS_PORT)
 
 
+def _is_connection_healthy() -> bool:
+    """检查 Milvus 连接是否健康。"""
+    try:
+        # list_collections 是轻量操作，用来验证连接
+        utility.list_collections()
+        return True
+    except Exception:
+        return False
+
+
+def _reconnect():
+    """断开后重新连接 Milvus。"""
+    global _collection
+    try:
+        connections.disconnect("default")
+    except Exception:
+        pass
+    _collection = None
+    _connect()
+
+
 def get_collection() -> Collection:
     global _collection
-    if _collection is not None:
-        return _collection
 
-    _connect()
+    # 快速路径：已缓存 + 连接健康
+    if _collection is not None:
+        if _is_connection_healthy():
+            return _collection
+        # 连接不健康，重连
+        logger.warning("Milvus connection unhealthy, reconnecting...")
+        _reconnect()
+
+    # 加锁防止并发初始化
+    with _init_lock:
+        # double-check
+        if _collection is not None:
+            return _collection
+        _connect()
 
     if not utility.has_collection(COLLECTION_NAME):
         fields = [
@@ -234,17 +275,19 @@ def search_knowledge(
     col = get_collection()
     q_embedding = embed_query(query)
 
-    # 构建过滤表达式
+    # 构建过滤表达式（参数化防注入）
     exprs = []
     if knowledge_id_filter:
-        ids_str = ", ".join(str(i) for i in knowledge_id_filter)
+        # 确保全部为整数
+        safe_ids = [int(i) for i in knowledge_id_filter]
+        ids_str = ", ".join(str(i) for i in safe_ids)
         exprs.append(f"knowledge_id in [{ids_str}]")
     if taxonomy_board:
-        exprs.append(f'taxonomy_board == "{taxonomy_board}"')
+        exprs.append(f'taxonomy_board == "{_sanitize_milvus_str(taxonomy_board)}"')
     if file_type:
-        exprs.append(f'file_type == "{file_type}"')
+        exprs.append(f'file_type == "{_sanitize_milvus_str(file_type)}"')
     if min_quality is not None:
-        exprs.append(f"quality_score >= {min_quality}")
+        exprs.append(f"quality_score >= {float(min_quality)}")
 
     expr = " and ".join(exprs) if exprs else None
 
@@ -290,5 +333,6 @@ def search_knowledge(
 def delete_knowledge_vectors(knowledge_id: int) -> None:
     """Delete all vectors for a given knowledge entry."""
     col = get_collection()
-    col.delete(f"knowledge_id == {knowledge_id}")
+    safe_id = int(knowledge_id)  # 确保为整数，防止注入
+    col.delete(f"knowledge_id == {safe_id}")
     col.flush()

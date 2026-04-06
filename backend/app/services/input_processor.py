@@ -131,6 +131,43 @@ def _parse_object_type(raw: str) -> DetectedObjectType:
     return mapping.get(raw.lower(), DetectedObjectType.UNKNOWN)
 
 
+_REQUIRED_TOP_KEYS = {"object_type", "fields"}
+_VALID_OBJECT_TYPES = {"knowledge", "opportunity", "feedback", "unknown"}
+
+
+def _validate_extraction_output(parsed: dict) -> dict:
+    """校验 LLM 抽取结果的基本结构，补全缺失字段防止下游崩溃。"""
+    if not isinstance(parsed, dict):
+        raise ValueError(f"LLM 返回非 dict 类型: {type(parsed).__name__}")
+
+    # 确保必须的 key 存在
+    for key in _REQUIRED_TOP_KEYS:
+        if key not in parsed:
+            parsed[key] = {} if key == "fields" else "unknown"
+
+    # object_type 白名单
+    if parsed.get("object_type", "").lower() not in _VALID_OBJECT_TYPES:
+        logger.warning(
+            "LLM returned invalid object_type=%r, falling back to unknown",
+            parsed.get("object_type"),
+        )
+        parsed["object_type"] = "unknown"
+
+    # fields 必须是 dict
+    if not isinstance(parsed.get("fields"), dict):
+        parsed["fields"] = {}
+
+    # 补全可选字段的类型
+    if not isinstance(parsed.get("pending_questions"), list):
+        parsed["pending_questions"] = []
+    if not isinstance(parsed.get("suggested_actions"), list):
+        parsed["suggested_actions"] = []
+    if not isinstance(parsed.get("confidence"), dict):
+        parsed["confidence"] = {}
+
+    return parsed
+
+
 async def process_raw_input(raw_input_id: int, db: Session) -> Draft:
     """主入口：处理一个 raw_input，返回生成的 Draft。"""
     raw_input = db.get(RawInput, raw_input_id)
@@ -174,6 +211,9 @@ async def process_raw_input(raw_input_id: int, db: Session) -> Draft:
         raw_input.status = RawInputStatus.FAILED
         db.commit()
         raise
+
+    # Step 2.5: Schema 校验 — 确保 LLM 返回的结构包含必要字段
+    parsed = _validate_extraction_output(parsed)
 
     # Step 3: save extraction
     object_type = _parse_object_type(parsed.get("object_type", "unknown"))

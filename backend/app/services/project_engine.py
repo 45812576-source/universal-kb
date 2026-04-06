@@ -151,7 +151,10 @@ class ProjectEngine:
         plan: dict,
         db: Session,
     ) -> None:
-        """根据规划方案创建 workspace 并绑定到成员。"""
+        """根据规划方案创建 workspace 并绑定到成员。
+
+        M21: 使用 savepoint 包裹，任何步骤失败时整体回滚。
+        """
         from app.models.workspace import Workspace, WorkspaceSkill, WorkspaceTool, WorkspaceStatus
         from app.models.skill import Skill, SkillStatus
         from app.models.tool import ToolRegistry
@@ -159,65 +162,71 @@ class ProjectEngine:
 
         workspaces_plan = plan.get("workspaces", [])
 
-        for ws_plan in workspaces_plan:
-            user_id = ws_plan.get("user_id")
-            if not user_id:
-                continue
+        nested = db.begin_nested()  # M21: savepoint
+        try:
+            for ws_plan in workspaces_plan:
+                user_id = ws_plan.get("user_id")
+                if not user_id:
+                    continue
 
-            # 创建 Workspace
-            ws = Workspace(
-                name=ws_plan.get("workspace_name", "项目工作台"),
-                description=ws_plan.get("identity_desc", ""),
-                icon="chat",
-                color="#00D1FF",
-                category="项目",
-                status=WorkspaceStatus.PUBLISHED,
-                created_by=user_id,
-                department_id=project.department_id,
-                visibility="department",
-                welcome_message="你好，有什么可以帮你的？",
-                system_context=ws_plan.get("system_context", ""),
-                project_id=project.id,
-            )
-            db.add(ws)
-            db.flush()
-
-            # 绑定推荐 skill（按名称模糊匹配）
-            for skill_name in ws_plan.get("suggested_skills", []):
-                skill = db.query(Skill).filter(
-                    Skill.name.ilike(f"%{skill_name}%"),
-                    Skill.status == SkillStatus.PUBLISHED,
-                ).first()
-                if skill:
-                    db.add(WorkspaceSkill(workspace_id=ws.id, skill_id=skill.id))
-
-            # 绑定推荐 tool（按名称模糊匹配）
-            for tool_name in ws_plan.get("suggested_tools", []):
-                tool = db.query(ToolRegistry).filter(
-                    ToolRegistry.name.ilike(f"%{tool_name}%"),
-                    ToolRegistry.is_active == True,
-                ).first()
-                if tool:
-                    db.add(WorkspaceTool(workspace_id=ws.id, tool_id=tool.id))
-
-            # 创建或更新 ProjectMember
-            member = db.query(ProjectMember).filter(
-                ProjectMember.project_id == project.id,
-                ProjectMember.user_id == user_id,
-            ).first()
-            if member:
-                member.workspace_id = ws.id
-                member.task_order = ws_plan.get("task_order", 0)
-            else:
-                db.add(ProjectMember(
+                # 创建 Workspace
+                ws = Workspace(
+                    name=ws_plan.get("workspace_name", "项目工作台"),
+                    description=ws_plan.get("identity_desc", ""),
+                    icon="chat",
+                    color="#00D1FF",
+                    category="项目",
+                    status=WorkspaceStatus.PUBLISHED,
+                    created_by=user_id,
+                    department_id=project.department_id,
+                    visibility="department",
+                    welcome_message="你好，有什么可以帮你的？",
+                    system_context=ws_plan.get("system_context", ""),
                     project_id=project.id,
-                    user_id=user_id,
-                    role_desc=ws_plan.get("identity_desc", ""),
-                    workspace_id=ws.id,
-                    task_order=ws_plan.get("task_order", 0),
-                ))
+                )
+                db.add(ws)
+                db.flush()
 
-        db.commit()
+                # 绑定推荐 skill（按名称模糊匹配）
+                for skill_name in ws_plan.get("suggested_skills", []):
+                    skill = db.query(Skill).filter(
+                        Skill.name.ilike(f"%{skill_name}%"),
+                        Skill.status == SkillStatus.PUBLISHED,
+                    ).first()
+                    if skill:
+                        db.add(WorkspaceSkill(workspace_id=ws.id, skill_id=skill.id))
+
+                # 绑定推荐 tool（按名称模糊匹配）
+                for tool_name in ws_plan.get("suggested_tools", []):
+                    tool = db.query(ToolRegistry).filter(
+                        ToolRegistry.name.ilike(f"%{tool_name}%"),
+                        ToolRegistry.is_active == True,
+                    ).first()
+                    if tool:
+                        db.add(WorkspaceTool(workspace_id=ws.id, tool_id=tool.id))
+
+                # 创建或更新 ProjectMember
+                member = db.query(ProjectMember).filter(
+                    ProjectMember.project_id == project.id,
+                    ProjectMember.user_id == user_id,
+                ).first()
+                if member:
+                    member.workspace_id = ws.id
+                    member.task_order = ws_plan.get("task_order", 0)
+                else:
+                    db.add(ProjectMember(
+                        project_id=project.id,
+                        user_id=user_id,
+                        role_desc=ws_plan.get("identity_desc", ""),
+                        workspace_id=ws.id,
+                        task_order=ws_plan.get("task_order", 0),
+                    ))
+
+            nested.commit()
+            db.commit()
+        except Exception:
+            nested.rollback()
+            raise
 
     async def sync_context(self, project, db: Session) -> None:
         """为每个项目 workspace 生成进度摘要并存入 project_contexts。"""

@@ -230,8 +230,9 @@ def _build_view_sql(
     extra_columns: list[str] | None = None,
     limit: int = 50,
     aggregate_mode: bool = False,
-) -> str:
-    """根据视图 + 权限构建 SQL。"""
+) -> tuple[str, dict]:
+    """根据视图 + 权限构建 SQL。返回 (sql_string, bind_params)。"""
+    bind_params: dict = {}
 
     # 确定 SELECT 列
     if aggregate_mode:
@@ -282,10 +283,11 @@ def _build_view_sql(
             if clause:
                 where_parts.append(clause)
 
-    # 2. 行权限过滤
-    row_filter = build_row_filter_sql(policy, user, table_name)
+    # 2. 行权限过滤（参数化）
+    row_filter, row_params = build_row_filter_sql(policy, user, table_name)
     if row_filter:
         where_parts.append(row_filter)
+        bind_params.update(row_params)
 
     # 3. 用户额外过滤
     for ef in (extra_filters or []):
@@ -325,7 +327,7 @@ def _build_view_sql(
     effective_limit = max(1, min(effective_limit, 500))  # 硬顶500
     sql += f" LIMIT {effective_limit}"
 
-    return sql
+    return sql, bind_params
 
 
 _OP_MAP = {
@@ -481,7 +483,7 @@ def execute_view_read(
         result.mode = "mixed"
 
     try:
-        sql = _build_view_sql(
+        sql, sql_params = _build_view_sql(
             table_name=bt.table_name,
             visible_columns=visible_col_names,
             view=view,
@@ -499,7 +501,7 @@ def execute_view_read(
         if not ok:
             return ViewReadResult(ok=False, error=f"SQL 校验失败: {reason}", table_id=bt.id, view_id=view.id)
 
-        raw_result = db.execute(text(sql))
+        raw_result = db.execute(text(sql), sql_params)
         col_names = list(raw_result.keys())
         raw_rows = raw_result.fetchall()
         rows = [dict(zip(col_names, [_serialize_value(c) for c in row])) for row in raw_rows]
@@ -531,7 +533,7 @@ def execute_view_read(
         # mixed 模式: summary + grouped_rows + sample_rows
         # 先跑一遍聚合 SQL
         try:
-            agg_sql = _build_view_sql(
+            agg_sql, agg_params = _build_view_sql(
                 table_name=bt.table_name,
                 visible_columns=visible_col_names,
                 view=view,
@@ -543,7 +545,7 @@ def execute_view_read(
             )
             ok2, reason2 = data_engine.validate_sql(agg_sql, "read", [bt.table_name])
             if ok2:
-                agg_result = db.execute(text(agg_sql))
+                agg_result = db.execute(text(agg_sql), agg_params)
                 agg_col_names = list(agg_result.keys())
                 agg_raw = agg_result.fetchall()
                 agg_rows = [dict(zip(agg_col_names, [_serialize_value(c) for c in row])) for row in agg_raw]

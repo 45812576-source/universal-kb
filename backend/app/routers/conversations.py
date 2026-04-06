@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from fastapi.responses import StreamingResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel, field_validator
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -28,17 +29,32 @@ router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 # ── SSE Keepalive ─────────────────────────────────────────────────────────────
 _SSE_KEEPALIVE = ": ping\n\n"  # SSE comment — ignored by browser but keeps proxy alive
 _KEEPALIVE_INTERVAL = 15  # seconds of silence before emitting a ping
+_SSE_TOTAL_TIMEOUT = 600  # H6: SSE 连接总超时 (秒)
+
+import time as _time
 
 
-async def _stream_with_keepalive(agen):
+async def _stream_with_keepalive(agen, request=None):
     """Wrap an async generator: yield items as they arrive;
     if no item arrives within _KEEPALIVE_INTERVAL seconds, yield a keepalive ping.
     Prevents nginx / Next.js proxy from closing idle SSE connections during
-    long LLM thinking phases."""
+    long LLM thinking phases.
+
+    H6: 添加总超时 + 客户端断连检测。
+    """
+    deadline = _time.monotonic() + _SSE_TOTAL_TIMEOUT
     it = agen.__aiter__()
     pending = asyncio.ensure_future(it.__anext__())
     try:
         while True:
+            # H6: 总超时检查
+            if _time.monotonic() > deadline:
+                logger.warning("SSE 连接总超时 (%ds)，强制关闭", _SSE_TOTAL_TIMEOUT)
+                break
+            # H6: 客户端断连检测
+            if request and await request.is_disconnected():
+                logger.info("SSE 客户端已断开连接")
+                break
             try:
                 item = await asyncio.wait_for(asyncio.shield(pending), timeout=_KEEPALIVE_INTERVAL)
                 pending = asyncio.ensure_future(it.__anext__())
@@ -48,10 +64,16 @@ async def _stream_with_keepalive(agen):
             except StopAsyncIteration:
                 break
     finally:
+        # M10: 确保 future 和底层 generator 都正确清理
         pending.cancel()
         try:
             await pending
         except (asyncio.CancelledError, StopAsyncIteration):
+            pass
+        # 关闭底层 async generator，释放资源
+        try:
+            await it.aclose()
+        except Exception:
             pass
 
 
@@ -82,6 +104,9 @@ class SendMessage(BaseModel):
     def content_not_blank(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("消息内容不能为空")
+        # L3: 消息内容最大长度 8K
+        if len(v) > 8192:
+            raise ValueError("消息内容超过最大长度限制 (8192 字符)")
         return v
 
 
@@ -389,6 +414,7 @@ async def send_message(
 async def stream_message(
     conv_id: int,
     req: SendMessage,
+    request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -421,7 +447,19 @@ async def stream_message(
     def _sse(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
+    # C4 fix: 将外层 db 保存，generator 中创建独立 Session
+    _outer_db = db
+
     async def event_generator():
+        from app.database import SessionLocal
+        # C4: 优先复用外层 Session（测试环境仍有效），否则创建独立 Session
+        _owns_session = False
+        try:
+            _outer_db.execute(text("SELECT 1"))
+            db = _outer_db
+        except Exception:
+            db = SessionLocal()
+            _owns_session = True
         try:
             # Re-fetch conv inside generator to avoid detached instance issues after outer flush
             conv = db.get(Conversation, conv_id)
@@ -600,7 +638,8 @@ async def stream_message(
                             source_files_content=_source_files_content,
                             selected_source_filename=req.selected_source_filename,
                             memo_context=_memo_ctx,
-                        )
+                        ),
+                        request=request,
                     ):
                         if isinstance(_item, str):
                             # keepalive ping
@@ -705,7 +744,7 @@ async def stream_message(
                 messages=prep.llm_messages,
                 tools=prep.tools_schema or None,
             )
-            async for item in _stream_with_keepalive(_llm_stream):
+            async for item in _stream_with_keepalive(_llm_stream, request=request):
                 if isinstance(item, str):
                     # keepalive ping — pass raw bytes to keep connection alive
                     yield item
@@ -765,7 +804,7 @@ async def stream_message(
                 # _handle_tool_calls_stream must start from 0 so it doesn't create sparse array holes.
                 _next_block_idx = block_idx + (1 if current_block_type is not None else 0)
                 async for item in skill_engine._handle_tool_calls_stream(
-                    db, skill_obj, response, prep.llm_messages, prep.model_config, user.id,
+                    db, skill_obj, response, prep.llm_messages, prep.model_config, current_user_id,
                     tools_schema=prep.tools_schema or None,
                     native_tool_calls=native_tool_calls or None,
                     start_block_idx=_next_block_idx,
@@ -837,6 +876,9 @@ async def stream_message(
                 "error_type": error_type,
                 "retryable": error_type in ("network", "rate_limit"),
             })
+        finally:
+            if _owns_session:
+                db.close()
 
     return StreamingResponse(
         event_generator(),
@@ -913,11 +955,16 @@ async def upload_and_chat(
     if not conv or conv.user_id != user.id:
         raise HTTPException(404, "Conversation not found")
 
+    # M8: 文件大小限制 50MB
+    _MAX_UPLOAD_SIZE = 50 * 1024 * 1024
+    content_bytes = await file.read()
+    if len(content_bytes) > _MAX_UPLOAD_SIZE:
+        raise HTTPException(413, f"文件大小超过限制（最大 50MB，实际 {len(content_bytes) / 1024 / 1024:.1f}MB）")
+
     # 保存文件
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     ext = os.path.splitext(file.filename or "")[1]
     saved_path = os.path.join(settings.UPLOAD_DIR, f"{uuid.uuid4()}{ext}")
-    content_bytes = await file.read()
     with open(saved_path, "wb") as f:
         f.write(content_bytes)
 
@@ -1148,15 +1195,20 @@ async def upload_stream_message(
     # 收集所有文件：单文件走 `file` 字段，多文件走 `file_<key>` 字段
     # uploaded_files: list of (key, filename, bytes)
     uploaded_files: list[tuple[str, str, bytes]] = []
+    _MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # M8: 50MB 限制
     for field_name, field_value in form.multi_items():
         if not isinstance(field_value, StarletteUploadFile):
             continue
         if field_name == "file":
             content = await field_value.read()
+            if len(content) > _MAX_UPLOAD_SIZE:
+                raise HTTPException(413, f"文件 '{field_value.filename}' 超过 50MB 限制")
             uploaded_files.append(("file", field_value.filename or "", content))
         elif field_name.startswith("file_"):
             key = field_name[5:]  # strip "file_" prefix
             content = await field_value.read()
+            if len(content) > _MAX_UPLOAD_SIZE:
+                raise HTTPException(413, f"文件 '{field_value.filename}' 超过 50MB 限制")
             uploaded_files.append((key, field_value.filename or "", content))
 
     if not uploaded_files:
@@ -1172,7 +1224,17 @@ async def upload_stream_message(
     def _sse(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
+    _outer_db2 = db
+
     async def event_generator():
+        from app.database import SessionLocal
+        _owns_session = False
+        try:
+            _outer_db2.execute(text("SELECT 1"))
+            db = _outer_db2
+        except Exception:
+            db = SessionLocal()
+            _owns_session = True
         try:
             # 1. Upload phase — 保存所有文件到磁盘
             yield _sse("status", {"stage": "uploading"})
@@ -1420,7 +1482,7 @@ async def upload_stream_message(
                 yield _sse("status", {"stage": "tool_calling"})
                 _next_block_idx = block_idx + (1 if current_block_type is not None else 0)
                 async for item in skill_engine._handle_tool_calls_stream(
-                    db, skill_obj, response, prep.llm_messages, prep.model_config, user.id,
+                    db, skill_obj, response, prep.llm_messages, prep.model_config, current_user_id,
                     tools_schema=prep.tools_schema or None,
                     native_tool_calls=native_tool_calls or None,
                     start_block_idx=_next_block_idx,
@@ -1483,6 +1545,9 @@ async def upload_stream_message(
                 "error_type": error_type,
                 "retryable": error_type in ("network", "rate_limit"),
             })
+        finally:
+            if _owns_session:
+                db.close()
 
     return StreamingResponse(
         event_generator(),
