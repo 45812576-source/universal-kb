@@ -309,6 +309,8 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
         "conditions": r.conditions or [],
         "security_scan_result": getattr(r, "security_scan_result", None),
         "dept_approved_policy": getattr(r, "dept_approved_policy", None),
+        "sandbox_report_id": getattr(r, "sandbox_report_id", None),
+        "sandbox_report_hash": getattr(r, "sandbox_report_hash", None),
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "actions": [
             {
@@ -592,9 +594,13 @@ async def act_on_approval(
         ApprovalRequestType.SKILL_PUBLISH,
         ApprovalRequestType.TOOL_PUBLISH,
     ):
-        scan = getattr(r, "security_scan_result", None) or {}
-        report_id = scan.get("sandbox_test_report_id")
-        report_hash = scan.get("report_hash")
+        # 优先使用 FK 列，fallback 到 security_scan_result JSON
+        report_id = getattr(r, "sandbox_report_id", None)
+        report_hash = getattr(r, "sandbox_report_hash", None)
+        if not report_id:
+            scan = getattr(r, "security_scan_result", None) or {}
+            report_id = scan.get("sandbox_test_report_id")
+            report_hash = report_hash or scan.get("report_hash")
         if not report_id:
             raise HTTPException(
                 400,
@@ -834,4 +840,17 @@ async def act_on_approval(
 
     db.commit()
     db.refresh(r)
+
+    # Gap 6: 发射审批事件
+    try:
+        from app.services import event_bus
+        event_type = "approval_resolved" if r.status != ApprovalStatus.PENDING else "approval_requested"
+        event_bus.emit(
+            db, event_type=event_type, source_type="approval", source_id=r.id,
+            payload={"request_type": str(r.request_type), "status": str(r.status), "action": req.action},
+            user_id=user.id,
+        )
+    except Exception:
+        pass
+
     return _req(r, db)

@@ -1100,3 +1100,101 @@ async def knowledge_confirm(
     db.commit()
 
     return {"results": results}
+
+
+# ─── Gap 7: Skill 自动回归测试 ──────────────────────────────────────────────
+
+@router.post("/regression/{skill_id}")
+async def run_regression_test(
+    skill_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """对 Skill 当前版本重跑上一版本的基线测试用例，返回回归 diff。"""
+    from app.models.sandbox import SandboxTestSession, SandboxTestReport
+
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill not found")
+
+    # 查找最新已发布版本的 baseline session
+    versions = (
+        db.query(SkillVersion)
+        .filter(SkillVersion.skill_id == skill_id, SkillVersion.baseline_sandbox_session_id.isnot(None))
+        .order_by(SkillVersion.version.desc())
+        .all()
+    )
+    if not versions:
+        raise HTTPException(400, "该 Skill 没有可用的回归测试基线")
+
+    baseline_ver = versions[0]
+    baseline_session = db.get(SandboxTestSession, baseline_ver.baseline_sandbox_session_id)
+    if not baseline_session or not baseline_session.report_id:
+        raise HTTPException(400, "基线沙盒会话无有效报告")
+
+    baseline_report = db.get(SandboxTestReport, baseline_session.report_id)
+    if not baseline_report:
+        raise HTTPException(400, "基线测试报告不存在")
+
+    # 从 baseline report 中提取 test cases
+    test_matrix = (baseline_report.part2_test_matrix or {}) if hasattr(baseline_report, "part2_test_matrix") else {}
+    cases = test_matrix.get("cases", [])
+    if not cases:
+        raise HTTPException(400, "基线报告中无测试用例")
+
+    # 获取当前版本 prompt
+    latest_ver = (
+        db.query(SkillVersion)
+        .filter(SkillVersion.skill_id == skill_id)
+        .order_by(SkillVersion.version.desc())
+        .first()
+    )
+    if not latest_ver:
+        raise HTTPException(400, "Skill 没有版本")
+
+    # 逐个重跑
+    regressions = []
+    passed = 0
+    model_config = llm_gateway.resolve_config(db, "sandbox.execute")
+
+    for case in cases:
+        user_input = case.get("input") or case.get("user_message", "")
+        if not user_input:
+            continue
+        expected_passed = case.get("passed", True)
+
+        try:
+            messages = [
+                {"role": "system", "content": latest_ver.system_prompt},
+                {"role": "user", "content": user_input},
+            ]
+            response, _usage = await llm_gateway.chat(
+                model_config=model_config,
+                messages=messages,
+                max_tokens=2048,
+            )
+            # 简单判定：如果基线通过且当前也有响应，算 pass
+            current_passed = bool(response and len(response.strip()) > 10)
+        except Exception as e:
+            current_passed = False
+            response = str(e)
+
+        if expected_passed and not current_passed:
+            regressions.append({
+                "input": user_input[:200],
+                "baseline_passed": expected_passed,
+                "current_passed": current_passed,
+                "response_preview": (response or "")[:300],
+            })
+        else:
+            passed += 1
+
+    return {
+        "skill_id": skill_id,
+        "baseline_version": baseline_ver.version,
+        "current_version": latest_ver.version,
+        "total_cases": len(cases),
+        "passed": passed,
+        "regressions": len(regressions),
+        "details": regressions,
+    }

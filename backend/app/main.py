@@ -325,6 +325,7 @@ from app.routers import knowledge_admin  # noqa: E402
 from app.routers import knowledge_tags  # noqa: E402
 from app.routers import knowledge_health  # noqa: E402
 from app.routers import knowledge_mask_feedback  # noqa: E402
+from app.routers import events  # noqa: E402
 app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(skills.router)
@@ -367,6 +368,7 @@ app.include_router(knowledge_admin.router)
 app.include_router(knowledge_tags.router)
 app.include_router(knowledge_health.router)
 app.include_router(knowledge_mask_feedback.router)
+app.include_router(events.router)
 
 # 头像静态文件服务
 _avatar_dir = Path("./uploads/avatars")

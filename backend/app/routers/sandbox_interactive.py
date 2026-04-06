@@ -1589,10 +1589,26 @@ async def submit_approval(
         requester_id=user.id,
         status=ApprovalStatus.PENDING,
         security_scan_result=sandbox_scan_data,
+        # Gap 4: 沙盒-审批强绑定
+        sandbox_report_id=report.id if report else None,
+        sandbox_report_hash=report.report_hash if report else None,
     )
     db.add(approval)
     db.commit()
     db.refresh(approval)
+
+    # Gap 7: 将当前 SandboxSession 标记为该版本的回归测试基线
+    if session.target_type == "skill" and session.target_id:
+        from app.models.skill import SkillVersion
+        latest_ver = (
+            db.query(SkillVersion)
+            .filter(SkillVersion.skill_id == session.target_id)
+            .order_by(SkillVersion.version.desc())
+            .first()
+        )
+        if latest_ver:
+            latest_ver.baseline_sandbox_session_id = session.id
+            db.commit()
 
     # 异步触发安全扫描，合并 suggested_policy 到 security_scan_result
     if session.target_type == "skill":

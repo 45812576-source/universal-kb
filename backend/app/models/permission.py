@@ -377,6 +377,9 @@ class ApprovalRequest(Base):
     stage = Column(String(20), default="dept_pending", nullable=False)  # dept_pending / super_pending
     security_scan_result = Column(JSON, default=None, nullable=True)   # 安全扫描结果（含风险报告 + Policy 草案）
     dept_approved_policy = Column(JSON, default=None, nullable=True)   # dept_admin 已确认的 Policy 分量（scope/overrides/masks 均在自己权限内）
+    # Gap 4: 沙盒-审批强绑定
+    sandbox_report_id = Column(Integer, ForeignKey("sandbox_test_reports.id"), nullable=True)
+    sandbox_report_hash = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     requester = relationship("User", foreign_keys=[requester_id])

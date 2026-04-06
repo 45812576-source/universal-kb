@@ -123,6 +123,22 @@ def _validate_params(tool: ToolRegistry, params: dict) -> str | None:
         return None  # schema itself is broken, skip validation
 
 
+def _validate_params_with_schema(tool: ToolRegistry, params: dict, schema: dict | None = None) -> str | None:
+    """Validate params against a specific schema (for version-pinned tools)."""
+    schema = schema or tool.input_schema
+    if not schema:
+        return None
+    try:
+        jsonschema.validate(instance=params, schema=schema)
+        return None
+    except jsonschema.ValidationError as e:
+        path = " -> ".join(str(p) for p in e.absolute_path) if e.absolute_path else "根字段"
+        return f"参数校验失败（{path}）：{e.message}"
+    except jsonschema.SchemaError as e:
+        logger.warning(f"Tool '{tool.name}' has invalid schema: {e}")
+        return None
+
+
 class ToolExecutor:
 
     async def execute_tool(
@@ -163,10 +179,28 @@ class ToolExecutor:
                                 "phases": ["permission_denied"],
                             }
 
+        # Gap 2: 版本解析 — 如果 Skill 绑定了 pinned_version，使用该版本的快照
+        _effective_config = tool.config
+        _effective_schema = tool.input_schema
+        if skill_id is not None:
+            from app.models.tool import SkillTool, ToolVersion
+            st = db.query(SkillTool).filter(
+                SkillTool.skill_id == skill_id, SkillTool.tool_id == tool.id,
+            ).first()
+            if st and st.pinned_version is not None:
+                tv = db.query(ToolVersion).filter(
+                    ToolVersion.tool_id == tool.id,
+                    ToolVersion.version == st.pinned_version,
+                ).first()
+                if tv:
+                    _effective_config = tv.config_snapshot or tool.config
+                    _effective_schema = tv.input_schema_snapshot or tool.input_schema
+                    logger.debug(f"Tool '{tool_name}' using pinned version {st.pinned_version}")
+
         phases = []
 
-        # Schema validation
-        validation_error = _validate_params(tool, params)
+        # Schema validation (use effective schema for version-pinned tools)
+        validation_error = _validate_params_with_schema(tool, params, _effective_schema)
         if validation_error:
             schema_str = json.dumps(tool.input_schema or {}, ensure_ascii=False)
             return {

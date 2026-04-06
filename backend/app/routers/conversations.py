@@ -451,6 +451,13 @@ async def stream_message(
     _outer_db = db
 
     async def event_generator():
+        import time as _time_mod
+        _stream_start = _time_mod.monotonic()
+        _tool_call_count = 0
+        _tool_error_count = 0
+        _stream_success = True
+        _stream_error_type: str | None = None
+
         from app.database import SessionLocal
         # C4: 优先复用外层 Session（测试环境仍有效），否则创建独立 Session
         _owns_session = False
@@ -853,6 +860,24 @@ async def stream_message(
             estimated_output_tokens = len(response) // 2
             model_context_limit = prep.model_config.get("context_window", 32000)
 
+            # Gap 1: 记录 Skill 执行度量
+            if prep and prep.skill_id:
+                try:
+                    skill_engine.record_execution(
+                        db,
+                        skill_id=prep.skill_id,
+                        conversation_id=conv_id,
+                        user_id=current_user_id,
+                        success=_stream_success,
+                        duration_ms=int((_time_mod.monotonic() - _stream_start) * 1000),
+                        tool_call_count=_tool_call_count,
+                        tool_error_count=_tool_error_count,
+                        token_usage={"input_tokens": estimated_input_tokens, "output_tokens": estimated_output_tokens},
+                        error_type=_stream_error_type,
+                    )
+                except Exception:
+                    logger.warning("Failed to record skill execution", exc_info=True)
+
             yield _sse("done", {
                 "message_id": assistant_msg.id,
                 "metadata": msg_metadata,
@@ -865,6 +890,8 @@ async def stream_message(
             })
 
         except Exception as e:
+            _stream_success = False
+            _stream_error_type = _classify_error(e) if '_classify_error' in dir() else "unknown"
             import traceback
             tb_str = traceback.format_exc()
             traceback.print_exc()
@@ -939,6 +966,55 @@ def save_message_as_knowledge(
         "taxonomy_code": entry.taxonomy_code,
         "taxonomy_board": entry.taxonomy_board,
     }
+
+
+class RatingBody(BaseModel):
+    rating: int  # 1=差 5=好
+
+
+@router.post("/{conv_id}/messages/{msg_id}/rating")
+def rate_message(
+    conv_id: int,
+    msg_id: int,
+    body: RatingBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """用户对 assistant 消息评分，更新关联的 SkillExecutionLog.user_rating。"""
+    if body.rating < 1 or body.rating > 5:
+        raise HTTPException(400, "评分范围 1-5")
+
+    conv = db.get(Conversation, conv_id)
+    if not conv or conv.user_id != user.id:
+        raise HTTPException(404, "Conversation not found")
+
+    msg = db.get(Message, msg_id)
+    if not msg or msg.conversation_id != conv_id:
+        raise HTTPException(404, "Message not found")
+    if msg.role != MessageRole.ASSISTANT:
+        raise HTTPException(400, "只能对 assistant 消息评分")
+
+    # 查找对应的 SkillExecutionLog（同一 conv + skill + 最近时间）
+    skill_id = (msg.metadata_ or {}).get("skill_id") or conv.skill_id
+    if not skill_id:
+        raise HTTPException(400, "该消息无关联 Skill")
+
+    from app.models.skill import SkillExecutionLog
+    log = (
+        db.query(SkillExecutionLog)
+        .filter(
+            SkillExecutionLog.skill_id == skill_id,
+            SkillExecutionLog.conversation_id == conv_id,
+        )
+        .order_by(SkillExecutionLog.created_at.desc())
+        .first()
+    )
+    if not log:
+        raise HTTPException(404, "未找到执行记录")
+
+    log.user_rating = body.rating
+    db.commit()
+    return {"ok": True, "rating": body.rating}
 
 
 @router.post("/{conv_id}/messages/upload")
@@ -1227,6 +1303,9 @@ async def upload_stream_message(
     _outer_db2 = db
 
     async def event_generator():
+        import time as _time_mod2
+        _stream_start2 = _time_mod2.monotonic()
+
         from app.database import SessionLocal
         _owns_session = False
         try:
@@ -1521,6 +1600,21 @@ async def upload_stream_message(
             estimated_input_tokens = total_input_chars // 2
             estimated_output_tokens = len(response) // 2
             model_context_limit = prep.model_config.get("context_window", 32000)
+
+            # Gap 1: 记录 Skill 执行度量（文件上传流）
+            if prep and prep.skill_id:
+                try:
+                    skill_engine.record_execution(
+                        db,
+                        skill_id=prep.skill_id,
+                        conversation_id=conv_id,
+                        user_id=current_user_id,
+                        success=True,
+                        duration_ms=int((_time_mod2.monotonic() - _stream_start2) * 1000),
+                        token_usage={"input_tokens": estimated_input_tokens, "output_tokens": estimated_output_tokens},
+                    )
+                except Exception:
+                    logger.warning("Failed to record skill execution (file)", exc_info=True)
 
             yield _sse("done", {
                 "message_id": assistant_msg.id,

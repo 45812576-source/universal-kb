@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass, field
 from typing import AsyncIterator, Any
 from pathlib import Path
 
@@ -16,6 +17,66 @@ logger = logging.getLogger(__name__)
 # ── 重试配置 ─────────────────────────────────────────────────────────────────
 _RETRYABLE_STATUS_CODES = {429, 502, 503}
 _RETRY_DELAYS = [1.0, 2.0, 4.0]  # 指数退避（最多 3 次重试）
+
+
+# ── Provider 熔断器 ──────────────────────────────────────────────────────────
+
+@dataclass
+class ProviderCircuitBreaker:
+    """三态熔断器：closed → open → half_open → closed。
+    closed: 正常通行
+    open: 拒绝请求，等待 recovery_timeout 后进入 half_open
+    half_open: 允许少量请求试探，成功则恢复 closed，失败则重新 open
+    """
+    state: str = "closed"  # closed / open / half_open
+    failure_count: int = 0
+    success_count_in_half_open: int = 0
+    last_failure_time: float = 0.0
+    failure_threshold: int = 5
+    recovery_timeout: float = 60.0
+    half_open_max_calls: int = 3
+
+    def allow_request(self) -> bool:
+        if self.state == "closed":
+            return True
+        if self.state == "open":
+            if time.monotonic() - self.last_failure_time >= self.recovery_timeout:
+                self.state = "half_open"
+                self.success_count_in_half_open = 0
+                logger.info("Circuit breaker → half_open")
+                return True
+            return False
+        # half_open
+        return self.success_count_in_half_open < self.half_open_max_calls
+
+    def record_success(self) -> None:
+        if self.state == "half_open":
+            self.success_count_in_half_open += 1
+            if self.success_count_in_half_open >= self.half_open_max_calls:
+                self.state = "closed"
+                self.failure_count = 0
+                logger.info("Circuit breaker → closed (recovered)")
+        elif self.state == "closed":
+            self.failure_count = max(0, self.failure_count - 1)
+
+    def record_failure(self) -> None:
+        self.failure_count += 1
+        self.last_failure_time = time.monotonic()
+        if self.state == "half_open":
+            self.state = "open"
+            logger.warning("Circuit breaker → open (half_open failed)")
+        elif self.failure_count >= self.failure_threshold:
+            self.state = "open"
+            logger.warning(f"Circuit breaker → open (failures={self.failure_count})")
+
+
+_PROVIDER_HEALTH: dict[str, ProviderCircuitBreaker] = {}
+
+
+def _get_circuit_breaker(provider: str) -> ProviderCircuitBreaker:
+    if provider not in _PROVIDER_HEALTH:
+        _PROVIDER_HEALTH[provider] = ProviderCircuitBreaker()
+    return _PROVIDER_HEALTH[provider]
 
 # ── 调用点注册表 ──────────────────────────────────────────────────────────────
 # 每个 slot 对应系统中一个独立的 AI 调用场景，可在 admin 前端绑定不同模型。
@@ -155,6 +216,13 @@ class LLMGateway:
 
         重试策略：ConnectTimeout/ReadTimeout/429/502/503 → 指数退避最多 3 次。
         """
+        # Gap 5: 熔断器检查
+        provider = model_config.get("provider", "unknown")
+        cb = _get_circuit_breaker(provider)
+        if not cb.allow_request():
+            logger.warning(f"Circuit breaker OPEN for provider={provider}, request blocked")
+            raise RuntimeError(f"Provider {provider} circuit breaker is OPEN, please retry later")
+
         url, headers, body = self._build_request(model_config, messages, temperature, max_tokens, tools=tools)
         t0 = time.monotonic()
         last_exc: Exception | None = None
@@ -183,9 +251,15 @@ class LLMGateway:
                     continue
                 raise
         if resp is None:
+            cb.record_failure()
             raise last_exc or RuntimeError("LLM call failed after retries")
         elapsed = time.monotonic() - t0
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except Exception:
+            cb.record_failure()
+            raise
+        cb.record_success()
         data = resp.json()
         msg = data["choices"][0]["message"]
         content = msg.get("content") or msg.get("reasoning_content") or ""
@@ -237,6 +311,13 @@ class LLMGateway:
           - ("tool_call", dict) — 原生工具调用 {"id", "name", "arguments": str}
                                    仅当传入 tools 且模型支持 function calling 时出现
         """
+        # Gap 5: 熔断器检查
+        provider = model_config.get("provider", "unknown")
+        cb = _get_circuit_breaker(provider)
+        if not cb.allow_request():
+            logger.warning(f"Circuit breaker OPEN for provider={provider}, stream blocked")
+            raise RuntimeError(f"Provider {provider} circuit breaker is OPEN, please retry later")
+
         url, headers, body = self._build_request(
             model_config, messages, temperature, max_tokens, stream=True, tools=tools
         )
@@ -304,6 +385,7 @@ class LLMGateway:
                         except KeyError as e:
                             logger.warning(f"LLM stream chunk missing key: {e}, raw={line[:200]}")
                             continue
+                    cb.record_success()
                     return  # 正常完成，退出重试循环
 
             except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as e:
@@ -316,9 +398,11 @@ class LLMGateway:
                     )
                     await asyncio.sleep(delay)
                     continue
+                cb.record_failure()
                 raise
 
         if last_exc:
+            cb.record_failure()
             raise last_exc
 
     def get_lite_config(self) -> dict:
@@ -398,7 +482,34 @@ class LLMGateway:
         1. 调用方显式传入的 model_config_id（如 Skill 绑定的模型）
         2. model_assignments 表中的绑定
         3. SLOT_REGISTRY 中的 fallback 策略
+
+        Gap 5: 如果解析出的 provider 熔断器 open，自动降级到 fallback 配置。
         """
+        config = self._resolve_config_inner(db, slot_key, model_config_id)
+        provider = config.get("provider", "unknown")
+        cb = _get_circuit_breaker(provider)
+        if not cb.allow_request():
+            # 当前 provider 熔断，尝试降级
+            slot = SLOT_REGISTRY.get(slot_key, {})
+            fb = slot.get("fallback", "default")
+            fallback_config = None
+            if fb != "lite":
+                try:
+                    fallback_config = self.get_lite_config()
+                except Exception:
+                    pass
+            if fallback_config is None:
+                try:
+                    fallback_config = self.get_config(db)
+                except Exception:
+                    pass
+            if fallback_config and fallback_config.get("provider") != provider:
+                logger.warning(f"Circuit breaker fallback: {provider} → {fallback_config.get('provider')}")
+                return fallback_config
+        return config
+
+    def _resolve_config_inner(self, db: Session, slot_key: str, model_config_id: int = None) -> dict:
+        """内部解析逻辑（无熔断降级）。"""
         if model_config_id:
             return self.get_config(db, model_config_id)
 

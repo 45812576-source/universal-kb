@@ -37,7 +37,35 @@ class ToolRegistry(Base):
         onupdate=datetime.datetime.utcnow,
     )
 
+    current_version = Column(Integer, default=1)
+
     skills = relationship("Skill", secondary="skill_tools", back_populates="bound_tools")
+    versions = relationship("ToolVersion", backref="tool", order_by="ToolVersion.version.desc()")
+
+
+class ToolVersionStatus(str, enum.Enum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+    DEPRECATED = "deprecated"
+
+
+class ToolVersion(Base):
+    """工具版本快照 — 每次 config/input_schema 变更时自动创建。"""
+    __tablename__ = "tool_versions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tool_id = Column(Integer, ForeignKey("tool_registry.id"), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    config_snapshot = Column(JSON, default=dict)
+    input_schema_snapshot = Column(JSON, default=dict)
+    status = Column(
+        Enum(ToolVersionStatus, values_callable=lambda x: [e.value for e in x]),
+        default=ToolVersionStatus.ACTIVE,
+        nullable=False,
+    )
+    version_note = Column(Text, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
 class UserSavedTool(Base):
@@ -55,3 +83,4 @@ class SkillTool(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     skill_id = Column(Integer, ForeignKey("skills.id"), nullable=False)
     tool_id = Column(Integer, ForeignKey("tool_registry.id"), nullable=False)
+    pinned_version = Column(Integer, nullable=True)  # null=latest

@@ -196,9 +196,30 @@ def update_tool(
     tool = db.get(ToolRegistry, tool_id)
     if not tool:
         raise HTTPException(status_code=404, detail="Tool not found")
-    for field, value in body.model_dump(exclude_none=True).items():
+
+    # Gap 2: 检测 config/input_schema 是否变更，自动创建版本快照
+    updates = body.model_dump(exclude_none=True)
+    config_changed = "config" in updates and updates["config"] != (tool.config or {})
+    schema_changed = "input_schema" in updates and updates["input_schema"] != (tool.input_schema or {})
+
+    for field, value in updates.items():
         setattr(tool, field, value)
     tool.updated_at = datetime.datetime.utcnow()
+
+    if config_changed or schema_changed:
+        from app.models.tool import ToolVersion, ToolVersionStatus
+        new_ver = (tool.current_version or 1) + 1
+        tool.current_version = new_ver
+        tv = ToolVersion(
+            tool_id=tool.id,
+            version=new_ver,
+            config_snapshot=tool.config or {},
+            input_schema_snapshot=tool.input_schema or {},
+            status=ToolVersionStatus.ACTIVE,
+            created_by=user.id,
+        )
+        db.add(tv)
+
     db.commit()
     db.refresh(tool)
     return _tool_dict(tool, user)
@@ -305,6 +326,81 @@ def delete_tool(
     if user.role != Role.SUPER_ADMIN and tool.created_by != user.id:
         raise HTTPException(status_code=403, detail="无权删除此工具")
     db.delete(tool)
+    db.commit()
+    return {"ok": True}
+
+
+# ─── Gap 2: 工具版本管理端点 ─────────────────────────────────────────────────
+
+@router.get("/{tool_id}/versions")
+def list_tool_versions(
+    tool_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """列出工具的版本历史。"""
+    from app.models.tool import ToolVersion
+    tool = db.get(ToolRegistry, tool_id)
+    if not tool:
+        raise HTTPException(404, "Tool not found")
+    versions = db.query(ToolVersion).filter(ToolVersion.tool_id == tool_id).order_by(ToolVersion.version.desc()).all()
+    return [
+        {
+            "id": v.id,
+            "version": v.version,
+            "status": v.status.value if hasattr(v.status, "value") else v.status,
+            "version_note": v.version_note,
+            "created_by": v.created_by,
+            "created_at": v.created_at.isoformat() if v.created_at else None,
+        }
+        for v in versions
+    ]
+
+
+@router.post("/{tool_id}/versions/{version}/activate")
+def activate_tool_version(
+    tool_id: int,
+    version: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """激活指定版本（设为 active，其他 active 改为 deprecated）。"""
+    from app.models.tool import ToolVersion, ToolVersionStatus
+    tv = db.query(ToolVersion).filter(
+        ToolVersion.tool_id == tool_id, ToolVersion.version == version,
+    ).first()
+    if not tv:
+        raise HTTPException(404, "Version not found")
+    # 将同一工具的所有 active 版本降为 deprecated
+    db.query(ToolVersion).filter(
+        ToolVersion.tool_id == tool_id, ToolVersion.status == ToolVersionStatus.ACTIVE,
+    ).update({"status": ToolVersionStatus.DEPRECATED})
+    tv.status = ToolVersionStatus.ACTIVE
+    tool = db.get(ToolRegistry, tool_id)
+    if tool:
+        tool.current_version = version
+        tool.config = tv.config_snapshot or tool.config
+        tool.input_schema = tv.input_schema_snapshot or tool.input_schema
+        tool.updated_at = datetime.datetime.utcnow()
+    db.commit()
+    return {"ok": True, "version": version}
+
+
+@router.post("/{tool_id}/versions/{version}/deprecate")
+def deprecate_tool_version(
+    tool_id: int,
+    version: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """废弃指定版本。"""
+    from app.models.tool import ToolVersion, ToolVersionStatus
+    tv = db.query(ToolVersion).filter(
+        ToolVersion.tool_id == tool_id, ToolVersion.version == version,
+    ).first()
+    if not tv:
+        raise HTTPException(404, "Version not found")
+    tv.status = ToolVersionStatus.DEPRECATED
     db.commit()
     return {"ok": True}
 

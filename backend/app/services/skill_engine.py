@@ -361,10 +361,34 @@ class SkillEngine:
             top = [s for s, sc in scored[:15] if sc > 0]
             skills = top if top else [s for s, _ in scored[:15]]
 
-        # description 截断到 30 字，避免 prompt 过长导致模型不遵循指令
-        skill_list = "\n".join(
-            f"- {s.name}: {(s.description or '无描述')[:30]}" for s in skills
+        # 注入执行统计信号（可靠性+使用量），辅助匹配决策
+        import datetime as _dt
+        from sqlalchemy import func as _sa_func
+        from app.models.skill import SkillExecutionLog
+        _since = _dt.datetime.utcnow() - _dt.timedelta(days=30)
+        from sqlalchemy import Integer as _SAInt
+        _stats_q = (
+            db.query(
+                SkillExecutionLog.skill_id,
+                _sa_func.count(SkillExecutionLog.id).label("cnt"),
+                _sa_func.avg(
+                    _sa_func.cast(SkillExecutionLog.success, _SAInt)
+                ).label("sr"),
+            )
+            .filter(SkillExecutionLog.created_at >= _since)
+            .group_by(SkillExecutionLog.skill_id)
+            .all()
         )
+        _skill_stats = {r.skill_id: (r.cnt, round(float(r.sr or 0) * 100)) for r in _stats_q}
+
+        # description 截断到 30 字，避免 prompt 过长导致模型不遵循指令
+        def _fmt(s: Skill) -> str:
+            base = f"- {s.name}: {(s.description or '无描述')[:30]}"
+            st = _skill_stats.get(s.id)
+            if st:
+                base += f" [可靠性:{st[1]}%, 使用量:{st[0]}]"
+            return base
+        skill_list = "\n".join(_fmt(s) for s in skills)
         prompt = _SKILL_MATCH_PROMPT.format(
             skill_list=skill_list, user_message=user_message
         )
@@ -2281,6 +2305,76 @@ class SkillEngine:
         return {
             "download_url": result["download_url"],
             "download_filename": result.get("filename", "演示文稿.html"),
+        }
+
+
+    # ── Skill 执行度量记录 ────────────────────────────────────────────────────
+
+    @staticmethod
+    def record_execution(
+        db: Session,
+        skill_id: int,
+        conversation_id: int | None = None,
+        user_id: int | None = None,
+        success: bool = True,
+        duration_ms: int | None = None,
+        round_count: int = 1,
+        tool_call_count: int = 0,
+        tool_error_count: int = 0,
+        token_usage: dict | None = None,
+        error_type: str | None = None,
+    ) -> None:
+        """记录一次 Skill 执行日志。"""
+        from app.models.skill import SkillExecutionLog
+        log = SkillExecutionLog(
+            skill_id=skill_id,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            success=success,
+            duration_ms=duration_ms,
+            round_count=round_count,
+            tool_call_count=tool_call_count,
+            tool_error_count=tool_error_count,
+            token_usage=token_usage or {},
+            error_type=error_type,
+        )
+        db.add(log)
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.warning("Failed to record skill execution log", exc_info=True)
+
+    @staticmethod
+    def get_execution_stats(db: Session, skill_id: int, days: int = 30) -> dict:
+        """获取 Skill 近 N 天的执行统计。"""
+        import datetime as _dt
+        from sqlalchemy import func
+        from app.models.skill import SkillExecutionLog
+        since = _dt.datetime.utcnow() - _dt.timedelta(days=days)
+        q = db.query(SkillExecutionLog).filter(
+            SkillExecutionLog.skill_id == skill_id,
+            SkillExecutionLog.created_at >= since,
+        )
+        total = q.count()
+        if total == 0:
+            return {"usage_count": 0, "success_rate": None, "avg_duration_ms": None, "avg_rating": None}
+        success_count = q.filter(SkillExecutionLog.success == True).count()
+        avg_dur = db.query(func.avg(SkillExecutionLog.duration_ms)).filter(
+            SkillExecutionLog.skill_id == skill_id,
+            SkillExecutionLog.created_at >= since,
+            SkillExecutionLog.duration_ms.isnot(None),
+        ).scalar()
+        avg_rating = db.query(func.avg(SkillExecutionLog.user_rating)).filter(
+            SkillExecutionLog.skill_id == skill_id,
+            SkillExecutionLog.created_at >= since,
+            SkillExecutionLog.user_rating.isnot(None),
+        ).scalar()
+        return {
+            "usage_count": total,
+            "success_rate": round(success_count / total * 100, 1) if total else None,
+            "avg_duration_ms": int(avg_dur) if avg_dur else None,
+            "avg_rating": round(float(avg_rating), 1) if avg_rating else None,
         }
 
 

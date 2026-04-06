@@ -141,6 +141,9 @@ class SkillVersion(Base):
     created_by = Column(Integer, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
+    # Gap 7: 回归测试基线
+    baseline_sandbox_session_id = Column(Integer, ForeignKey("sandbox_test_sessions.id"), nullable=True)
+
     skill = relationship("Skill", back_populates="versions")
     model_config = relationship("ModelConfig")
 
@@ -211,6 +214,25 @@ class SkillPreflightResult(Base):
     checked_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     skill = relationship("Skill", foreign_keys=[skill_id])
+
+
+class SkillExecutionLog(Base):
+    """Skill 执行度量日志 — 每次 Skill 被调用后记录一条。"""
+    __tablename__ = "skill_execution_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skill_id = Column(Integer, ForeignKey("skills.id"), nullable=False, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    success = Column(Boolean, nullable=False, default=True)
+    duration_ms = Column(Integer, nullable=True)
+    round_count = Column(Integer, default=1)
+    tool_call_count = Column(Integer, default=0)
+    tool_error_count = Column(Integer, default=0)
+    token_usage = Column(JSON, default=dict)
+    user_rating = Column(Integer, nullable=True)  # 1=差 5=好
+    error_type = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
 
 
 class SkillAttribution(Base):

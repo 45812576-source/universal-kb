@@ -24,6 +24,7 @@ class PEVStepStatus(str, enum.Enum):
     PASSED = "passed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    COMPENSATED = "compensated"
 
 
 class PEVJob(Base):
@@ -84,6 +85,8 @@ class PEVStep(Base):
     result = Column(JSON, nullable=True)
     verify_result = Column(JSON, nullable=True)
     retry_count = Column(Integer, default=0)
+    # Gap 3: 补偿规格 — 如 {"undo_tool": "...", "undo_params_template": {"table": "$input.table", "row_id": "$result.row_id"}}
+    compensation_spec = Column(JSON, nullable=True)
 
     # 关系
     job = relationship("PEVJob", back_populates="steps")

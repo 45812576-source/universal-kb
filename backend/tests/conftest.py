@@ -101,7 +101,7 @@ def client():
         tasks, projects, permissions, skill_policies, approvals,
         handoff, output_schemas, sandbox, sandbox_interactive,
         skill_memos, collab, knowledge_admin, knowledge_tags,
-        dev_studio,
+        dev_studio, events,
     )
 
     test_app = FastAPI(title="Universal KB Test API")
@@ -150,6 +150,7 @@ def client():
     test_app.include_router(knowledge_admin.router)
     test_app.include_router(knowledge_tags.router)
     test_app.include_router(dev_studio.router)
+    test_app.include_router(events.router)
     test_app.dependency_overrides[get_db] = override_get_db
 
     with TestClient(test_app, raise_server_exceptions=True) as c:

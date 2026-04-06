@@ -1392,6 +1392,22 @@ def get_skill_usage(
     }
 
 
+@router.get("/{skill_id}/execution-stats")
+def get_execution_stats(
+    skill_id: int,
+    days: int = 30,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """获取 Skill 近 N 天的执行统计（成功率、使用量、平均耗时、平均评分）。"""
+    from app.services.skill_engine import skill_engine
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill not found")
+    stats = skill_engine.get_execution_stats(db, skill_id, days=days)
+    return {"skill_id": skill_id, "days": days, **stats}
+
+
 def _get_rejection_comment(skill_id: int, db: Session) -> str | None:
     """返回该 Skill 最近一次被驳回时审批人写的意见（供提交人看）。"""
     try:
@@ -1603,6 +1619,29 @@ def add_version(
             approval_id = approval.id
 
     db.commit()
+
+    # Gap 7: 新版本保存时，如上一版本有 baseline，发射回归触发事件
+    try:
+        prev_ver = (
+            db.query(SkillVersion)
+            .filter(
+                SkillVersion.skill_id == skill_id,
+                SkillVersion.version < v.version,
+                SkillVersion.baseline_sandbox_session_id.isnot(None),
+            )
+            .order_by(SkillVersion.version.desc())
+            .first()
+        )
+        if prev_ver:
+            from app.services import event_bus
+            event_bus.emit(
+                db, event_type="regression_triggered", source_type="skill", source_id=skill_id,
+                payload={"baseline_version": prev_ver.version, "new_version": v.version},
+                user_id=user.id,
+            )
+    except Exception:
+        pass
+
     return {
         "version": v.version,
         "id": v.id,

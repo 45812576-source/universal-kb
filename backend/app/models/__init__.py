@@ -1,5 +1,5 @@
 from app.models.user import Department, Role, User  # noqa: F401
-from app.models.skill import ModelConfig, Skill, SkillMode, SkillStatus, SkillVersion, SkillSuggestion, SuggestionStatus, SkillAttribution, AttributionLevel  # noqa: F401
+from app.models.skill import ModelConfig, Skill, SkillMode, SkillStatus, SkillVersion, SkillSuggestion, SuggestionStatus, SkillAttribution, AttributionLevel, SkillExecutionLog  # noqa: F401
 from app.models.knowledge import KnowledgeEntry, KnowledgeStatus, KnowledgeRevision  # noqa: F401
 from app.models.knowledge_understanding import KnowledgeUnderstandingProfile  # noqa: F401
 from app.models.knowledge_share import KnowledgeShareLink  # noqa: F401
@@ -12,7 +12,7 @@ from app.models.knowledge_doc import KnowledgeDoc, KnowledgeDocSnapshot, Knowled
 from app.models.master_data import Confirmation, InputTaxonomy, ObjectFieldDictionary, SkillMaster  # noqa: F401
 from app.models.conversation import Conversation, Message, MessageRole  # noqa: F401
 from app.models.business import BusinessTable, AuditLog, SkillDataQuery, DataOwnership, VisibilityLevel, TableView, DataFolder, TableField, TableSyncJob, SkillTableBinding, TableRoleGroup, TablePermissionPolicy, FieldValueDictionary, SkillDataGrant  # noqa: F401
-from app.models.tool import ToolRegistry, SkillTool, ToolType  # noqa: F401
+from app.models.tool import ToolRegistry, SkillTool, ToolType, ToolVersion, ToolVersionStatus  # noqa: F401
 from app.models.web_app import WebApp  # noqa: F401
 from app.models.intel import IntelSource, IntelEntry, IntelSourceType, IntelEntryStatus  # noqa: F401
 from app.models import mcp  # noqa: F401
@@ -24,6 +24,7 @@ from app.models.opportunity import Opportunity  # noqa: F401
 from app.models.raw_input import RawInput  # noqa: F401
 from app.models.project import Project, ProjectMember, ProjectKnowledgeShare, ProjectReport, ProjectContext, ProjectStatus, ReportType  # noqa: F401
 from app.models.pev_job import PEVJob, PEVStep, PEVJobStatus, PEVStepStatus  # noqa: F401
+from app.models.event_bus import UnifiedEvent  # noqa: F401
 from app.models.lark_approval import LarkApprovalInstance  # noqa: F401
 from app.models.skill_memo import SkillMemo  # noqa: F401
 from app.models.permission import (  # noqa: F401

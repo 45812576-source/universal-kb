@@ -189,6 +189,18 @@ def create_task(
     db.add(task)
     db.commit()
     db.refresh(task)
+
+    # Gap 6: 发射任务创建事件
+    try:
+        from app.services import event_bus
+        event_bus.emit(
+            db, event_type="task_created", source_type="task", source_id=task.id,
+            payload={"title": task.title}, user_id=user.id,
+            project_id=getattr(task, "project_id", None),
+        )
+    except Exception:
+        pass
+
     return _task_dict(task)
 
 
@@ -359,6 +371,19 @@ def update_task(
     task.updated_at = datetime.datetime.utcnow()
     db.commit()
     db.refresh(task)
+
+    # Gap 6: 发射任务完成事件
+    if req.status and str(req.status) == "done":
+        try:
+            from app.services import event_bus
+            event_bus.emit(
+                db, event_type="task_completed", source_type="task", source_id=task.id,
+                payload={"title": task.title}, user_id=user.id,
+                project_id=getattr(task, "project_id", None),
+            )
+        except Exception:
+            pass
+
     return _task_dict(task)
 
 
