@@ -905,9 +905,22 @@ def list_governance_suggestions(
             return []
 
     items = q.order_by(GovernanceSuggestionTask.created_at.desc()).all()
+
+    # 批量预加载 subject_title
+    knowledge_ids = [it.subject_id for it in items if it.subject_type == "knowledge"]
+    table_ids = [it.subject_id for it in items if it.subject_type == "business_table"]
+    title_map: dict[tuple[str, int], str] = {}
+    if knowledge_ids:
+        for kid, ktitle in db.query(KnowledgeEntry.id, KnowledgeEntry.title).filter(KnowledgeEntry.id.in_(knowledge_ids)).all():
+            title_map[("knowledge", kid)] = ktitle or ""
+    if table_ids:
+        for tid, tname in db.query(BusinessTable.id, BusinessTable.display_name).filter(BusinessTable.id.in_(table_ids)).all():
+            title_map[("business_table", tid)] = tname or ""
+
     result = []
     for item in items:
         d = _suggestion_dict(item)
+        d["subject_title"] = title_map.get((item.subject_type, item.subject_id), "")
         # 附加同策略最近 5 条已采纳决策
         if item.suggested_payload and isinstance(item.suggested_payload, dict):
             meta = item.suggested_payload.get("reinforcement_meta", {})
