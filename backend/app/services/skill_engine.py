@@ -565,6 +565,16 @@ class SkillEngine:
             except Exception as e:
                 logger.warning(f"Failed to load doc desensitization levels: {e}")
 
+            # 批量加载 visibility_scope 和 created_by
+            kb_scope_map: dict[int, tuple[str | None, int]] = {}
+            try:
+                scope_rows = db.query(
+                    KnowledgeEntry.id, KnowledgeEntry.visibility_scope, KnowledgeEntry.created_by
+                ).filter(KnowledgeEntry.id.in_(kid_set)).all()
+                kb_scope_map = {r.id: (r.visibility_scope, r.created_by) for r in scope_rows}
+            except Exception:
+                pass
+
             # 已发布 Skill：加载已审知识引用集合
             if skill and hasattr(skill, 'status') and str(getattr(skill.status, 'value', skill.status)) == 'published':
                 try:
@@ -585,6 +595,15 @@ class SkillEngine:
             if kid in seen_ids:
                 continue
             seen_ids.add(kid)
+
+            # visibility_scope 检查
+            scope_info = kb_scope_map.get(kid)
+            if scope_info:
+                vs, vs_creator = scope_info
+                if vs == "project" and not project_id:
+                    continue  # 非项目上下文跳过项目级知识
+                if vs == "owner_only" and vs_creator != user_id:
+                    continue
 
             # 已发布 Skill 运行时召回约束：不在已审集合中的 D2+ 文件跳过
             if published_ref_ids is not None and kid not in published_ref_ids:
@@ -684,7 +703,10 @@ class SkillEngine:
             columns = exec_result["columns"]
 
             # ── 权限：对查询结果做字段级脱敏 ──
-            if rows and user_id and skill:
+            # 如果是通过视图路径返回的数据（已由 policy_engine 脱敏），跳过旧引擎
+            if exec_result.get("view_id"):
+                pass  # 数据已经过 data_view_runtime → policy_engine 脱敏
+            elif rows and user_id and skill:
                 try:
                     from app.services.data_visibility import data_visibility
                     caller = db.get(User, user_id)

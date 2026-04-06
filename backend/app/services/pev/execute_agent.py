@@ -11,6 +11,14 @@ from app.services.llm_gateway import llm_gateway
 logger = logging.getLogger(__name__)
 
 
+def _extract_skill_id_from_context(job) -> int | None:
+    """从 job.context 中追溯最近一次 skill_execute 步骤的 skill_id。"""
+    for key, val in (getattr(job, "context", None) or {}).items():
+        if isinstance(val, dict) and val.get("data", {}).get("meta", {}).get("skill_id"):
+            return val["data"]["meta"]["skill_id"]
+    return None
+
+
 class ExecuteAgent:
 
     async def execute_step(
@@ -94,11 +102,15 @@ class ExecuteAgent:
         params = resolved_inputs.get("params") or {}
         user_id = job.user_id if job else None
 
+        # 从 job.context 获取关联的 skill_id
+        _ctx_skill_id = _extract_skill_id_from_context(job)
+
         result = await tool_executor.execute_tool(
             db=db,
             tool_name=tool_name,
             params=params,
             user_id=user_id,
+            skill_id=_ctx_skill_id,
         )
         return {
             "ok": result.get("ok", False),
@@ -247,6 +259,18 @@ class ExecuteAgent:
                     .first()
                 )
                 if skill_obj:
+                    # Handoff 白名单校验
+                    upstream_skill_id = _extract_skill_id_from_context(job)
+                    if upstream_skill_id and upstream_skill_id != skill_obj.id:
+                        from app.services.handoff_engine import handoff_engine
+                        if not handoff_engine.validate_connection(
+                            upstream_skill_id, skill_obj.id, skill_db
+                        ):
+                            skill_db.close()
+                            return {
+                                "ok": False, "data": None,
+                                "error": f"Skill '{skill_name}' 不在上游 Skill {upstream_skill_id} 的下游白名单中",
+                            }
                     temp_conv.skill_id = skill_obj.id
 
             skill_db.add(temp_conv)

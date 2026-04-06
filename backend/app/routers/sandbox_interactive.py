@@ -408,7 +408,7 @@ def _detect_tools(skill: Skill) -> list[dict]:
     return tools
 
 
-def _build_permission_snapshot(skill: Skill, db: Session) -> list[dict]:
+def _build_permission_snapshot(skill: Skill, db: Session, tester_user: User | None = None) -> list[dict]:
     """自动发现相关数据资产，构建权限快照。"""
     table_names = set()
 
@@ -583,7 +583,7 @@ def _build_permission_snapshot(skill: Skill, db: Session) -> list[dict]:
         if not permission_required:
             why_no_permission = "该表无行级权限策略、无字段遮罩规则、无数据归属配置"
 
-        snapshots.append({
+        snapshot = {
             "table_name": tn,
             "display_name": bt.display_name,
             "row_visibility": ",".join(sorted(row_visibility_set)) if row_visibility_set else "all",
@@ -607,7 +607,43 @@ def _build_permission_snapshot(skill: Skill, db: Session) -> list[dict]:
                 f"行可见: {','.join(sorted(row_visibility_set)) if row_visibility_set else 'all'}",
                 f"遮罩字段数: {len(field_masks)}",
             ],
-        })
+        }
+
+        # ── 新引擎快照：policy_engine + SkillDataGrant ──
+        try:
+            from app.services.policy_engine import resolve_user_role_groups, resolve_effective_policy
+            from app.models.business import SkillDataGrant
+
+            role_groups = resolve_user_role_groups(db, bt.id, tester_user, skill_id=skill.id)
+            group_ids = [g.id for g in role_groups]
+            policy_result = resolve_effective_policy(db, bt.id, group_ids, skill_id=skill.id)
+
+            snapshot["policy_engine_result"] = {
+                "matched_role_groups": [{"id": g.id, "name": g.name} for g in role_groups],
+                "denied": policy_result.denied,
+                "deny_reasons": policy_result.deny_reasons,
+                "row_access_mode": policy_result.row_access_mode,
+                "disclosure_level": policy_result.disclosure_level,
+                "field_access_mode": policy_result.field_access_mode,
+                "masking_rules": policy_result.masking_rules,
+                "tool_permission_mode": policy_result.tool_permission_mode,
+            }
+
+            grant = db.query(SkillDataGrant).filter(
+                SkillDataGrant.skill_id == skill.id,
+                SkillDataGrant.table_id == bt.id,
+            ).first()
+            snapshot["skill_data_grant"] = {
+                "grant_mode": grant.grant_mode,
+                "max_disclosure_level": grant.max_disclosure_level,
+                "view_id": grant.view_id,
+            } if grant else None
+        except Exception as e:
+            logger.warning(f"Policy engine snapshot failed for table {tn}: {e}")
+            snapshot["policy_engine_result"] = None
+            snapshot["skill_data_grant"] = None
+
+        snapshots.append(snapshot)
 
     return snapshots
 
@@ -1194,7 +1230,8 @@ async def submit_permission_review(
         if session.target_type == "skill":
             skill = db.get(Skill, session.target_id)
             if skill:
-                session.permission_snapshot = _build_permission_snapshot(skill, db)
+                tester_user = db.get(User, session.tester_id) if session.tester_id else None
+                session.permission_snapshot = _build_permission_snapshot(skill, db, tester_user)
 
     snapshots = session.permission_snapshot or []
     snap_map = {s["table_name"]: s for s in snapshots}
@@ -1618,7 +1655,7 @@ def _build_test_input_from_evidence(session: SandboxTestSession, db: Session) ->
         elif source == "data_table" and slot.get("table_name"):
             table_name = slot["table_name"]
             field_name = slot.get("field_name")
-            real_data = _fetch_real_table_data(table_name, field_name, session.tester_id, db)
+            real_data = _fetch_real_table_data(table_name, field_name, session.tester_id, db, skill_id=session.target_id)
             if real_data is None:
                 cannot_test_reasons.append(
                     f"数据表 '{table_name}' 无法读取真实数据（表未注册或无权限）"
@@ -1647,7 +1684,8 @@ def _build_test_input_from_evidence(session: SandboxTestSession, db: Session) ->
 
 
 def _fetch_real_table_data(
-    table_name: str, field_name: str | None, tester_id: int, db: Session
+    table_name: str, field_name: str | None, tester_id: int, db: Session,
+    skill_id: int | None = None,
 ) -> list[dict] | None:
     """查询真实数据表行，应用 DataOwnership 行级权限 + 字段遮罩。
 
@@ -1722,7 +1760,7 @@ def _fetch_real_table_data(
                 rows=rows,
                 table_name=table_name,
                 user=tester,
-                skill_id=None,
+                skill_id=skill_id or 0,
                 db=db,
             )
     except Exception as e:
