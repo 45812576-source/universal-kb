@@ -843,6 +843,30 @@ def move_table(
     return {"ok": True}
 
 
+@router.delete("/tables/{table_id}")
+def delete_table(
+    table_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+):
+    """删除数据表及其关联的字段、行数据、视图等（级联删除）。"""
+    bt = db.get(BusinessTable, table_id)
+    if not bt:
+        raise HTTPException(404, "数据表不存在")
+
+    # 删除物理表（如果存在）
+    table_name = bt.table_name
+    try:
+        from sqlalchemy import text as sa_text
+        db.execute(sa_text(f'DROP TABLE IF EXISTS "{table_name}"'))
+    except Exception:
+        pass  # 物理表可能不存在（仅元数据）
+
+    db.delete(bt)
+    db.commit()
+    return {"ok": True, "deleted_table": table_name}
+
+
 # ─── Field profile ───────────────────────────────────────────────────────────
 
 
