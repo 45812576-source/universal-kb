@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { data, redirect, useActionData, useLoaderData, useNavigation, useSearchParams } from "react-router";
 import { Form } from "react-router";
 import type { Route } from "./+types/my";
@@ -267,6 +267,129 @@ function CreateForm({ onCancel }: { onCancel: () => void }) {
   );
 }
 
+interface Grant {
+  id: number;
+  user_id: number;
+  user_name: string | null;
+  granted_by: number;
+  created_at: string | null;
+}
+
+interface SuggestedUser {
+  id: number;
+  display_name: string;
+  username: string;
+}
+
+function CollabPanel({ entryId, onClose }: { entryId: number; onClose: () => void }) {
+  const [grants, setGrants] = useState<Grant[]>([]);
+  const [search, setSearch] = useState("");
+  const [suggestions, setSuggestions] = useState<SuggestedUser[]>([]);
+  const [loading, setLoading] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  const loadGrants = useCallback(async () => {
+    const res = await fetch(`/api/knowledge/${entryId}/edit-grants`);
+    if (res.ok) setGrants(await res.json());
+  }, [entryId]);
+
+  useEffect(() => { loadGrants(); }, [loadGrants]);
+
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (panelRef.current && !panelRef.current.contains(e.target as Node)) onClose();
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [onClose]);
+
+  useEffect(() => {
+    if (!search.trim()) { setSuggestions([]); return; }
+    const t = setTimeout(async () => {
+      const exclude = grants.map((g) => g.user_id).join(",");
+      const res = await fetch(`/api/admin/users/suggested?q=${encodeURIComponent(search)}&exclude=${exclude}`);
+      if (res.ok) setSuggestions(await res.json());
+    }, 300);
+    return () => clearTimeout(t);
+  }, [search, grants]);
+
+  const handleGrant = async (uid: number) => {
+    setLoading(true);
+    const res = await fetch(`/api/knowledge/${entryId}/edit-grants`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_ids: [uid] }),
+    });
+    if (res.ok) { setGrants(await res.json()); setSearch(""); setSuggestions([]); }
+    setLoading(false);
+  };
+
+  const handleRevoke = async (uid: number) => {
+    await fetch(`/api/knowledge/${entryId}/edit-grants/${uid}`, { method: "DELETE" });
+    loadGrants();
+  };
+
+  return (
+    <div ref={panelRef} className="absolute right-0 top-full mt-1 z-50 w-72 border-2 border-[#1A202C] bg-white shadow-lg">
+      <div className="bg-[#2D3748] text-white px-3 py-2 flex items-center justify-between">
+        <span className="text-[10px] font-bold uppercase tracking-widest">协作者管理</span>
+        <button onClick={onClose} className="text-gray-400 hover:text-white text-xs font-bold">[X]</button>
+      </div>
+      <div className="p-3 space-y-3">
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="搜索用户..."
+          className="w-full border-2 border-[#1A202C] bg-white px-2 py-1.5 text-xs font-bold focus:outline-none focus:border-[#00D1FF]"
+        />
+
+        {suggestions.length > 0 && (
+          <div className="border border-gray-200 divide-y divide-gray-100 max-h-32 overflow-y-auto">
+            {suggestions.map((u) => (
+              <div key={u.id} className="flex items-center justify-between px-2 py-1.5">
+                <span className="text-xs font-bold text-[#1A202C] truncate">{u.display_name}</span>
+                <button
+                  onClick={() => handleGrant(u.id)}
+                  disabled={loading}
+                  className="text-[9px] font-bold uppercase text-[#00A3C4] hover:text-[#00D1FF] disabled:opacity-50"
+                >
+                  + 授权编辑
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {grants.length > 0 && (
+          <div>
+            <p className="text-[9px] font-bold uppercase text-gray-400 mb-1">已授权:</p>
+            <div className="border border-gray-200 divide-y divide-gray-100 max-h-40 overflow-y-auto">
+              {grants.map((g) => (
+                <div key={g.id} className="flex items-center justify-between px-2 py-1.5">
+                  <div>
+                    <span className="text-xs font-bold text-[#1A202C]">{g.user_name || `用户#${g.user_id}`}</span>
+                    <span className="text-[9px] text-gray-400 ml-1.5">可编辑</span>
+                  </div>
+                  <button
+                    onClick={() => handleRevoke(g.user_id)}
+                    className="text-[9px] font-bold uppercase text-red-500 hover:text-red-700"
+                  >
+                    撤销
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {grants.length === 0 && !search && (
+          <p className="text-[10px] font-bold text-gray-400 text-center py-2">暂无协作者</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function MyKnowledge() {
   const { entries, source_type, status } = useLoaderData<typeof loader>() as {
     entries: KnowledgeEntry[];
@@ -276,6 +399,7 @@ export default function MyKnowledge() {
   const [searchParams] = useSearchParams();
   const justSubmitted = searchParams.get("submitted");
   const [showForm, setShowForm] = useState(false);
+  const [collabEntryId, setCollabEntryId] = useState<number | null>(null);
 
   return (
     <div className="min-h-full bg-[#F0F4F8]">
@@ -367,6 +491,7 @@ export default function MyKnowledge() {
                 <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-gray-500">状态</th>
                 <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-gray-500">标签</th>
                 <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-gray-500">提交时间</th>
+                <th className="py-3 px-4 text-[10px] font-bold uppercase tracking-widest text-gray-500">操作</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
@@ -404,12 +529,23 @@ export default function MyKnowledge() {
                     <td className="py-3 px-4 text-[10px] font-bold text-gray-400 uppercase">
                       {new Date(e.created_at).toLocaleDateString("zh-CN")}
                     </td>
+                    <td className="py-3 px-4 relative">
+                      <button
+                        onClick={() => setCollabEntryId(collabEntryId === e.id ? null : e.id)}
+                        className="text-[9px] font-bold uppercase px-2 py-1 border-2 border-[#1A202C] bg-white text-[#1A202C] hover:bg-[#EBF4F7] transition-colors"
+                      >
+                        协作者
+                      </button>
+                      {collabEntryId === e.id && (
+                        <CollabPanel entryId={e.id} onClose={() => setCollabEntryId(null)} />
+                      )}
+                    </td>
                   </tr>
                 );
               })}
               {entries.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="py-12 text-center text-xs font-bold uppercase text-gray-400">
+                  <td colSpan={7} className="py-12 text-center text-xs font-bold uppercase text-gray-400">
                     暂无数据 —{" "}
                     <button
                       onClick={() => setShowForm(true)}

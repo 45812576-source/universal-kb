@@ -2278,6 +2278,45 @@ def list_edit_grants(
     ]
 
 
+class EditGrantRequest(BaseModel):
+    user_ids: list[int]
+
+
+@router.post("/{kid}/edit-grants")
+def create_edit_grants(
+    kid: int,
+    req: EditGrantRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """批量授予用户编辑权限。只有创建者和 super_admin 可操作。"""
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    if entry.created_by != user.id and user.role != Role.SUPER_ADMIN:
+        raise HTTPException(403, "只有文档创建者可以管理编辑权限")
+
+    for uid in req.user_ids:
+        existing = db.query(KnowledgeEditGrant).filter_by(entry_id=kid, user_id=uid).first()
+        if existing:
+            continue
+        grant = KnowledgeEditGrant(entry_id=kid, user_id=uid, granted_by=user.id)
+        db.add(grant)
+    db.commit()
+
+    grants = db.query(KnowledgeEditGrant).filter_by(entry_id=kid).all()
+    return [
+        {
+            "id": g.id,
+            "user_id": g.user_id,
+            "user_name": g.user.display_name if g.user else None,
+            "granted_by": g.granted_by,
+            "created_at": g.created_at.isoformat() if g.created_at else None,
+        }
+        for g in grants
+    ]
+
+
 @router.delete("/{kid}/edit-grants/{uid}")
 def revoke_edit_grant(
     kid: int,
