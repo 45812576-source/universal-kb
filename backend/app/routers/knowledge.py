@@ -1628,8 +1628,14 @@ def super_review_knowledge(
     return _entry_dict(entry, db=db)
 
 
+_SYSTEM_READONLY_SOURCE_TYPES = {"sandbox_test"}
+
+
 def can_edit_entry(entry: KnowledgeEntry, user: User, db: Session) -> bool:
-    """检查用户是否有编辑权限：创建者/super_admin/被授权者。"""
+    """检查用户是否有编辑权限：创建者/super_admin/被授权者。
+    系统自动生成的文档（如沙盒测试报告）始终只读。"""
+    if entry.source_type in _SYSTEM_READONLY_SOURCE_TYPES:
+        return False
     if entry.created_by == user.id:
         return True
     if user.role == Role.SUPER_ADMIN:

@@ -278,15 +278,12 @@ async def generate_report(
     # 生成人类可读的报告内容
     report_text = _render_report_text(title, part1, part2, part3, session)
 
-    from app.models.user import get_system_user_id
-    system_uid = get_system_user_id(db)
-
     ke = KnowledgeEntry(
         title=title,
         content=report_text,
         category="sandbox_test_report",
         status=KnowledgeStatus.APPROVED,
-        created_by=system_uid,
+        created_by=session.tester_id,
         source_type="sandbox_test",
         source_file=f"sandbox_report_{report.id}.md",
     )
