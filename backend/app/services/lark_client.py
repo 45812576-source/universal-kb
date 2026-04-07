@@ -221,13 +221,54 @@ class LarkClient:
             )
             data = resp.json()
             if data.get("code") != 0:
-                raise RuntimeError(f"解析 wiki 节点失败: {data.get('msg')}")
+                msg = data.get("msg", "")
+                if "permission" in msg.lower() or "denied" in msg.lower() or data.get("code") == 99991672:
+                    raise PermissionError(
+                        "知识库节点权限不足，请在飞书管理后台为应用开通该知识空间的阅读权限。"
+                        "操作路径：飞书管理后台 → 知识库 → 空间设置 → 添加应用为成员"
+                    )
+                raise RuntimeError(f"解析 wiki 节点失败: {msg}")
             node = data["data"]["node"]
             return {
                 "obj_token": node["obj_token"],
                 "obj_type": node["obj_type"],
                 "title": node.get("title", ""),
             }
+
+    async def download_file(self, file_token: str) -> tuple[bytes, str]:
+        """直接下载飞书云空间文件。返回 (file_bytes, filename)。"""
+        access_token = await self.get_tenant_access_token()
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            resp = await client.get(
+                f"{_LARK_API_BASE}/drive/v1/files/{file_token}/download",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if resp.status_code != 200:
+                # 可能是媒体文件，尝试 medias 接口
+                resp = await client.get(
+                    f"{_LARK_API_BASE}/drive/v1/medias/{file_token}/download",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                if resp.status_code != 200:
+                    raise RuntimeError(f"下载飞书文件失败: HTTP {resp.status_code}")
+
+            # 从 Content-Disposition 提取文件名
+            filename = ""
+            cd = resp.headers.get("content-disposition", "")
+            if "filename" in cd:
+                import re
+                # 优先匹配 filename*=UTF-8''xxx
+                m = re.search(r"filename\*=(?:UTF-8''|utf-8'')(.+?)(?:;|$)", cd)
+                if m:
+                    from urllib.parse import unquote
+                    filename = unquote(m.group(1).strip())
+                else:
+                    # 匹配 filename="xxx"
+                    m = re.search(r'filename="?([^";]+)"?', cd)
+                    if m:
+                        filename = m.group(1).strip()
+
+            return resp.content, filename
 
     async def create_export_task(
         self, token: str, doc_type: str, file_extension: str = "docx"
