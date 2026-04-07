@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, useLoaderData } from "react-router";
+import { Link, useLoaderData, useFetcher } from "react-router";
 import type { Route } from "./+types/index";
 import { requireUser } from "~/lib/auth.server";
 import { apiFetch } from "~/lib/api";
@@ -18,6 +18,18 @@ export async function loader({ request }: Route.LoaderArgs) {
   return { mySkills, deptSkills, companySkills, marketSkills, user };
 }
 
+export async function action({ request }: Route.ActionArgs) {
+  const { token } = await requireUser(request);
+  const form = await request.formData();
+  const intent = form.get("intent") as string;
+  const skillId = form.get("skillId") as string;
+
+  if (intent === "delete") {
+    await apiFetch(`/api/skills/${skillId}`, { method: "DELETE", token });
+  }
+  return null;
+}
+
 const STATUS_INFO: Record<string, { label: string; color: string }> = {
   draft:     { label: "草稿",   color: "bg-gray-100 text-gray-600 border-gray-400" },
   reviewing: { label: "审核中", color: "bg-yellow-100 text-yellow-800 border-yellow-400" },
@@ -29,6 +41,10 @@ function SkillCard({ skill, showActions, user }: { skill: Skill & { scope?: stri
   const si = STATUS_INFO[skill.status] || { label: skill.status, color: "bg-gray-100 text-gray-500 border-gray-400" };
   const isOwner = skill.created_by === user.id;
   const canEdit = user.role === "super_admin" || user.role === "dept_admin";
+  const fetcher = useFetcher();
+  const isDeleting = fetcher.state !== "idle" && fetcher.formData?.get("intent") === "delete";
+
+  if (isDeleting) return null;
 
   return (
     <div className="pixel-border bg-white p-4 flex flex-col gap-2">
@@ -56,7 +72,7 @@ function SkillCard({ skill, showActions, user }: { skill: Skill & { scope?: stri
       </div>
 
       {showActions && canEdit && (
-        <div className="flex gap-2 pt-1 border-t border-gray-100">
+        <div className="flex gap-2 pt-1 border-t border-gray-100 items-center">
           <Link
             to={`/admin/skills/${skill.id}`}
             className="text-[9px] font-bold uppercase text-[#00A3C4] hover:underline"
@@ -68,6 +84,17 @@ function SkillCard({ skill, showActions, user }: { skill: Skill & { scope?: stri
               · 我创建
             </span>
           )}
+          <fetcher.Form method="post" className="ml-auto">
+            <input type="hidden" name="skillId" value={skill.id} />
+            <button
+              name="intent"
+              value="delete"
+              onClick={(e) => { if (!confirm(`确认删除 Skill「${skill.name}」？此操作不可恢复。`)) e.preventDefault(); }}
+              className="text-[9px] font-bold uppercase text-red-500 hover:text-red-700"
+            >
+              删除
+            </button>
+          </fetcher.Form>
         </div>
       )}
     </div>
