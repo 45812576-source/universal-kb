@@ -201,11 +201,18 @@ def _convert_pdf_and_upload(entry: KnowledgeEntry, pdf_path: str, db: Optional[S
     扫描件 PDF 兜底：如果转换后的 DOCX 内容为空（< 1KB 或提取文本 < 40 字符），
     则不设置 docx_oss_key，前端自动走 iframe 预览原始 PDF。
     AI 笔记仍然从 entry.content（Vision OCR 文本）生成。
+
+    转换失败（超时、复杂排版等）时返回 None，前端走 iframe 预览原始 PDF。
     """
     from app.utils.file_parser import convert_pdf_to_docx
     from app.services.oss_service import upload_file as oss_upload
 
-    docx_path = convert_pdf_to_docx(pdf_path)
+    try:
+        docx_path = convert_pdf_to_docx(pdf_path)
+    except Exception as e:
+        logger.warning(f"PDF→DOCX conversion failed for entry {entry.id}: {e}")
+        # 转换失败不算致命错误，前端走 iframe 预览原始 PDF
+        return None
     try:
         # 检测转换后 DOCX 是否实质为空（扫描件 PDF 场景）
         docx_size = os.path.getsize(docx_path)

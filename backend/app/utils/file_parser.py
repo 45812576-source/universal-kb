@@ -6,20 +6,42 @@ import tempfile
 from dataclasses import dataclass
 
 
-def convert_pdf_to_docx(pdf_path: str) -> str:
+def convert_pdf_to_docx(pdf_path: str, timeout: int = 120) -> str:
     """将 PDF 转换为 DOCX，返回生成的 DOCX 文件路径。
 
     使用 pdf2docx 库保留排版、表格、图片。
     调用者负责清理返回的临时文件。
+    timeout 秒后自动终止，防止设计类 PDF 卡死。
     """
-    from pdf2docx import Converter
+    import subprocess
+    import sys
+    import json as _json
 
     docx_path = pdf_path.rsplit(".", 1)[0] + ".docx"
-    cv = Converter(pdf_path)
+
+    # 在子进程中运行 pdf2docx，防止卡死阻塞主进程
+    script = (
+        "import sys, json; "
+        "from pdf2docx import Converter; "
+        "cv = Converter(sys.argv[1]); "
+        "cv.convert(sys.argv[2]); "
+        "cv.close(); "
+        "print(json.dumps({'ok': True}))"
+    )
     try:
-        cv.convert(docx_path)
-    finally:
-        cv.close()
+        result = subprocess.run(
+            [sys.executable, "-c", script, pdf_path, docx_path],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()[-500:]
+            raise RuntimeError(f"pdf2docx 转换失败 (exit {result.returncode}): {stderr}")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"pdf2docx 转换超时 ({timeout}s)，该 PDF 可能包含复杂图形排版")
+
+    if not os.path.exists(docx_path):
+        raise RuntimeError("pdf2docx 未生成 DOCX 文件")
+
     return docx_path
 
 
