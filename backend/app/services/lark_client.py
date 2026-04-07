@@ -235,6 +235,46 @@ class LarkClient:
                 "title": node.get("title", ""),
             }
 
+    async def get_doc_meta(self, doc_token: str, doc_type: str) -> dict:
+        """获取飞书文档元数据（标题、创建者、修改时间等）。
+
+        通过 POST /drive/v1/metas/batch_query 批量查询接口。
+        Returns: {"title": "...", "create_time": ..., "latest_modify_time": ...,
+                  "owner_id": "...", "url": "..."}
+        """
+        access_token = await self.get_tenant_access_token()
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{_LARK_API_BASE}/drive/v1/metas/batch_query",
+                params={"user_id_type": "open_id"},
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "request_docs": [
+                        {"doc_token": doc_token, "doc_type": doc_type}
+                    ],
+                    "with_url": True,
+                },
+            )
+            data = resp.json()
+            if data.get("code") != 0:
+                logger.warning(f"get_doc_meta failed: {data.get('msg')}")
+                return {}
+            metas = data.get("data", {}).get("metas", [])
+            if not metas:
+                return {}
+            meta = metas[0]
+            return {
+                "title": meta.get("title", ""),
+                "create_time": meta.get("create_time", ""),
+                "latest_modify_time": meta.get("latest_modify_time", ""),
+                "owner_id": meta.get("owner_id", ""),
+                "url": meta.get("url", ""),
+                "type": meta.get("type", ""),
+            }
+
     async def download_file(self, file_token: str) -> tuple[bytes, str]:
         """直接下载飞书云空间文件。返回 (file_bytes, filename)。"""
         access_token = await self.get_tenant_access_token()

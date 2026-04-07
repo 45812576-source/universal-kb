@@ -352,26 +352,72 @@ class LarkDocImporter:
         entry = submit_knowledge(db, entry)
         return entry
 
-    # ── 策略C：不可导出类型 → 链接引用 ──────────────────────────────────
+    # ── 策略C：不可导出类型 → 获取元数据 + 嵌入链接 ────────────────────
 
     async def _strategy_link_reference(
         self, db, user, url, token, api_type, title, wiki_title, folder_id, category
     ) -> KnowledgeEntry:
-        """mindnote/slides/board/minutes 等 → 只保存 URL 和元数据。"""
+        """mindnote/slides/board/minutes/survey 等 → 通过元数据 API 获取信息，生成知识条目。"""
+        from app.services.lark_client import lark_client
         from app.services.knowledge_service import submit_knowledge
 
         type_name = _TYPE_DISPLAY_NAME.get(api_type, api_type)
-        content = (
-            f"此条目为飞书{type_name}的链接引用，该类型暂不支持内容导出。\n"
-            f"请点击原始链接查看完整内容：{url}"
-        )
-        content_html = (
-            f"<p>此条目为飞书<strong>{type_name}</strong>的链接引用，该类型暂不支持内容导出。</p>"
-            f'<p>请点击原始链接查看完整内容：<a href="{url}" target="_blank">{url}</a></p>'
-        )
+
+        # 尝试通过飞书 Drive API 获取文档元数据
+        meta = {}
+        try:
+            meta = await lark_client.get_doc_meta(token, api_type)
+        except Exception as e:
+            logger.warning(f"获取飞书文档元数据失败: {e}")
+
+        meta_title = meta.get("title", "") or wiki_title or ""
+        create_time = meta.get("create_time", "")
+        modify_time = meta.get("latest_modify_time", "")
+
+        # 格式化时间
+        def _fmt_ts(ts):
+            if not ts:
+                return ""
+            try:
+                import datetime
+                return datetime.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                return str(ts)
+
+        create_str = _fmt_ts(create_time)
+        modify_str = _fmt_ts(modify_time)
+
+        # 生成有信息量的内容文本
+        content_lines = [f"飞书{type_name}：{meta_title or '未命名'}"]
+        if create_str:
+            content_lines.append(f"创建时间：{create_str}")
+        if modify_str:
+            content_lines.append(f"最近更新：{modify_str}")
+        content_lines.append(f"文档类型：{type_name}（该类型暂不支持全文导出）")
+        content_lines.append(f"原始链接：{url}")
+        content = "\n".join(content_lines)
+
+        # 生成嵌入式链接卡片 HTML
+        card_parts = []
+        card_parts.append(f'<div class="lark-link-card" style="border:1px solid #e0e0e0;border-radius:8px;padding:16px;margin:8px 0;background:#fafafa;">')
+        card_parts.append(f'  <h3 style="margin:0 0 8px 0;font-size:16px;">📄 {meta_title or "未命名"}</h3>')
+        card_parts.append(f'  <p style="margin:4px 0;color:#666;font-size:13px;">类型：飞书{type_name}</p>')
+        if create_str:
+            card_parts.append(f'  <p style="margin:4px 0;color:#666;font-size:13px;">创建：{create_str}</p>')
+        if modify_str:
+            card_parts.append(f'  <p style="margin:4px 0;color:#666;font-size:13px;">更新：{modify_str}</p>')
+        card_parts.append(f'  <p style="margin:8px 0 0 0;">')
+        card_parts.append(f'    <a href="{url}" target="_blank" style="color:#3370ff;text-decoration:none;">在飞书中打开 →</a>')
+        card_parts.append(f'  </p>')
+        card_parts.append(f'</div>')
+        card_parts.append(f'<p style="color:#999;font-size:12px;margin-top:8px;">该文档类型暂不支持全文内容导出，如需查看完整内容请点击上方链接。</p>')
+        content_html = "\n".join(card_parts)
+
+        # 优先用元数据标题
+        effective_title = title or meta_title or wiki_title
 
         entry = self._build_entry(
-            db, user, url, token, api_type, title, wiki_title, folder_id, category,
+            db, user, url, token, api_type, effective_title, wiki_title, folder_id, category,
             content=content,
             content_html=content_html,
             capture_mode="upload",
@@ -383,6 +429,10 @@ class LarkDocImporter:
         )
         db.add(entry)
         db.flush()
+
+        # AI 命名（用元数据内容做输入）
+        if content:
+            await self._ai_enrich(entry, content, url, None, title, db)
 
         entry = submit_knowledge(db, entry)
         return entry
