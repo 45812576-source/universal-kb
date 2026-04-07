@@ -249,57 +249,7 @@ def update_tool_status(
         raise HTTPException(403, "无权操作")
 
     if status == "published":
-        # 超管直接发布
-        if user.role == Role.SUPER_ADMIN:
-            tool.status = "published"
-            tool.scope = scope
-            tool.department_id = department_id
-            tool.is_active = True
-            db.commit()
-            return {"id": tool_id, "status": "published", "scope": scope}
-
-        # 部门管理员 → 进入审核，等超管审批（super_pending）
-        if user.role == Role.DEPT_ADMIN:
-            tool.status = "reviewing"
-            tool.scope = scope
-            tool.department_id = department_id
-            tool.updated_at = datetime.datetime.utcnow()
-            existing = db.query(ApprovalRequest).filter(
-                ApprovalRequest.request_type == ApprovalRequestType.TOOL_PUBLISH,
-                ApprovalRequest.target_id == tool_id,
-                ApprovalRequest.status == ApprovalStatus.PENDING,
-            ).first()
-            if not existing:
-                db.add(ApprovalRequest(
-                    request_type=ApprovalRequestType.TOOL_PUBLISH,
-                    target_id=tool_id,
-                    target_type="tool",
-                    requester_id=user.id,
-                    stage="super_pending",
-                ))
-            db.commit()
-            return {"id": tool_id, "status": "reviewing", "stage": "super_pending"}
-
-        # 普通员工 → 进入审核，先等部门管理员审批（dept_pending）
-        tool.status = "reviewing"
-        tool.scope = scope
-        tool.department_id = department_id
-        tool.updated_at = datetime.datetime.utcnow()
-        existing = db.query(ApprovalRequest).filter(
-            ApprovalRequest.request_type == ApprovalRequestType.TOOL_PUBLISH,
-            ApprovalRequest.target_id == tool_id,
-            ApprovalRequest.status == ApprovalStatus.PENDING,
-        ).first()
-        if not existing:
-            db.add(ApprovalRequest(
-                request_type=ApprovalRequestType.TOOL_PUBLISH,
-                target_id=tool_id,
-                target_type="tool",
-                requester_id=user.id,
-                stage="dept_pending",
-            ))
-        db.commit()
-        return {"id": tool_id, "status": "reviewing", "stage": "dept_pending"}
+        raise HTTPException(400, "工具不能单独发布，请先绑定到 Skill，由 Skill 统一提交发布审批")
 
     elif status == "archived":
         tool.status = "archived"

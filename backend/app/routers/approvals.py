@@ -592,7 +592,6 @@ async def act_on_approval(
     # Skill/Tool 发布审批必须关联有效的沙盒测试报告
     if req.action == "approve" and r.request_type in (
         ApprovalRequestType.SKILL_PUBLISH,
-        ApprovalRequestType.TOOL_PUBLISH,
     ):
         # 优先使用 FK 列，fallback 到 security_scan_result JSON
         report_id = getattr(r, "sandbox_report_id", None)
@@ -646,6 +645,8 @@ async def act_on_approval(
                     skill.status = SkillStatus.PUBLISHED
                     skill.scope = "company"
                     _apply_scan_policy(r.target_id, r, user, db)
+                    from app.routers.skills import _cascade_tool_status_on_publish
+                    _cascade_tool_status_on_publish(r.target_id, db)
             elif user.role == Role.DEPT_ADMIN:
                 # 分割 Policy：dept 只确认本部门权限内的部分
                 scan = getattr(r, "security_scan_result", None) or {}
@@ -668,6 +669,8 @@ async def act_on_approval(
                 skill.status = SkillStatus.PUBLISHED
                 skill.scope = "company"
                 _apply_scan_policy(r.target_id, r, user, db)
+                from app.routers.skills import _cascade_tool_status_on_publish
+                _cascade_tool_status_on_publish(r.target_id, db)
         elif is_tool_publish and stage == "dept_pending":
             # 超管可在第一阶段直接终审通过；部门管理员则推进到超管审批阶段
             if user.role == Role.SUPER_ADMIN:
@@ -789,6 +792,8 @@ async def act_on_approval(
                     skill.status = SkillStatus.PUBLISHED
                     skill.scope = "company"
                     _apply_scan_policy(r.target_id, r, user, db)
+                    from app.routers.skills import _cascade_tool_status_on_publish
+                    _cascade_tool_status_on_publish(r.target_id, db)
             elif is_tool_publish:
                 from app.models.tool import ToolRegistry, ToolType
                 tool = db.get(ToolRegistry, r.target_id)

@@ -1703,6 +1703,32 @@ def transfer_ownership(
     return {"approval_id": approval.id, "status": "pending"}
 
 
+def _cascade_tool_status_on_publish(skill_id: int, db: Session) -> None:
+    """Skill 发布通过后，自动将绑定的 Tool 状态改为 published + is_active。"""
+    import datetime as _dt
+    from app.models.tool import SkillTool, ToolRegistry
+    tool_ids = [row.tool_id for row in db.query(SkillTool).filter(SkillTool.skill_id == skill_id).all()]
+    for tid in tool_ids:
+        tool = db.get(ToolRegistry, tid)
+        if tool and tool.status != "published":
+            tool.status = "published"
+            tool.is_active = True
+            tool.updated_at = _dt.datetime.utcnow()
+
+
+def _cascade_tool_status_on_archive(skill_id: int, db: Session) -> None:
+    """Skill 归档时，自动将绑定的 Tool 也归档。"""
+    import datetime as _dt
+    from app.models.tool import SkillTool, ToolRegistry
+    tool_ids = [row.tool_id for row in db.query(SkillTool).filter(SkillTool.skill_id == skill_id).all()]
+    for tid in tool_ids:
+        tool = db.get(ToolRegistry, tid)
+        if tool and tool.status != "archived":
+            tool.status = "archived"
+            tool.is_active = False
+            tool.updated_at = _dt.datetime.utcnow()
+
+
 @router.patch("/{skill_id}/status")
 def update_status(
     skill_id: int,
@@ -1828,6 +1854,12 @@ def update_status(
         _ensure_skill_policy(skill_id, user, db)
         # 写入知识引用快照
         _save_knowledge_reference_snapshot(skill_id, user.id, kr_result, db)
+        # 联动发布绑定的 Tool
+        _cascade_tool_status_on_publish(skill_id, db)
+
+    # 归档时联动归档绑定的 Tool
+    if status == SkillStatus.ARCHIVED.value:
+        _cascade_tool_status_on_archive(skill_id, db)
 
     db.commit()
     return {"id": skill_id, "status": status, "scope": skill.scope}
@@ -1926,6 +1958,7 @@ def batch_publish(
         skill.status = SkillStatus.PUBLISHED
         skill.scope = req.scope
         _ensure_skill_policy(skill_id, user, db)
+        _cascade_tool_status_on_publish(skill_id, db)
         results.append({"id": skill_id, "ok": True, "name": skill.name})
     db.commit()
     ok_count = sum(1 for r in results if r["ok"])
