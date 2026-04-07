@@ -99,10 +99,11 @@ def _display_title(entry: KnowledgeEntry, understanding: dict | None = None) -> 
     4. 清洗后文件名
     5. "未命名文档"
     """
-    # 1. 用户显式标题
+    # 1. 用户显式标题（非空且非"未命名文档"即采用，不再与文件名比较——
+    #    因为 _sanitize_title 会去掉扩展名，导致从文件名推导的 title 与
+    #    source_file 清洗后相等而被误判为"非用户显式标题"）
     user_title = _sanitize_title(entry.title or "")
-    source_file_cleaned = _sanitize_title(entry.source_file or "")
-    if user_title and user_title != "未命名文档" and user_title != source_file_cleaned:
+    if user_title and user_title != "未命名文档":
         return user_title
 
     # 2. understanding profile display_title
@@ -117,6 +118,7 @@ def _display_title(entry: KnowledgeEntry, understanding: dict | None = None) -> 
         return ai
 
     # 4. 清洗后文件名
+    source_file_cleaned = _sanitize_title(entry.source_file or "")
     if source_file_cleaned and source_file_cleaned != "未命名文档":
         return source_file_cleaned
 
@@ -644,7 +646,7 @@ async def upload_knowledge(
 
     file_data = await file.read()
 
-    # ── ZIP 解压：逐文件入库 ──
+    # ── ZIP 解压：按目录结构创建文件夹，逐文件入库 ──
     if ext == ".zip":
         import zipfile, io, tempfile
         results = []
@@ -653,8 +655,65 @@ async def upload_knowledge(
         except zipfile.BadZipFile:
             raise HTTPException(400, "无效的 ZIP 文件")
 
+        # 确定 zip 根目录的父 folder：用户指定的 folder_id，或"我的知识"
+        base_folder_id = folder_id
+        if base_folder_id is None:
+            personal_root = _ensure_personal_root(db, user)
+            base_folder_id = personal_root.id
+
+        # 按 zip 内目录路径创建 KnowledgeFolder，缓存已创建的路径
+        # key: 相对目录路径 (如 "docs/子目录"), value: folder.id
+        _zip_folder_cache: dict[str, int] = {}
+
+        def _ensure_zip_folder(dir_path: str) -> int:
+            """递归确保 zip 内的目录路径对应的 KnowledgeFolder 存在。"""
+            if not dir_path or dir_path == ".":
+                return base_folder_id
+            if dir_path in _zip_folder_cache:
+                return _zip_folder_cache[dir_path]
+            parent_path = os.path.dirname(dir_path)
+            parent_fid = _ensure_zip_folder(parent_path) if parent_path and parent_path != dir_path else base_folder_id
+            folder_name = os.path.basename(dir_path)
+            # 查找同名同父的已有文件夹
+            existing = (
+                db.query(KnowledgeFolder)
+                .filter(
+                    KnowledgeFolder.name == folder_name,
+                    KnowledgeFolder.parent_id == parent_fid,
+                    KnowledgeFolder.created_by == user.id,
+                )
+                .first()
+            )
+            if existing:
+                _zip_folder_cache[dir_path] = existing.id
+                return existing.id
+            new_folder = KnowledgeFolder(
+                name=folder_name,
+                parent_id=parent_fid,
+                created_by=user.id,
+                department_id=user.department_id,
+            )
+            db.add(new_folder)
+            db.flush()
+            _zip_folder_cache[dir_path] = new_folder.id
+            return new_folder.id
+
+        # 检测并跳过 zip 中常见的单层根目录包装（如 "project/" 包住所有文件）
+        file_names = [i.filename for i in zf.infolist()
+                       if not i.is_dir() and "__MACOSX" not in i.filename]
+        strip_prefix = ""
+        if len(file_names) > 1:
+            common_prefix = os.path.commonpath(file_names)
+            # commonpath 返回公共路径前缀（不带尾 /）
+            # 只有当它不是某个文件名本身时（即真的是一个目录前缀），才剥离
+            if common_prefix and common_prefix not in file_names:
+                strip_prefix = common_prefix + "/"
+
         for info in zf.infolist():
             if info.is_dir():
+                continue
+            # 跳过 macOS 元数据
+            if "__MACOSX" in info.filename:
                 continue
             inner_name = os.path.basename(info.filename)
             if not inner_name or inner_name.startswith("."):
@@ -664,6 +723,13 @@ async def upload_knowledge(
                                   ".jpg", ".jpeg", ".png", ".webp", ".bmp"):
                 continue
 
+            # 计算文件所属的目录 folder_id
+            rel_path = info.filename
+            if strip_prefix and rel_path.startswith(strip_prefix):
+                rel_path = rel_path[len(strip_prefix):]
+            dir_part = os.path.dirname(rel_path)
+            file_folder_id = _ensure_zip_folder(dir_part) if dir_part else base_folder_id
+
             inner_data = zf.read(info.filename)
             inner_path = os.path.join(settings.UPLOAD_DIR, f"{uuid.uuid4()}{inner_ext}")
             with open(inner_path, "wb") as f:
@@ -672,7 +738,7 @@ async def upload_knowledge(
             try:
                 entry, content, file_type = _create_entry_from_file(
                     db, inner_path, inner_name, inner_data,
-                    category, industry_tags, platform_tags, topic_tags, user, folder_id,
+                    category, industry_tags, platform_tags, topic_tags, user, file_folder_id,
                     explicit_title=_sanitize_title(inner_name),
                 )
                 db.commit()
@@ -1697,6 +1763,40 @@ def delete_knowledge(
             import logging
             logging.getLogger(__name__).warning(f"Failed to delete OSS file {entry.oss_key}: {e}")
 
+    # 清理关联表记录（这些外键没有 CASCADE，需手动删除）
+    from sqlalchemy import text
+    # (表名, 外键列名) — 按依赖顺序排列
+    _related_tables: list[tuple[str, str]] = [
+        ("knowledge_chunk_mappings", "knowledge_id"),
+        ("knowledge_document_blocks", "knowledge_id"),
+        ("knowledge_doc_comments", "knowledge_id"),
+        ("knowledge_doc_snapshots", "knowledge_id"),
+        ("knowledge_docs", "knowledge_id"),
+        ("knowledge_jobs", "knowledge_id"),
+        ("knowledge_revisions", "knowledge_id"),
+        ("knowledge_edit_grants", "entry_id"),
+        ("knowledge_filing_suggestions", "knowledge_id"),
+        ("knowledge_filing_actions", "knowledge_id"),
+        ("knowledge_share_links", "knowledge_id"),
+        ("knowledge_understanding_profiles", "knowledge_id"),
+        ("skill_knowledge_references", "knowledge_id"),
+        ("knowledge_mask_feedbacks", "knowledge_id"),
+        ("project_knowledge_shares", "knowledge_id"),
+        ("sandbox_test_cases", "knowledge_entry_id"),
+        ("sandbox_test_evidences", "knowledge_entry_id"),
+    ]
+    _insp = inspect(db.bind)
+    for tbl, col in _related_tables:
+        try:
+            if not _insp.has_table(tbl):
+                continue
+            cols = {c["name"] for c in _insp.get_columns(tbl)}
+            if col not in cols:
+                continue
+            db.execute(text(f"DELETE FROM {tbl} WHERE {col} = :kid"), {"kid": kid})
+        except Exception:
+            pass
+
     db.delete(entry)
     db.commit()
     return {"ok": True}
@@ -1969,6 +2069,7 @@ async def import_from_lark(
 ):
     """从飞书文档链接导入为知识库云文档。"""
     from app.services.lark_doc_importer import lark_doc_importer
+    from app.services.lark_client import LarkConfigError, LarkAuthError
 
     try:
         entry = await lark_doc_importer.import_doc(
@@ -1982,6 +2083,12 @@ async def import_from_lark(
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except LarkConfigError as e:
+        raise HTTPException(501, f"飞书集成未配置: {e}")
+    except LarkAuthError as e:
+        raise HTTPException(502, f"飞书认证失败: {e}")
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except RuntimeError as e:
         raise HTTPException(502, f"飞书 API 调用失败: {e}")
 
