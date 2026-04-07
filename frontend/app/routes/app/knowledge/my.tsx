@@ -400,6 +400,15 @@ export default function MyKnowledge() {
   const justSubmitted = searchParams.get("submitted");
   const [showForm, setShowForm] = useState(false);
   const [collabEntryId, setCollabEntryId] = useState<number | null>(null);
+  const [copiedId, setCopiedId] = useState<number | null>(null);
+
+  const handleCopyLink = (entryId: number) => {
+    const url = `${window.location.origin}/knowledge/my?entry=${entryId}`;
+    navigator.clipboard.writeText(url).then(() => {
+      setCopiedId(entryId);
+      setTimeout(() => setCopiedId(null), 2000);
+    });
+  };
 
   return (
     <div className="min-h-full bg-[#F0F4F8]">
@@ -530,12 +539,20 @@ export default function MyKnowledge() {
                       {new Date(e.created_at).toLocaleDateString("zh-CN")}
                     </td>
                     <td className="py-3 px-4 relative">
-                      <button
-                        onClick={() => setCollabEntryId(collabEntryId === e.id ? null : e.id)}
-                        className="text-[9px] font-bold uppercase px-2 py-1 border-2 border-[#1A202C] bg-white text-[#1A202C] hover:bg-[#EBF4F7] transition-colors"
-                      >
-                        协作者
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => handleCopyLink(e.id)}
+                          className="text-[9px] font-bold uppercase px-2 py-1 border-2 border-[#00D1FF] bg-[#CCF2FF] text-[#00A3C4] hover:bg-[#00D1FF] hover:text-white transition-colors"
+                        >
+                          {copiedId === e.id ? "已复制" : "分享链接"}
+                        </button>
+                        <button
+                          onClick={() => setCollabEntryId(collabEntryId === e.id ? null : e.id)}
+                          className="text-[9px] font-bold uppercase px-2 py-1 border-2 border-[#1A202C] bg-white text-[#1A202C] hover:bg-[#EBF4F7] transition-colors"
+                        >
+                          协作者
+                        </button>
+                      </div>
                       {collabEntryId === e.id && (
                         <CollabPanel entryId={e.id} onClose={() => setCollabEntryId(null)} />
                       )}
