@@ -234,12 +234,15 @@ async def startup_event():
             backfill_ungoverned,
             backfill_ungoverned_tables,
             backfill_failed_renders,
+            backfill_missing_ai_notes,
         )
         upstream_scheduler.add_job(process_knowledge_jobs, "interval", seconds=30, id="knowledge_job_worker")
         # 每 10 分钟补偿未分类条目
         upstream_scheduler.add_job(backfill_unclassified, "interval", minutes=10, id="knowledge_backfill_classify")
         # 每 10 分钟补偿渲染失败条目
         upstream_scheduler.add_job(backfill_failed_renders, "interval", minutes=10, id="knowledge_backfill_render")
+        # 每 10 分钟补偿缺失 AI 笔记的条目
+        upstream_scheduler.add_job(backfill_missing_ai_notes, "interval", minutes=10, id="knowledge_backfill_ai_notes")
         # 每 10 分钟补齐未治理条目
         upstream_scheduler.add_job(backfill_ungoverned, "interval", minutes=10, id="knowledge_backfill_governance")
         # 每 10 分钟补齐未治理数据表

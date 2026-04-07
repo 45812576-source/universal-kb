@@ -8,6 +8,7 @@ import asyncio
 import datetime
 import logging
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
@@ -21,6 +22,9 @@ _BATCH_SIZE = 10
 
 # 分类置信度低于此阈值标记为 needs_review
 _NEEDS_REVIEW_THRESHOLD = 0.5
+
+# backfill 累计失败次数上限：超过此值的条目不再创建新 job
+_BACKFILL_MAX_TOTAL_FAILURES = 5
 
 
 def _run_render_job(db: Session, job: KnowledgeJob, entry: KnowledgeEntry) -> None:
@@ -321,16 +325,34 @@ def backfill_ungoverned():
         db.close()
 
 
+def _exhausted_entry_ids(db: Session, job_type: str) -> "Subquery":
+    """返回累计失败次数超过 _BACKFILL_MAX_TOTAL_FAILURES 的条目 ID 子查询。
+
+    防止 backfill 为永远无法成功的条目无限创建新 job。
+    """
+    return (
+        db.query(KnowledgeJob.knowledge_id)
+        .filter(
+            KnowledgeJob.job_type == job_type,
+            KnowledgeJob.status == "failed",
+        )
+        .group_by(KnowledgeJob.knowledge_id)
+        .having(func.count(KnowledgeJob.id) >= _BACKFILL_MAX_TOTAL_FAILURES)
+        .subquery()
+    )
+
+
 def backfill_unclassified():
     """补偿任务：扫描未分类/分类失败的知识条目，为其创建 classify job。
 
     由 scheduler 低频调用（如每 10 分钟一次）。
+    累计失败超过 _BACKFILL_MAX_TOTAL_FAILURES 次的条目不再重试。
     """
     db = SessionLocal()
     try:
         from sqlalchemy import or_, and_
 
-        # 找到需要补分类的条目（无 taxonomy_code 且没有 queued/running 的 classify job）
+        # 排除正在处理的
         subq = (
             db.query(KnowledgeJob.knowledge_id)
             .filter(
@@ -339,6 +361,8 @@ def backfill_unclassified():
             )
             .subquery()
         )
+        # 排除累计失败过多的
+        exhausted = _exhausted_entry_ids(db, "classify")
 
         entries = (
             db.query(KnowledgeEntry.id)
@@ -352,6 +376,7 @@ def backfill_unclassified():
                 ),
                 KnowledgeEntry.content.isnot(None),
                 KnowledgeEntry.id.notin_(subq),
+                KnowledgeEntry.id.notin_(exhausted),
             )
             .limit(20)
             .all()
@@ -374,13 +399,15 @@ def backfill_unclassified():
 
 
 def backfill_ununderstood():
-    """补偿任务：扫描无 understanding profile 的知识条目，创建 understand job。"""
+    """补偿任务：扫描无 understanding profile 的知识条目，创建 understand job。
+
+    累计失败超过 _BACKFILL_MAX_TOTAL_FAILURES 次的条目不再重试。
+    """
     db = SessionLocal()
     try:
         from sqlalchemy import and_
         from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
 
-        # 已有 queued/running understand job 的条目
         subq = (
             db.query(KnowledgeJob.knowledge_id)
             .filter(
@@ -389,12 +416,11 @@ def backfill_ununderstood():
             )
             .subquery()
         )
-
-        # 已有 profile 的条目
         profile_subq = (
             db.query(KnowledgeUnderstandingProfile.knowledge_id)
             .subquery()
         )
+        exhausted = _exhausted_entry_ids(db, "understand")
 
         entries = (
             db.query(KnowledgeEntry.id)
@@ -402,6 +428,7 @@ def backfill_ununderstood():
                 KnowledgeEntry.content.isnot(None),
                 KnowledgeEntry.id.notin_(subq),
                 KnowledgeEntry.id.notin_(profile_subq),
+                KnowledgeEntry.id.notin_(exhausted),
             )
             .limit(20)
             .all()
@@ -424,9 +451,15 @@ def backfill_ununderstood():
 
 
 def backfill_failed_renders():
-    """补偿任务：扫描渲染失败的知识条目，为其创建 render retry job。"""
+    """补偿任务：扫描渲染失败的知识条目，为其创建 render retry job。
+
+    累计失败超过 _BACKFILL_MAX_TOTAL_FAILURES 次的条目不再重试。
+    无 oss_key 但有 content 的条目也纳入（从 content 直接生成 HTML）。
+    """
     db = SessionLocal()
     try:
+        from sqlalchemy import or_
+
         subq = (
             db.query(KnowledgeJob.knowledge_id)
             .filter(
@@ -435,13 +468,19 @@ def backfill_failed_renders():
             )
             .subquery()
         )
+        exhausted = _exhausted_entry_ids(db, "render")
 
         entries = (
             db.query(KnowledgeEntry.id)
             .filter(
                 KnowledgeEntry.doc_render_status.in_(["failed", "pending"]),
-                KnowledgeEntry.oss_key.isnot(None),
+                # 有 oss_key 或有 content（后者走 content 直渲染兜底）
+                or_(
+                    KnowledgeEntry.oss_key.isnot(None),
+                    KnowledgeEntry.content.isnot(None),
+                ),
                 KnowledgeEntry.id.notin_(subq),
+                KnowledgeEntry.id.notin_(exhausted),
             )
             .limit(10)
             .all()
@@ -511,5 +550,56 @@ def backfill_ungoverned_tables():
             db.commit()
     except Exception:
         logger.exception("[KnowledgeWorker] table governance backfill error")
+    finally:
+        db.close()
+
+
+def backfill_missing_ai_notes():
+    """补偿任务：为有 content 但无 AI 笔记的条目创建 ai_notes job。
+
+    覆盖早期条目（ai_notes_status=None 且无 ai_notes job）。
+    累计失败超过 _BACKFILL_MAX_TOTAL_FAILURES 次的条目不再重试。
+    """
+    db = SessionLocal()
+    try:
+        from sqlalchemy import or_
+
+        subq = (
+            db.query(KnowledgeJob.knowledge_id)
+            .filter(
+                KnowledgeJob.job_type == "ai_notes",
+                KnowledgeJob.status.in_(["queued", "running"]),
+            )
+            .subquery()
+        )
+        exhausted = _exhausted_entry_ids(db, "ai_notes")
+
+        entries = (
+            db.query(KnowledgeEntry.id)
+            .filter(
+                or_(
+                    KnowledgeEntry.ai_notes_status.is_(None),
+                    KnowledgeEntry.ai_notes_status == "pending",
+                    KnowledgeEntry.ai_notes_status == "failed",
+                ),
+                KnowledgeEntry.content.isnot(None),
+                KnowledgeEntry.id.notin_(subq),
+                KnowledgeEntry.id.notin_(exhausted),
+            )
+            .limit(10)
+            .all()
+        )
+
+        if entries:
+            logger.info(f"[KnowledgeWorker] backfill: creating ai_notes jobs for {len(entries)} entries")
+            for (eid,) in entries:
+                db.add(KnowledgeJob(
+                    knowledge_id=eid,
+                    job_type="ai_notes",
+                    trigger_source="scheduled",
+                ))
+            db.commit()
+    except Exception:
+        logger.exception("[KnowledgeWorker] ai_notes backfill error")
     finally:
         db.close()

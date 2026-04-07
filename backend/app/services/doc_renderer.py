@@ -51,7 +51,13 @@ def render_entry(db: Session, entry_id: int) -> dict:
     if not entry:
         return {"ok": False, "error": "entry not found", "status": "failed"}
 
+    # file_ext 可能为 None（早期条目），尝试从 source_file 推断
     ext = (entry.file_ext or "").lower()
+    if not ext and entry.source_file:
+        import os as _os
+        ext = _os.path.splitext(entry.source_file)[1].lower()
+        if ext:
+            entry.file_ext = ext  # 顺便修复缺失的 file_ext
 
     # 标记处理中
     entry.doc_render_status = "processing"
