@@ -2592,9 +2592,9 @@ def reject_filing_suggestion(
 @router.post("/filing/auto-run")
 def filing_auto_run(
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
 ):
-    """一键自动归档所有未归档文档。仅超管可操作。"""
+    """一键自动归档所有未归档文档。超管和部门管理员可操作。"""
     from app.services.auto_filer import auto_file_batch
     stats = auto_file_batch(db, user_id=user.id)
     return stats

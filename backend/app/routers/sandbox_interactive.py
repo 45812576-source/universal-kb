@@ -1383,6 +1383,25 @@ async def run_tests(
                 file_ctx = _read_source_files(skill.id, skill.source_files or [])
                 if file_ctx:
                     system_prompt += file_ctx
+    elif session.target_type == "tool":
+        tool = db.get(ToolRegistry, session.target_id)
+        if tool:
+            import json as _json
+            schema_text = _json.dumps(tool.input_schema, ensure_ascii=False, indent=2) if tool.input_schema else "无"
+            manifest = (tool.config or {}).get("manifest", {})
+            preconditions = manifest.get("preconditions", [])
+            precond_text = "\n".join(f"- {p}" for p in preconditions) if preconditions else "无"
+            system_prompt = (
+                f"你是一个工具测试引擎。请根据以下工具定义模拟调用并验证输出。\n\n"
+                f"## 工具信息\n"
+                f"- 名称：{tool.display_name or tool.name}\n"
+                f"- 描述：{tool.description or '无'}\n"
+                f"- 类型：{tool.tool_type.value if tool.tool_type else 'unknown'}\n"
+                f"- 输出格式：{tool.output_format or 'json'}\n\n"
+                f"## 输入 Schema\n```json\n{schema_text}\n```\n\n"
+                f"## 前置条件\n{precond_text}\n\n"
+                f"请模拟该工具的典型调用场景，验证输出是否符合预期格式和业务逻辑。"
+            )
 
     # 4. 逐用例执行
     from app.services.llm_gateway import llm_gateway
