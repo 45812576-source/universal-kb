@@ -38,7 +38,7 @@ class TestUrlRegex:
         ("https://abc.feishu.cn/board/AbcDef123", "board", "AbcDef123"),
         ("https://abc.feishu.cn/minutes/AbcDef123", "minutes", "AbcDef123"),
         ("https://abc.feishu.cn/survey/AbcDef123", "survey", "AbcDef123"),
-        ("https://abc.feishu.cn/drive/AbcDef123", "drive", "AbcDef123"),
+        # drive 路径已移除（/drive/folder/xxx 是文件夹，不是文件）
         # larksuite 域名
         ("https://abc.larksuite.com/docx/Token123", "docx", "Token123"),
         ("https://abc.larksuite.com/sheets/Token123", "sheets", "Token123"),
@@ -64,6 +64,10 @@ class TestUrlRegex:
         assert m is not None
         assert m.group("token") == "AbcDef123"
 
+    def test_drive_folder_not_matched(self):
+        """文件夹链接不应被主正则匹配。"""
+        assert _LARK_URL_RE.search("https://abc.feishu.cn/drive/folder/abc123") is None
+
     def test_invalid_url_no_match(self):
         """非飞书链接不应匹配。"""
         assert _LARK_URL_RE.search("https://google.com/docx/abc") is None
@@ -79,7 +83,7 @@ class TestTypeMapping:
     @pytest.mark.parametrize("url_type,api_type", [
         ("sheets", "sheet"),
         ("base", "bitable"),
-        ("drive", "file"),
+        ("form", "survey"),
         ("docx", "docx"),
         ("doc", "doc"),
         ("file", "file"),
@@ -118,6 +122,19 @@ class TestParseLarkUrl:
         token, api_type = importer.parse_lark_url("https://abc.feishu.cn/wiki/WikiToken123")
         assert token == "WikiToken123"
         assert api_type == "wiki"
+
+    def test_share_form_url(self, importer):
+        """问卷分享链接应解析为 survey。"""
+        token, api_type = importer.parse_lark_url(
+            "https://qnyspu28uo.feishu.cn/share/base/form/shrcnEppSqiaiCN"
+        )
+        assert token == "shrcnEppSqiaiCN"
+        assert api_type == "survey"
+
+    def test_drive_folder_rejected(self, importer):
+        """文件夹链接应明确拒绝。"""
+        with pytest.raises(ValueError, match="文件夹不支持"):
+            importer.parse_lark_url("https://abc.feishu.cn/drive/folder/abc123")
 
     def test_invalid_url_raises(self, importer):
         with pytest.raises(ValueError, match="无法解析飞书链接"):

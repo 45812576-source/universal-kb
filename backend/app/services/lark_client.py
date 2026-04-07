@@ -293,7 +293,7 @@ class LarkClient:
                 raise RuntimeError(f"创建导出任务失败: {data.get('msg')} (code={data.get('code')})")
             return data["data"]["ticket"]
 
-    async def poll_and_download_export(self, ticket: str, max_wait: int = 60) -> bytes:
+    async def poll_and_download_export(self, ticket: str, doc_token: str = "", max_wait: int = 60) -> bytes:
         """轮询导出任务直到完成，然后下载文件内容。"""
         import asyncio
         access_token = await self.get_tenant_access_token()
@@ -303,6 +303,7 @@ class LarkClient:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(
                     f"{_LARK_API_BASE}/drive/v1/export_tasks/{ticket}",
+                    params={"token": doc_token} if doc_token else None,
                     headers={"Authorization": f"Bearer {access_token}"},
                 )
                 data = resp.json()

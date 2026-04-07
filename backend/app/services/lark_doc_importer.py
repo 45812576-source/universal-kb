@@ -21,17 +21,26 @@ from app.models.knowledge import KnowledgeEntry
 logger = logging.getLogger(__name__)
 
 # ── 飞书链接正则 ─────────────────────────────────────────────────────────
-# 覆盖所有已知飞书路径类型，含 wiki 套壳
+# 覆盖所有已知飞书路径类型，含 wiki 套壳和 share 前缀
 _LARK_URL_RE = re.compile(
     r"https?://[^/]*(?:feishu\.cn|larksuite\.com)"
-    r"/(?:wiki/)?(?P<type>docx|doc|sheets|sheet|file|base|bitable|slides|mindnotes|mindnote|board|minutes|survey|drive)"
-    r"/(?P<token>[A-Za-z0-9_-]+)"
+    r"/(?:wiki/|share/)?"
+    r"(?P<type>docx|doc|sheets|sheet|file|base|bitable|slides|mindnotes|mindnote|board|minutes|survey)"
+    r"/(?!folder/)(?P<token>[A-Za-z0-9_-]+)"
+    # ↑ 负向前瞻排除 /drive/folder/xxx（文件夹不是文件）
+    # ↑ 去掉 drive（/drive/xxx 是文件夹或容器，不是具体文档）
+)
+
+# 飞书问卷分享链接：/share/base/form/TOKEN
+_LARK_SHARE_FORM_RE = re.compile(
+    r"https?://[^/]*(?:feishu\.cn|larksuite\.com)"
+    r"/share/base/form/(?P<token>[A-Za-z0-9_-]+)"
 )
 
 # 单独匹配纯 wiki 链接（/wiki/TOKEN，不含二级类型路径）
 _LARK_WIKI_RE = re.compile(
     r"https?://[^/]*(?:feishu\.cn|larksuite\.com)"
-    r"/wiki/(?P<token>[A-Za-z0-9_-]+)$"
+    r"/wiki/(?P<token>[A-Za-z0-9_-]+)(?:\?|$)"
 )
 
 # ── URL 路径名 → API 类型名 ──────────────────────────────────────────────
@@ -46,10 +55,10 @@ _URL_PATH_TO_API_TYPE = {
     "slides": "slides",
     "mindnotes": "mindnote",
     "mindnote": "mindnote",
-    "drive": "file",
     "board": "board",
     "minutes": "minutes",
     "survey": "survey",
+    "form": "survey",  # 问卷分享链接
 }
 
 # ── 策略分类 ─────────────────────────────────────────────────────────────
@@ -100,6 +109,11 @@ class LarkDocImporter:
         Raises:
             ValueError: 链接格式不支持
         """
+        # 问卷分享链接（优先匹配，避免被主正则的 /base/ 吃掉）
+        m = _LARK_SHARE_FORM_RE.search(url)
+        if m:
+            return m.group("token"), "survey"
+
         m = _LARK_URL_RE.search(url)
         if m:
             token = m.group("token")
@@ -111,9 +125,13 @@ class LarkDocImporter:
         if m:
             return m.group("token"), "wiki"
 
+        # 飞书文件夹链接 — 不支持导入，给明确提示
+        if re.search(r"feishu\.cn/drive/folder/", url) or re.search(r"larksuite\.com/drive/folder/", url):
+            raise ValueError("飞书文件夹不支持直接导入，请导入文件夹内的具体文档链接")
+
         raise ValueError(
             f"无法解析飞书链接: {url}\n"
-            "支持的格式：飞书文档/表格/知识库/云空间文件等链接，"
+            "支持的格式：飞书文档/表格/知识库/云空间文件/问卷等链接，"
             "如 https://xxx.feishu.cn/docx/TOKEN 或 https://xxx.feishu.cn/wiki/TOKEN"
         )
 
@@ -173,7 +191,7 @@ class LarkDocImporter:
 
         # 创建导出任务 → 轮询 → 下载
         ticket = await lark_client.create_export_task(token, api_type, file_ext_str)
-        file_bytes = await lark_client.poll_and_download_export(ticket)
+        file_bytes = await lark_client.poll_and_download_export(ticket, doc_token=token)
 
         # 写临时文件 → 提取文本
         ext = f".{file_ext_str}"
@@ -450,7 +468,7 @@ class LarkDocImporter:
 
         try:
             ticket = await lark_client.create_export_task(token, doc_type, file_ext_str)
-            file_bytes = await lark_client.poll_and_download_export(ticket)
+            file_bytes = await lark_client.poll_and_download_export(ticket, doc_token=token)
         except Exception as e:
             logger.warning(f"Lark doc export failed for entry {entry.id}: {e}")
             return {"updated": False, "error": str(e)}
