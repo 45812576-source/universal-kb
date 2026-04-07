@@ -1797,6 +1797,23 @@ def delete_knowledge(
         except Exception:
             pass
 
+    # sandbox_test_reports.knowledge_entry_id → 先断开 session.report_id 再删 report
+    try:
+        if _insp.has_table("sandbox_test_reports") and _insp.has_table("sandbox_test_sessions"):
+            db.execute(
+                text(
+                    "UPDATE sandbox_test_sessions SET report_id = NULL"
+                    " WHERE report_id IN"
+                    " (SELECT id FROM sandbox_test_reports WHERE knowledge_entry_id = :kid)"
+                ),
+                {"kid": kid},
+            )
+            db.execute(
+                text("DELETE FROM sandbox_test_reports WHERE knowledge_entry_id = :kid"), {"kid": kid}
+            )
+    except Exception:
+        pass
+
     db.delete(entry)
     db.commit()
     return {"ok": True}
