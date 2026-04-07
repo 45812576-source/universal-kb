@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # 覆盖所有已知飞书路径类型，含 wiki 套壳
 _LARK_URL_RE = re.compile(
     r"https?://[^/]*(?:feishu\.cn|larksuite\.com)"
-    r"/(?:wiki/)?(?P<type>docx|doc|sheets|sheet|file|base|bitable|slides|mindnote|board|minutes|survey|drive)"
+    r"/(?:wiki/)?(?P<type>docx|doc|sheets|sheet|file|base|bitable|slides|mindnotes|mindnote|board|minutes|survey|drive)"
     r"/(?P<token>[A-Za-z0-9_-]+)"
 )
 
@@ -44,6 +44,7 @@ _URL_PATH_TO_API_TYPE = {
     "bitable": "bitable",
     "file": "file",
     "slides": "slides",
+    "mindnotes": "mindnote",
     "mindnote": "mindnote",
     "drive": "file",
     "board": "board",
