@@ -325,6 +325,20 @@ def delete_tool(
         raise HTTPException(status_code=404, detail="Tool not found")
     if user.role != Role.SUPER_ADMIN and tool.created_by != user.id:
         raise HTTPException(status_code=403, detail="无权删除此工具")
+
+    # 清理 sandbox 测试数据（外键链：session → report/case/evidence）
+    from sqlalchemy import text
+    tid = tool_id
+    db.execute(text(
+        "UPDATE sandbox_test_sessions SET report_id = NULL"
+        " WHERE report_id IN (SELECT id FROM sandbox_test_reports WHERE session_id IN"
+        " (SELECT id FROM sandbox_test_sessions WHERE target_type = 'tool' AND target_id = :tid))"
+    ), {"tid": tid})
+    db.execute(text("DELETE FROM sandbox_test_reports WHERE session_id IN (SELECT id FROM sandbox_test_sessions WHERE target_type = 'tool' AND target_id = :tid)"), {"tid": tid})
+    db.execute(text("DELETE FROM sandbox_test_cases WHERE session_id IN (SELECT id FROM sandbox_test_sessions WHERE target_type = 'tool' AND target_id = :tid)"), {"tid": tid})
+    db.execute(text("DELETE FROM sandbox_test_evidences WHERE session_id IN (SELECT id FROM sandbox_test_sessions WHERE target_type = 'tool' AND target_id = :tid)"), {"tid": tid})
+    db.execute(text("DELETE FROM sandbox_test_sessions WHERE target_type = 'tool' AND target_id = :tid"), {"tid": tid})
+
     db.delete(tool)
     db.commit()
     return {"ok": True}
