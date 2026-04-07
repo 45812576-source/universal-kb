@@ -7,6 +7,7 @@ from sqlalchemy import text
 
 from app.database import get_db
 from app.dependencies import get_current_user, require_role
+from app.utils.sql_safe import qi
 from app.models.business import BusinessTable, DataOwnership, VisibilityLevel, SkillDataQuery
 from app.models.user import User, Role, Department
 from app.models.skill import Skill
@@ -489,15 +490,15 @@ def import_external_table(
                 col_defs.append(f"  `{cname}` {mysql_type}")
 
             col_defs.append("  `_imported_at` DATETIME DEFAULT CURRENT_TIMESTAMP")
-            ddl = f"CREATE TABLE IF NOT EXISTS `{safe_name}` (\n" + ",\n".join(col_defs) + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+            ddl = f"CREATE TABLE IF NOT EXISTS {qi(safe_name, '表名')} (\n" + ",\n".join(col_defs) + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
 
             # Create local table
-            db.execute(sa_text(f"DROP TABLE IF EXISTS `{safe_name}`"))
+            db.execute(sa_text(f"DROP TABLE IF EXISTS {qi(safe_name, '表名')}"))
             db.execute(sa_text(ddl))
             db.commit()
 
             # Fetch all data from external
-            result = ext_conn.execute(sa_text(f"SELECT * FROM `{req.table_name}`"))
+            result = ext_conn.execute(sa_text(f"SELECT * FROM {qi(req.table_name, '表名')}"))
             rows = result.fetchall()
             ext_col_keys = list(result.keys())
 
@@ -505,7 +506,7 @@ def import_external_table(
             if rows:
                 local_cols = [cname for _, cname in col_names]
                 placeholders = ", ".join([f":{cname}" for cname in local_cols])
-                insert_sql = f"INSERT INTO `{safe_name}` ({', '.join([f'`{c}`' for c in local_cols])}) VALUES ({placeholders})"
+                insert_sql = f"INSERT INTO {qi(safe_name, '表名')} ({', '.join([qi(c, '列名') for c in local_cols])}) VALUES ({placeholders})"
 
                 def _serialize(v):
                     if v is None:
@@ -773,7 +774,7 @@ async def sync_bitable(
         mysql_type = _BITABLE_TYPE_MAP.get(f.get("type", 1), "TEXT")
         col_defs.append(f"  `{col}` {mysql_type} COMMENT '{fn}'")
     col_defs.append("  `_synced_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
-    ddl = f"CREATE TABLE IF NOT EXISTS `{safe_name}` (\n" + ",\n".join(col_defs) + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    ddl = f"CREATE TABLE IF NOT EXISTS {qi(safe_name, '表名')} (\n" + ",\n".join(col_defs) + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
 
     # col name mapping: field_name → mysql col name
     col_map = {}
@@ -783,7 +784,7 @@ async def sync_bitable(
 
     # 5. Create/reset table
     try:
-        db.execute(text(f"DROP TABLE IF EXISTS `{safe_name}`"))
+        db.execute(text(f"DROP TABLE IF EXISTS {qi(safe_name, '表名')}"))
         db.execute(text(ddl))
         db.commit()
     except Exception as e:
@@ -811,7 +812,7 @@ async def sync_bitable(
         cols_sql = ", ".join(f"`{k}`" for k in row_data)
         placeholders = ", ".join(f":{k}" for k in row_data)
         try:
-            db.execute(text(f"INSERT INTO `{safe_name}` ({cols_sql}) VALUES ({placeholders})"), row_data)
+            db.execute(text(f"INSERT INTO {qi(safe_name, '表名')} ({cols_sql}) VALUES ({placeholders})"), row_data)
             inserted += 1
         except Exception:
             pass
@@ -882,7 +883,7 @@ def probe_external_table(
                 }
                 for c in cols
             ]
-            result = conn.execute(sa_text(f"SELECT * FROM `{req.table_name}` LIMIT 20"))
+            result = conn.execute(sa_text(f"SELECT * FROM {qi(req.table_name, '表名')} LIMIT 20"))
             col_names = list(result.keys())
             rows = [dict(zip(col_names, row)) for row in result.fetchall()]
             # serialize non-JSON-safe types
@@ -974,7 +975,7 @@ def create_blank_table(
         })
 
     ddl = (
-        f"CREATE TABLE IF NOT EXISTS `{table_name}` (\n"
+        f"CREATE TABLE IF NOT EXISTS {qi(table_name, '表名')} (\n"
         + ",\n".join(col_defs)
         + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
@@ -1088,7 +1089,7 @@ async def upload_file_as_table(
         field_meta.append({"name": col, "field_type": field_type, "options": [], "nullable": True, "comment": ""})
 
     ddl = (
-        f"CREATE TABLE IF NOT EXISTS `{table_name}` (\n"
+        f"CREATE TABLE IF NOT EXISTS {qi(table_name, '表名')} (\n"
         + ",\n".join(col_defs)
         + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
@@ -1125,7 +1126,7 @@ async def upload_file_as_table(
                     params[key] = val
                 row_ph.append(f":{key}")
             placeholders.append(f"({', '.join(row_ph)})")
-        insert_sql = f"INSERT INTO `{table_name}` ({col_list}) VALUES {', '.join(placeholders)}"
+        insert_sql = f"INSERT INTO {qi(table_name, '表名')} ({col_list}) VALUES {', '.join(placeholders)}"
         try:
             db.execute(text(insert_sql), params)
             db.commit()
@@ -1199,7 +1200,7 @@ def add_column(
     mysql_type = _FIELD_TYPE_MAP[req.field_type]
     null_clause = "NULL" if req.nullable else "NOT NULL"
     comment_clause = f" COMMENT '{req.comment}'" if req.comment else ""
-    alter_sql = f"ALTER TABLE `{bt.table_name}` ADD COLUMN `{req.name}` {mysql_type} {null_clause}{comment_clause}"
+    alter_sql = f"ALTER TABLE {qi(bt.table_name, '表名')} ADD COLUMN {qi(req.name, '列名')} {mysql_type} {null_clause}{comment_clause}"
 
     try:
         db.execute(text(alter_sql))
@@ -1252,8 +1253,8 @@ def rename_column(
     comment_clause = f" COMMENT '{comment}'" if comment else ""
 
     alter_sql = (
-        f"ALTER TABLE `{bt.table_name}` "
-        f"CHANGE COLUMN `{col_name}` `{new_name}` {data_type} {null_clause}{comment_clause}"
+        f"ALTER TABLE {qi(bt.table_name, '表名')} "
+        f"CHANGE COLUMN {qi(col_name, '列名')} {qi(new_name, '列名')} {data_type} {null_clause}{comment_clause}"
     )
     try:
         db.execute(text(alter_sql))
@@ -1293,7 +1294,7 @@ def drop_column(
         raise HTTPException(400, f"列 '{col_name}' 是系统保留列，不允许删除")
 
     try:
-        db.execute(text(f"ALTER TABLE `{bt.table_name}` DROP COLUMN `{col_name}`"))
+        db.execute(text(f"ALTER TABLE {qi(bt.table_name, '表名')} DROP COLUMN {qi(col_name, '列名')}"))
         db.commit()
     except Exception as e:
         db.rollback()

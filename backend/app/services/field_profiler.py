@@ -13,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.models.business import BusinessTable, TableField
+from app.utils.sql_safe import qi
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ async def profile_table(
 
         # 更新记录数缓存
         try:
-            result = db.execute(text(f"SELECT COUNT(*) FROM `{bt.table_name}`"))
+            result = db.execute(text(f"SELECT COUNT(*) FROM {qi(bt.table_name, '表名')}"))
             bt.record_count_cache = result.scalar()
         except Exception:
             pass
@@ -141,12 +142,12 @@ async def _profile_from_scratch(db: Session, bt: BusinessTable):
             existing_priority = ENUM_SOURCE_PRIORITY.get(tf.enum_source or "", -1)
             new_priority = ENUM_SOURCE_PRIORITY.get("observed", 0)
             if existing_priority < new_priority and tf.distinct_count_cache and tf.distinct_count_cache <= 20:
-                total = db.execute(text(f"SELECT COUNT(*) FROM `{bt.table_name}`")).scalar() or 1
+                total = db.execute(text(f"SELECT COUNT(*) FROM {qi(bt.table_name, '表名')}")).scalar() or 1
                 ratio = tf.distinct_count_cache / total
                 if ratio <= 0.6:
                     vals = db.execute(text(
-                        f"SELECT DISTINCT `{col_name}` FROM `{bt.table_name}` "
-                        f"WHERE `{col_name}` IS NOT NULL LIMIT 20"
+                        f"SELECT DISTINCT {qi(col_name, '列名')} FROM {qi(bt.table_name, '表名')} "
+                        f"WHERE {qi(col_name, '列名')} IS NOT NULL LIMIT 20"
                     ))
                     tf.enum_values = [str(r[0]) for r in vals if r[0] is not None]
                     tf.enum_source = "observed"
@@ -163,14 +164,14 @@ def _fill_stats(db: Session, table_name: str, col_name: str, tf: TableField):
     """填充 sample_values / distinct_count / null_ratio。"""
     # distinct count
     result = db.execute(text(
-        f"SELECT COUNT(DISTINCT `{col_name}`) FROM `{table_name}`"
+        f"SELECT COUNT(DISTINCT {qi(col_name, '列名')}) FROM {qi(table_name, '表名')}"
     ))
     tf.distinct_count_cache = result.scalar()
 
     # null ratio
     result = db.execute(text(
-        f"SELECT COUNT(*) as total, SUM(CASE WHEN `{col_name}` IS NULL THEN 1 ELSE 0 END) as nulls "
-        f"FROM `{table_name}`"
+        f"SELECT COUNT(*) as total, SUM(CASE WHEN {qi(col_name, '列名')} IS NULL THEN 1 ELSE 0 END) as nulls "
+        f"FROM {qi(table_name, '表名')}"
     ))
     row = result.fetchone()
     total, nulls = row[0] or 0, row[1] or 0
@@ -183,8 +184,8 @@ def _fill_stats(db: Session, table_name: str, col_name: str, tf: TableField):
 
     # sample values (max 10 distinct non-null)
     result = db.execute(text(
-        f"SELECT DISTINCT `{col_name}` FROM `{table_name}` "
-        f"WHERE `{col_name}` IS NOT NULL LIMIT 10"
+        f"SELECT DISTINCT {qi(col_name, '列名')} FROM {qi(table_name, '表名')} "
+        f"WHERE {qi(col_name, '列名')} IS NOT NULL LIMIT 10"
     ))
     tf.sample_values = [str(r[0]) for r in result if r[0] is not None]
 

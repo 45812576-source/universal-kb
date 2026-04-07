@@ -23,6 +23,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_db
 from app.dependencies import get_current_user
+from app.utils.sql_safe import qi
 from app.models.user import User, Role
 from app.models.skill import Skill, SkillVersion
 from app.models.tool import ToolRegistry
@@ -1722,7 +1723,7 @@ def _fetch_real_table_data(
     else:
         select_clause = "*"
 
-    sql = f"SELECT {select_clause} FROM `{table_name}`"
+    sql = f"SELECT {select_clause} FROM {qi(table_name, '表名')}"
 
     # 行级权限注入（DataOwnership）
     from app.models.user import User as UserModel

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user, require_role
+from app.utils.sql_safe import qi
 from app.models.skill import Skill, SkillStatus, SkillVersion
 from app.models.tool import ToolRegistry, ToolType, SkillTool
 from app.models.user import User, Role
@@ -1785,7 +1786,7 @@ async def transfer_table(
         raise HTTPException(404, f"业务表 '{req.table_name}' 未注册")
 
     # 3. 拉取全量数据（不分页）
-    rows_result = db.execute(_text(f"SELECT * FROM `{req.table_name}`"))
+    rows_result = db.execute(_text(f"SELECT * FROM {qi(req.table_name, '表名')}"))
     columns = list(rows_result.keys())
     raw_rows = [dict(zip(columns, row)) for row in rows_result.fetchall()]
 
@@ -1829,7 +1830,7 @@ async def transfer_table(
                 else:
                     val_parts.append("'" + str(v).replace("'", "''") + "'")
             val_str = ", ".join(val_parts)
-            lines.append(f"INSERT INTO `{table_name}` ({col_str}) VALUES ({val_str});")
+            lines.append(f"INSERT INTO {qi(table_name, '表名')} ({col_str}) VALUES ({val_str});")
         content = "\n".join(lines)
         ext = "sql"
 

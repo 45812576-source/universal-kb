@@ -23,6 +23,7 @@ from app.models.business import (
 from app.models.permission import PermissionAuditLog
 from app.models.skill import Skill
 from app.models.user import Department, Role, User
+from app.utils.sql_safe import qi, check_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -857,11 +858,9 @@ def delete_table(
     # 删除物理表（如果存在）
     table_name = bt.table_name
     try:
-        import re
-        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', table_name):
-            raise ValueError(f"非法表名: {table_name}")
+        check_identifier(table_name, "表名")
         from sqlalchemy import text as sa_text
-        db.execute(sa_text(f'DROP TABLE IF EXISTS "{table_name}"'))
+        db.execute(sa_text(f"DROP TABLE IF EXISTS {qi(table_name, '表名')}"))
     except Exception:
         pass  # 物理表可能不存在（仅元数据）
 
@@ -948,10 +947,10 @@ def get_table_preview(
         columns = [{"name": r[0], "type": r[1]} for r in col_rows]
 
         # Row count
-        record_count = db.execute(text(f"SELECT COUNT(*) FROM `{bt.table_name}`")).scalar()
+        record_count = db.execute(text(f"SELECT COUNT(*) FROM {qi(bt.table_name, '表名')}")).scalar()
 
         # Preview rows
-        result = db.execute(text(f"SELECT * FROM `{bt.table_name}` LIMIT :lim"), {"lim": page_size})
+        result = db.execute(text(f"SELECT * FROM {qi(bt.table_name, '表名')} LIMIT :lim"), {"lim": page_size})
         col_names = list(result.keys())
         rows = [{k: _serialize(v) for k, v in zip(col_names, row)} for row in result.fetchall()]
 

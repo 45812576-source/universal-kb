@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 
 from app.models.business import BusinessTable, TableView
 from app.services.data_engine import data_engine
+from app.utils.sql_safe import qi
 
 logger = logging.getLogger(__name__)
 
@@ -203,14 +204,14 @@ async def execute(params: dict, db: Session, user_id: int | None = None) -> dict
         invalid = [c for c in columns if c not in allowed_cols]
         if invalid:
             return {"ok": False, "error": f"不存在的列: {invalid}"}
-        select_clause = ", ".join(f"`{c}`" for c in columns)
+        select_clause = ", ".join(qi(c, '列名') for c in columns)
     else:
         rules = bt.validation_rules or {}
         hidden = set(rules.get("hidden_fields") or [])
-        select_clause = ", ".join(f"`{c}`" for c in [c["name"] for c in columns_info] if c not in hidden)
+        select_clause = ", ".join(qi(c, '列名') for c in [c["name"] for c in columns_info] if c not in hidden)
         columns = [c["name"] for c in columns_info if c["name"] not in hidden]
 
-    sql = f"SELECT {select_clause} FROM `{table_name}`"
+    sql = f"SELECT {select_clause} FROM {qi(table_name, '表名')}"
 
     where_parts = []
     for f in filters:

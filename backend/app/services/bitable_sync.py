@@ -13,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.models.business import BusinessTable, TableField, TableSyncJob
+from app.utils.sql_safe import qi
 
 logger = logging.getLogger(__name__)
 
@@ -247,7 +248,7 @@ class BitableSync:
             )
 
             sql = (
-                f"INSERT INTO `{table_name}` ({cols_sql}) VALUES ({placeholders}) "
+                f"INSERT INTO {qi(table_name, '表名')} ({cols_sql}) VALUES ({placeholders}) "
                 f"ON DUPLICATE KEY UPDATE {update_parts}"
             )
             try:
@@ -293,9 +294,9 @@ class BitableSync:
                 mysql_type = _BITABLE_TYPE_MAP.get(f.get("type", 1), "TEXT")
                 col_defs.append(f"  `{col}` {mysql_type} COMMENT '{f['field_name']}'")
             col_defs.append("  `_synced_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
-            ddl = f"CREATE TABLE IF NOT EXISTS `{table_name}` (\n" + ",\n".join(col_defs) + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+            ddl = f"CREATE TABLE IF NOT EXISTS {qi(table_name, '表名')} (\n" + ",\n".join(col_defs) + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
 
-            db.execute(text(f"DROP TABLE IF EXISTS `{table_name}`"))
+            db.execute(text(f"DROP TABLE IF EXISTS {qi(table_name, '表名')}"))
             db.execute(text(ddl))
             db.commit()
 

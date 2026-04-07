@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user
+from app.utils.sql_safe import qi
 from app.models.business import AuditLog, BusinessTable, DataOwnership, TableRoleGroup, TableField
 from app.models.user import User, Role
 from app.services.data_visibility import data_visibility
@@ -228,7 +229,7 @@ def _list_rows_new_policy(
         return empty
 
     # 构建 SQL
-    base_sql = f"SELECT * FROM `{table_name}`"
+    base_sql = f"SELECT * FROM {qi(table_name, '表名')}"
     sql_params: dict = {}
 
     # 行过滤（参数化）
@@ -291,7 +292,7 @@ def _list_rows_legacy(
     if not is_admin and row_scope == "private":
         return {"total": 0, "page": page, "page_size": page_size, "columns": [], "rows": []}
 
-    base_sql = f"SELECT * FROM `{table_name}`"
+    base_sql = f"SELECT * FROM {qi(table_name, '表名')}"
 
     if not is_admin and row_scope == "department":
         dept_ids = rules.get("row_department_ids") or []
@@ -390,7 +391,7 @@ def create_row(
     data = {k: v for k, v in req.data.items()}
     cols = ", ".join(f"`{k}`" for k in data.keys())
     placeholders = ", ".join(f":{k}" for k in data.keys())
-    sql = text(f"INSERT INTO `{table_name}` ({cols}) VALUES ({placeholders})")
+    sql = text(f"INSERT INTO {qi(table_name, '表名')} ({cols}) VALUES ({placeholders})")
 
     try:
         result = db.execute(sql, data)
@@ -428,14 +429,14 @@ def update_row(
 
     # Get old values for audit
     old_row = db.execute(
-        text(f"SELECT * FROM `{table_name}` WHERE id = :id"),
+        text(f"SELECT * FROM {qi(table_name, '表名')} WHERE id = :id"),
         {"id": row_id},
     ).fetchone()
     if not old_row:
         raise HTTPException(404, "Row not found")
 
     old_cols = db.execute(
-        text(f"SELECT * FROM `{table_name}` WHERE id = :id"),
+        text(f"SELECT * FROM {qi(table_name, '表名')} WHERE id = :id"),
         {"id": row_id},
     )
     col_names = list(old_cols.keys())
@@ -456,7 +457,7 @@ def update_row(
 
     data = {k: v for k, v in req.data.items() if k != "id"}
     set_clause = ", ".join(f"`{k}` = :{k}" for k in data.keys())
-    sql = text(f"UPDATE `{table_name}` SET {set_clause} WHERE id = :__id")
+    sql = text(f"UPDATE {qi(table_name, '表名')} SET {set_clause} WHERE id = :__id")
     data["__id"] = row_id
 
     try:
@@ -493,14 +494,14 @@ def delete_row(
     _check_write_permission(bt, user)
 
     old_row = db.execute(
-        text(f"SELECT * FROM `{table_name}` WHERE id = :id"),
+        text(f"SELECT * FROM {qi(table_name, '表名')} WHERE id = :id"),
         {"id": row_id},
     ).fetchone()
     if not old_row:
         raise HTTPException(404, "Row not found")
 
     old_cols = db.execute(
-        text(f"SELECT * FROM `{table_name}` WHERE id = :id"),
+        text(f"SELECT * FROM {qi(table_name, '表名')} WHERE id = :id"),
         {"id": row_id},
     )
     col_names = list(old_cols.keys())
@@ -508,7 +509,7 @@ def delete_row(
     _check_row_owner(bt, old_values, user)
 
     try:
-        db.execute(text(f"DELETE FROM `{table_name}` WHERE id = :id"), {"id": row_id})
+        db.execute(text(f"DELETE FROM {qi(table_name, '表名')} WHERE id = :id"), {"id": row_id})
         db.commit()
 
         log = AuditLog(

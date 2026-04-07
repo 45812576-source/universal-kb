@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.models.business import BusinessTable
 from app.services.data_engine import data_engine
+from app.utils.sql_safe import qi
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ async def execute(params: dict, db: Session, user_id: int | None = None) -> dict
         cols = list(row.keys())
         col_list = ", ".join(f"`{c}`" for c in cols)
         val_list = ", ".join(_escape_value(row[c]) for c in cols)
-        sql = f"INSERT INTO `{table_name}` ({col_list}) VALUES ({val_list})"
+        sql = f"INSERT INTO {qi(table_name, '表名')} ({col_list}) VALUES ({val_list})"
 
         # Safety check
         ok, reason = data_engine.validate_sql(sql, "write", [table_name])

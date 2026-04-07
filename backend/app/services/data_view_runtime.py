@@ -21,6 +21,7 @@ from app.models.business import (
     TableField,
     TableView,
 )
+from app.utils.sql_safe import qi
 from app.services.policy_engine import (
     DISCLOSURE_ORDER,
     PolicyResult,
@@ -246,7 +247,7 @@ def _build_view_sql(
             col = rule.get("field", "")
             alias = rule.get("alias", f"{func_name}_{col}")
             if col and _SAFE_FIELD_RE.match(col) and func_name.upper() in ("COUNT", "SUM", "AVG", "MIN", "MAX"):
-                agg_exprs.append(f"{func_name.upper()}(`{col}`) AS `{alias}`")
+                agg_exprs.append(f"{func_name.upper()}({qi(col, '列名')}) AS {qi(alias, '别名')}")
 
         for gf in (agg_rules.get("group_by") or []):
             if _SAFE_FIELD_RE.match(gf) and gf in visible_columns:
@@ -267,7 +268,7 @@ def _build_view_sql(
             cols = visible_columns
         select_clause = ", ".join(f"`{c}`" for c in cols)
 
-    sql = f"SELECT {select_clause} FROM `{table_name}`"
+    sql = f"SELECT {select_clause} FROM {qi(table_name, '表名')}"
 
     # WHERE 条件
     where_parts: list[str] = []
