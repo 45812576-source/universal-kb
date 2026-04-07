@@ -1328,7 +1328,7 @@ async def run_tests(
     if session.status not in allow_status or session.current_step not in allow_step:
         raise HTTPException(400, f"当前状态不允许执行测试: step={session.current_step.value}, status={session.status.value}")
 
-    # 重跑时清理旧的测试用例和报告
+    # 重跑时清理旧的测试用例和报告，并升级到最新版本
     if session.current_step == SessionStep.DONE:
         for case in list(session.cases):
             db.delete(case)
@@ -1337,6 +1337,20 @@ async def run_tests(
             if old_report:
                 db.delete(old_report)
             session.report_id = None
+        # 升级到最新版本，确保评估纳入最新提交的 prompt 和文件
+        if session.target_type == "skill":
+            latest_ver = (
+                db.query(SkillVersion)
+                .filter(SkillVersion.skill_id == session.target_id)
+                .order_by(SkillVersion.version.desc())
+                .first()
+            )
+            if latest_ver and latest_ver.version != session.target_version:
+                logger.info(
+                    "sandbox rerun: upgrading skill %s from v%s to v%s",
+                    session.target_id, session.target_version, latest_ver.version,
+                )
+                session.target_version = latest_ver.version
 
     session.current_step = SessionStep.EXECUTION
     session.status = SessionStatus.RUNNING
@@ -1367,18 +1381,26 @@ async def run_tests(
         db.commit()
         return _serialize_session(session)
 
-    # 3. 获取 system_prompt
+    # 3. 获取 system_prompt — 始终使用最新版本，确保用户中途保存的改动被纳入
     system_prompt = ""
     if session.target_type == "skill":
         skill = db.get(Skill, session.target_id)
         if skill:
-            version = (
+            # 总是取最新版本，而非锁定的版本
+            latest_ver = (
                 db.query(SkillVersion)
-                .filter(SkillVersion.skill_id == skill.id, SkillVersion.version == session.target_version)
+                .filter(SkillVersion.skill_id == skill.id)
+                .order_by(SkillVersion.version.desc())
                 .first()
             )
-            if version:
-                system_prompt = version.system_prompt or ""
+            if latest_ver:
+                if latest_ver.version != session.target_version:
+                    logger.info(
+                        "sandbox run: using latest skill %s v%s (session locked v%s)",
+                        skill.id, latest_ver.version, session.target_version,
+                    )
+                    session.target_version = latest_ver.version
+                system_prompt = latest_ver.system_prompt or ""
                 from app.services.skill_engine import _read_source_files
                 file_ctx = _read_source_files(skill.id, skill.source_files or [])
                 if file_ctx:
