@@ -426,6 +426,135 @@ class ProbeTableRequest(BaseModel):
     table_name: str
 
 
+class ImportExternalRequest(BaseModel):
+    db_url: str
+    table_name: str
+    display_name: str = ""
+
+
+@router.post("/import-external")
+def import_external_table(
+    req: ImportExternalRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Connect to external DB, copy schema + all data to local, register in business_tables."""
+    from sqlalchemy import create_engine, inspect as sa_inspect, text as sa_text
+    import re, datetime, decimal
+
+    display = req.display_name.strip() or req.table_name
+    # Sanitize local table name
+    safe_name = re.sub(r"[^a-z0-9_]", "_", req.table_name.strip().lower())[:60]
+    if not safe_name or safe_name[0].isdigit():
+        safe_name = "ext_" + safe_name
+
+    # Check if already registered
+    existing = db.query(BusinessTable).filter(BusinessTable.table_name == safe_name).first()
+    if existing:
+        raise HTTPException(400, f"表 '{safe_name}' 已存在")
+
+    try:
+        ext_engine = create_engine(req.db_url, connect_args={"connect_timeout": 10})
+    except Exception as e:
+        raise HTTPException(400, f"数据库连接字符串无效: {e}")
+
+    try:
+        with ext_engine.connect() as ext_conn:
+            insp = sa_inspect(ext_engine)
+            columns = insp.get_columns(req.table_name)
+            if not columns:
+                raise HTTPException(400, f"表 '{req.table_name}' 无列信息")
+
+            # Build DDL from external schema
+            _TYPE_MAP = {
+                "INTEGER": "INT", "BIGINT": "BIGINT", "SMALLINT": "SMALLINT",
+                "FLOAT": "FLOAT", "DOUBLE": "DOUBLE", "DECIMAL": "DECIMAL(20,4)",
+                "NUMERIC": "DECIMAL(20,4)", "VARCHAR": "VARCHAR(500)", "CHAR": "CHAR(50)",
+                "TEXT": "TEXT", "LONGTEXT": "LONGTEXT", "MEDIUMTEXT": "MEDIUMTEXT",
+                "DATE": "DATE", "DATETIME": "DATETIME", "TIMESTAMP": "DATETIME",
+                "BOOLEAN": "TINYINT(1)", "TINYINT": "TINYINT", "BLOB": "BLOB",
+                "JSON": "JSON",
+            }
+            col_defs = []
+            col_names = []
+            for c in columns:
+                cname = re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fff]", "_", c["name"])
+                col_names.append((c["name"], cname))
+                type_str = str(c["type"]).upper().split("(")[0].strip()
+                mysql_type = _TYPE_MAP.get(type_str, "TEXT")
+                # Preserve length for VARCHAR
+                raw = str(c["type"]).upper()
+                if "VARCHAR" in raw and "(" in raw:
+                    mysql_type = raw
+                col_defs.append(f"  `{cname}` {mysql_type}")
+
+            col_defs.append("  `_imported_at` DATETIME DEFAULT CURRENT_TIMESTAMP")
+            ddl = f"CREATE TABLE IF NOT EXISTS `{safe_name}` (\n" + ",\n".join(col_defs) + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+
+            # Create local table
+            db.execute(sa_text(f"DROP TABLE IF EXISTS `{safe_name}`"))
+            db.execute(sa_text(ddl))
+            db.commit()
+
+            # Fetch all data from external
+            result = ext_conn.execute(sa_text(f"SELECT * FROM `{req.table_name}`"))
+            rows = result.fetchall()
+            ext_col_keys = list(result.keys())
+
+            # Batch insert
+            if rows:
+                local_cols = [cname for _, cname in col_names]
+                placeholders = ", ".join([f":{cname}" for cname in local_cols])
+                insert_sql = f"INSERT INTO `{safe_name}` ({', '.join([f'`{c}`' for c in local_cols])}) VALUES ({placeholders})"
+
+                def _serialize(v):
+                    if v is None:
+                        return None
+                    if isinstance(v, (datetime.datetime, datetime.date)):
+                        return v.isoformat()
+                    if isinstance(v, decimal.Decimal):
+                        return float(v)
+                    if isinstance(v, bytes):
+                        return v.decode("utf-8", errors="replace")
+                    return v
+
+                batch = []
+                for row in rows:
+                    row_dict = {}
+                    for i, (orig_name, local_name) in enumerate(col_names):
+                        idx = ext_col_keys.index(orig_name) if orig_name in ext_col_keys else i
+                        row_dict[local_name] = _serialize(row[idx])
+                    batch.append(row_dict)
+
+                # Insert in chunks of 500
+                for i in range(0, len(batch), 500):
+                    db.execute(sa_text(insert_sql), batch[i:i+500])
+                db.commit()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"导入失败: {e}")
+
+    # Register in business_tables
+    masked_url = re.sub(r":[^@]*@", ":***@", req.db_url)
+    bt = BusinessTable(
+        table_name=safe_name,
+        display_name=display,
+        description=f"从外部数据库导入: {masked_url}/{req.table_name}",
+        ddl_sql=ddl,
+        source_type="external_db",
+        source_ref={"db_url_masked": masked_url, "remote_table": req.table_name},
+        owner_id=user.id,
+        record_count_cache=len(rows) if rows else 0,
+    )
+    db.add(bt)
+    db.commit()
+    db.refresh(bt)
+
+    return {"id": bt.id, "table_name": safe_name, "display_name": display, "rows_imported": len(rows) if rows else 0}
+
+
 @router.post("/resolve-wiki")
 async def resolve_wiki(
     req: ResolveWikiRequest,
