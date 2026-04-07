@@ -857,6 +857,9 @@ def delete_table(
     # 删除物理表（如果存在）
     table_name = bt.table_name
     try:
+        import re
+        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', table_name):
+            raise ValueError(f"非法表名: {table_name}")
         from sqlalchemy import text as sa_text
         db.execute(sa_text(f'DROP TABLE IF EXISTS "{table_name}"'))
     except Exception:
