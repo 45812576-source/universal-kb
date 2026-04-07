@@ -366,6 +366,179 @@ class RowUpdate(BaseModel):
     data: dict
 
 
+# ── 智能采样接口 ────────────────────────────────────────────────────────────────
+
+_ENUM_FIELD_TYPES = {"single_select", "multi_select", "boolean"}
+
+
+def _is_enum_field(f: TableField) -> bool:
+    """字段是否为结构化枚举类型，需要按值取样。"""
+    if getattr(f, "is_enum", False):
+        return True
+    if (f.field_type or "").lower() in _ENUM_FIELD_TYPES:
+        return True
+    return False
+
+
+@router.get("/{table_name}/sample")
+def sample_rows(
+    table_name: str,
+    max_rows: int = Query(200, ge=1, le=1000),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """智能采样：对结构化枚举字段，每种枚举值至少返回一行；其余空位用最新数据补足。
+
+    - total: 表的总行数（不受采样影响，便于前端展示数据量）
+    - rows: 采样后的行
+    - sample_strategy: 描述采样逻辑的元数据
+    """
+    bt = _get_registered_table(db, table_name)
+
+    # 权限：复用 list_rows 的策略——非管理员表若有新权限模型走新策略，否则 legacy
+    from app.models.user import Role as _Role
+    is_admin = user.role in (_Role.SUPER_ADMIN, _Role.DEPT_ADMIN)
+    has_new_policy = (
+        db.query(TableRoleGroup).filter(TableRoleGroup.table_id == bt.id).first()
+        is not None
+    )
+
+    base_sql = f"SELECT * FROM {qi(table_name, '表名')}"
+    sql_params: dict = {}
+    visible_cols_filter: list[str] | None = None
+    masking_rules = None
+    fields_for_mask: list[TableField] = []
+
+    if has_new_policy and not is_admin:
+        groups = resolve_user_role_groups(db, bt.id, user, skill_id=None)
+        policy = resolve_effective_policy(db, bt.id, [g.id for g in groups], None)
+        if policy.denied:
+            return {"total": 0, "columns": [], "rows": [], "sample_strategy": {"enum_fields": [], "covered": 0, "filled": 0}}
+        caps = check_disclosure_capability(policy.disclosure_level)
+        if not caps["can_see_rows"]:
+            return {"total": 0, "columns": [], "rows": [], "sample_strategy": {"enum_fields": [], "covered": 0, "filled": 0}}
+        row_filter, row_params = build_row_filter_sql(policy, user, table_name)
+        if row_filter:
+            base_sql += f" WHERE ({row_filter})"
+            sql_params.update(row_params)
+        fields_for_mask = db.query(TableField).filter(TableField.table_id == bt.id).all()
+        if fields_for_mask and policy.field_access_mode != "all":
+            # 延后到取出列后再算 visible_cols
+            visible_cols_filter = "deferred"  # type: ignore
+            _policy_for_visible = policy
+        else:
+            _policy_for_visible = policy
+        if policy.masking_rules and not caps["can_see_raw"]:
+            masking_rules = policy.masking_rules
+    else:
+        # legacy 路径：若 row_scope=private 且非 admin，直接拒绝
+        rules = bt.validation_rules or {}
+        if not is_admin and rules.get("row_scope", "private") == "private":
+            return {"total": 0, "columns": [], "rows": [], "sample_strategy": {"enum_fields": [], "covered": 0, "filled": 0}}
+        _policy_for_visible = None
+
+    # ── 1. 总行数 ──
+    total = db.execute(text(f"SELECT COUNT(*) FROM ({base_sql}) AS _t"), sql_params).scalar() or 0
+
+    # ── 2. 取一行用于发现列名 ──
+    probe = db.execute(text(base_sql + " LIMIT 1"), sql_params)
+    all_columns = list(probe.keys())
+    probe.fetchall()  # drain
+
+    # ── 3. 找出枚举字段（必须是物理列） ──
+    fields = db.query(TableField).filter(TableField.table_id == bt.id).all()
+    field_by_col: dict[str, TableField] = {}
+    for f in fields:
+        col = f.physical_column_name or f.field_name
+        if col in all_columns:
+            field_by_col[col] = f
+    enum_field_cols = [col for col, f in field_by_col.items() if _is_enum_field(f)]
+
+    sampled_row_ids: set = set()
+    sampled_rows: list[dict] = []
+    enum_strategy: list[dict] = []
+
+    def _add_row(row_dict: dict):
+        rid = row_dict.get("id")
+        key = rid if rid is not None else id(row_dict)
+        if key in sampled_row_ids:
+            return False
+        sampled_row_ids.add(key)
+        sampled_rows.append(row_dict)
+        return True
+
+    # ── 4. 对每个枚举字段，取每种值的代表行 ──
+    for col in enum_field_cols:
+        if len(sampled_rows) >= max_rows:
+            break
+        # 获取该列的所有 distinct 值（排除 NULL，用样本表读）
+        try:
+            distinct_vals = db.execute(
+                text(f"SELECT DISTINCT {qi(col, '列名')} AS v FROM ({base_sql}) AS _t WHERE {qi(col, '列名')} IS NOT NULL LIMIT 200"),
+                sql_params,
+            ).fetchall()
+        except Exception:
+            continue
+        covered_vals = []
+        for (val,) in distinct_vals:
+            if len(sampled_rows) >= max_rows:
+                break
+            row_q = db.execute(
+                text(f"SELECT * FROM ({base_sql}) AS _t WHERE {qi(col, '列名')} = :v LIMIT 1"),
+                {**sql_params, "v": val},
+            )
+            row = row_q.fetchone()
+            if row is None:
+                continue
+            row_dict = _serialize_row(dict(zip(all_columns, row)))
+            if _add_row(row_dict):
+                covered_vals.append(_serialize_value(val))
+        enum_strategy.append({"field": col, "covered_values": covered_vals})
+
+    # ── 5. 用最新数据补足到 max_rows ──
+    if len(sampled_rows) < max_rows:
+        remaining = max_rows - len(sampled_rows)
+        # 优先按 id DESC（如有 id 列），否则不排序
+        order_clause = " ORDER BY id DESC" if "id" in all_columns else ""
+        fill_q = db.execute(
+            text(base_sql + order_clause + " LIMIT :limit"),
+            {**sql_params, "limit": remaining + len(sampled_rows)},  # 多取一些以便去重
+        )
+        for row in fill_q.fetchall():
+            if len(sampled_rows) >= max_rows:
+                break
+            row_dict = _serialize_row(dict(zip(all_columns, row)))
+            _add_row(row_dict)
+
+    # ── 6. 字段过滤 + 脱敏（新策略路径） ──
+    if has_new_policy and not is_admin and _policy_for_visible is not None and fields_for_mask:
+        if _policy_for_visible.field_access_mode != "all":
+            visible_cols = compute_visible_columns(all_columns, fields_for_mask, _policy_for_visible)
+            sampled_rows = [{k: v for k, v in r.items() if k in visible_cols} for r in sampled_rows]
+            all_columns = visible_cols
+        if masking_rules:
+            sampled_rows = apply_field_masking(sampled_rows, masking_rules, fields_for_mask)
+
+    # legacy hidden_fields 处理
+    if not has_new_policy:
+        rules = bt.validation_rules or {}
+        hidden_fields = rules.get("hidden_fields") or []
+        if hidden_fields and not is_admin:
+            all_columns = [c for c in all_columns if c not in hidden_fields]
+            sampled_rows = [{k: v for k, v in r.items() if k not in hidden_fields} for r in sampled_rows]
+
+    return {
+        "total": total,
+        "columns": all_columns,
+        "rows": sampled_rows,
+        "sample_strategy": {
+            "enum_fields": enum_strategy,
+            "sampled": len(sampled_rows),
+            "max_rows": max_rows,
+        },
+    }
+
+
 @router.post("/{table_name}/rows")
 def create_row(
     table_name: str,
