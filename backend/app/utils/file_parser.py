@@ -6,6 +6,23 @@ import tempfile
 from dataclasses import dataclass
 
 
+def convert_pdf_to_docx(pdf_path: str) -> str:
+    """将 PDF 转换为 DOCX，返回生成的 DOCX 文件路径。
+
+    使用 pdf2docx 库保留排版、表格、图片。
+    调用者负责清理返回的临时文件。
+    """
+    from pdf2docx import Converter
+
+    docx_path = pdf_path.rsplit(".", 1)[0] + ".docx"
+    cv = Converter(pdf_path)
+    try:
+        cv.convert(docx_path)
+    finally:
+        cv.close()
+    return docx_path
+
+
 def _call_kimi_vision(image_path: str) -> str:
     """Call Kimi vision API (via 百炼 Coding Plan) to OCR/describe an image."""
     import openai

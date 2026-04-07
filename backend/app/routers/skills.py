@@ -211,20 +211,21 @@ def create_skill(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    # 员工/部门管理员：最多 3 个未发布的个人 Skill
+    # 员工/部门管理员：最多 3 个未发布的个人 Skill（DRAFT + REVIEWING，不含 ARCHIVED）
     if user.role in (Role.EMPLOYEE, Role.DEPT_ADMIN):
-        unpublished_count = (
+        unpublished = (
             db.query(Skill)
             .filter(
                 Skill.created_by == user.id,
-                Skill.status != SkillStatus.PUBLISHED,
+                Skill.status.in_([SkillStatus.DRAFT, SkillStatus.REVIEWING]),
             )
-            .count()
+            .all()
         )
-        if unpublished_count >= MAX_EMPLOYEE_UNPUBLISHED_SKILLS:
+        if len(unpublished) >= MAX_EMPLOYEE_UNPUBLISHED_SKILLS:
+            names = "、".join(s.name for s in unpublished[:5])
             raise HTTPException(
                 400,
-                f"最多只能有 {MAX_EMPLOYEE_UNPUBLISHED_SKILLS} 个未发布 Skill，请先发布或删除已有草稿",
+                f"最多只能有 {MAX_EMPLOYEE_UNPUBLISHED_SKILLS} 个未发布 Skill（当前有：{names}），请先发布或删除已有草稿",
             )
 
     if db.query(Skill).filter(Skill.name == req.name, Skill.created_by == user.id).first():

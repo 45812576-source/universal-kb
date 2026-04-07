@@ -65,8 +65,19 @@ def get_editor_config(
         raise HTTPException(400, "此知识条目没有关联的原始文件")
 
     ext = (entry.file_ext or "").lower()
-    if ext not in _EDITABLE_EXTS:
+
+    # PDF 通过转换后的 DOCX 文件走 OnlyOffice
+    is_pdf = ext == ".pdf"
+    if is_pdf:
+        if not entry.docx_oss_key:
+            raise HTTPException(400, "PDF 尚未完成转换，请稍后重试")
+        oss_key_for_office = entry.docx_oss_key
+        ext_for_office = ".docx"
+    elif ext not in _EDITABLE_EXTS:
         raise HTTPException(400, f"OnlyOffice 不支持编辑此文件类型: {ext}")
+    else:
+        oss_key_for_office = entry.oss_key
+        ext_for_office = ext
 
     # 编辑权限：只有创建者和超管可以编辑
     can_edit = (user.role == Role.SUPER_ADMIN or entry.created_by == user.id)
@@ -74,7 +85,7 @@ def get_editor_config(
 
     # 生成文件下载 URL（OnlyOffice 服务器需要能访问到）
     from app.services.oss_service import generate_signed_url
-    file_url = generate_signed_url(entry.oss_key, expires=7200)
+    file_url = generate_signed_url(oss_key_for_office, expires=7200)
 
     # 回调 URL（OnlyOffice 编辑完成后调用）
     backend_base = os.getenv("BACKEND_PUBLIC_URL", "http://localhost:8000")
@@ -84,12 +95,12 @@ def get_editor_config(
 
     config = {
         "document": {
-            "fileType": ext.lstrip("."),
+            "fileType": ext_for_office.lstrip("."),
             "key": doc_key,
             "title": entry.source_file or entry.title,
             "url": file_url,
         },
-        "documentType": _EXT_TO_DOCTYPE.get(ext, "word"),
+        "documentType": _EXT_TO_DOCTYPE.get(ext_for_office, "word"),
         "editorConfig": {
             "callbackUrl": callback_url,
             "lang": "zh-CN",
@@ -159,16 +170,20 @@ async def editor_callback(
             resp.raise_for_status()
             file_data = resp.content
 
-        # 保存到临时文件
+        # PDF 条目编辑的是转换后的 DOCX
         ext = entry.file_ext or ".docx"
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        is_pdf = ext.lower() == ".pdf"
+        save_oss_key = entry.docx_oss_key if is_pdf and entry.docx_oss_key else entry.oss_key
+        save_ext = ".docx" if is_pdf else ext
+
+        with tempfile.NamedTemporaryFile(suffix=save_ext, delete=False) as tmp:
             tmp.write(file_data)
             tmp_path = tmp.name
 
         try:
-            # 上传新版本到 OSS（覆盖原文件）
+            # 上传新版本到 OSS（覆盖原文件 / 覆盖转换后的 DOCX）
             from app.services.oss_service import upload_file as oss_upload
-            oss_upload(tmp_path, entry.oss_key)
+            oss_upload(tmp_path, save_oss_key)
 
             # 重新提取文本
             from app.utils.file_parser import extract_text
