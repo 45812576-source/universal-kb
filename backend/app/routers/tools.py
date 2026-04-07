@@ -329,6 +329,9 @@ def delete_tool(
     # 清理 sandbox 测试数据（外键链：session → report/case/evidence）
     from sqlalchemy import text
     tid = tool_id
+    # 其他 session（如 skill）的 evidence 可能引用此 tool_id，置空即可
+    db.execute(text("UPDATE sandbox_test_evidences SET tool_id = NULL WHERE tool_id = :tid"), {"tid": tid})
+    # 删除以此 tool 为 target 的完整 session 链
     db.execute(text(
         "UPDATE sandbox_test_sessions SET report_id = NULL"
         " WHERE report_id IN (SELECT id FROM sandbox_test_reports WHERE session_id IN"
