@@ -171,6 +171,10 @@ def _to_raw_url(github_url: str) -> str:
     """Convert any GitHub URL pointing to a skill folder or SKILL.md into a raw SKILL.md URL."""
     github_url = github_url.strip().rstrip("/")
 
+    # 补全 scheme
+    if github_url.startswith("github.com"):
+        github_url = "https://" + github_url
+
     # Already raw
     if "raw.githubusercontent.com" in github_url:
         if not github_url.endswith("SKILL.md"):
@@ -196,7 +200,20 @@ def _to_raw_url(github_url: str) -> str:
         owner, repo, branch, path = m.groups()
         return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
 
-    # https://github.com/owner/repo  (bare repo, no path) — not supported for single import
+    # https://github.com/owner/repo/tree/branch  (branch root, no path)
+    m = re.match(
+        r"https://github\.com/([^/]+)/([^/]+)/tree/([^/]+)$", github_url
+    )
+    if m:
+        owner, repo, branch = m.groups()
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/SKILL.md"
+
+    # https://github.com/owner/repo  (bare repo, default to main branch root)
+    m = re.match(r"https://github\.com/([^/]+)/([^/]+)$", github_url)
+    if m:
+        owner, repo = m.groups()
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/main/SKILL.md"
+
     raise ValueError(
         "无法解析 GitHub URL，请提供 skill 文件夹路径，例如：\n"
         "https://github.com/mattpocock/skills/tree/main/write-a-skill"
