@@ -726,6 +726,56 @@ def complete_from_save(
     }
 
 
+def resolve_tool_bound_tasks(db: Session, skill_id: int) -> bool:
+    """绑定 Tool 后自动完成 memo 中 acceptance_rule.mode == 'tool_bound' 的任务并清除关联 notice。
+
+    返回 True 表示有任务被完成。
+    """
+    memo = db.query(SkillMemo).filter(SkillMemo.skill_id == skill_id).first()
+    if not memo:
+        return False
+
+    payload = copy.deepcopy(memo.memo_payload or {})
+    tasks = payload.get("tasks", [])
+    completed_any = False
+
+    for task in tasks:
+        rule = task.get("acceptance_rule", {})
+        if rule.get("mode") == "tool_bound" and task["status"] != "done":
+            task["status"] = "done"
+            task["completed_at"] = _now_iso()
+            task["completed_by"] = "system"
+            task["result_summary"] = "工具已绑定"
+            completed_any = True
+
+            task_id = task["id"]
+
+            payload.setdefault("progress_log", []).append({
+                "id": _new_id("log"),
+                "task_id": task_id,
+                "kind": "task_completed",
+                "summary": f"已完成{task['title']}（工具绑定触发）",
+                "created_at": _now_iso(),
+            })
+
+            # 清除关联 notice
+            for notice in payload.get("persistent_notices", []):
+                if task_id in notice.get("related_task_ids", []):
+                    notice["status"] = "resolved"
+
+    if not completed_any:
+        return False
+
+    # 选择下一个任务 + 推进生命周期
+    next_task = _pick_next_task(payload)
+    payload["current_task_id"] = next_task["id"] if next_task else None
+    _advance_lifecycle(memo, payload)
+
+    _save_memo_payload(db, memo, payload)
+    memo.status_summary = "工具已绑定。" + (f"下一步：{next_task['title']}" if next_task else "所有编辑任务已完成。")
+    return True
+
+
 def direct_test(db: Session, skill_id: int, user_id: int) -> dict:
     """用户点击"无需完善直接提交测试"。不清除提醒。"""
     memo = db.query(SkillMemo).filter(SkillMemo.skill_id == skill_id).first()

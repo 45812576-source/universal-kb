@@ -826,8 +826,13 @@ def bind_skill_tool(
         return {"ok": True, "message": "Already bound"}
     link = SkillTool(skill_id=skill_id, tool_id=tool_id)
     db.add(link)
+
+    # 自动完成 memo 中 tool_bound 类型任务 + 清除关联 notice
+    from app.services.skill_memo_service import resolve_tool_bound_tasks
+    memo_updated = resolve_tool_bound_tasks(db, skill_id)
+
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "memo_updated": memo_updated}
 
 
 @router.delete("/skill/{skill_id}/tools/{tool_id}")
