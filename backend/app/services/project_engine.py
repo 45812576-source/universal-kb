@@ -150,10 +150,11 @@ class ProjectEngine:
         project,
         plan: dict,
         db: Session,
-    ) -> None:
+    ) -> dict:
         """根据规划方案创建 workspace 并绑定到成员。
 
         M21: 使用 savepoint 包裹，任何步骤失败时整体回滚。
+        返回 {"warnings": [...]} 列表，包含未匹配到的 skill/tool 名称。
         """
         from app.models.workspace import Workspace, WorkspaceSkill, WorkspaceTool, WorkspaceStatus
         from app.models.skill import Skill, SkillStatus
@@ -161,6 +162,7 @@ class ProjectEngine:
         from app.models.project import ProjectMember
 
         workspaces_plan = plan.get("workspaces", [])
+        warnings: list[str] = []
 
         nested = db.begin_nested()  # M21: savepoint
         try:
@@ -195,6 +197,8 @@ class ProjectEngine:
                     ).first()
                     if skill:
                         db.add(WorkspaceSkill(workspace_id=ws.id, skill_id=skill.id))
+                    else:
+                        warnings.append(f"Skill '{skill_name}' 未匹配到已发布的 Skill，已跳过")
 
                 # 绑定推荐 tool（按名称模糊匹配）
                 for tool_name in ws_plan.get("suggested_tools", []):
@@ -204,6 +208,8 @@ class ProjectEngine:
                     ).first()
                     if tool:
                         db.add(WorkspaceTool(workspace_id=ws.id, tool_id=tool.id))
+                    else:
+                        warnings.append(f"Tool '{tool_name}' 未匹配到已激活的工具，已跳过")
 
                 # 创建或更新 ProjectMember
                 member = db.query(ProjectMember).filter(
@@ -227,6 +233,10 @@ class ProjectEngine:
         except Exception:
             nested.rollback()
             raise
+
+        if warnings:
+            logger.warning("apply_plan 未匹配项: %s", "; ".join(warnings))
+        return {"warnings": warnings}
 
     async def sync_context(self, project, db: Session) -> None:
         """为每个项目 workspace 生成进度摘要并存入 project_contexts。"""
@@ -287,7 +297,7 @@ class ProjectEngine:
             ).first()
             if ctx:
                 ctx.summary = summary.strip()
-                ctx.updated_at = datetime.datetime.utcnow()
+                ctx.updated_at = datetime.datetime.now(datetime.UTC)
             else:
                 db.add(ProjectContext(
                     project_id=project.id,
@@ -367,7 +377,7 @@ class ProjectEngine:
             ctx.requirements = requirements
             ctx.acceptance_criteria = acceptance_criteria
             ctx.handoff_status = "submitted"
-            ctx.handoff_at = datetime.datetime.utcnow()
+            ctx.handoff_at = datetime.datetime.now(datetime.UTC)
         else:
             db.add(ProjectContext(
                 project_id=project.id,
@@ -375,7 +385,7 @@ class ProjectEngine:
                 requirements=requirements,
                 acceptance_criteria=acceptance_criteria,
                 handoff_status="submitted",
-                handoff_at=datetime.datetime.utcnow(),
+                handoff_at=datetime.datetime.now(datetime.UTC),
             ))
         db.commit()
 
@@ -626,7 +636,7 @@ class ProjectEngine:
             else:
                 new_content = summary_text
             entry.content = new_content
-            entry.updated_at = datetime.datetime.utcnow()
+            entry.updated_at = datetime.datetime.now(datetime.UTC)
             db.flush()
             # 重新向量化
             try:

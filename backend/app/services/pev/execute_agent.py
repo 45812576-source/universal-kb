@@ -167,24 +167,27 @@ class ExecuteAgent:
                 is_active=True,
             )
             db.add(temp_source)
-            db.commit()
-            db.refresh(temp_source)
+            db.flush()  # 获取 id 但不提交，保持同一事务
 
-            count = await intel_collector.collect_crawler(db, temp_source)
-
-            # M25: 清理临时 IntelSource
             try:
-                db.delete(temp_source)
-                db.commit()
-            except Exception:
-                db.rollback()
-                logger.warning(f"M25: 清理临时 IntelSource {temp_source.id} 失败")
-
-            return {
-                "ok": True,
-                "data": {"new_entries": count, "url": url},
-                "error": None,
-            }
+                count = await intel_collector.collect_crawler(db, temp_source)
+                return {
+                    "ok": True,
+                    "data": {"new_entries": count, "url": url},
+                    "error": None,
+                }
+            finally:
+                # M25: 清理临时 IntelSource（无论成功失败）
+                try:
+                    temp_source_id = temp_source.id
+                    db.rollback()  # 确保 session 干净
+                    stale = db.get(IntelSource, temp_source_id)
+                    if stale:
+                        db.delete(stale)
+                        db.commit()
+                except Exception:
+                    db.rollback()
+                    logger.warning(f"M25: 清理临时 IntelSource {temp_source_id} 失败")
 
     # ── sub_task ──────────────────────────────────────────────────────────────
 
@@ -275,6 +278,7 @@ class ExecuteAgent:
 
             skill_db.add(temp_conv)
             skill_db.flush()
+            temp_conv_id = temp_conv.id  # 记住 id，用于 finally 中重新查找
 
             try:
                 response, meta = await skill_engine.execute(
@@ -287,9 +291,13 @@ class ExecuteAgent:
                     "error": None,
                 }
             finally:
+                # 先 rollback 确保 session 干净，再重新查找删除
                 try:
-                    skill_db.delete(temp_conv)
-                    skill_db.commit()
+                    skill_db.rollback()
+                    stale_conv = skill_db.get(Conversation, temp_conv_id)
+                    if stale_conv:
+                        skill_db.delete(stale_conv)
+                        skill_db.commit()
                 except Exception:
                     skill_db.rollback()
         finally:

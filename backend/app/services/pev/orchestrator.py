@@ -42,7 +42,7 @@ class PEVOrchestrator:
 
         # ─── Phase 1: Planning ────────────────────────────────────────────────
         job.status = PEVJobStatus.PLANNING
-        job.started_at = datetime.datetime.utcnow()
+        job.started_at = datetime.datetime.now(datetime.UTC)
         db.commit()
 
         try:
@@ -53,7 +53,7 @@ class PEVOrchestrator:
                 db=db,
             )
         except Exception as e:
-            for ev in self._fail(db, job, f"计划生成失败: {e}"):
+            async for ev in self._fail(db, job, f"计划生成失败: {e}"):
                 yield ev
             return
 
@@ -62,7 +62,7 @@ class PEVOrchestrator:
         try:
             sorted_steps = topological_sort(raw_steps)
         except ValueError as e:
-            for ev in self._fail(db, job, str(e)):
+            async for ev in self._fail(db, job, str(e)):
                 yield ev
             return
 
@@ -132,7 +132,7 @@ class PEVOrchestrator:
                 # H8: PEV 全局超时检查
                 if _time.monotonic() > _deadline:
                     logger.warning("PEV Job %s 全局超时 (%ds)", job.id, _PEV_GLOBAL_TIMEOUT)
-                    for ev in self._fail(db, job, f"任务执行超时（{_PEV_GLOBAL_TIMEOUT}s）"):
+                    async for ev in self._fail(db, job, f"任务执行超时（{_PEV_GLOBAL_TIMEOUT}s）"):
                         yield ev
                     return
 
@@ -274,7 +274,11 @@ class PEVOrchestrator:
                                 new_sorted = new_raw_steps
 
                             completed_keys = {s.step_key for s in steps if s.status == PEVStepStatus.PASSED}
-                            base_index = step.order_index + 1
+                            from sqlalchemy import func as _sa_func
+                            _max_idx = db.query(_sa_func.max(PEVStep.order_index)).filter(
+                                PEVStep.job_id == job.id
+                            ).scalar() or 0
+                            base_index = _max_idx + 1
                             for idx, s in enumerate(new_sorted):
                                 sk = s.get("step_key", f"replan_step_{idx}")
                                 if sk in completed_keys:
@@ -304,7 +308,7 @@ class PEVOrchestrator:
 
                     if not _replan_triggered:
                         # replan 耗尽或失败 → Job FAILED
-                        for ev in self._fail(db, job, f"步骤 '{step.step_key}' 执行失败且无法恢复"):
+                        async for ev in self._fail(db, job, f"步骤 '{step.step_key}' 执行失败且无法恢复"):
                             yield ev
                         return
 
@@ -323,7 +327,7 @@ class PEVOrchestrator:
 
         # 完成
         job.status = PEVJobStatus.COMPLETED if final_result.get("pass") else PEVJobStatus.FAILED
-        job.finished_at = datetime.datetime.utcnow()
+        job.finished_at = datetime.datetime.now(datetime.UTC)
         db.commit()
 
         yield {
@@ -339,9 +343,9 @@ class PEVOrchestrator:
 
     # ── 辅助：失败终止 ────────────────────────────────────────────────────────
 
-    def _fail(self, db: Session, job: PEVJob, message: str):
-        """将 Job 标记为 FAILED，执行补偿操作，yield 相关事件。"""
-        events = []
+    async def _fail(self, db: Session, job: PEVJob, message: str) -> AsyncIterator[dict]:
+        """将 Job 标记为 FAILED，实际执行补偿操作，yield 相关事件。"""
+        from app.services.tool_executor import tool_executor
 
         # Gap 3: 补偿已完成的步骤（逆序）
         passed_steps = (
@@ -358,9 +362,9 @@ class PEVOrchestrator:
             if not undo_tool:
                 continue
 
-            events.append({"event": "pev_compensation_start", "data": {
+            yield {"event": "pev_compensation_start", "data": {
                 "job_id": job.id, "step_key": step.step_key, "undo_tool": undo_tool,
-            }})
+            }}
 
             # 解析 undo_params_template 中的 $input.X / $result.X 占位符
             undo_params = {}
@@ -375,30 +379,26 @@ class PEVOrchestrator:
                 else:
                     undo_params[k] = v
 
-            # 同步执行补偿（_fail 是 sync，需要 run_coroutine_threadsafe 或简单标记）
-            import asyncio
             try:
-                from app.services.tool_executor import tool_executor
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # 在已有事件循环中，创建 task（但 _fail 是 sync，所以标记为 COMPENSATED 即可）
-                    # 补偿执行由调用方在 async 上下文中处理
-                    pass
-                comp_result = {"ok": True, "note": "compensation_scheduled"}
+                comp_result = await tool_executor.execute_tool(
+                    db=db,
+                    tool_name=undo_tool,
+                    params=undo_params,
+                    user_id=job.user_id,
+                )
             except Exception as e:
                 comp_result = {"ok": False, "error": str(e)}
 
             step.status = PEVStepStatus.COMPENSATED
-            events.append({"event": "pev_compensation_result", "data": {
+            yield {"event": "pev_compensation_result", "data": {
                 "job_id": job.id, "step_key": step.step_key,
                 "undo_tool": undo_tool, "result": comp_result,
-            }})
+            }}
 
         job.status = PEVJobStatus.FAILED
-        job.finished_at = datetime.datetime.utcnow()
+        job.finished_at = datetime.datetime.now(datetime.UTC)
         db.commit()
-        events.append({"event": "pev_error", "data": {"job_id": job.id, "message": message}})
-        return events
+        yield {"event": "pev_error", "data": {"job_id": job.id, "message": message}}
 
     # ── should_upgrade ────────────────────────────────────────────────────────
 
