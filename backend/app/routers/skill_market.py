@@ -167,56 +167,95 @@ def import_skill(
 
 # ─── GitHub import ────────────────────────────────────────────────────────────
 
-def _to_raw_url(github_url: str) -> str:
-    """Convert any GitHub URL pointing to a skill folder or SKILL.md into a raw SKILL.md URL."""
+def _to_raw_base(github_url: str) -> tuple[str, str | None]:
+    """将 GitHub URL 转为 raw.githubusercontent.com 基础路径。
+
+    返回 (base_url, specific_file)：
+    - 如果 URL 指向具体 .md 文件，specific_file 为该文件名
+    - 否则 specific_file 为 None，调用方需要尝试多个候选文件名
+    """
     github_url = github_url.strip().rstrip("/")
 
     # 补全 scheme
     if github_url.startswith("github.com"):
         github_url = "https://" + github_url
 
-    # Already raw
+    # Already raw — 指向具体文件
     if "raw.githubusercontent.com" in github_url:
-        if not github_url.endswith("SKILL.md"):
-            github_url = github_url.rstrip("/") + "/SKILL.md"
-        return github_url
+        if github_url.endswith(".md"):
+            return github_url, github_url.rsplit("/", 1)[-1]
+        return github_url.rstrip("/"), None
 
-    # https://github.com/owner/repo/tree/branch/path  →  raw
+    # https://github.com/owner/repo/blob/branch/path/file.md  →  指向具体文件
+    m = re.match(
+        r"https://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.+)", github_url
+    )
+    if m:
+        owner, repo, branch, path = m.groups()
+        raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
+        return raw, path.rsplit("/", 1)[-1]
+
+    # https://github.com/owner/repo/tree/branch/path  →  文件夹
     m = re.match(
         r"https://github\.com/([^/]+)/([^/]+)/tree/([^/]+)/(.+)", github_url
     )
     if m:
         owner, repo, branch, path = m.groups()
         path = path.rstrip("/")
-        if not path.endswith("SKILL.md"):
-            path = path + "/SKILL.md"
-        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}", None
 
-    # https://github.com/owner/repo/blob/branch/path/SKILL.md  →  raw
-    m = re.match(
-        r"https://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.+)", github_url
-    )
-    if m:
-        owner, repo, branch, path = m.groups()
-        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
-
-    # https://github.com/owner/repo/tree/branch  (branch root, no path)
+    # https://github.com/owner/repo/tree/branch  (branch root)
     m = re.match(
         r"https://github\.com/([^/]+)/([^/]+)/tree/([^/]+)$", github_url
     )
     if m:
         owner, repo, branch = m.groups()
-        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/SKILL.md"
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}", None
 
-    # https://github.com/owner/repo  (bare repo, default to main branch root)
+    # https://github.com/owner/repo  (bare repo)
     m = re.match(r"https://github\.com/([^/]+)/([^/]+)$", github_url)
     if m:
         owner, repo = m.groups()
-        return f"https://raw.githubusercontent.com/{owner}/{repo}/main/SKILL.md"
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/main", None
 
     raise ValueError(
         "无法解析 GitHub URL，请提供 skill 文件夹路径，例如：\n"
         "https://github.com/mattpocock/skills/tree/main/write-a-skill"
+    )
+
+
+# 按优先级尝试的候选文件名
+_CANDIDATE_FILES = ["SKILL.md", "skill.md", "README.md", "readme.md"]
+
+
+def _fetch_skill_content(github_url: str) -> tuple[str, str]:
+    """从 GitHub URL 获取 skill 内容。返回 (raw_url, content)。
+
+    如果 URL 指向具体文件直接获取；否则依次尝试候选文件名。
+    """
+    base_url, specific_file = _to_raw_base(github_url)
+
+    if specific_file:
+        # URL 指向具体文件，直接获取
+        resp = httpx.get(base_url, timeout=15, follow_redirects=True)
+        resp.raise_for_status()
+        return base_url, resp.text
+
+    # 依次尝试候选文件名
+    last_error = None
+    for filename in _CANDIDATE_FILES:
+        url = f"{base_url}/{filename}"
+        try:
+            resp = httpx.get(url, timeout=15, follow_redirects=True)
+            if resp.status_code == 200:
+                return url, resp.text
+        except httpx.HTTPError as e:
+            last_error = e
+
+    raise httpx.HTTPStatusError(
+        f"在 {base_url} 下未找到 skill 文件（已尝试：{', '.join(_CANDIDATE_FILES)}）",
+        request=httpx.Request("GET", base_url),
+        response=httpx.Response(404),
     )
 
 
@@ -270,19 +309,15 @@ def import_from_github(
     user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
 ):
     try:
-        raw_url = _to_raw_url(req.github_url)
+        raw_url, content = _fetch_skill_content(req.github_url)
     except ValueError as e:
         raise HTTPException(400, str(e))
-
-    try:
-        resp = httpx.get(raw_url, timeout=15, follow_redirects=True)
-        resp.raise_for_status()
     except httpx.HTTPStatusError as e:
         raise HTTPException(502, f"GitHub 返回 {e.response.status_code}，请确认 URL 正确且仓库公开")
     except httpx.HTTPError as e:
         raise HTTPException(502, f"网络错误: {e}")
 
-    skill_data = _parse_skill_md(resp.text)
+    skill_data = _parse_skill_md(content)
 
     existing = db.query(Skill).filter(Skill.upstream_url == raw_url).first()
     if existing:
@@ -320,7 +355,7 @@ def import_from_github(
 
 
 def _import_one(raw_url: str, source_url: str, user_id: int, db: Session) -> dict:
-    """Import a single SKILL.md. Returns {name, status: 'ok'|'skipped'|'error', ...}"""
+    """Import a single skill file. Returns {name, status: 'ok'|'skipped'|'error', ...}"""
     try:
         resp = httpx.get(raw_url, timeout=15, follow_redirects=True)
         resp.raise_for_status()
@@ -397,15 +432,24 @@ def import_github_batch(
     results = []
     for entry in entries:
         if entry["type"] == "dir":
-            # Check if SKILL.md exists in this subfolder
-            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{entry['path']}/SKILL.md"
-            result = _import_one(raw_url, url, user.id, db)
-            results.append(result)
-        elif entry["type"] == "file" and entry["name"] == "SKILL.md":
-            # The folder itself is a skill (url pointed directly at a skill folder)
+            # 子文件夹：依次尝试候选文件名
+            base = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{entry['path']}"
+            imported = False
+            for candidate in _CANDIDATE_FILES:
+                raw_url = f"{base}/{candidate}"
+                result = _import_one(raw_url, url, user.id, db)
+                if result["status"] != "error":
+                    results.append(result)
+                    imported = True
+                    break
+            if not imported:
+                results.append({"raw_url": base, "status": "error", "reason": f"未找到 skill 文件（已尝试：{', '.join(_CANDIDATE_FILES)}）"})
+        elif entry["type"] == "file" and entry["name"].lower() in {c.lower() for c in _CANDIDATE_FILES}:
+            # 根目录直接有 skill 文件
             raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{entry['path']}"
             result = _import_one(raw_url, url, user.id, db)
             results.append(result)
+            break  # 根目录只导入一次
 
     ok = [r for r in results if r["status"] == "ok"]
     skipped = [r for r in results if r["status"] == "skipped"]
