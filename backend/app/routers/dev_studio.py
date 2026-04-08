@@ -346,6 +346,17 @@ def ensure_workspace_layout(workdir: str, display_name: str = "") -> tuple[str, 
                     "- **archive/** — 归档内容\n"
                 )
 
+    # symlink: project/.opencode → runtime/config/opencode/
+    # 让 OpenCode 在 cwd(=project/) 下的 .opencode/ 实际指向 runtime 隔离目录
+    oc_link = os.path.join(project_dir, ".opencode")
+    oc_target = os.path.join(runtime_dir, "config", "opencode")
+    os.makedirs(oc_target, exist_ok=True)
+    if not os.path.exists(oc_link):
+        try:
+            os.symlink(oc_target, oc_link)
+        except OSError:
+            pass
+
     return project_dir, runtime_dir
 
 
@@ -1583,6 +1594,7 @@ class SaveToolRequest(BaseModel):
     input_schema: dict = {}
     output_format: str = "text"
     config: dict = {}
+    bind_skill_id: int          # 必须绑定到一个 Skill
 
 
 @router.post("/save-tool")
@@ -1591,6 +1603,11 @@ def save_tool(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    # 校验目标 Skill 存在
+    skill = db.query(Skill).filter(Skill.id == req.bind_skill_id).first()
+    if not skill:
+        raise HTTPException(404, f"绑定目标 Skill (id={req.bind_skill_id}) 不存在")
+
     existing = db.query(ToolRegistry).filter(ToolRegistry.name == req.name).first()
     if existing:
         raise HTTPException(409, f"工具名称 '{req.name}' 已存在")
@@ -1614,9 +1631,15 @@ def save_tool(
         status="draft",
     )
     db.add(tool)
+    db.flush()
+
+    # 创建 SkillTool 绑定
+    binding = SkillTool(skill_id=req.bind_skill_id, tool_id=tool.id)
+    db.add(binding)
+
     db.commit()
     db.refresh(tool)
-    return {"id": tool.id, "name": tool.name, "display_name": tool.display_name}
+    return {"id": tool.id, "name": tool.name, "display_name": tool.display_name, "bound_skill_id": req.bind_skill_id}
 
 
 # ─── Save as Skill ────────────────────────────────────────────────────────────
@@ -1624,7 +1647,8 @@ def save_tool(
 class SaveSkillRequest(BaseModel):
     name: str
     description: str = ""
-    system_prompt: str
+    system_prompt: str = ""
+    source_files: list[str] = []   # 用户选中的文件相对路径
     change_note: str = "由工具开发工作台生成"
 
 
@@ -1634,7 +1658,31 @@ def save_skill(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    # 统一创建为草稿，由用户在 Skills & Tools 页面沙盒测试通过后手动提交发布
+    """整体成果保存为 Skill：支持选择文件包 + 名字 + 描述。"""
+    workdir = _user_workdir(user)
+
+    # 读取选中文件的内容，存入 source_files JSON
+    file_entries: list[dict] = []
+    for rel_path in (req.source_files or []):
+        abs_path = _safe_path(workdir, rel_path)
+        if os.path.isfile(abs_path):
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read(500_000)  # 单文件最大 500KB
+                file_entries.append({"path": rel_path, "content": content})
+            except OSError:
+                file_entries.append({"path": rel_path, "content": ""})
+
+    # 如果 system_prompt 为空，尝试从第一个 .md 文件提取
+    system_prompt = req.system_prompt.strip()
+    if not system_prompt:
+        for entry in file_entries:
+            if entry["path"].endswith(".md") and entry["content"].strip():
+                system_prompt = entry["content"]
+                break
+    if not system_prompt:
+        raise HTTPException(400, "system_prompt 不能为空，且未找到可用的 .md 文件")
+
     skill = Skill(
         name=req.name,
         description=req.description,
@@ -1644,6 +1692,7 @@ def save_skill(
         status=SkillStatus.DRAFT,
         auto_inject=True,
         source_type="local",
+        source_files=file_entries if file_entries else None,
     )
     db.add(skill)
     db.flush()
@@ -1651,7 +1700,7 @@ def save_skill(
     version = SkillVersion(
         skill_id=skill.id,
         version=1,
-        system_prompt=req.system_prompt,
+        system_prompt=system_prompt,
         change_note=req.change_note,
         created_by=user.id,
     )
