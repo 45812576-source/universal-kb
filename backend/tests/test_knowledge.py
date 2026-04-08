@@ -86,8 +86,7 @@ def test_employee_cannot_see_other_pending_entries(client, db):
 
 
 def test_super_admin_sees_own_and_approved_entries(client, db):
-    """个人工作台视图：SUPER_ADMIN 也只看到自己创建的 + 已审批的，
-    全局查看走 knowledge_admin / knowledge_governance 路由。"""
+    """SUPER_ADMIN 可见全部知识（与 _can_view_entry 语义一致）。"""
     dept = _make_dept(db)
     admin = _make_user(db, "kadmin3", Role.SUPER_ADMIN, dept.id)
     emp = _make_user(db, "kemp5", Role.EMPLOYEE, dept.id)
@@ -104,8 +103,8 @@ def test_super_admin_sees_own_and_approved_entries(client, db):
     titles = [e["title"] for e in resp.json()]
     # admin 能看到自己创建的
     assert "管理员经验" in titles
-    # 别人的 pending 在个人工作台不可见
-    assert "待审经验" not in titles
+    # super_admin 能看到所有人的所有状态
+    assert "待审经验" in titles
 
 
 def test_list_knowledge_filter_by_category(client, db):
