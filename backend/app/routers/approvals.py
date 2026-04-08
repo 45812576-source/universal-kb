@@ -203,6 +203,7 @@ class ApprovalRequestCreate(BaseModel):
     request_type: str
     target_id: Optional[int] = None
     target_type: Optional[str] = None
+    reason: Optional[str] = None
 
 
 class ApprovalActionCreate(BaseModel):
@@ -247,6 +248,26 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
                     for t in list(skill.bound_tools)
                 ],
             }
+            # 版本 diff：查上一版 system_prompt
+            if latest_ver and latest_ver.version > 1:
+                prev_ver = (
+                    db.query(SkillVersion)
+                    .filter(
+                        SkillVersion.skill_id == skill.id,
+                        SkillVersion.version == latest_ver.version - 1,
+                    )
+                    .first()
+                )
+                if prev_ver:
+                    target_detail["prev_system_prompt"] = prev_ver.system_prompt or ""
+                    target_detail["prev_version"] = prev_ver.version
+            # 所有权转让：从 conditions 提取 new_owner
+            if r.request_type == ApprovalRequestType.SKILL_OWNERSHIP_TRANSFER and r.conditions:
+                for cond in r.conditions:
+                    if isinstance(cond, dict) and cond.get("new_owner_id"):
+                        new_owner = db.get(User, cond["new_owner_id"])
+                        if new_owner:
+                            target_detail["new_owner_name"] = new_owner.display_name
     elif r.target_type == "tool" and r.target_id:
         from app.models.tool import ToolRegistry
         tool = db.get(ToolRegistry, r.target_id)
@@ -271,11 +292,15 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
         from app.models.web_app import WebApp
         webapp = db.get(WebApp, r.target_id)
         if webapp:
+            creator = db.get(User, webapp.created_by) if webapp.created_by else None
             target_detail = {
                 "name": webapp.name,
                 "description": webapp.description or "",
                 "is_public": webapp.is_public,
                 "preview_url": f"/api/web-apps/{webapp.id}/preview",
+                "html_code": (webapp.html_code or "")[:3000],
+                "creator_name": creator.display_name if creator else None,
+                "status": webapp.status,
             }
     elif r.target_type == "knowledge" and r.target_id:
         from app.models.knowledge import KnowledgeEntry
@@ -284,7 +309,8 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
             target_detail = {
                 "name": entry.ai_title or entry.title,
                 "title": entry.title,
-                "content": (entry.content or "")[:500],
+                "content": entry.content or "",
+                "entry_id": entry.id,
                 "category": entry.category,
                 "file_ext": entry.file_ext,
                 "source_file": entry.source_file,
@@ -296,6 +322,13 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
                 "auto_review_note": entry.auto_review_note,
             }
 
+    # 从 conditions 提取 reason
+    reason = None
+    for cond in (r.conditions or []):
+        if isinstance(cond, dict) and cond.get("reason"):
+            reason = cond["reason"]
+            break
+
     return {
         "id": r.id,
         "request_type": r.request_type,
@@ -306,6 +339,7 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
         "requester_name": r.requester.display_name if r.requester else None,
         "status": r.status,
         "stage": getattr(r, "stage", None),
+        "reason": reason,
         "conditions": r.conditions or [],
         "security_scan_result": getattr(r, "security_scan_result", None),
         "dept_approved_policy": getattr(r, "dept_approved_policy", None),
@@ -526,12 +560,16 @@ def create_approval(
     user: User = Depends(get_current_user),
 ):
     """发起审批申请"""
+    conditions = None
+    if req.reason:
+        conditions = [{"reason": req.reason}]
     r = ApprovalRequest(
         request_type=req.request_type,
         target_id=req.target_id,
         target_type=req.target_type,
         requester_id=user.id,
         status=ApprovalStatus.PENDING,
+        conditions=conditions,
     )
     db.add(r)
     db.commit()

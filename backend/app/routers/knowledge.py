@@ -2208,9 +2208,14 @@ def check_edit_permission(
     }
 
 
+class _EditPermissionBody(BaseModel):
+    reason: Optional[str] = None
+
+
 @router.post("/{kid}/request-edit")
 def request_edit_permission(
     kid: int,
+    body: _EditPermissionBody = _EditPermissionBody(),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -2238,6 +2243,10 @@ def request_edit_permission(
     if existing:
         raise HTTPException(400, "已有待审批的申请")
 
+    conditions = None
+    if body.reason:
+        conditions = [{"reason": body.reason}]
+
     r = ApprovalRequest(
         request_type=ApprovalRequestType.KNOWLEDGE_EDIT,
         target_id=kid,
@@ -2245,6 +2254,7 @@ def request_edit_permission(
         requester_id=user.id,
         status=ApprovalStatus.PENDING,
         stage="owner_pending",
+        conditions=conditions,
     )
     db.add(r)
     db.commit()
