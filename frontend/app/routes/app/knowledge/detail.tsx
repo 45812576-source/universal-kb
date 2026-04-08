@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Link, useLoaderData, useFetcher } from "react-router";
 import type { Route } from "./+types/detail";
 import { requireUser } from "~/lib/auth.server";
@@ -50,6 +50,10 @@ export async function action({ params, request }: Route.ActionArgs) {
   if (intent === "retry-render") {
     await apiFetch(`/api/knowledge/${params.id}/retry-render`, { method: "POST", token });
   }
+  if (intent === "download") {
+    const result = await apiFetch(`/api/knowledge/${params.id}/file-url`, { token });
+    return { download_url: result.url };
+  }
   return null;
 }
 
@@ -63,7 +67,16 @@ const RENDER_LABELS: Record<string, { label: string; color: string; desc: string
 export default function KnowledgeDetail() {
   const { entry, error } = useLoaderData<typeof loader>() as { entry: EntryDetail | null; error: string };
   const fetcher = useFetcher();
+  const downloadFetcher = useFetcher();
   const [tab, setTab] = useState<"content" | "ai_notes">("content");
+
+  // 下载：fetcher 返回签名 URL 后自动打开
+  useEffect(() => {
+    const data = downloadFetcher.data as { download_url?: string } | null;
+    if (data?.download_url) {
+      window.open(data.download_url, "_blank");
+    }
+  }, [downloadFetcher.data]);
 
   if (error || !entry) {
     return (
@@ -129,12 +142,16 @@ export default function KnowledgeDetail() {
               </a>
             )}
             {entry.oss_key && (
-              <a
-                href={`/api/knowledge/${entry.id}/download`}
-                className="text-[10px] font-bold uppercase px-3 py-1.5 border-2 border-[#1A202C] bg-white text-[#1A202C] hover:bg-[#EBF4F7] transition-colors"
-              >
-                下载原文件
-              </a>
+              <downloadFetcher.Form method="post">
+                <button
+                  name="intent"
+                  value="download"
+                  disabled={downloadFetcher.state !== "idle"}
+                  className="text-[10px] font-bold uppercase px-3 py-1.5 border-2 border-[#1A202C] bg-white text-[#1A202C] hover:bg-[#EBF4F7] transition-colors disabled:opacity-50"
+                >
+                  {downloadFetcher.state !== "idle" ? "准备中..." : "下载原文件"}
+                </button>
+              </downloadFetcher.Form>
             )}
           </div>
         </div>
@@ -170,7 +187,7 @@ export default function KnowledgeDetail() {
         {isReadyButEmpty && (
           <div className="mb-4 border-2 border-orange-400 bg-orange-50 px-4 py-3 text-xs font-bold text-orange-600">
             文档转换完成但正文为空 — 可能是格式不支持或内容提取失败。
-            {entry.oss_key && <span> 请<a href={`/api/knowledge/${entry.id}/download`} className="underline">下载原文件</a>查看。</span>}
+            {entry.oss_key && <span> 请<button onClick={() => downloadFetcher.submit({ intent: "download" }, { method: "POST" })} className="underline">下载原文件</button>查看。</span>}
             {isLark && entry.lark_doc_url && <span> 或<a href={entry.lark_doc_url} target="_blank" rel="noopener" className="underline">在飞书中打开</a>。</span>}
           </div>
         )}
@@ -216,9 +233,12 @@ export default function KnowledgeDetail() {
               <div className="text-center py-12">
                 <p className="text-xs font-bold uppercase text-gray-400">暂无可显示内容</p>
                 {entry.oss_key && (
-                  <a href={`/api/knowledge/${entry.id}/download`} className="mt-2 inline-block text-[10px] font-bold uppercase text-[#00A3C4] hover:underline">
+                  <button
+                    onClick={() => downloadFetcher.submit({ intent: "download" }, { method: "POST" })}
+                    className="mt-2 inline-block text-[10px] font-bold uppercase text-[#00A3C4] hover:underline"
+                  >
                     下载原文件查看
-                  </a>
+                  </button>
                 )}
               </div>
             )}
