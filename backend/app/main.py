@@ -230,12 +230,16 @@ async def startup_event():
         # 知识处理 Job Worker：每 30 秒扫一次 queued 的 render/classify 任务
         from app.services.knowledge_worker import (
             process_knowledge_jobs,
+            recover_stuck_jobs,
             backfill_unclassified,
             backfill_ungoverned,
             backfill_ungoverned_tables,
             backfill_failed_renders,
             backfill_missing_ai_notes,
+            backfill_ununderstood,
         )
+        # 每 2 分钟回收超时 stuck job（必须在 process 之前执行）
+        upstream_scheduler.add_job(recover_stuck_jobs, "interval", minutes=2, id="knowledge_recover_stuck")
         upstream_scheduler.add_job(process_knowledge_jobs, "interval", seconds=30, id="knowledge_job_worker")
         # 每 10 分钟补偿未分类条目
         upstream_scheduler.add_job(backfill_unclassified, "interval", minutes=10, id="knowledge_backfill_classify")
@@ -243,6 +247,8 @@ async def startup_event():
         upstream_scheduler.add_job(backfill_failed_renders, "interval", minutes=10, id="knowledge_backfill_render")
         # 每 10 分钟补偿缺失 AI 笔记的条目
         upstream_scheduler.add_job(backfill_missing_ai_notes, "interval", minutes=10, id="knowledge_backfill_ai_notes")
+        # 每 10 分钟补偿未理解条目
+        upstream_scheduler.add_job(backfill_ununderstood, "interval", minutes=10, id="knowledge_backfill_understand")
         # 每 10 分钟补齐未治理条目
         upstream_scheduler.add_job(backfill_ungoverned, "interval", minutes=10, id="knowledge_backfill_governance")
         # 每 10 分钟补齐未治理数据表

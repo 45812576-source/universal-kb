@@ -257,6 +257,9 @@ class LarkDocImporter:
         except Exception as e:
             logger.warning(f"Auto-classification failed for lark doc: {e}")
 
+        # 后台 job 队列
+        self._enqueue_jobs(db, entry)
+
         # 审核流程
         entry = submit_knowledge(db, entry)
         return entry
@@ -349,6 +352,8 @@ class LarkDocImporter:
             except Exception as e:
                 logger.warning(f"Auto-classification failed for lark file: {e}")
 
+        self._enqueue_jobs(db, entry)
+
         entry = submit_knowledge(db, entry)
         return entry
 
@@ -434,10 +439,25 @@ class LarkDocImporter:
         if content:
             await self._ai_enrich(entry, content, url, None, title, db)
 
+        # 策略C 也入 job 队列（understand/governance_classify）
+        self._enqueue_jobs(db, entry)
+
         entry = submit_knowledge(db, entry)
         return entry
 
     # ── 公共工具方法 ─────────────────────────────────────────────────────
+
+    def _enqueue_jobs(self, db, entry: KnowledgeEntry):
+        """为飞书导入的 entry 创建后台处理 job（understand/ai_notes/governance_classify）。"""
+        try:
+            from app.models.knowledge_job import KnowledgeJob
+            if entry.content:
+                db.add(KnowledgeJob(knowledge_id=entry.id, job_type="understand", trigger_source="lark_import"))
+                db.add(KnowledgeJob(knowledge_id=entry.id, job_type="ai_notes", trigger_source="lark_import"))
+                entry.ai_notes_status = "pending"
+            db.add(KnowledgeJob(knowledge_id=entry.id, job_type="governance_classify", trigger_source="lark_import"))
+        except Exception as e:
+            logger.warning(f"Failed to enqueue jobs for lark entry {entry.id}: {e}")
 
     def _build_entry(
         self, db, user, url, token, api_type, title, wiki_title, folder_id, category,
@@ -446,6 +466,10 @@ class LarkDocImporter:
     ) -> KnowledgeEntry:
         """构建 KnowledgeEntry 对象。"""
         import datetime
+
+        # 有 content_html 才标记 ready，否则 failed
+        render_status = "ready" if content_html else "failed"
+        render_error = None if content_html else "导入后未能生成可渲染内容"
 
         return KnowledgeEntry(
             title=title or wiki_title or f"飞书文档导入 {token[:8]}",
@@ -468,8 +492,9 @@ class LarkDocImporter:
             lark_sync_interval=0,
             lark_last_synced_at=int(time.time()),
             external_edit_mode="detached_copy",
-            doc_render_status="ready",
-            doc_render_mode=doc_render_mode,
+            doc_render_status=render_status,
+            doc_render_mode=doc_render_mode if content_html else None,
+            doc_render_error=render_error,
             last_rendered_at=datetime.datetime.utcnow(),
             source_uri=url,
             sync_status="ok",

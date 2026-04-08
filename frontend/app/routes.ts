@@ -28,6 +28,7 @@ export default [
 
     // Knowledge Management
     route("knowledge/my", "routes/app/knowledge/my.tsx"),
+    route("knowledge/:id", "routes/app/knowledge/detail.tsx"),
     // knowledge/new now redirects to knowledge/my (form is inline)
     route("knowledge/new", "routes/app/knowledge/new.tsx"),
 

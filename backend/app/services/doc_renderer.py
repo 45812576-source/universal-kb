@@ -98,9 +98,22 @@ def render_entry(db: Session, entry_id: int) -> dict:
             if ext in ONLYOFFICE_EXTS or (ext == ".pdf" and entry.docx_oss_key):
                 entry.doc_render_status = "ready"
                 entry.doc_render_mode = "onlyoffice"
+            elif entry.content:
+                # 有纯文本但无法转 HTML，生成 fallback
+                fallback = render_from_content(entry.content, ext)
+                if fallback:
+                    entry.content_html = fallback
+                    entry.doc_render_status = "ready"
+                    entry.doc_render_mode = "text_fallback"
+                else:
+                    entry.doc_render_status = "failed"
+                    entry.doc_render_error = "无法生成可渲染内容"
+                    entry.doc_render_mode = None
             else:
-                entry.doc_render_status = "ready"
-                entry.doc_render_mode = "text_fallback"
+                # 既无 HTML 也无纯文本 — 真正的失败
+                entry.doc_render_status = "failed"
+                entry.doc_render_error = "文件内容为空，无法渲染"
+                entry.doc_render_mode = None
 
         _update_phase("persisting")
         entry.doc_render_error = None
@@ -150,9 +163,18 @@ def render_from_path(db: Session, entry: KnowledgeEntry, file_path: str) -> None
         elif ext in ONLYOFFICE_EXTS or ext == ".pdf":
             entry.doc_render_status = "ready"
             entry.doc_render_mode = "onlyoffice"
+        elif entry.content:
+            fallback = render_from_content(entry.content, ext)
+            if fallback:
+                entry.content_html = fallback
+                entry.doc_render_status = "ready"
+                entry.doc_render_mode = "text_fallback"
+            else:
+                entry.doc_render_status = "failed"
+                entry.doc_render_error = "无法生成可渲染内容"
         else:
-            entry.doc_render_status = "ready"
-            entry.doc_render_mode = "text_fallback"
+            entry.doc_render_status = "failed"
+            entry.doc_render_error = "文件内容为空，无法渲染"
 
         entry.doc_render_error = None
         entry.last_rendered_at = utcnow()

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { data, redirect, useActionData, useLoaderData, useNavigation, useSearchParams } from "react-router";
+import { data, redirect, useActionData, useLoaderData, useNavigation, useSearchParams, Link } from "react-router";
 import { Form } from "react-router";
 import type { Route } from "./+types/my";
 import { requireUser } from "~/lib/auth.server";
@@ -14,8 +14,17 @@ export async function loader({ request }: Route.LoaderArgs) {
   const params = new URLSearchParams();
   if (source_type) params.set("source_type", source_type);
   if (status) params.set("status", status);
-  const entries = await apiFetch(`/api/knowledge${params.toString() ? "?" + params : ""}`, { token });
-  return { entries, source_type, status };
+
+  // 容错：entries 加载失败不白屏
+  let entries: KnowledgeEntry[] = [];
+  let loadError = "";
+  try {
+    entries = await apiFetch(`/api/knowledge${params.toString() ? "?" + params : ""}`, { token });
+  } catch (e) {
+    loadError = e instanceof ApiError ? e.message : "加载知识列表失败";
+  }
+
+  return { entries, source_type, status, loadError };
 }
 
 export async function action({ request }: Route.ActionArgs) {
@@ -79,6 +88,7 @@ const SOURCE_LABELS: Record<string, string> = {
   auto_collected: "自动采集",
   chat_output: "对话产出",
   chat_upload: "对话上传",
+  lark_doc: "飞书导入",
 };
 
 const CATEGORY_LABELS: Record<string, string> = {
@@ -390,11 +400,19 @@ function CollabPanel({ entryId, onClose }: { entryId: number; onClose: () => voi
   );
 }
 
+const RENDER_STATUS_INFO: Record<string, { label: string; color: string }> = {
+  pending:    { label: "转换中", color: "bg-yellow-100 text-yellow-700 border-yellow-400" },
+  processing: { label: "转换中", color: "bg-yellow-100 text-yellow-700 border-yellow-400" },
+  ready:      { label: "可查看", color: "bg-green-100 text-green-700 border-green-400" },
+  failed:     { label: "转换失败", color: "bg-red-100 text-red-600 border-red-400" },
+};
+
 export default function MyKnowledge() {
-  const { entries, source_type, status } = useLoaderData<typeof loader>() as {
+  const { entries, source_type, status, loadError } = useLoaderData<typeof loader>() as {
     entries: KnowledgeEntry[];
     source_type: string;
     status: string;
+    loadError: string;
   };
   const [searchParams] = useSearchParams();
   const justSubmitted = searchParams.get("submitted");
@@ -403,7 +421,7 @@ export default function MyKnowledge() {
   const [copiedId, setCopiedId] = useState<number | null>(null);
 
   const handleCopyLink = (entryId: number) => {
-    const url = `${window.location.origin}/knowledge/my?entry=${entryId}`;
+    const url = `${window.location.origin}/knowledge/${entryId}`;
     navigator.clipboard.writeText(url).then(() => {
       setCopiedId(entryId);
       setTimeout(() => setCopiedId(null), 2000);
@@ -432,6 +450,11 @@ export default function MyKnowledge() {
       </div>
 
       <div className="p-6 max-w-5xl">
+        {loadError && (
+          <div className="mb-4 border-2 border-red-400 bg-red-50 px-4 py-3 text-xs font-bold text-red-600 uppercase">
+            [ERROR] {loadError}
+          </div>
+        )}
         {justSubmitted && (
           <div className="mb-4 border-2 border-[#00D1FF] bg-[#CCF2FF]/30 px-4 py-3 text-xs font-bold text-[#00A3C4] uppercase">
             [OK] 提交成功！已进入审核队列，管理员审核后将自动入库。
@@ -454,6 +477,7 @@ export default function MyKnowledge() {
             <option value="chat_output">对话产出</option>
             <option value="chat_upload">对话上传</option>
             <option value="auto_collected">自动采集</option>
+            <option value="lark_doc">飞书导入</option>
           </select>
           <select
             name="status"
@@ -510,8 +534,31 @@ export default function MyKnowledge() {
                 return (
                   <tr key={e.id} className="hover:bg-[#F0F4F8] transition-colors">
                     <td className="py-3 px-4">
-                      <div className="text-xs font-bold text-[#1A202C] truncate max-w-xs">{e.title}</div>
-                      <div className="text-[10px] text-gray-400 mt-0.5 truncate max-w-xs">{e.content}</div>
+                      <Link to={`/knowledge/${e.id}`} className="text-xs font-bold text-[#1A202C] hover:text-[#00A3C4] truncate max-w-xs block">{e.ai_title || e.title}</Link>
+                      <div className="text-[10px] text-gray-400 mt-0.5 truncate max-w-xs">{e.ai_summary || e.content}</div>
+                      <div className="flex items-center gap-1.5 mt-1">
+                        {e.doc_render_status && (() => {
+                          const ri = RENDER_STATUS_INFO[e.doc_render_status];
+                          return ri ? (
+                            <span className={`inline-block border px-1 py-0.5 text-[8px] font-bold uppercase ${ri.color}`} title={e.doc_render_error || ""}>
+                              {ri.label}
+                            </span>
+                          ) : null;
+                        })()}
+                        {e.source_type === "lark_doc" && e.lark_doc_url && (
+                          <a href={e.lark_doc_url} target="_blank" rel="noopener" className="text-[8px] font-bold text-[#3370ff] hover:underline uppercase">
+                            飞书原文
+                          </a>
+                        )}
+                        {e.doc_render_status === "failed" && e.can_retry_render && (
+                          <button
+                            onClick={() => fetch(`/api/knowledge/${e.id}/retry-render`, { method: "POST" })}
+                            className="text-[8px] font-bold text-orange-500 hover:underline uppercase"
+                          >
+                            重试转换
+                          </button>
+                        )}
+                      </div>
                     </td>
                     <td className="py-3 px-4 text-[10px] font-bold uppercase text-gray-500">
                       {CATEGORY_LABELS[e.category] || e.category}

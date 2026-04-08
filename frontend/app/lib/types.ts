@@ -121,6 +121,7 @@ export interface KnowledgeEntry {
   platform_tags: string[];
   topic_tags: string[];
   source_type: string;
+  source_file: string | null;
   capture_mode: string;
   review_level: number;
   review_level_label: string;
@@ -129,6 +130,35 @@ export interface KnowledgeEntry {
   sensitivity_flags: string[];
   auto_review_note: string | null;
   created_at: string;
+  // 文件/OSS
+  oss_key: string | null;
+  file_type: string | null;
+  file_ext: string | null;
+  file_size: number | null;
+  // 文档渲染
+  doc_render_status: "pending" | "processing" | "ready" | "failed" | null;
+  doc_render_error: string | null;
+  doc_render_mode: string | null;
+  can_retry_render: boolean;
+  // AI
+  ai_title: string | null;
+  ai_summary: string | null;
+  ai_notes_status: string | null;
+  ai_notes_error: string | null;
+  // 飞书
+  lark_doc_url: string | null;
+  lark_doc_token: string | null;
+  external_edit_mode: string | null;
+  source_origin_label: string | null;
+  can_refresh_from_source: boolean;
+  // 文件夹/可见性
+  folder_id: number | null;
+  folder_name: string | null;
+  folder_missing: boolean;
+  is_in_my_knowledge: boolean;
+  visibility_scope: { scope: string; reason: string } | null;
+  // OnlyOffice
+  can_open_onlyoffice: boolean;
 }
 
 export interface ModelConfig {

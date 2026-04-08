@@ -214,6 +214,40 @@ def _run_governance_classify_job(db: Session, job: KnowledgeJob, entry: Knowledg
             job.status = "queued"
 
 
+def recover_stuck_jobs():
+    """回收超时的 running job：超过 10 分钟仍为 running 的标记为 failed 或放回 queued。
+
+    由 scheduler 在 process_knowledge_jobs 前调用，防止死锁。
+    """
+    db = SessionLocal()
+    try:
+        cutoff = datetime.datetime.utcnow() - datetime.timedelta(minutes=10)
+        stuck = (
+            db.query(KnowledgeJob)
+            .filter(
+                KnowledgeJob.status == "running",
+                KnowledgeJob.started_at < cutoff,
+            )
+            .all()
+        )
+        if not stuck:
+            return
+        logger.warning(f"[KnowledgeWorker] recovering {len(stuck)} stuck running jobs")
+        for job in stuck:
+            if job.attempt_count >= job.max_attempts:
+                job.status = "failed"
+                job.error_message = (job.error_message or "") + " [auto-recovered: stuck >10min]"
+            else:
+                job.status = "queued"
+                job.error_message = (job.error_message or "") + " [auto-recovered: stuck >10min, will retry]"
+            job.finished_at = datetime.datetime.utcnow()
+        db.commit()
+    except Exception:
+        logger.exception("[KnowledgeWorker] stuck job recovery error")
+    finally:
+        db.close()
+
+
 def process_knowledge_jobs():
     """扫描并执行一批 queued 的 knowledge jobs。由 scheduler 周期调用。"""
     db = SessionLocal()
