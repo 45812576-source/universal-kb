@@ -1601,6 +1601,11 @@ def review_knowledge(
         .first()
     )
     if not approval:
+        try:
+            from app.services.approval_templates import get_auto_evidence
+            auto_ep = get_auto_evidence("knowledge_review", "knowledge", kid, db)
+        except Exception:
+            auto_ep = None
         approval = ApprovalRequest(
             request_type=ApprovalRequestType.KNOWLEDGE_REVIEW,
             target_id=kid,
@@ -1608,6 +1613,7 @@ def review_knowledge(
             requester_id=entry.created_by,
             status=ApprovalStatus.PENDING,
             stage="dept_pending",
+            evidence_pack=auto_ep if auto_ep else None,
         )
         db.add(approval)
         db.flush()
@@ -2250,6 +2256,11 @@ def request_edit_permission(
     if body.reason:
         conditions = [{"reason": body.reason}]
 
+    try:
+        from app.services.approval_templates import get_auto_evidence
+        auto_ep = get_auto_evidence("knowledge_edit", "knowledge", kid, db)
+    except Exception:
+        auto_ep = None
     r = ApprovalRequest(
         request_type=ApprovalRequestType.KNOWLEDGE_EDIT,
         target_id=kid,
@@ -2258,6 +2269,7 @@ def request_edit_permission(
         status=ApprovalStatus.PENDING,
         stage="owner_pending",
         conditions=conditions,
+        evidence_pack=auto_ep if auto_ep else None,
     )
     db.add(r)
     db.commit()

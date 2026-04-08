@@ -340,18 +340,19 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
             break
 
     # V2: 模板 + 证据完整性
-    from app.services.approval_templates import get_template, check_evidence_completeness
+    from app.services.approval_templates import get_template, check_evidence_completeness, is_high_risk_type
     request_type_str = r.request_type.value if hasattr(r.request_type, "value") else str(r.request_type)
     review_template = get_template(request_type_str)
     ep = getattr(r, "evidence_pack", None)
     missing = check_evidence_completeness(request_type_str, ep)
+    high_risk = is_high_risk_type(request_type_str)
 
     # Fix 3: 提取最近一次 request_more_info 的内容
     needs_info_comment = None
     stage_val = getattr(r, "stage", None)
     if stage_val == "needs_info" and r.actions:
         for act in reversed(r.actions):
-            if act.action == ApprovalActionType.REQUEST_MORE_INFO and not (act.comment or "").startswith("[补充证据]"):
+            if act.action == ApprovalActionType.REQUEST_MORE_INFO:
                 needs_info_comment = act.comment
                 break
 
@@ -379,6 +380,8 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
         "review_template": review_template,
         "evidence_complete": len(missing) == 0,
         "missing_evidence": missing,
+        "is_high_risk": high_risk,
+        "approve_blocked": high_risk and len(missing) > 0,  # 高风险+缺证据=硬阻断
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "actions": [
             {
@@ -615,7 +618,7 @@ def create_approval(
     user: User = Depends(get_current_user),
 ):
     """发起审批申请"""
-    from app.services.approval_templates import get_auto_evidence, check_evidence_completeness
+    from app.services.approval_templates import get_auto_evidence, check_evidence_completeness, is_high_risk_type
 
     conditions = None
     if req.reason:
@@ -628,6 +631,12 @@ def create_approval(
     # 校验证据完整性（缺必填项返回 400）
     missing = check_evidence_completeness(req.request_type, merged_evidence)
     if missing:
+        if is_high_risk_type(req.request_type):
+            raise HTTPException(
+                400,
+                f"高风险类型 [{req.request_type}] 创建审批失败：缺少 {len(missing)} 项必填证据 ({', '.join(missing)})。"
+                f"高风险审批不接受占位数据，请先准备好全部真实证据再提交。"
+            )
         raise HTTPException(400, f"证据包缺少必填项: {', '.join(missing)}")
 
     r = ApprovalRequest(
@@ -686,10 +695,17 @@ async def act_on_approval(
 
     # 审批通过前校验证据完整性
     if req.action in ("approve", "approve_with_conditions"):
-        from app.services.approval_templates import check_evidence_completeness, get_template
+        from app.services.approval_templates import check_evidence_completeness, get_template, is_high_risk_type
         request_type_str = r.request_type.value if hasattr(r.request_type, "value") else str(r.request_type)
         missing = check_evidence_completeness(request_type_str, getattr(r, "evidence_pack", None))
         if missing:
+            high_risk = is_high_risk_type(request_type_str)
+            if high_risk:
+                raise HTTPException(
+                    400,
+                    f"高风险类型 [{request_type_str}] 缺少 {len(missing)} 项必填证据: {', '.join(missing)}。"
+                    f"高风险审批必须提供全部真实证据，不接受占位数据。请通知申请人补齐后重新提交。"
+                )
             raise HTTPException(400, f"证据包缺少必填项，无法通过: {', '.join(missing)}")
 
         # Fix 2: 审批清单硬约束 — 所有清单项必须已确认
@@ -705,6 +721,39 @@ async def act_on_approval(
                 raise HTTPException(400, f"审批清单有 {len(rejected_items)} 项未通过，无法批准。请选择驳回或要求补充信息")
             if need_info_items:
                 raise HTTPException(400, f"审批清单有 {len(need_info_items)} 项待补充，无法批准。请选择要求补充信息")
+
+        # ── 第三层：类型专属闸门 ──
+        ep = getattr(r, "evidence_pack", None) or {}
+        from app.services.approval_templates import _is_real_evidence
+
+        # Skill 发布：必须有沙盒测试报告（已在下方单独校验）
+        # 数据安全/权限类：必须有真实影响分析
+        if r.request_type in (
+            ApprovalRequestType.SCOPE_CHANGE, ApprovalRequestType.MASK_OVERRIDE,
+            ApprovalRequestType.SCHEMA_APPROVAL, ApprovalRequestType.EXPORT_SENSITIVE,
+            ApprovalRequestType.ELEVATE_DISCLOSURE, ApprovalRequestType.GRANT_ACCESS,
+            ApprovalRequestType.POLICY_CHANGE, ApprovalRequestType.FIELD_SENSITIVITY_CHANGE,
+            ApprovalRequestType.SMALL_SAMPLE_CHANGE,
+        ):
+            impact_keys = {"impact_analysis", "impact_assessment", "cascade_impact",
+                           "privacy_impact", "protection_weakening_assessment"}
+            has_impact = any(_is_real_evidence(ep.get(k)) for k in impact_keys if k in ep)
+            if not has_impact:
+                raise HTTPException(400, "数据安全/权限类审批必须包含真实影响分析证据，不能凭空通过")
+
+        # WebApp 发布：必须有测试结果和回滚方案
+        if r.request_type == ApprovalRequestType.WEBAPP_PUBLISH:
+            if not _is_real_evidence(ep.get("test_result")):
+                raise HTTPException(400, "WebApp 发布审批必须包含功能测试结果")
+            if not _is_real_evidence(ep.get("rollback_plan")):
+                raise HTTPException(400, "WebApp 发布审批必须包含回滚方案")
+
+        # 知识审核：必须有来源信息和敏感判断
+        if r.request_type == ApprovalRequestType.KNOWLEDGE_REVIEW:
+            if not _is_real_evidence(ep.get("source_info")):
+                raise HTTPException(400, "知识审核必须包含来源信息")
+            if not _is_real_evidence(ep.get("sensitivity_check")):
+                raise HTTPException(400, "知识审核必须包含敏感检查结果")
 
     # request_more_info 校验：至少需要 comment 说明需要什么
     if req.action == "request_more_info" and not req.comment:
@@ -1018,6 +1067,8 @@ async def act_on_approval(
         # ── 条件下沉到执行层 ──
         scope_limit_cond = next((c for c in req.conditions if c["type"] == "scope_limit"), None)
         effective_until_cond = next((c for c in req.conditions if c["type"] == "effective_until"), None)
+        followup_cond = next((c for c in req.conditions if c["type"] == "requires_followup_review"), None)
+        allowed_targets_cond = next((c for c in req.conditions if c["type"] == "allowed_targets"), None)
 
         # 驱动发布
         if r.target_type == "skill" and r.target_id:
@@ -1034,12 +1085,15 @@ async def act_on_approval(
                 _apply_scan_policy(r.target_id, r, user, db)
                 from app.routers.skills import _cascade_tool_status_on_publish
                 _cascade_tool_status_on_publish(r.target_id, db)
-                # effective_until 执行：写入 Skill 的 conditions_meta
+                # effective_until 执行：写入条件元数据
+                conditions_meta = skill.conditions_meta if hasattr(skill, "conditions_meta") and skill.conditions_meta else {}
                 if effective_until_cond and effective_until_cond.get("expires_at"):
-                    skill_conditions = skill.conditions_meta if hasattr(skill, "conditions_meta") and skill.conditions_meta else {}
-                    skill_conditions["expires_at"] = effective_until_cond["expires_at"]
-                    if hasattr(skill, "conditions_meta"):
-                        skill.conditions_meta = skill_conditions
+                    conditions_meta["expires_at"] = effective_until_cond["expires_at"]
+                # allowed_targets 执行：写入可用对象限制
+                if allowed_targets_cond:
+                    conditions_meta["allowed_targets"] = allowed_targets_cond.get("value", "")
+                if conditions_meta and hasattr(skill, "conditions_meta"):
+                    skill.conditions_meta = conditions_meta
         elif r.target_type == "tool" and r.target_id:
             from app.models.tool import ToolRegistry
             tool = db.get(ToolRegistry, r.target_id)
@@ -1051,6 +1105,24 @@ async def act_on_approval(
             webapp = db.get(WebApp, r.target_id)
             if webapp and webapp.status == "reviewing":
                 webapp.status = "published"
+
+        # requires_followup_review 执行：自动创建复核工单
+        if followup_cond:
+            followup_date = followup_cond.get("expires_at") or followup_cond.get("value", "")
+            followup_req = ApprovalRequest(
+                request_type=r.request_type,
+                target_id=r.target_id,
+                target_type=r.target_type,
+                requester_id=user.id,
+                status=ApprovalStatus.PENDING,
+                stage="followup_review",
+                conditions=[{
+                    "reason": f"[自动创建] 附条件通过复核 — 源审批 #{r.id}，复核要求: {followup_cond.get('label', '')}",
+                    "source_approval_id": r.id,
+                    "followup_date": followup_date,
+                }],
+            )
+            db.add(followup_req)
 
     db.commit()
     db.refresh(r)
@@ -1077,7 +1149,7 @@ def supplement_evidence(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Fix 3: 发起人补充证据（仅 needs_info 阶段可用）"""
+    """发起人补充证据（仅 needs_info 阶段可用）"""
     r = db.get(ApprovalRequest, request_id)
     if not r:
         raise HTTPException(404, "审批申请不存在")
@@ -1093,17 +1165,29 @@ def supplement_evidence(
     merged = {**existing_ep, **req.evidence_pack}
     r.evidence_pack = merged
 
-    # 恢复 stage 为 dept_pending（回到审批队列）
-    r.stage = "dept_pending"
+    # 补资料后重新校验证据完整性
+    from app.services.approval_templates import check_evidence_completeness
+    request_type_str = r.request_type.value if hasattr(r.request_type, "value") else str(r.request_type)
+    still_missing = check_evidence_completeness(request_type_str, merged)
 
-    # 记录补充动作
+    # 证据齐了才恢复到审批队列，否则保持 needs_info
+    if still_missing:
+        r.stage = "needs_info"  # 仍然缺证据，不回审批队列
+    else:
+        r.stage = "dept_pending"  # 回到审批队列
+
+    # 记录补充动作 — 使用独立的 SUPPLEMENT 类型，不复用 REQUEST_MORE_INFO
     a = ApprovalAction(
         request_id=request_id,
         actor_id=user.id,
-        action=ApprovalActionType.REQUEST_MORE_INFO,  # 复用类型，comment 区分
-        comment=f"[补充证据] {req.comment}" if req.comment else "[补充证据]",
+        action=ApprovalActionType.SUPPLEMENT,
+        comment=req.comment or "",
     )
     db.add(a)
     db.commit()
     db.refresh(r)
-    return _req(r, db)
+
+    result = _req(r, db)
+    if still_missing:
+        result["supplement_warning"] = f"仍缺少 {len(still_missing)} 项必填证据: {', '.join(still_missing)}"
+    return result

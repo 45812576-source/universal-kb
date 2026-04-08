@@ -59,6 +59,12 @@ def submit_knowledge(db: Session, entry: KnowledgeEntry) -> KnowledgeEntry:
             from app.models.permission import (
                 ApprovalRequest, ApprovalRequestType, ApprovalStatus,
             )
+            # Fix 6: 自动采集证据包
+            try:
+                from app.services.approval_templates import get_auto_evidence
+                auto_ep = get_auto_evidence("knowledge_review", "knowledge", entry.id, db)
+            except Exception:
+                auto_ep = None
             approval = ApprovalRequest(
                 request_type=ApprovalRequestType.KNOWLEDGE_REVIEW,
                 target_id=entry.id,
@@ -66,6 +72,7 @@ def submit_knowledge(db: Session, entry: KnowledgeEntry) -> KnowledgeEntry:
                 requester_id=entry.created_by,
                 status=ApprovalStatus.PENDING,
                 stage="dept_pending",
+                evidence_pack=auto_ep if auto_ep else None,
             )
             db.add(approval)
         except Exception as e:

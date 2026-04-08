@@ -1690,6 +1690,13 @@ async def submit_approval(
         "target_version": session.target_version,
     }
 
+    # Fix 6: 自动采集证据包
+    try:
+        from app.services.approval_templates import get_auto_evidence
+        req_type_str = req_type.value if hasattr(req_type, "value") else str(req_type)
+        auto_ep = get_auto_evidence(req_type_str, session.target_type, session.target_id, db)
+    except Exception:
+        auto_ep = None
     approval = ApprovalRequest(
         request_type=req_type,
         target_id=session.target_id,
@@ -1700,6 +1707,7 @@ async def submit_approval(
         # Gap 4: 沙盒-审批强绑定
         sandbox_report_id=report.id if report else None,
         sandbox_report_hash=report.report_hash if report else None,
+        evidence_pack=auto_ep if auto_ep else None,
     )
     db.add(approval)
     db.commit()

@@ -347,6 +347,13 @@ class ApprovalRequestType(str, enum.Enum):
     SCHEMA_APPROVAL = "schema_approval"
     KNOWLEDGE_EDIT = "knowledge_edit"
     KNOWLEDGE_REVIEW = "knowledge_review"
+    # 数据安全 6 类
+    EXPORT_SENSITIVE = "export_sensitive"
+    ELEVATE_DISCLOSURE = "elevate_disclosure"
+    GRANT_ACCESS = "grant_access"
+    POLICY_CHANGE = "policy_change"
+    FIELD_SENSITIVITY_CHANGE = "field_sensitivity_change"
+    SMALL_SAMPLE_CHANGE = "small_sample_change"
 
 
 class ApprovalStatus(str, enum.Enum):
@@ -380,6 +387,10 @@ class ApprovalRequest(Base):
     # Gap 4: 沙盒-审批强绑定
     sandbox_report_id = Column(Integer, ForeignKey("sandbox_test_reports.id"), nullable=True)
     sandbox_report_hash = Column(String(64), nullable=True)
+    # V2: 证据包 + 风险评估
+    evidence_pack = Column(JSON, default=None, nullable=True)
+    risk_level = Column(String(20), nullable=True)        # high / medium / low
+    impact_summary = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     requester = relationship("User", foreign_keys=[requester_id])
@@ -390,6 +401,9 @@ class ApprovalActionType(str, enum.Enum):
     APPROVE = "approve"
     REJECT = "reject"
     ADD_CONDITIONS = "add_conditions"
+    REQUEST_MORE_INFO = "request_more_info"
+    APPROVE_WITH_CONDITIONS = "approve_with_conditions"
+    SUPPLEMENT = "supplement"
 
 
 class ApprovalAction(Base):
@@ -404,6 +418,9 @@ class ApprovalAction(Base):
         nullable=False,
     )
     comment = Column(Text, nullable=True)
+    # V2: 结构化审批结论
+    decision_payload = Column(JSON, default=None, nullable=True)
+    checklist_result = Column(JSON, default=None, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     request = relationship("ApprovalRequest", back_populates="actions")

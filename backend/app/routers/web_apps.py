@@ -233,7 +233,12 @@ def update_web_app_status(
     app.publish_department_ids = body.publish_department_ids
     app.publish_user_ids = body.publish_user_ids
 
-    # 创建审批申请
+    # Fix 6: 创建审批申请 + 自动采集证据
+    try:
+        from app.services.approval_templates import get_auto_evidence
+        auto_ep = get_auto_evidence("webapp_publish", "webapp", app.id, db)
+    except Exception:
+        auto_ep = None
     req = ApprovalRequest(
         request_type=ApprovalRequestType.WEBAPP_PUBLISH,
         target_id=app.id,
@@ -244,6 +249,7 @@ def update_web_app_status(
         conditions=[{"publish_scope": body.publish_scope,
                      "publish_department_ids": body.publish_department_ids,
                      "publish_user_ids": body.publish_user_ids}],
+        evidence_pack=auto_ep if auto_ep else None,
     )
     db.add(req)
     db.commit()

@@ -61,7 +61,7 @@ APPROVAL_TEMPLATES: dict[str, dict[str, Any]] = {
         "decision_focus": "所有权转让是否合理，新所有者是否具备维护能力",
         "required_evidence": [
             {"key": "transfer_reason", "label": "转让原因", "required": True, "auto": False},
-            {"key": "new_owner_info", "label": "新所有者信息", "required": True, "auto": True},
+            {"key": "new_owner_info", "label": "新所有者信息", "required": True, "auto": False},
             {"key": "handover_plan", "label": "交接计划", "required": False, "auto": False},
         ],
         "review_checklist": [
@@ -98,55 +98,70 @@ APPROVAL_TEMPLATES: dict[str, dict[str, Any]] = {
 
     # ── 知识类 ────────────────────────────────────────────────────────────────
     "knowledge_review": {
-        "decision_focus": "知识内容是否准确、合规，敏感信息是否处理",
+        "decision_focus": "知识内容是否准确、合规，敏感信息是否处理，可见性设置是否恰当",
         "required_evidence": [
             {"key": "content_preview", "label": "内容预览", "required": True, "auto": True},
             {"key": "source_info", "label": "来源信息", "required": True, "auto": True},
             {"key": "sensitivity_check", "label": "敏感检查结果", "required": True, "auto": True},
             {"key": "ai_review_note", "label": "AI 审核意见", "required": False, "auto": True},
+            {"key": "visibility_setting", "label": "可见性设置", "required": True, "auto": True},
+            {"key": "classification_suggestion", "label": "分类建议", "required": False, "auto": True},
+            {"key": "duplicate_check", "label": "重复内容检查", "required": False, "auto": False},
         ],
         "review_checklist": [
             "内容准确，无明显错误",
             "敏感信息已脱敏或标注",
             "分类归属正确",
+            "可见性范围符合信息密级",
+            "无重复或冲突的知识条目",
             "符合知识管理规范",
         ],
-        "approval_criteria": "内容准确、敏感信息处理得当、分类正确",
-        "rejection_criteria": "内容不准确 / 敏感信息未处理 / 分类错误",
+        "approval_criteria": "内容准确、敏感信息处理得当、分类正确、可见性恰当",
+        "rejection_criteria": "内容不准确 / 敏感信息未处理 / 分类错误 / 可见性设置不当",
         "post_approve": "知识状态更新为 approved",
         "post_reject": "知识状态更新为 rejected",
     },
     "knowledge_edit": {
-        "decision_focus": "申请者是否有合理的编辑需求和能力",
+        "decision_focus": "申请者是否有合理的编辑需求，修改对文档质量和可见范围的影响",
         "required_evidence": [
             {"key": "edit_reason", "label": "编辑理由", "required": True, "auto": False},
             {"key": "document_info", "label": "文档信息", "required": True, "auto": True},
+            {"key": "document_risk", "label": "文档风险等级", "required": True, "auto": True},
+            {"key": "visibility_scope", "label": "文档可见范围", "required": True, "auto": True},
+            {"key": "edit_scope", "label": "预计修改范围", "required": True, "auto": False},
         ],
         "review_checklist": [
-            "编辑理由合理",
+            "编辑理由合理，有业务必要性",
             "申请者具备相关知识背景",
+            "文档敏感级别已知，编辑不会降低安全性",
+            "预计修改范围明确，不涉及越权内容",
         ],
-        "approval_criteria": "理由合理、申请者具备背景",
-        "rejection_criteria": "理由不充分 / 非必要编辑",
+        "approval_criteria": "理由合理、申请者具备背景、修改范围清晰不越权",
+        "rejection_criteria": "理由不充分 / 非必要编辑 / 涉及越权内容 / 可能降低文档安全性",
         "post_approve": "写入 KnowledgeEditGrant",
         "post_reject": "拒绝授权",
     },
 
     # ── Web App ───────────────────────────────────────────────────────────────
     "webapp_publish": {
-        "decision_focus": "Web 应用是否安全、功能是否符合预期",
+        "decision_focus": "Web 应用是否安全、功能是否符合预期、有无回滚路径",
         "required_evidence": [
             {"key": "app_info", "label": "应用基本信息", "required": True, "auto": True},
             {"key": "code_preview", "label": "代码预览", "required": True, "auto": True},
             {"key": "creator_info", "label": "创建者信息", "required": True, "auto": True},
+            {"key": "security_scan", "label": "安全扫描结果", "required": False, "auto": True},
+            {"key": "test_result", "label": "功能测试结果", "required": True, "auto": False},
+            {"key": "rollback_plan", "label": "回滚方案", "required": True, "auto": False},
         ],
         "review_checklist": [
             "应用功能描述准确",
-            "无安全风险（XSS、数据泄露等）",
+            "无安全风险（XSS、数据泄露、CSRF 等）",
             "界面可用，无明显 Bug",
+            "测试覆盖核心功能",
+            "有可执行的回滚路径",
         ],
-        "approval_criteria": "功能合规、无安全风险",
-        "rejection_criteria": "存在安全风险 / 功能不符",
+        "approval_criteria": "功能合规、无安全风险、测试通过、有回滚路径",
+        "rejection_criteria": "存在安全风险 / 功能不符 / 无测试 / 无回滚方案",
         "post_approve": "更新 WebApp 状态为 published",
         "post_reject": "回退 WebApp 状态为 draft",
     },
@@ -155,7 +170,7 @@ APPROVAL_TEMPLATES: dict[str, dict[str, Any]] = {
     "scope_change": {
         "decision_focus": "权限范围变更是否必要，对数据安全的影响",
         "required_evidence": [
-            {"key": "current_scope", "label": "当前权限范围", "required": True, "auto": True},
+            {"key": "current_scope", "label": "当前权限范围", "required": True, "auto": False},
             {"key": "target_scope", "label": "目标权限范围", "required": True, "auto": False},
             {"key": "change_reason", "label": "变更原因", "required": True, "auto": False},
             {"key": "impact_analysis", "label": "影响分析", "required": True, "auto": False},
@@ -174,7 +189,7 @@ APPROVAL_TEMPLATES: dict[str, dict[str, Any]] = {
     "mask_override": {
         "decision_focus": "脱敏覆盖是否必要，数据安全风险是否可控",
         "required_evidence": [
-            {"key": "current_mask", "label": "当前脱敏规则", "required": True, "auto": True},
+            {"key": "current_mask", "label": "当前脱敏规则", "required": True, "auto": False},
             {"key": "target_mask", "label": "目标脱敏规则", "required": True, "auto": False},
             {"key": "override_reason", "label": "覆盖原因", "required": True, "auto": False},
             {"key": "data_usage_scenario", "label": "数据使用场景", "required": True, "auto": False},
@@ -191,19 +206,25 @@ APPROVAL_TEMPLATES: dict[str, dict[str, Any]] = {
         "post_reject": "保持原脱敏规则",
     },
     "schema_approval": {
-        "decision_focus": "输出 Schema 变更是否合理，对下游的影响是否可控",
+        "decision_focus": "输出 Schema 变更是否合理，对下游消费方的影响是否可控",
         "required_evidence": [
-            {"key": "schema_diff", "label": "Schema 差异", "required": True, "auto": True},
-            {"key": "downstream_impact", "label": "下游影响", "required": True, "auto": False},
+            {"key": "current_schema", "label": "现有 Schema 快照", "required": True, "auto": False},
+            {"key": "target_schema", "label": "目标 Schema", "required": True, "auto": False},
+            {"key": "schema_diff", "label": "Schema 差异对比", "required": True, "auto": False},
+            {"key": "consumer_list", "label": "下游消费方列表", "required": True, "auto": False},
+            {"key": "compatibility_note", "label": "兼容性说明", "required": True, "auto": False},
             {"key": "change_reason", "label": "变更原因", "required": True, "auto": False},
+            {"key": "migration_plan", "label": "迁移计划", "required": False, "auto": False},
         ],
         "review_checklist": [
-            "Schema 变更合理",
-            "下游影响已评估",
-            "向后兼容或有迁移计划",
+            "Schema 变更合理，字段增删有业务依据",
+            "下游消费方已列明，影响已评估",
+            "向后兼容，或有明确的迁移计划",
+            "字段类型变更不会导致数据截断或误解",
+            "不违反数据域约束",
         ],
-        "approval_criteria": "变更合理、影响可控、有迁移计划",
-        "rejection_criteria": "破坏性变更 / 影响不清",
+        "approval_criteria": "变更合理、消费方影响可控、兼容或有迁移计划",
+        "rejection_criteria": "破坏性变更未说明 / 下游影响不清 / 无迁移计划",
         "post_approve": "更新 Schema 状态为 approved",
         "post_reject": "保持 Schema 为 draft",
     },
@@ -232,7 +253,7 @@ APPROVAL_TEMPLATES: dict[str, dict[str, Any]] = {
     "elevate_disclosure": {
         "decision_focus": "提升披露等级是否必要，对数据安全的影响",
         "required_evidence": [
-            {"key": "current_level", "label": "当前披露等级", "required": True, "auto": True},
+            {"key": "current_level", "label": "当前披露等级", "required": True, "auto": False},
             {"key": "target_level", "label": "目标披露等级", "required": True, "auto": False},
             {"key": "elevation_reason", "label": "提升原因", "required": True, "auto": False},
             {"key": "impact_assessment", "label": "影响评估", "required": True, "auto": False},
@@ -249,29 +270,36 @@ APPROVAL_TEMPLATES: dict[str, dict[str, Any]] = {
         "post_reject": "保持当前等级",
     },
     "grant_access": {
-        "decision_focus": "访问权限授予是否必要，是否符合最小权限原则",
+        "decision_focus": "访问权限授予是否必要，是否符合最小权限原则，是否有替代方案",
         "required_evidence": [
             {"key": "access_scope", "label": "访问范围", "required": True, "auto": False},
             {"key": "access_reason", "label": "访问原因", "required": True, "auto": False},
-            {"key": "grantee_info", "label": "被授权人信息", "required": True, "auto": True},
+            {"key": "grantee_info", "label": "被授权人信息", "required": True, "auto": False},
+            {"key": "current_permissions", "label": "当前权限快照", "required": True, "auto": False},
+            {"key": "alternatives_considered", "label": "替代方案说明", "required": True, "auto": False},
             {"key": "duration", "label": "授权期限", "required": True, "auto": False},
         ],
         "review_checklist": [
-            "访问原因合理",
+            "访问原因合理且有业务必要性",
             "访问范围最小化",
             "被授权人身份确认",
-            "授权期限合理",
+            "已评估替代方案（如脱敏后访问、只读权限等）",
+            "授权期限合理，有到期自动回收机制",
+            "不与现有权限策略冲突",
         ],
-        "approval_criteria": "原因合理、范围最小、期限明确",
-        "rejection_criteria": "范围过大 / 原因不充分 / 期限不合理",
+        "approval_criteria": "原因合理、范围最小、替代方案不可行、期限明确",
+        "rejection_criteria": "范围过大 / 原因不充分 / 有可行替代方案 / 期限不合理",
         "post_approve": "授予访问权限",
         "post_reject": "拒绝授权",
     },
     "policy_change": {
-        "decision_focus": "策略变更是否合理，对系统安全的影响",
+        "decision_focus": "策略变更是否合理，受影响角色范围是否可控，对系统安全的影响",
         "required_evidence": [
-            {"key": "current_policy", "label": "当前策略", "required": True, "auto": True},
+            {"key": "current_policy", "label": "当前策略快照", "required": True, "auto": False},
             {"key": "target_policy", "label": "目标策略", "required": True, "auto": False},
+            {"key": "policy_diff", "label": "策略差异对比", "required": True, "auto": False},
+            {"key": "affected_roles", "label": "受影响角色列表", "required": True, "auto": False},
+            {"key": "affected_user_count", "label": "受影响用户数", "required": True, "auto": False},
             {"key": "change_reason", "label": "变更原因", "required": True, "auto": False},
             {"key": "impact_analysis", "label": "影响分析", "required": True, "auto": False},
             {"key": "rollback_plan", "label": "回滚方案", "required": True, "auto": False},
@@ -279,20 +307,22 @@ APPROVAL_TEMPLATES: dict[str, dict[str, Any]] = {
         "review_checklist": [
             "变更原因合理",
             "目标策略符合安全要求",
+            "受影响角色和用户范围已明确",
+            "策略差异对比已确认",
             "影响分析完整",
             "有可执行的回滚方案",
             "不违反上级策略约束",
         ],
-        "approval_criteria": "原因合理、策略合规、影响可控、有回滚方案",
-        "rejection_criteria": "违反安全要求 / 影响不清 / 无回滚方案",
+        "approval_criteria": "原因合理、策略合规、影响范围明确可控、有回滚方案",
+        "rejection_criteria": "违反安全要求 / 影响范围不清 / 受影响面过广 / 无回滚方案",
         "post_approve": "应用新策略",
         "post_reject": "保持原策略",
     },
     "field_sensitivity_change": {
         "decision_focus": "字段敏感级别变更是否合理，对脱敏策略的连锁影响",
         "required_evidence": [
-            {"key": "field_info", "label": "字段信息", "required": True, "auto": True},
-            {"key": "current_sensitivity", "label": "当前敏感级别", "required": True, "auto": True},
+            {"key": "field_info", "label": "字段信息", "required": True, "auto": False},
+            {"key": "current_sensitivity", "label": "当前敏感级别", "required": True, "auto": False},
             {"key": "target_sensitivity", "label": "目标敏感级别", "required": True, "auto": False},
             {"key": "change_reason", "label": "变更原因", "required": True, "auto": False},
             {"key": "cascade_impact", "label": "连锁影响评估", "required": True, "auto": False},
@@ -309,21 +339,26 @@ APPROVAL_TEMPLATES: dict[str, dict[str, Any]] = {
         "post_reject": "保持当前敏感级别",
     },
     "small_sample_change": {
-        "decision_focus": "小样本保护变更是否合理，对数据隐私的影响",
+        "decision_focus": "小样本保护阈值变更对数据隐私的影响，保护削弱是否可接受",
         "required_evidence": [
-            {"key": "current_config", "label": "当前保护配置", "required": True, "auto": True},
+            {"key": "current_config", "label": "当前保护配置", "required": True, "auto": False},
             {"key": "target_config", "label": "目标保护配置", "required": True, "auto": False},
+            {"key": "threshold_diff", "label": "阈值变更对比", "required": True, "auto": False},
+            {"key": "affected_queries", "label": "受影响查询场景", "required": True, "auto": False},
+            {"key": "protection_weakening_assessment", "label": "保护削弱评估", "required": True, "auto": False},
             {"key": "change_reason", "label": "变更原因", "required": True, "auto": False},
             {"key": "privacy_impact", "label": "隐私影响评估", "required": True, "auto": False},
         ],
         "review_checklist": [
-            "变更原因合理",
+            "变更原因合理，有业务必要性",
+            "阈值变更对比清晰，保护级别变化已量化",
             "新配置不低于最低保护要求",
+            "受影响查询场景已列明",
+            "保护削弱后不会导致个体可识别",
             "隐私影响已评估",
-            "不会导致个体可识别",
         ],
-        "approval_criteria": "原因合理、保护级别充分、隐私安全",
-        "rejection_criteria": "保护级别不足 / 隐私风险 / 原因不充分",
+        "approval_criteria": "原因合理、保护级别充分、隐私安全、受影响场景已评估",
+        "rejection_criteria": "保护级别不足 / 隐私风险 / 受影响场景不清 / 原因不充分",
         "post_approve": "应用新保护配置",
         "post_reject": "保持当前配置",
     },
@@ -337,8 +372,28 @@ def get_template(request_type: str) -> dict[str, Any] | None:
     return APPROVAL_TEMPLATES.get(request_type)
 
 
+def _is_real_evidence(value: Any) -> bool:
+    """判断证据值是否为真实数据（非占位符/空值）"""
+    if value is None:
+        return False
+    # 占位符对象：{"_status": "pending_integration", ...}
+    if isinstance(value, dict):
+        if value.get("_status") == "pending_integration":
+            return False
+        if len(value) == 0:
+            return False
+    # 空数组
+    if isinstance(value, list) and len(value) == 0:
+        return False
+    # 空字符串
+    if isinstance(value, str) and value.strip() == "":
+        return False
+    return True
+
+
 def check_evidence_completeness(request_type: str, evidence_pack: dict | None) -> list[str]:
-    """校验证据包完整性，返回缺失的必填项 key 列表"""
+    """校验证据包完整性，返回缺失的必填项 key 列表。
+    占位符、空对象、空数组、空字符串均视为缺失。"""
     tpl = get_template(request_type)
     if not tpl:
         return []
@@ -346,7 +401,7 @@ def check_evidence_completeness(request_type: str, evidence_pack: dict | None) -
     evidence = evidence_pack or {}
     missing = []
     for item in tpl.get("required_evidence", []):
-        if item["required"] and evidence.get(item["key"]) is None:
+        if item["required"] and not _is_real_evidence(evidence.get(item["key"])):
             missing.append(item["key"])
     return missing
 
@@ -377,7 +432,6 @@ def get_auto_evidence(request_type: str, target_type: str | None, target_id: int
             if "change_note" in auto_keys and latest_ver:
                 evidence["change_note"] = latest_ver.change_note or ""
             if "owner_info" in auto_keys:
-                owner = db.get(db.bind.dialect.dbapi.module if False else None, None)  # placeholder
                 from app.models.user import User
                 owner = db.get(User, skill.created_by)
                 evidence["owner_info"] = {
@@ -428,9 +482,7 @@ def get_auto_evidence(request_type: str, target_type: str | None, target_id: int
                         "prev_prompt_len": len(prev_ver.system_prompt or ""),
                         "current_prompt_len": len(latest_ver.system_prompt or ""),
                     }
-            if "new_owner_info" in auto_keys:
-                # 从 conditions 获取 new_owner_id
-                pass  # 在 API 层面处理
+            # new_owner_info: auto=false, 由申请端提交
 
     # ── Tool 类 ──
     elif target_type == "tool" and request_type == "tool_publish":
@@ -470,11 +522,33 @@ def get_auto_evidence(request_type: str, target_type: str | None, target_id: int
                 }
             if "ai_review_note" in auto_keys and entry.auto_review_note:
                 evidence["ai_review_note"] = entry.auto_review_note
+            if "visibility_setting" in auto_keys:
+                evidence["visibility_setting"] = {
+                    "review_level": entry.review_level,
+                    "review_stage": entry.review_stage.value if entry.review_stage else None,
+                }
+            if "classification_suggestion" in auto_keys:
+                evidence["classification_suggestion"] = {
+                    "category": entry.category,
+                    "ai_title": entry.ai_title,
+                }
+            # duplicate_check: auto=false, 由人工提交
             if "document_info" in auto_keys:
                 evidence["document_info"] = {
                     "title": entry.ai_title or entry.title,
                     "category": entry.category,
                     "creator_id": entry.created_by,
+                }
+            if "document_risk" in auto_keys:
+                evidence["document_risk"] = {
+                    "review_level": entry.review_level,
+                    "sensitivity_flags": entry.sensitivity_flags or [],
+                }
+            if "visibility_scope" in auto_keys:
+                evidence["visibility_scope"] = {
+                    "review_level": entry.review_level,
+                    "review_stage": entry.review_stage.value if entry.review_stage else None,
+                    "category": entry.category,
                 }
 
     # ── WebApp 类 ──
@@ -494,15 +568,33 @@ def get_auto_evidence(request_type: str, target_type: str | None, target_id: int
                     "user_id": webapp.created_by,
                     "name": creator.display_name if creator else None,
                 }
+            if "security_scan" in auto_keys:
+                # 基础安全扫描：检查代码中的可疑模式
+                code = webapp.html_code or ""
+                suspicious = []
+                for pattern in ["eval(", "innerHTML", "document.cookie", "localStorage", "fetch("]:
+                    if pattern in code:
+                        suspicious.append(pattern)
+                evidence["security_scan"] = {
+                    "suspicious_patterns": suspicious,
+                    "code_length": len(code),
+                    "risk_level": "high" if len(suspicious) > 2 else "medium" if suspicious else "low",
+                }
 
-    # ── 权限 & 脱敏 / 数据安全类 ──
-    # auto 证据主要来自当前快照，大部分需要后端数据接口对接
-    # 此处提供占位，标注"待系统对接"
-    elif request_type in ("scope_change", "mask_override", "schema_approval",
-                          "export_sensitive", "elevate_disclosure", "grant_access",
-                          "policy_change", "field_sensitivity_change", "small_sample_change"):
-        for item in tpl.get("required_evidence", []):
-            if item.get("auto") and item["key"] not in evidence:
-                evidence[item["key"]] = {"_status": "pending_integration", "_label": "待系统对接"}
+    # 权限 & 脱敏 / 数据安全类：所有证据均为 auto=false，申请人手动提交，
+    # 此处不生成任何自动证据。
 
     return evidence
+
+
+# ─── 高风险类型集合 ──────────────────────────────────────────────────────────
+
+HIGH_RISK_TYPES: set[str] = {
+    "scope_change", "mask_override", "schema_approval",
+    "export_sensitive", "elevate_disclosure", "grant_access",
+    "policy_change", "field_sensitivity_change", "small_sample_change",
+}
+
+
+def is_high_risk_type(request_type: str) -> bool:
+    return request_type in HIGH_RISK_TYPES
