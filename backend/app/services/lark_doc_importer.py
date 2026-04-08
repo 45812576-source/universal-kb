@@ -99,6 +99,39 @@ def _normalize_type(url_type: str) -> str:
     return _URL_PATH_TO_API_TYPE.get(url_type, url_type)
 
 
+async def get_valid_user_token(db: Session, user) -> str | None:
+    """获取用户的有效 lark user_access_token，过期则自动刷新。
+
+    Returns: 有效的 access_token 或 None（未授权/刷新失败）。
+    """
+    if not user.lark_access_token:
+        return None
+
+    import datetime
+    from app.services.lark_client import lark_client
+
+    # 未过期，直接返回
+    if user.lark_token_expires_at and datetime.datetime.utcnow() < user.lark_token_expires_at:
+        return user.lark_access_token
+
+    # 过期了，尝试 refresh
+    if not user.lark_refresh_token:
+        return None
+
+    try:
+        token_data = await lark_client.refresh_user_token(user.lark_refresh_token)
+        user.lark_access_token = token_data.get("access_token", "")
+        user.lark_refresh_token = token_data.get("refresh_token", user.lark_refresh_token)
+        expires_in = token_data.get("expires_in", 7200)
+        user.lark_token_expires_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=expires_in)
+        db.commit()
+        logger.info(f"用户 {user.id} 飞书 OAuth token 自动刷新成功")
+        return user.lark_access_token
+    except Exception as e:
+        logger.warning(f"用户 {user.id} 飞书 OAuth token 刷新失败: {e}")
+        return None
+
+
 class LarkDocImporter:
 
     def parse_lark_url(self, url: str) -> tuple[str, str]:
@@ -145,38 +178,83 @@ class LarkDocImporter:
         category: str = "experience",
         sync_interval: int = 0,
     ) -> KnowledgeEntry:
-        """完整导入一个飞书文档到知识库。根据类型自动分发到三种策略。"""
-        from app.services.lark_client import lark_client
+        """完整导入一个飞书文档到知识库。根据类型自动分发到三种策略。
+
+        权限 fallback：默认用 tenant_access_token，遇权限错误自动切换 user_access_token 重试。
+        """
+        from app.services.lark_client import lark_client, LarkPermissionError
 
         # 1. 解析链接
         token, api_type = self.parse_lark_url(url)
 
+        # 默认不使用 user token
+        effective_token: str | None = None
+
         # 2. wiki → 解析为实际文档 token
         wiki_title = None
         if api_type == "wiki":
-            node = await lark_client.get_wiki_node(token)
+            try:
+                node = await lark_client.get_wiki_node(token)
+            except (PermissionError, LarkPermissionError):
+                # tenant token 权限不足，尝试 user token
+                effective_token = await self._get_user_token_or_raise(db, user)
+                node = await lark_client.get_wiki_node(token, access_token=effective_token)
             token = node["obj_token"]
             api_type = node["obj_type"]
             wiki_title = node.get("title", "")
 
-        # 3. 根据 api_type 分发到三种策略
+        # 3. 根据 api_type 分发到三种策略（带 fallback）
+        try:
+            return await self._dispatch_strategy(
+                db, user, url, token, api_type, title, wiki_title,
+                folder_id, category, effective_token,
+            )
+        except (PermissionError, LarkPermissionError):
+            if effective_token:
+                raise  # 已经用了 user token 还失败，直接抛
+            # 用 user token 重试
+            effective_token = await self._get_user_token_or_raise(db, user)
+            return await self._dispatch_strategy(
+                db, user, url, token, api_type, title, wiki_title,
+                folder_id, category, effective_token,
+            )
+
+    async def _get_user_token_or_raise(self, db: Session, user) -> str:
+        """获取用户的有效 user_access_token，无则抛出提示性错误。"""
+        token = await get_valid_user_token(db, user)
+        if not token:
+            raise PermissionError(
+                "该文档需要用户授权才能访问。请先在「我的知识」页面点击「连接飞书账号」完成授权，"
+                "然后重新导入。"
+            )
+        return token
+
+    async def _dispatch_strategy(
+        self, db, user, url, token, api_type, title, wiki_title,
+        folder_id, category, access_token,
+    ) -> KnowledgeEntry:
+        """根据 api_type 分发到三种策略。"""
         if api_type in _EXPORTABLE_TYPES:
             return await self._strategy_export(
-                db, user, url, token, api_type, title, wiki_title, folder_id, category
+                db, user, url, token, api_type, title, wiki_title,
+                folder_id, category, access_token=access_token,
             )
         elif api_type in _DIRECT_DOWNLOAD_TYPES:
             return await self._strategy_download(
-                db, user, url, token, api_type, title, wiki_title, folder_id, category
+                db, user, url, token, api_type, title, wiki_title,
+                folder_id, category, access_token=access_token,
             )
         else:
             return await self._strategy_link_reference(
-                db, user, url, token, api_type, title, wiki_title, folder_id, category
+                db, user, url, token, api_type, title, wiki_title,
+                folder_id, category, access_token=access_token,
             )
 
     # ── 策略A：可导出类型 ────────────────────────────────────────────────
 
     async def _strategy_export(
-        self, db, user, url, token, api_type, title, wiki_title, folder_id, category
+        self, db, user, url, token, api_type, title, wiki_title, folder_id, category,
+        *, access_token: str | None = None,
     ) -> KnowledgeEntry:
         """doc/docx/sheet/bitable → export_tasks → 下载 → 提取文本 → 入库。"""
         from app.services.lark_client import lark_client
@@ -190,8 +268,8 @@ class LarkDocImporter:
         file_ext_str = _EXPORT_EXT_MAP[api_type]
 
         # 创建导出任务 → 轮询 → 下载
-        ticket = await lark_client.create_export_task(token, api_type, file_ext_str)
-        file_bytes = await lark_client.poll_and_download_export(ticket, doc_token=token)
+        ticket = await lark_client.create_export_task(token, api_type, file_ext_str, access_token=access_token)
+        file_bytes = await lark_client.poll_and_download_export(ticket, doc_token=token, access_token=access_token)
 
         # 写临时文件 → 提取文本
         ext = f".{file_ext_str}"
@@ -267,7 +345,8 @@ class LarkDocImporter:
     # ── 策略B：文件直接下载 ──────────────────────────────────────────────
 
     async def _strategy_download(
-        self, db, user, url, token, api_type, title, wiki_title, folder_id, category
+        self, db, user, url, token, api_type, title, wiki_title, folder_id, category,
+        *, access_token: str | None = None,
     ) -> KnowledgeEntry:
         """file 类型 → drive/v1/files/:token/download → 入库。"""
         from app.services.lark_client import lark_client
@@ -278,7 +357,7 @@ class LarkDocImporter:
         from app.services.review_policy import review_policy
         from app.utils.file_parser import extract_text, extract_html
 
-        file_bytes, filename = await lark_client.download_file(token)
+        file_bytes, filename = await lark_client.download_file(token, access_token=access_token)
 
         # 推断扩展名
         ext = os.path.splitext(filename)[1] if filename else ""
@@ -360,7 +439,8 @@ class LarkDocImporter:
     # ── 策略C：不可导出类型 → 获取元数据 + 嵌入链接 ────────────────────
 
     async def _strategy_link_reference(
-        self, db, user, url, token, api_type, title, wiki_title, folder_id, category
+        self, db, user, url, token, api_type, title, wiki_title, folder_id, category,
+        *, access_token: str | None = None,
     ) -> KnowledgeEntry:
         """mindnote/slides/board/minutes/survey 等 → 通过元数据 API 获取信息，生成知识条目。"""
         from app.services.lark_client import lark_client
@@ -371,7 +451,7 @@ class LarkDocImporter:
         # 尝试通过飞书 Drive API 获取文档元数据
         meta = {}
         try:
-            meta = await lark_client.get_doc_meta(token, api_type)
+            meta = await lark_client.get_doc_meta(token, api_type, access_token=access_token)
         except Exception as e:
             logger.warning(f"获取飞书文档元数据失败: {e}")
 

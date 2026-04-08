@@ -267,8 +267,10 @@ class TestStrategyDispatch:
 
         # 实际上 import_doc 里是 lazy import，我们需要 mock 模块
         import sys
+        from app.services.lark_client import LarkPermissionError
         fake_client_module = type(sys)("fake_lark_client")
         fake_client_module.lark_client = FakeLarkClient()
+        fake_client_module.LarkPermissionError = LarkPermissionError
         monkeypatch.setitem(sys.modules, "app.services.lark_client", fake_client_module)
 
         result = await importer.import_doc(

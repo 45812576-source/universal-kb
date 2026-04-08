@@ -1,7 +1,7 @@
 import datetime
 import enum
 
-from sqlalchemy import Boolean, Column, DateTime, Enum, ForeignKey, Integer, JSON, String
+from sqlalchemy import Boolean, Column, DateTime, Enum, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -53,6 +53,9 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     avatar_url = Column(String(500), nullable=True)
     feature_flags = Column(JSON, default=dict, server_default="{}")
+    lark_access_token = Column(Text, nullable=True)
+    lark_refresh_token = Column(Text, nullable=True)
+    lark_token_expires_at = Column(DateTime, nullable=True)
 
     department = relationship("Department", back_populates="users", foreign_keys=[department_id])
     managed_department = relationship("Department", foreign_keys=[managed_department_id])

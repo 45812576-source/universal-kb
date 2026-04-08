@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { data, redirect, useActionData, useLoaderData, useNavigation, useSearchParams, Link } from "react-router";
+import { data, redirect, useActionData, useLoaderData, useNavigation, useSearchParams, useSubmit, Link } from "react-router";
 import { Form } from "react-router";
 import type { Route } from "./+types/my";
 import { requireUser } from "~/lib/auth.server";
@@ -24,7 +24,16 @@ export async function loader({ request }: Route.LoaderArgs) {
     loadError = e instanceof ApiError ? e.message : "加载知识列表失败";
   }
 
-  return { entries, source_type, status, loadError };
+  // 查询飞书 OAuth 授权状态
+  let larkOAuthConnected = false;
+  try {
+    const oauthStatus = await apiFetch("/api/lark/oauth/status", { token });
+    larkOAuthConnected = oauthStatus.connected && !oauthStatus.expired;
+  } catch {
+    // 忽略错误
+  }
+
+  return { entries, source_type, status, loadError, larkOAuthConnected };
 }
 
 export async function action({ request }: Route.ActionArgs) {
@@ -39,7 +48,10 @@ export async function action({ request }: Route.ActionArgs) {
       .filter(Boolean);
 
   try {
-    if (mode === "text") {
+    if (mode === "lark_oauth") {
+      const result = await apiFetch("/api/lark/oauth/authorize", { token });
+      return redirect(result.authorize_url);
+    } else if (mode === "text") {
       const result = await apiFetch("/api/knowledge", {
         method: "POST",
         body: JSON.stringify({
@@ -408,17 +420,26 @@ const RENDER_STATUS_INFO: Record<string, { label: string; color: string }> = {
 };
 
 export default function MyKnowledge() {
-  const { entries, source_type, status, loadError } = useLoaderData<typeof loader>() as {
+  const { entries, source_type, status, loadError, larkOAuthConnected } = useLoaderData<typeof loader>() as {
     entries: KnowledgeEntry[];
     source_type: string;
     status: string;
     loadError: string;
+    larkOAuthConnected: boolean;
   };
   const [searchParams] = useSearchParams();
   const justSubmitted = searchParams.get("submitted");
+  const larkAuthSuccess = searchParams.get("lark_auth") === "success";
   const [showForm, setShowForm] = useState(false);
   const [collabEntryId, setCollabEntryId] = useState<number | null>(null);
   const [copiedId, setCopiedId] = useState<number | null>(null);
+  const [larkConnecting, setLarkConnecting] = useState(false);
+  const submit = useSubmit();
+
+  const handleConnectLark = () => {
+    setLarkConnecting(true);
+    submit({ mode: "lark_oauth" }, { method: "POST" });
+  };
 
   const handleCopyLink = (entryId: number) => {
     const url = `${window.location.origin}/knowledge/${entryId}`;
@@ -439,14 +460,30 @@ export default function MyKnowledge() {
             <p className="text-[9px] text-gray-500 uppercase font-bold mt-0.5">知识条目管理与录入</p>
           </div>
         </div>
-        {!showForm && (
-          <button
-            onClick={() => setShowForm(true)}
-            className="bg-[#1A202C] text-white px-4 py-2 text-[10px] font-bold uppercase tracking-widest hover:bg-black pixel-border transition-colors"
-          >
-            + 录入新知识
-          </button>
-        )}
+        <div className="flex items-center gap-3">
+          {!larkOAuthConnected && (
+            <button
+              onClick={handleConnectLark}
+              disabled={larkConnecting}
+              className="border-2 border-[#3370ff] bg-white px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-[#3370ff] hover:bg-[#3370ff] hover:text-white disabled:opacity-50 transition-colors"
+            >
+              {larkConnecting ? "跳转中..." : "连接飞书账号"}
+            </button>
+          )}
+          {larkOAuthConnected && (
+            <span className="text-[9px] font-bold uppercase text-green-600 border-2 border-green-400 bg-green-50 px-3 py-2">
+              飞书已连接
+            </span>
+          )}
+          {!showForm && (
+            <button
+              onClick={() => setShowForm(true)}
+              className="bg-[#1A202C] text-white px-4 py-2 text-[10px] font-bold uppercase tracking-widest hover:bg-black pixel-border transition-colors"
+            >
+              + 录入新知识
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="p-6 max-w-5xl">
@@ -458,6 +495,11 @@ export default function MyKnowledge() {
         {justSubmitted && (
           <div className="mb-4 border-2 border-[#00D1FF] bg-[#CCF2FF]/30 px-4 py-3 text-xs font-bold text-[#00A3C4] uppercase">
             [OK] 提交成功！已进入审核队列，管理员审核后将自动入库。
+          </div>
+        )}
+        {larkAuthSuccess && (
+          <div className="mb-4 border-2 border-green-400 bg-green-50 px-4 py-3 text-xs font-bold text-green-700 uppercase">
+            [OK] 飞书账号授权成功！现在可以导入你有编辑权限的飞书文档了。
           </div>
         )}
 

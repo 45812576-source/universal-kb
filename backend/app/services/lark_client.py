@@ -20,6 +20,10 @@ class LarkAuthError(Exception):
     """飞书租户 token 获取失败（应用配置错误、secret 错误等）"""
 
 
+class LarkPermissionError(Exception):
+    """飞书 API 权限不足（文档无访问权限等）"""
+
+
 class LarkClient:
 
     def __init__(self):
@@ -30,6 +34,10 @@ class LarkClient:
         from app.config import settings
         self._app_id = getattr(settings, "LARK_APP_ID", "")
         self._app_secret = getattr(settings, "LARK_APP_SECRET", "")
+
+    async def _get_token(self, access_token: str | None = None) -> str:
+        """获取有效 token：优先使用传入的 user_access_token，否则走 tenant_access_token。"""
+        return access_token or await self.get_tenant_access_token()
 
     async def get_tenant_access_token(self) -> str:
         """Get or refresh tenant access token."""
@@ -61,6 +69,72 @@ class LarkClient:
                 "expires_at": time.time() + expires_in,
             }
             return token
+
+    # ── OAuth 方法 ─────────────────────────────────────────────────────
+
+    def get_oauth_url(self, state: str) -> str:
+        """生成飞书 OAuth 授权页面 URL。"""
+        self._load_config()
+        from app.config import settings
+        redirect_uri = getattr(settings, "LARK_OAUTH_REDIRECT_URI", "")
+        if not self._app_id:
+            raise LarkConfigError("飞书集成尚未配置，请联系管理员")
+        from urllib.parse import quote
+        return (
+            f"https://open.feishu.cn/open-apis/authen/v1/authorize"
+            f"?app_id={self._app_id}"
+            f"&redirect_uri={quote(redirect_uri)}"
+            f"&state={state}"
+        )
+
+    async def exchange_code_for_token(self, code: str) -> dict:
+        """用授权 code 换取 user_access_token + refresh_token。
+
+        Returns: {"access_token": ..., "refresh_token": ..., "expires_in": ...,
+                  "open_id": ..., "union_id": ..., "name": ...}
+        """
+        self._load_config()
+        if not self._app_id or not self._app_secret:
+            raise LarkConfigError("飞书集成尚未配置，请联系管理员")
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{_LARK_API_BASE}/authen/v2/oauth/token",
+                json={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "app_id": self._app_id,
+                    "app_secret": self._app_secret,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("code") != 0:
+                raise LarkAuthError(f"飞书 OAuth 换取 token 失败: {data.get('msg')}")
+            return data.get("data", {})
+
+    async def refresh_user_token(self, refresh_token: str) -> dict:
+        """刷新 user_access_token。
+
+        Returns: {"access_token": ..., "refresh_token": ..., "expires_in": ...}
+        """
+        self._load_config()
+        if not self._app_id or not self._app_secret:
+            raise LarkConfigError("飞书集成尚未配置，请联系管理员")
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{_LARK_API_BASE}/authen/v2/oauth/token",
+                json={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "app_id": self._app_id,
+                    "app_secret": self._app_secret,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("code") != 0:
+                raise LarkAuthError(f"飞书 OAuth 刷新 token 失败: {data.get('msg')}")
+            return data.get("data", {})
 
     async def send_message(
         self,
@@ -210,9 +284,9 @@ class LarkClient:
 
     # ── 文档导出 API ────────────────────────────────────────────────────
 
-    async def get_wiki_node(self, token: str) -> dict:
+    async def get_wiki_node(self, token: str, access_token: str | None = None) -> dict:
         """解析 wiki token 为实际文档 obj_token + obj_type。"""
-        access_token = await self.get_tenant_access_token()
+        access_token = await self._get_token(access_token)
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 f"{_LARK_API_BASE}/wiki/v2/spaces/get_node",
@@ -235,14 +309,14 @@ class LarkClient:
                 "title": node.get("title", ""),
             }
 
-    async def get_doc_meta(self, doc_token: str, doc_type: str) -> dict:
+    async def get_doc_meta(self, doc_token: str, doc_type: str, access_token: str | None = None) -> dict:
         """获取飞书文档元数据（标题、创建者、修改时间等）。
 
         通过 POST /drive/v1/metas/batch_query 批量查询接口。
         Returns: {"title": "...", "create_time": ..., "latest_modify_time": ...,
                   "owner_id": "...", "url": "..."}
         """
-        access_token = await self.get_tenant_access_token()
+        access_token = await self._get_token(access_token)
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
                 f"{_LARK_API_BASE}/drive/v1/metas/batch_query",
@@ -275,9 +349,9 @@ class LarkClient:
                 "type": meta.get("type", ""),
             }
 
-    async def download_file(self, file_token: str) -> tuple[bytes, str]:
+    async def download_file(self, file_token: str, access_token: str | None = None) -> tuple[bytes, str]:
         """直接下载飞书云空间文件。返回 (file_bytes, filename)。"""
-        access_token = await self.get_tenant_access_token()
+        access_token = await self._get_token(access_token)
         async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
             resp = await client.get(
                 f"{_LARK_API_BASE}/drive/v1/files/{file_token}/download",
@@ -311,10 +385,11 @@ class LarkClient:
             return resp.content, filename
 
     async def create_export_task(
-        self, token: str, doc_type: str, file_extension: str = "docx"
+        self, token: str, doc_type: str, file_extension: str = "docx",
+        access_token: str | None = None,
     ) -> str:
         """创建文档导出任务，返回 ticket。"""
-        access_token = await self.get_tenant_access_token()
+        access_token = await self._get_token(access_token)
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 f"{_LARK_API_BASE}/drive/v1/export_tasks",
@@ -330,13 +405,20 @@ class LarkClient:
             )
             data = resp.json()
             if data.get("code") != 0:
-                raise RuntimeError(f"创建导出任务失败: {data.get('msg')} (code={data.get('code')})")
+                msg = data.get("msg", "")
+                code = data.get("code", 0)
+                if code in (99991672, 99991668) or "permission" in msg.lower() or "denied" in msg.lower():
+                    raise LarkPermissionError(f"文档权限不足: {msg} (code={code})")
+                raise RuntimeError(f"创建导出任务失败: {msg} (code={code})")
             return data["data"]["ticket"]
 
-    async def poll_and_download_export(self, ticket: str, doc_token: str = "", max_wait: int = 60) -> bytes:
+    async def poll_and_download_export(
+        self, ticket: str, doc_token: str = "", max_wait: int = 60,
+        access_token: str | None = None,
+    ) -> bytes:
         """轮询导出任务直到完成，然后下载文件内容。"""
         import asyncio
-        access_token = await self.get_tenant_access_token()
+        access_token = await self._get_token(access_token)
 
         file_token = None
         for _ in range(max_wait // 2):
