@@ -2431,6 +2431,18 @@ async def ingest_paste(
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     async def generate():
+        # SSE generator 运行时 Depends(get_db) 的 session 已关闭，需要独立 session
+        from app.database import SessionLocal
+        _db = SessionLocal()
+        try:
+            async for chunk in _generate_inner(_db):
+                yield chunk
+        finally:
+            _db.close()
+
+    async def _generate_inner(db):
+        # 重新加载 skill（外层 session 已关闭）
+        skill = db.get(Skill, skill_id)
         try:
             # ── Step A: 意图识别 + 内容拆块 ──
             yield _sse("stage", {"stage": "ingest_parsing", "label": "识别内容类型..."})

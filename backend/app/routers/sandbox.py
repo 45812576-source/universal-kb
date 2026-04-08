@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import get_db, SessionLocal
 from app.dependencies import get_current_user
 from app.models.user import User
 from app.models.skill import Skill, SkillVersion, SkillPreflightResult
@@ -628,6 +628,17 @@ async def preflight(
     source_files = skill.source_files or []
 
     async def generate():
+        # SSE generator 运行时 Depends(get_db) 的 session 已关闭，需要独立 session
+        _db = SessionLocal()
+        try:
+            async for chunk in _generate_inner(_db):
+                yield chunk
+        finally:
+            _db.close()
+
+    async def _generate_inner(db: Session):
+        # 重新加载 skill（外层 Depends session 已关闭）
+        skill = db.get(Skill, skill_id)
         gates = []
         all_passed = True
 
