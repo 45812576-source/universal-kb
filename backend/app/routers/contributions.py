@@ -734,3 +734,130 @@ def refresh_opencode_usage(
     """手动触发重新计算 OpenCode 用量缓存。"""
     compute_and_store_opencode_usage(db)
     return {"ok": True}
+
+
+# ─── Token 用量看板 ────────────────────────────────────────────────────────────
+
+@router.get("/token-dashboard")
+def token_dashboard(
+    db: Session = Depends(get_db),
+    _user: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """按用户 × 工作台类型聚合的 token 用量看板。"""
+    from app.models.conversation import Conversation
+    from app.models.workspace import Workspace
+    from app.models.opencode import OpenCodeUsageCache
+    from app.models.skill import SkillExecutionLog
+    from sqlalchemy import case, literal_column, text
+
+    # 1) Chat / Skill Studio / 项目工作台 — 从 messages 聚合
+    msg_rows = (
+        db.query(
+            Conversation.user_id,
+            case(
+                (Conversation.project_id.isnot(None), literal_column("'project'")),
+                else_=func.coalesce(Workspace.workspace_type, literal_column("'chat'")),
+            ).label("source"),
+            func.sum(func.json_extract(Message.metadata_, "$.input_tokens")).label("input_tokens"),
+            func.sum(func.json_extract(Message.metadata_, "$.output_tokens")).label("output_tokens"),
+            func.count(func.distinct(Conversation.id)).label("conversations"),
+        )
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .outerjoin(Workspace, Conversation.workspace_id == Workspace.id)
+        .filter(
+            Message.role == MessageRole.ASSISTANT,
+            func.json_extract(Message.metadata_, "$.input_tokens") > 0,
+        )
+        .group_by(Conversation.user_id, "source")
+        .all()
+    )
+
+    # 2) SkillExecutionLog 中的 token (skill_studio 来源补充)
+    skill_exec_rows = (
+        db.query(
+            SkillExecutionLog.user_id,
+            func.sum(func.json_extract(SkillExecutionLog.token_usage, "$.input_tokens")).label("input_tokens"),
+            func.sum(func.json_extract(SkillExecutionLog.token_usage, "$.output_tokens")).label("output_tokens"),
+        )
+        .filter(SkillExecutionLog.user_id.isnot(None))
+        .group_by(SkillExecutionLog.user_id)
+        .all()
+    )
+
+    # 3) OpenCode — 从缓存表
+    oc_rows = db.query(OpenCodeUsageCache).all()
+
+    # 所有用户
+    all_user_ids: set[int] = set()
+    for r in msg_rows:
+        all_user_ids.add(r.user_id)
+    for r in skill_exec_rows:
+        if r.user_id:
+            all_user_ids.add(r.user_id)
+    for r in oc_rows:
+        all_user_ids.add(r.user_id)
+
+    users = db.query(User).filter(User.id.in_(all_user_ids)).all() if all_user_ids else []
+    user_name = {u.id: u.display_name for u in users}
+
+    # 构建每个用户的聚合数据
+    data: dict[int, dict] = {}
+
+    def _ensure(uid: int) -> dict:
+        if uid not in data:
+            data[uid] = {
+                "user_id": uid,
+                "display_name": user_name.get(uid, str(uid)),
+                "opencode": {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0},
+                "skill_studio": {"input_tokens": 0, "output_tokens": 0},
+                "chat": {"input_tokens": 0, "output_tokens": 0},
+                "project": {"input_tokens": 0, "output_tokens": 0},
+            }
+        return data[uid]
+
+    for r in msg_rows:
+        d = _ensure(r.user_id)
+        source = r.source or "chat"
+        if source == "skill_studio":
+            d["skill_studio"]["input_tokens"] += int(r.input_tokens or 0)
+            d["skill_studio"]["output_tokens"] += int(r.output_tokens or 0)
+        elif source == "project":
+            d["project"]["input_tokens"] += int(r.input_tokens or 0)
+            d["project"]["output_tokens"] += int(r.output_tokens or 0)
+        else:
+            # chat / opencode workspace 等都归入 chat
+            d["chat"]["input_tokens"] += int(r.input_tokens or 0)
+            d["chat"]["output_tokens"] += int(r.output_tokens or 0)
+
+    for r in skill_exec_rows:
+        if not r.user_id:
+            continue
+        d = _ensure(r.user_id)
+        d["skill_studio"]["input_tokens"] += int(r.input_tokens or 0)
+        d["skill_studio"]["output_tokens"] += int(r.output_tokens or 0)
+
+    for r in oc_rows:
+        d = _ensure(r.user_id)
+        d["opencode"]["input_tokens"] = r.input_tokens or 0
+        d["opencode"]["output_tokens"] = r.output_tokens or 0
+        d["opencode"]["cache_read_tokens"] = r.cache_read_tokens or 0
+
+    # 计算合计并排序
+    result = []
+    for d in data.values():
+        d["total_input"] = (
+            d["opencode"]["input_tokens"]
+            + d["skill_studio"]["input_tokens"]
+            + d["chat"]["input_tokens"]
+            + d["project"]["input_tokens"]
+        )
+        d["total_output"] = (
+            d["opencode"]["output_tokens"]
+            + d["skill_studio"]["output_tokens"]
+            + d["chat"]["output_tokens"]
+            + d["project"]["output_tokens"]
+        )
+        result.append(d)
+
+    result.sort(key=lambda x: -(x["total_input"] + x["total_output"]))
+    return result
