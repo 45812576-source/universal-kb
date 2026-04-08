@@ -1328,6 +1328,32 @@ async def run_tests(
     if session.status not in allow_status or session.current_step not in allow_step:
         raise HTTPException(400, f"当前状态不允许执行测试: step={session.current_step.value}, status={session.status.value}")
 
+    # 提取上次 baseline（重跑前读取，清理后不可用）
+    previous_deductions = None
+    if session.current_step == SessionStep.DONE and session.report_id:
+        old_report = db.get(SandboxTestReport, session.report_id)
+        if old_report and old_report.part3_evaluation:
+            qd = old_report.part3_evaluation.get("quality_detail", {})
+            previous_deductions = qd.get("top_deductions")
+    if not previous_deductions:
+        # 新 session：查同 target 最近一次已完成 session 的 report
+        prev_session = (
+            db.query(SandboxTestSession)
+            .filter(
+                SandboxTestSession.target_type == session.target_type,
+                SandboxTestSession.target_id == session.target_id,
+                SandboxTestSession.status == SessionStatus.COMPLETED,
+                SandboxTestSession.id != session.id,
+            )
+            .order_by(SandboxTestSession.completed_at.desc())
+            .first()
+        )
+        if prev_session and prev_session.report_id:
+            prev_report = db.get(SandboxTestReport, prev_session.report_id)
+            if prev_report and prev_report.part3_evaluation:
+                qd = prev_report.part3_evaluation.get("quality_detail", {})
+                previous_deductions = qd.get("top_deductions")
+
     # 重跑时清理旧的测试用例和报告，并升级到最新版本
     if session.current_step == SessionStep.DONE:
         for case in list(session.cases):
@@ -1486,7 +1512,7 @@ async def run_tests(
     db.commit()
 
     # 5. 评价阶段
-    evaluation = await _evaluate_session(session, cases, db)
+    evaluation = await _evaluate_session(session, cases, db, previous_deductions=previous_deductions)
     session.quality_passed = evaluation["quality_passed"]
     session.usability_passed = evaluation["usability_passed"]
     session.anti_hallucination_passed = evaluation["anti_hallucination_passed"]
@@ -1504,6 +1530,46 @@ async def run_tests(
     session.status = SessionStatus.COMPLETED
     session.completed_at = datetime.datetime.utcnow()
     db.commit()
+
+    # 7. 同步 fix_plan 到 Skill Memo（仅 skill 类型）
+    if session.target_type == "skill":
+        try:
+            from app.services.skill_memo_service import record_test_result
+            quality_detail = evaluation.get("quality_detail", {})
+            avg_score = quality_detail.get("avg_score", 0)
+            top_deductions = quality_detail.get("top_deductions", [])
+            fix_plan = quality_detail.get("fix_plan", [])
+
+            # 摘要：综合分 + 主问题
+            main_issues = [d.get("reason", "") for d in top_deductions[:3] if d.get("reason")]
+            summary_text = f"综合分 {avg_score}"
+            if main_issues:
+                summary_text += f"，主问题：{'；'.join(main_issues)}"
+
+            # 将 top_deductions + fix_plan 转为 suggested_followups
+            suggested_followups = []
+            for d in top_deductions:
+                title = f"修复: [{d.get('dimension', '')}] {d.get('reason', '未知问题')}"
+                if d.get("fix_suggestion"):
+                    title += f" → {d['fix_suggestion']}"
+                suggested_followups.append({
+                    "title": title[:200],
+                    "type": "fix_after_test",
+                })
+
+            record_test_result(
+                db=db,
+                skill_id=session.target_id,
+                source="sandbox_interactive",
+                version=session.target_version,
+                status="passed" if session.approval_eligible else "failed",
+                summary=summary_text,
+                details=evaluation,
+                suggested_followups=suggested_followups if not session.approval_eligible else None,
+                user_id=session.tester_id,
+            )
+        except Exception as e:
+            logger.warning("同步 fix_plan 到 memo 失败: %s", e)
 
     return _serialize_session(session)
 
@@ -1857,6 +1923,7 @@ async def _evaluate_session(
     session: SandboxTestSession,
     cases: list[SandboxTestCase],
     db: Session,
+    previous_deductions: list[dict] | None = None,
 ) -> dict:
     """Part 3 评价：质量 + 易用性 + 反幻觉限制。"""
     evaluation = {
@@ -1880,6 +1947,27 @@ async def _evaluate_session(
         all_deductions = []
         all_fix_suggestions = []
         for case in successful_cases[:5]:
+            # 构建 baseline 段落（上次扣分项锚定）
+            baseline_section = ""
+            if previous_deductions:
+                baseline_lines = []
+                for bd in previous_deductions:
+                    dim = bd.get("dimension", "unknown")
+                    pts = bd.get("points", 0)
+                    reason = bd.get("reason", "")
+                    fix = bd.get("fix_suggestion", "")
+                    baseline_lines.append(f"- [{dim}] {pts}分: {reason} → 修复建议: {fix}")
+                baseline_section = (
+                    f"\n\n## 上次测试的主要扣分项（本次必须优先验证）\n"
+                    + "\n".join(baseline_lines)
+                    + "\n\n评分规则补充：\n"
+                    f"- 对上述每条扣分项，先验证是否已修复：\n"
+                    f'  - 已修复 → 在 deductions 中标注 "status": "FIXED"，不扣分\n'
+                    f"  - 未修复 → 继续扣分，维持原扣分值\n"
+                    f"- 新发现的问题正常评分\n"
+                    f"- 禁止对上次未提及的维度首次出现就大幅扣分（新扣分项单项 ≤ -10）"
+                )
+
             score_prompt = (
                 f"你是 AI Skill 质量评审官。评估以下输出是否真正解决了 Skill 定义的问题。\n\n"
                 f"Skill 名称：{session.target_name}\n"
@@ -1892,11 +1980,13 @@ async def _evaluate_session(
                 f"3. constraint_score（约束遵守度 20%）：是否遵守权限限制\n"
                 f"4. actionability_score（可行动性 20%）：输出是否可直接用于决策\n\n"
                 f"对每个扣分项，说明扣分维度、扣分值、原因和修复建议。\n\n"
-                f"只输出 JSON：\n"
+                + baseline_section
+                + f"\n\n只输出 JSON：\n"
                 f'{{"score": 75, "coverage_score": 80, "correctness_score": 70, '
                 f'"constraint_score": 75, "actionability_score": 60, '
                 f'"deductions": [{{"dimension": "correctness", "points": -15, '
-                f'"reason": "引用了不存在的字段", "fix_suggestion": "限制输出字段白名单"}}], '
+                f'"reason": "引用了不存在的字段", "fix_suggestion": "限制输出字段白名单"'
+                f', "status": "FIXED 或 NEW"}}], '
                 f'"reason": "主问题一句话", "fix_suggestion": "整改动作一句话"}}'
             )
             try:

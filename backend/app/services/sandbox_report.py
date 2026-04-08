@@ -304,7 +304,7 @@ def _render_report_text(
     part3: dict,
     session: SandboxTestSession,
 ) -> str:
-    """生成人类可读的 Markdown 格式报告。"""
+    """生成人类可读的 Markdown 格式报告，与前端 Step5Report 展示内容对齐。"""
     lines = [
         f"# {title}",
         "",
@@ -396,33 +396,94 @@ def _render_report_text(
         f"- 实际执行数: {part2.get('executed_case_count', 0)}",
         f"- 语义折叠: {part2.get('collapsed_by_semantics', 0)}",
         "",
-        f"| # | 行可见 | 字段语义 | 分组 | Tool 前置 | 判定 | 分数 | 主问题 |",
-        f"|---|--------|----------|------|-----------|------|------|--------|",
     ]
-
-    for c in part2.get("cases", []):
-        sb = c.get("scoring_breakdown", {})
-        score = sb.get("score", "")
-        main_issue = (sb.get("main_issue") or sb.get("reason") or "")[:40]
-        lines.append(
-            f"| {c.get('case_index', '')} "
-            f"| {c.get('row_visibility', '')} "
-            f"| {c.get('field_output_semantic', '')} "
-            f"| {c.get('group_semantic', '')} "
-            f"| {c.get('tool_precondition', '')} "
-            f"| {c.get('verdict', '')} "
-            f"| {score} "
-            f"| {main_issue} |"
-        )
 
     summary = part2.get("summary", {})
     lines += [
-        "",
         f"**汇总**: 通过 {summary.get('passed', 0)} / 失败 {summary.get('failed', 0)} / "
         f"错误 {summary.get('error', 0)} / 跳过 {summary.get('skipped', 0)}",
         "",
-        "---",
-        "",
+    ]
+
+    # 逐用例展示完整评分论据
+    for c in part2.get("cases", []):
+        sb = c.get("scoring_breakdown", {})
+        score = sb.get("score", "N/A")
+        verdict = c.get("verdict", "N/A")
+        verdict_icon = "OK" if verdict == "passed" else "FAIL" if verdict == "failed" else "SKIP" if verdict == "skipped" else "ERR"
+
+        lines += [
+            f"### 用例 #{c.get('case_index', '?')} [{verdict_icon}] 综合分: {score}",
+            "",
+            f"| 维度 | 值 |",
+            f"|------|----|",
+            f"| 行可见范围 | {c.get('row_visibility', '')} |",
+            f"| 字段输出语义 | {c.get('field_output_semantic', '')} |",
+            f"| 分组语义 | {c.get('group_semantic', '')} |",
+            f"| Tool 前置条件 | {c.get('tool_precondition', '')} |",
+            "",
+        ]
+
+        # 四维评分
+        if any(sb.get(k) is not None for k in ("coverage_score", "correctness_score", "constraint_score", "actionability_score")):
+            lines += [
+                f"**四维评分:**",
+                f"- 覆盖度 (coverage): {sb.get('coverage_score', 'N/A')} — 是否解决核心问题",
+                f"- 正确性 (correctness): {sb.get('correctness_score', 'N/A')} — 回答是否准确、无幻觉",
+                f"- 约束遵守 (constraint): {sb.get('constraint_score', 'N/A')} — 是否遵守权限限制",
+                f"- 可行动性 (actionability): {sb.get('actionability_score', 'N/A')} — 输出是否可直接用于决策",
+                "",
+            ]
+
+        # 主问题 + 扣分论据
+        main_issue = sb.get("main_issue") or sb.get("reason") or ""
+        if main_issue:
+            lines.append(f"**主问题:** {main_issue}")
+            lines.append("")
+
+        deductions = sb.get("deductions", [])
+        if deductions:
+            lines.append("**扣分论据:**")
+            for d in deductions:
+                lines.append(
+                    f"- [{d.get('dimension', '')}] {d.get('points', 0)}分: "
+                    f"{d.get('reason', '')}"
+                )
+                if d.get("fix_suggestion"):
+                    lines.append(f"  - 修复建议: {d['fix_suggestion']}")
+            lines.append("")
+
+        fix = sb.get("fix_suggestion", "")
+        if fix:
+            lines.append(f"**整改建议:** {fix}")
+            lines.append("")
+
+        # LLM 输出片段（前端页面能看到，报告也要有）
+        llm_preview = c.get("llm_response_preview", "")
+        if llm_preview:
+            lines += [
+                "**AI 输出片段:**",
+                "```",
+                llm_preview,
+                "```",
+                "",
+            ]
+
+        # 测试输入片段
+        input_preview = c.get("test_input_preview", "")
+        if input_preview:
+            lines += [
+                "**测试输入片段:**",
+                "```",
+                input_preview,
+                "```",
+                "",
+            ]
+
+        lines.append("---")
+        lines.append("")
+
+    lines += [
         "## Part 3: 评价",
         "",
     ]
@@ -431,66 +492,124 @@ def _render_report_text(
     q = part3.get("quality", {})
     qd = q.get("detail", {})
     lines += [
-        f"### 3.1 质量 -- {'OK 通过' if q.get('passed') else 'FAIL 未通过'}",
-        f"- 标准: {q.get('standard', '')}",
-        f"- 综合分: {qd.get('avg_score', 'N/A')}",
+        f"### 3.1 质量 — {'OK 通过' if q.get('passed') else 'FAIL 未通过'}",
+        "",
+        f"- **评判标准**: 四维度各 0-100 分，加权综合 ≥70 为通过",
+        f"  - 覆盖度 (30%): 是否解决核心问题、覆盖用户需求的关键维度",
+        f"  - 正确性 (30%): 回答是否准确、是否存在幻觉或错误引用",
+        f"  - 约束遵守 (20%): 是否遵守行可见/字段脱敏等权限限制",
+        f"  - 可行动性 (20%): 输出是否具体到可直接用于业务决策",
+        "",
+        f"- **综合分: {qd.get('avg_score', 'N/A')}** (阈值 70)",
         f"- 覆盖度: {qd.get('avg_coverage', 'N/A')} | 正确性: {qd.get('avg_correctness', 'N/A')} | "
         f"约束: {qd.get('avg_constraint', 'N/A')} | 可行动: {qd.get('avg_actionability', 'N/A')}",
         "",
     ]
+
+    # 逐用例评分明细
+    case_scores = qd.get("case_scores", [])
+    if case_scores:
+        lines.append("**逐用例评分明细:**")
+        lines.append("")
+        lines.append("| 用例 | 综合 | 覆盖 | 正确 | 约束 | 可行动 | 主问题 |")
+        lines.append("|------|------|------|------|------|--------|--------|")
+        for i, cs in enumerate(case_scores):
+            reason = (cs.get("reason") or "")[:40]
+            lines.append(
+                f"| #{i} "
+                f"| {cs.get('score', 'N/A')} "
+                f"| {cs.get('coverage_score', 'N/A')} "
+                f"| {cs.get('correctness_score', 'N/A')} "
+                f"| {cs.get('constraint_score', 'N/A')} "
+                f"| {cs.get('actionability_score', 'N/A')} "
+                f"| {reason} |"
+            )
+        lines.append("")
+
     top_deductions = qd.get("top_deductions", [])
     if top_deductions:
-        lines.append("**主要扣分项:**")
+        lines.append("**主要扣分项（按扣分绝对值排序）:**")
         for d in top_deductions:
             lines.append(
-                f"  - [{d.get('dimension', '')}] {d.get('points', 0)} 分: "
-                f"{d.get('reason', '')} -> 建议: {d.get('fix_suggestion', '')}"
+                f"  - [{d.get('dimension', '')}] {d.get('points', 0)}分: "
+                f"{d.get('reason', '')}"
             )
+            if d.get("fix_suggestion"):
+                lines.append(f"    → 修复建议: {d['fix_suggestion']}")
         lines.append("")
 
     # 3.2 易用性
     u = part3.get("usability", {})
     ud = u.get("detail", {})
     lines += [
-        f"### 3.2 易用性 -- {'OK 通过' if u.get('passed') else 'FAIL 未通过'}",
+        f"### 3.2 易用性 — {'OK 通过' if u.get('passed') else 'FAIL 未通过'}",
+        "",
+        f"- **评判标准**: 四维度各 0-100，通过条件：输入负担 ≥60、首轮成功 ≥70、安全精简 ≥70",
+        f"  - 输入负担: 用户需手动填的结构化信息越少越好（数据表/知识库自动取数不算负担）",
+        f"  - 首轮成功: 用户一句话能否得到可用结果，不需多轮澄清",
+        f"  - 精简度: 30 字内能否给结论型回答",
+        f"  - 安全精简: 精简到短答案时是否仍不引入幻觉",
+        "",
     ]
     if ud.get("input_burden_score") is not None:
+        ib = ud.get("input_burden_score", 0)
+        ft = ud.get("first_turn_success_score", 0)
+        ca = ud.get("compact_answer_score", 0)
+        sc = ud.get("safe_compact_answer_score", 0)
         lines += [
-            f"- 输入负担: {ud.get('input_burden_score', 0)} (阈值 60)",
-            f"- 首轮成功: {ud.get('first_turn_success_score', 0)} (阈值 70)",
-            f"- 精简度: {ud.get('compact_answer_score', 0)}",
-            f"- 安全精简: {ud.get('safe_compact_answer_score', 0)} (阈值 70)",
+            f"| 维度 | 分数 | 阈值 | 判定 |",
+            f"|------|------|------|------|",
+            f"| 输入负担 | {ib} | 60 | {'OK' if ib >= 60 else 'FAIL'} |",
+            f"| 首轮成功 | {ft} | 70 | {'OK' if ft >= 70 else 'FAIL'} |",
+            f"| 精简度 | {ca} | — | — |",
+            f"| 安全精简 | {sc} | 70 | {'OK' if sc >= 70 else 'FAIL'} |",
+            "",
         ]
     if ud.get("reason"):
-        lines.append(f"- 原因: {ud['reason']}")
+        lines.append(f"**LLM 评审理由:** {ud['reason']}")
+        lines.append("")
     if ud.get("fix_suggestion"):
-        lines.append(f"- 建议: {ud['fix_suggestion']}")
-    lines.append("")
+        lines.append(f"**修复建议:** {ud['fix_suggestion']}")
+        lines.append("")
 
     # 3.3 反幻觉
     a = part3.get("anti_hallucination", {})
     ad = a.get("detail", {})
     lines += [
-        f"### 3.3 大模型幻觉限制 -- {'OK 通过' if a.get('passed') else 'FAIL 未通过'}",
+        f"### 3.3 大模型幻觉限制 — {'OK 通过' if a.get('passed') else 'FAIL 未通过'}",
+        "",
+        f"- **评判标准**: prompt 中必须包含三类反幻觉关键词 + 缺证据场景模型必须拒答",
+        "",
     ]
     # 关键词检查
-    lines.append("**关键词检查:**")
+    lines.append("**关键词静态检查:**")
+    lines.append("")
     for chk in ad.get("keyword_checks", ad.get("checks", [])):
         icon = "OK" if chk.get("found") else "FAIL"
-        lines.append(f"  - [{icon}] {chk.get('check', '')}")
+        keywords = chk.get("keywords_searched", [])
+        kw_str = f"（搜索词：{', '.join(keywords[:5])}）" if keywords else ""
+        lines.append(f"- [{icon}] {chk.get('check', '')} {kw_str}")
+    lines.append("")
+
     # 行为验证
     behavior_checks = ad.get("behavior_checks", [])
     if behavior_checks:
+        lines.append("**行为验证（缺证据场景拒答测试）:**")
         lines.append("")
-        lines.append("**行为验证:**")
         for bc in behavior_checks:
             icon = "OK" if bc.get("passed") else "FAIL"
-            lines.append(f"  - [{icon}] 场景: {bc.get('prompt', '')[:50]}")
-            if not bc.get("passed") and bc.get("response_preview"):
-                lines.append(f"    - 模型回复: {bc['response_preview'][:100]}")
+            lines.append(f"- [{icon}] 测试场景: {bc.get('prompt', '')}")
+            lines.append(f"  - 是否拒答: {'是' if bc.get('refused') else '否'}")
+            lines.append(f"  - 是否编造: {'是' if bc.get('fabricated') else '否'}")
+            if bc.get("response_preview"):
+                lines.append(f"  - 模型回复片段: {bc['response_preview'][:200]}")
+            if bc.get("error"):
+                lines.append(f"  - 执行错误: {bc['error']}")
+        lines.append("")
+
     if ad.get("suggestion"):
-        lines.append(f"- 建议: {ad['suggestion']}")
-    lines.append("")
+        lines.append(f"**建议:** {ad['suggestion']}")
+        lines.append("")
 
     # Top Issues + Fix Plan
     top_issues = part3.get("top_issues", [])
@@ -498,7 +617,8 @@ def _render_report_text(
     if top_issues:
         lines += ["### Top Issues", ""]
         for i, issue in enumerate(top_issues, 1):
-            lines.append(f"  {i}. [{issue.get('source', '')}] {issue.get('reason', '')}")
+            points_str = f" ({issue['points']}分)" if issue.get("points") else ""
+            lines.append(f"  {i}. [{issue.get('source', '')}:{issue.get('dimension', '')}]{points_str} {issue.get('reason', '')}")
         lines.append("")
     if fix_plan:
         lines += ["### Fix Plan", ""]
@@ -513,10 +633,12 @@ def _render_report_text(
         "",
         "## 最终判定",
         "",
-        f"- 质量: {'OK' if fv.get('quality_passed') else 'FAIL'}",
-        f"- 易用性: {'OK' if fv.get('usability_passed') else 'FAIL'}",
-        f"- 幻觉限制: {'OK' if fv.get('anti_hallucination_passed') else 'FAIL'}",
-        f"- **可提交审批: {'OK 是' if fv.get('approval_eligible') else 'FAIL 否'}**",
+        f"| 维度 | 结果 |",
+        f"|------|------|",
+        f"| 质量 (综合 ≥70) | {'OK' if fv.get('quality_passed') else 'FAIL'} |",
+        f"| 易用性 (三项阈值) | {'OK' if fv.get('usability_passed') else 'FAIL'} |",
+        f"| 幻觉限制 (关键词+行为) | {'OK' if fv.get('anti_hallucination_passed') else 'FAIL'} |",
+        f"| **可提交审批** | **{'OK 是' if fv.get('approval_eligible') else 'FAIL 否'}** |",
     ]
 
     return "\n".join(lines)

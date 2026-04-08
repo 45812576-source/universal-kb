@@ -727,7 +727,7 @@ def _build_memo_context(memo_data: dict | None) -> str:
     recent = progress_log[-3:] if progress_log else []
     recent_desc = "、".join(r["summary"] for r in recent) if recent else "无"
 
-    return _MEMO_CONTEXT_TEMPLATE.format(
+    base = _MEMO_CONTEXT_TEMPLATE.format(
         lifecycle_stage=memo_data.get("lifecycle_stage", "unknown"),
         status_summary=memo_data.get("status_summary", ""),
         current_task_desc=current_desc,
@@ -736,6 +736,33 @@ def _build_memo_context(memo_data: dict | None) -> str:
         latest_test_desc=test_desc,
         recent_progress=recent_desc,
     )
+
+    # fixing 阶段 + 最近测试失败 → 追加 fix plan 提示
+    if memo_data.get("lifecycle_stage") == "fixing" and latest_test and latest_test.get("status") == "failed":
+        details = latest_test.get("details", {})
+        quality_detail = details.get("quality_detail", {})
+        avg_score = quality_detail.get("avg_score", "N/A")
+        top_deductions = quality_detail.get("top_deductions", [])
+
+        if top_deductions:
+            lines = []
+            for i, d in enumerate(top_deductions, 1):
+                dim = d.get("dimension", "unknown")
+                reason = d.get("reason", "")
+                fix = d.get("fix_suggestion", "")
+                line = f"{i}. [{dim}] {reason}"
+                if fix:
+                    line += f" → 建议: {fix}"
+                lines.append(line)
+            fix_section = (
+                f"\n\n## 沙盒测试待修复\n"
+                f"上次沙盒测试未通过（综合分 {avg_score}），发现以下问题：\n"
+                + "\n".join(lines)
+                + "\n请询问用户是否按此计划逐项修复。"
+            )
+            base += fix_section
+
+    return base
 
 
 def _build_system(
