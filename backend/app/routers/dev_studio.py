@@ -346,6 +346,15 @@ def ensure_workspace_layout(workdir: str, display_name: str = "") -> tuple[str, 
                     "- **archive/** — 归档内容\n"
                 )
 
+    # 确保 project/ 是 git repo — opencode 的 @ 文件引用和工具依赖 git 索引
+    git_dir = os.path.join(project_dir, ".git")
+    if not os.path.exists(git_dir):
+        try:
+            import subprocess as _sp
+            _sp.run(["git", "init"], cwd=project_dir, capture_output=True, timeout=5)
+        except Exception:
+            pass
+
     # symlink: project/.opencode → runtime/config/opencode/
     # 让 OpenCode 在 cwd(=project/) 下的 .opencode/ 实际指向 runtime 隔离目录
     oc_link = os.path.join(project_dir, ".opencode")
