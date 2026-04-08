@@ -14,6 +14,10 @@ from app.models.tool import ToolRegistry, ToolType
 from app.models.user import Role
 
 
+# tool_publish 审批需要完整 checklist（5 项）
+_TOOL_APPROVE_CHECKLIST = [{"status": "approved"}] * 5
+
+
 # ── 辅助：构造 zip ─────────────────────────────────────────────────────────────
 
 def _make_zip(files: dict[str, str]) -> bytes:
@@ -303,7 +307,8 @@ class TestMcpToolStatusFlow:
         db.flush()
         return tool
 
-    def test_employee_submit_creates_dept_pending(self, client, db):
+    def test_direct_publish_blocked(self, client, db):
+        """工具不能单独发布，应返回 400。"""
         dept = _make_dept(db)
         emp = _make_user(db, "mflow_emp1", Role.EMPLOYEE, dept.id)
         tool = self._make_mcp_tool(db, emp.id, "mcp_emp_flow1")
@@ -314,25 +319,10 @@ class TestMcpToolStatusFlow:
             headers=_auth(token),
             json={"status": "published", "scope": "company"},
         )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "reviewing"
-        assert resp.json()["stage"] == "dept_pending"
+        assert resp.status_code == 400
 
-    def test_dept_admin_submit_creates_super_pending(self, client, db):
-        dept = _make_dept(db)
-        admin = _make_user(db, "mflow_da1", Role.DEPT_ADMIN, dept.id)
-        tool = self._make_mcp_tool(db, admin.id, "mcp_da_flow1")
-        db.commit()
-        token = _login(client, "mflow_da1")
-        resp = client.patch(
-            f"/api/tools/{tool.id}/status",
-            headers=_auth(token),
-            json={"status": "published", "scope": "company"},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["stage"] == "super_pending"
-
-    def test_super_admin_publishes_directly(self, client, db):
+    def test_archive_allowed(self, client, db):
+        """归档操作应正常通过。"""
         dept = _make_dept(db)
         sa = _make_user(db, "mflow_sa1", Role.SUPER_ADMIN, dept.id)
         tool = self._make_mcp_tool(db, sa.id, "mcp_sa_flow1")
@@ -341,24 +331,10 @@ class TestMcpToolStatusFlow:
         resp = client.patch(
             f"/api/tools/{tool.id}/status",
             headers=_auth(token),
-            json={"status": "published", "scope": "company"},
+            json={"status": "archived"},
         )
         assert resp.status_code == 200
-        assert resp.json()["status"] == "published"
-
-    def test_no_duplicate_approval_request(self, client, db):
-        dept = _make_dept(db)
-        emp = _make_user(db, "mflow_emp2", Role.EMPLOYEE, dept.id)
-        tool = self._make_mcp_tool(db, emp.id, "mcp_nodup1")
-        db.commit()
-        token = _login(client, "mflow_emp2")
-        client.patch(f"/api/tools/{tool.id}/status", headers=_auth(token), json={"status": "published", "scope": "company"})
-        client.patch(f"/api/tools/{tool.id}/status", headers=_auth(token), json={"status": "published", "scope": "company"})
-        count = db.query(ApprovalRequest).filter(
-            ApprovalRequest.target_id == tool.id,
-            ApprovalRequest.status == ApprovalStatus.PENDING,
-        ).count()
-        assert count == 1
+        assert resp.json()["status"] == "archived"
 
 
 # ── 审批 approve → install_and_start 被调用 ──────────────────────────────────
@@ -409,6 +385,13 @@ class TestApprovalInstallHook:
                 "sandbox_test_report_id": report.id,
                 "report_hash": report.report_hash,
             },
+            evidence_pack={
+                "tool_manifest": {"invocation_mode": "test"},
+                "deploy_info": {"usage": "test"},
+                "test_result": {"tested": True},
+                "permission_declaration": [],
+                "rollback_plan": "卸载工具即可",
+            },
         )
         db.add(req)
         db.commit()
@@ -424,7 +407,7 @@ class TestApprovalInstallHook:
             resp = client.post(
                 f"/api/approvals/{req.id}/actions",
                 headers=_auth(token),
-                json={"action": "approve"},
+                json={"action": "approve", "checklist_result": _TOOL_APPROVE_CHECKLIST},
             )
         assert resp.status_code == 200
         mock_install.assert_called_once()
@@ -439,7 +422,7 @@ class TestApprovalInstallHook:
             resp = client.post(
                 f"/api/approvals/{req.id}/actions",
                 headers=_auth(token),
-                json={"action": "approve"},
+                json={"action": "approve", "checklist_result": _TOOL_APPROVE_CHECKLIST},
             )
         assert resp.status_code == 200
         db.refresh(tool)
@@ -492,6 +475,13 @@ class TestApprovalInstallHook:
                 "sandbox_test_report_id": report.id,
                 "report_hash": report.report_hash,
             },
+            evidence_pack={
+                "tool_manifest": {"invocation_mode": "test"},
+                "deploy_info": {"usage": "test"},
+                "test_result": {"tested": True},
+                "permission_declaration": [],
+                "rollback_plan": "卸载工具即可",
+            },
         )
         db.add(req)
         db.commit()
@@ -501,7 +491,7 @@ class TestApprovalInstallHook:
             resp = client.post(
                 f"/api/approvals/{req.id}/actions",
                 headers=_auth(token),
-                json={"action": "approve"},
+                json={"action": "approve", "checklist_result": _TOOL_APPROVE_CHECKLIST},
             )
         assert resp.status_code == 200
         mock_install.assert_not_called()

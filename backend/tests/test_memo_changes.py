@@ -19,6 +19,10 @@ from app.models.user import Role
 from app.models.tool import ToolType
 
 
+# tool_publish 审批需要完整 checklist（5 项）
+_TOOL_APPROVE_CHECKLIST = [{"status": "approved"}] * 5
+
+
 def _attach_sandbox_report_for_tool(db, approval_request_id, tester_id, tool_id):
     """为工具审批请求创建沙盒测试报告并关联。"""
     from app.models.sandbox import SandboxTestSession, SandboxTestReport
@@ -861,11 +865,12 @@ class TestApprovalToolTargetDetail:
         resp = client.post(
             "/api/tools/upload-py",  # 通过状态接口更简单，直接手动创建审批
         )
-        # 直接用 /api/approvals POST 接口创建审批
+        # 直接用 /api/approvals POST 接口创建审批（需要 rollback_plan 证据）
+        _TOOL_EVIDENCE = {"rollback_plan": "卸载工具即可"}
         r = client.post(
             "/api/approvals",
             headers=_auth(token),
-            json={"request_type": "tool_publish", "target_id": tool.id, "target_type": "tool"},
+            json={"request_type": "tool_publish", "target_id": tool.id, "target_type": "tool", "evidence_pack": _TOOL_EVIDENCE},
         )
         assert r.status_code == 200
         approval_id = r.json()["id"]
@@ -906,71 +911,70 @@ class TestApprovalToolTargetDetail:
         r = client.post(
             "/api/approvals",
             headers=_auth(token),
-            json={"request_type": "tool_publish", "target_id": tool.id, "target_type": "tool"},
+            json={"request_type": "tool_publish", "target_id": tool.id, "target_type": "tool", "evidence_pack": {"rollback_plan": "卸载即可"}},
         )
         approval_id = r.json()["id"]
         td = client.get(f"/api/approvals/{approval_id}", headers=_auth(token)).json()["target_detail"]
         assert "write:reports" in td.get("permissions", [])
 
     def test_approval_tool_two_stage_workflow(self, client, db):
-        """工具审批两阶段流程：dept_pending → super_pending → approved。"""
+        """工具审批两阶段流程：直接创建审批 → dept_pending → super_pending → approved。"""
         dept = _make_dept(db)
         emp = _make_user(db, "wf_emp", Role.EMPLOYEE, dept.id)
         dept_adm = _make_user(db, "wf_dept", Role.DEPT_ADMIN, dept.id)
         super_adm = _make_user(db, "wf_super", Role.SUPER_ADMIN, dept.id)
         db.commit()
 
-        emp_token = _login(client, "wf_emp")
         dept_token = _login(client, "wf_dept")
         super_token = _login(client, "wf_super")
 
-        # 员工上传工具并申请发布 → dept_pending
         from app.models.tool import ToolRegistry, ToolType
         tool = ToolRegistry(
             name="wf_tool", display_name="wf", description="wf",
             tool_type=ToolType.BUILTIN, config={}, input_schema={},
             output_format="json", created_by=emp.id,
-            is_active=False, scope="personal", status="draft",
+            is_active=False, scope="company", status="reviewing",
         )
         db.add(tool)
+        db.flush()
+
+        # 直接在 DB 创建审批（工具不能单独发布，走 Skill 统一提交）
+        from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus
+        appr = ApprovalRequest(
+            request_type=ApprovalRequestType.TOOL_PUBLISH,
+            target_id=tool.id, target_type="tool",
+            requester_id=emp.id, status=ApprovalStatus.PENDING,
+            stage="dept_pending",
+            evidence_pack={
+                "tool_manifest": {}, "deploy_info": {},
+                "test_result": {"tested": True},
+                "permission_declaration": [],
+                "rollback_plan": "卸载工具即可",
+            },
+        )
+        db.add(appr)
         db.commit()
 
-        status_resp = client.patch(
-            f"/api/tools/{tool.id}/status",
-            headers=_auth(emp_token),
-            json={"status": "published", "scope": "company"},
-        )
-        assert status_resp.status_code == 200
-        assert status_resp.json()["stage"] == "dept_pending"
-
-        # 查出审批 ID
-        approvals = client.get("/api/approvals", headers=_auth(dept_token)).json()
-        appr = next((a for a in approvals["items"] if a["target_id"] == tool.id), None)
-        assert appr is not None
-        appr_id = appr["id"]
-
-        # 关联沙盒测试报告（审批通过 tool_publish 需要）
-        _attach_sandbox_report_for_tool(db, appr_id, super_adm.id, tool.id)
+        _attach_sandbox_report_for_tool(db, appr.id, super_adm.id, tool.id)
 
         # 部门管理员通过 → super_pending
         act1 = client.post(
-            f"/api/approvals/{appr_id}/actions",
+            f"/api/approvals/{appr.id}/actions",
             headers=_auth(dept_token),
-            json={"action": "approve"},
+            json={"action": "approve", "checklist_result": _TOOL_APPROVE_CHECKLIST},
         )
         assert act1.status_code == 200
         assert act1.json()["stage"] == "super_pending"
 
         # 超管通过 → approved + tool published
         act2 = client.post(
-            f"/api/approvals/{appr_id}/actions",
+            f"/api/approvals/{appr.id}/actions",
             headers=_auth(super_token),
-            json={"action": "approve"},
+            json={"action": "approve", "checklist_result": _TOOL_APPROVE_CHECKLIST},
         )
         assert act2.status_code == 200
         assert act2.json()["status"] == "approved"
 
-        # 工具应已发布
         tool_resp = client.get(f"/api/tools/{tool.id}", headers=_auth(super_token))
         assert tool_resp.json()["status"] == "published"
 
@@ -980,7 +984,6 @@ class TestApprovalToolTargetDetail:
         super_adm = _make_user(db, "rj_super", Role.SUPER_ADMIN, dept.id)
         db.commit()
 
-        emp_token = _login(client, "rj_emp")
         super_token = _login(client, "rj_super")
 
         from app.models.tool import ToolRegistry, ToolType
@@ -988,23 +991,24 @@ class TestApprovalToolTargetDetail:
             name="rj_tool", display_name="rj", description="rj",
             tool_type=ToolType.BUILTIN, config={}, input_schema={},
             output_format="json", created_by=emp.id,
-            is_active=False, scope="personal", status="draft",
+            is_active=False, scope="personal", status="reviewing",
         )
         db.add(tool)
+        db.flush()
+
+        from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus
+        appr = ApprovalRequest(
+            request_type=ApprovalRequestType.TOOL_PUBLISH,
+            target_id=tool.id, target_type="tool",
+            requester_id=emp.id, status=ApprovalStatus.PENDING,
+            stage="super_pending",
+        )
+        db.add(appr)
         db.commit()
 
-        client.patch(
-            f"/api/tools/{tool.id}/status",
-            headers=_auth(emp_token),
-            json={"status": "published", "scope": "personal"},
-        )
-
-        approvals = client.get("/api/approvals", headers=_auth(super_token)).json()
-        appr_id = next(a["id"] for a in approvals["items"] if a["target_id"] == tool.id)
-
-        # 超管直接拒绝
+        # 超管直接拒绝（reject 不需要 evidence）
         act = client.post(
-            f"/api/approvals/{appr_id}/actions",
+            f"/api/approvals/{appr.id}/actions",
             headers=_auth(super_token),
             json={"action": "reject", "comment": "不符合规范"},
         )
@@ -1015,13 +1019,12 @@ class TestApprovalToolTargetDetail:
         assert tool_resp.json()["status"] == "draft"
 
     def test_super_admin_approves_dept_pending_tool_directly(self, client, db):
-        """员工提交后，超级管理员可直接批准，无需部门管理员先审批。"""
+        """超级管理员可直接批准 dept_pending 的工具审批。"""
         dept = _make_dept(db)
         emp = _make_user(db, "dir_emp", Role.EMPLOYEE, dept.id)
         super_adm = _make_user(db, "dir_super", Role.SUPER_ADMIN, dept.id)
         db.commit()
 
-        emp_token = _login(client, "dir_emp")
         super_token = _login(client, "dir_super")
 
         from app.models.tool import ToolRegistry, ToolType
@@ -1029,37 +1032,36 @@ class TestApprovalToolTargetDetail:
             name="dir_tool", display_name="dir", description="dir",
             tool_type=ToolType.BUILTIN, config={}, input_schema={},
             output_format="json", created_by=emp.id,
-            is_active=False, scope="personal", status="draft",
+            is_active=False, scope="company", status="reviewing",
         )
         db.add(tool)
+        db.flush()
+
+        from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus
+        appr = ApprovalRequest(
+            request_type=ApprovalRequestType.TOOL_PUBLISH,
+            target_id=tool.id, target_type="tool",
+            requester_id=emp.id, status=ApprovalStatus.PENDING,
+            stage="dept_pending",
+            evidence_pack={
+                "tool_manifest": {}, "deploy_info": {},
+                "test_result": {"tested": True},
+                "permission_declaration": [],
+                "rollback_plan": "卸载工具即可",
+            },
+        )
+        db.add(appr)
         db.commit()
 
-        submit_resp = client.patch(
-            f"/api/tools/{tool.id}/status",
-            headers=_auth(emp_token),
-            json={"status": "published", "scope": "company"},
-        )
-        assert submit_resp.status_code == 200
-        assert submit_resp.json()["stage"] == "dept_pending"
-
-        approvals = client.get("/api/approvals", headers=_auth(super_token)).json()
-        appr = next((a for a in approvals["items"] if a["target_id"] == tool.id), None)
-        assert appr is not None
-        assert appr["stage"] == "dept_pending"
-
-        # 关联沙盒测试报告（审批通过 tool_publish 需要）
-        _attach_sandbox_report_for_tool(db, appr["id"], super_adm.id, tool.id)
+        _attach_sandbox_report_for_tool(db, appr.id, super_adm.id, tool.id)
 
         act = client.post(
-            f"/api/approvals/{appr['id']}/actions",
+            f"/api/approvals/{appr.id}/actions",
             headers=_auth(super_token),
-            json={"action": "approve"},
+            json={"action": "approve", "checklist_result": _TOOL_APPROVE_CHECKLIST},
         )
         assert act.status_code == 200
         assert act.json()["status"] == "approved"
-
-        approval_detail = client.get(f"/api/approvals/{appr['id']}", headers=_auth(super_token)).json()
-        assert approval_detail["status"] == "approved"
 
         tool_resp = client.get(f"/api/tools/{tool.id}", headers=_auth(super_token))
         assert tool_resp.json()["status"] == "published"
@@ -1071,7 +1073,8 @@ class TestApprovalToolTargetDetail:
 
 class TestToolStatusUpdateDeployInfo:
 
-    def test_super_admin_publish_directly(self, client, db):
+    def test_direct_publish_blocked(self, client, db):
+        """工具不能单独发布，无论角色，应返回 400。"""
         dept = _make_dept(db)
         admin = _make_user(db, "su_publish", Role.SUPER_ADMIN, dept.id)
         db.commit()
@@ -1096,10 +1099,10 @@ class TestToolStatusUpdateDeployInfo:
                 "deploy_info": {"usage": "全公司使用"},
             },
         )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "published"
+        assert resp.status_code == 400
 
-    def test_employee_publish_creates_dept_pending_approval(self, client, db):
+    def test_employee_publish_blocked(self, client, db):
+        """员工也不能直接发布工具，应返回 400。"""
         dept = _make_dept(db)
         emp = _make_user(db, "emp_pub", Role.EMPLOYEE, dept.id)
         db.commit()
@@ -1120,5 +1123,4 @@ class TestToolStatusUpdateDeployInfo:
             headers=_auth(token),
             json={"status": "published", "scope": "department"},
         )
-        assert resp.status_code == 200
-        assert resp.json()["stage"] == "dept_pending"
+        assert resp.status_code == 400
