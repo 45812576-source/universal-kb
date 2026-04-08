@@ -927,6 +927,135 @@ def adopt_feedback(
     }
 
 
+# ── 长文本 Ingest 接入 ────────────────────────────────────────────────────────
+
+# 文件角色到 memo category 的映射
+_ROLE_TO_CATEGORY: dict[str, str] = {
+    "input_definition": "reference",
+    "knowledge": "knowledge-base",
+    "reference": "reference",
+    "example": "example",
+}
+
+
+def ingest_from_paste(
+    db: Session,
+    skill_id: int,
+    user_intent: str,
+    saved_files: list[dict],
+    user_id: int | None = None,
+) -> dict:
+    """长文本 ingest 完成后接入 memo：推进任务、记录日志、更新 notices。
+
+    saved_files 格式: [{"filename": "x.json", "block_type": "json-schema",
+                         "suggested_role": "input_definition", "size": 1234}, ...]
+    """
+    memo = db.query(SkillMemo).filter(SkillMemo.skill_id == skill_id).first()
+    if not memo:
+        # 没有 memo → 自动创建一个 published_iteration 类型的 memo
+        init_memo(db, skill_id, "published_iteration", user_intent, user_id or 0)
+        memo = db.query(SkillMemo).filter(SkillMemo.skill_id == skill_id).first()
+        if not memo:
+            return {"ok": False, "error": "Failed to create memo"}
+
+    payload = copy.deepcopy(memo.memo_payload or _empty_payload())
+    tasks = payload.get("tasks", [])
+    completed_task_ids: list[str] = []
+    filenames = [f["filename"] for f in saved_files]
+
+    # ── 1. 尝试自动推进匹配的 create_file 任务 ──
+    for task in tasks:
+        if task["status"] not in ("todo", "in_progress"):
+            continue
+        if task["type"] not in ("create_file", "update_file"):
+            continue
+        # 检查 target_files 是否被 ingest 的文件满足
+        target_files = task.get("target_files", [])
+        if not target_files:
+            continue
+
+        # 精确匹配或 category 匹配
+        task_cat = _infer_task_category(target_files)
+        ingested_cats = {_ROLE_TO_CATEGORY.get(f.get("suggested_role", ""), "other") for f in saved_files}
+
+        matched = any(tf in filenames for tf in target_files) or (task_cat and task_cat in ingested_cats)
+        if matched:
+            task["status"] = "done"
+            task["completed_at"] = _now_iso()
+            task["completed_by"] = "ingest_paste"
+            task["result_summary"] = f"通过长文本粘贴自动完成，文件：{', '.join(filenames)}"
+            completed_task_ids.append(task["id"])
+
+            # 清除关联 notice
+            for notice in payload.get("persistent_notices", []):
+                if task["id"] in notice.get("related_task_ids", []):
+                    notice["status"] = "resolved"
+
+    # ── 2. 写入 progress_log ──
+    file_list = "、".join(filenames)
+    log_entry = {
+        "id": _new_id("log"),
+        "task_id": None,
+        "kind": "ingest_paste",
+        "summary": f"长文本粘贴：{user_intent}。存储文件：{file_list}",
+        "created_at": _now_iso(),
+    }
+    payload.setdefault("progress_log", []).append(log_entry)
+
+    # ── 3. 写入 context_rollups（供 Studio Agent 压缩上下文用） ──
+    rollup_entry = {
+        "id": _new_id("rollup"),
+        "task_id": completed_task_ids[0] if completed_task_ids else None,
+        "summary": f"用户通过粘贴提供了{len(saved_files)}个文件（{file_list}），意图：{user_intent}",
+        "created_at": _now_iso(),
+    }
+    payload.setdefault("context_rollups", []).append(rollup_entry)
+
+    # ── 4. 更新 package_analysis.directory_tree ──
+    dir_tree = payload.get("package_analysis", {}).get("directory_tree", [])
+    for fn in filenames:
+        if fn not in dir_tree:
+            dir_tree.append(fn)
+
+    # ── 5. 推进 current_task 和 lifecycle ──
+    if completed_task_ids:
+        next_task = _pick_next_task(payload)
+        payload["current_task_id"] = next_task["id"] if next_task else payload.get("current_task_id")
+        _advance_lifecycle(memo, payload)
+
+    # 更新 status_summary
+    if completed_task_ids:
+        done_titles = [t["title"] for t in tasks if t["id"] in completed_task_ids]
+        memo.status_summary = f"长文本粘贴已自动完成：{'、'.join(done_titles)}。"
+    else:
+        memo.status_summary = f"已接收粘贴文件：{file_list}。"
+
+    _save_memo_payload(db, memo, payload)
+    if user_id:
+        memo.updated_by = user_id
+    db.commit()
+
+    return {
+        "ok": True,
+        "completed_task_ids": completed_task_ids,
+        "rollup": rollup_entry["summary"],
+        "memo": get_memo(db, skill_id),
+    }
+
+
+def _infer_task_category(target_files: list[str]) -> str | None:
+    """从任务 target_files 推断目标 category。"""
+    for f in target_files:
+        fl = f.lower()
+        if "example" in fl:
+            return "example"
+        if "reference" in fl or "knowledge" in fl or "kb" in fl:
+            return "reference"
+        if "template" in fl:
+            return "template"
+    return None
+
+
 # ── 辅助方法 ──────────────────────────────────────────────────────────────────
 
 def _deps_done(task: dict, all_tasks: list[dict]) -> bool:

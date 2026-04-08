@@ -132,6 +132,8 @@ SLOT_REGISTRY: dict[str, dict] = {
     "intel.collect":              {"name": "情报收集", "category": "其他", "desc": "收集和分析竞品/市场情报", "fallback": "default"},
     "rule.engine":                {"name": "规则引擎", "category": "其他", "desc": "用 LLM 执行自然语言规则判断", "fallback": "default"},
     "studio.agent":               {"name": "Studio Agent", "category": "其他", "desc": "DevStudio 中的 AI 对话（流式+非流式）", "fallback": "default"},
+    "studio.ingest_parse":        {"name": "长文本拆块", "category": "其他", "desc": "Studio 长文本粘贴：意图识别+内容拆块", "fallback": "ark_kimi"},
+    "studio.ingest_analyze":      {"name": "长文本关系分析", "category": "其他", "desc": "Studio 长文本粘贴：分析子文件与 Skill 的关系", "fallback": "ark_kimi"},
     "task.engine":                {"name": "任务引擎", "category": "其他", "desc": "项目任务中的 AI 辅助（总结/分解任务等）", "fallback": "default"},
     "business_table.generate":    {"name": "业务表格生成", "category": "其他", "desc": "用 LLM 解析业务数据生成结构化表格", "fallback": "default"},
     "output_schema.gen":          {"name": "输出模式生成", "category": "其他", "desc": "根据描述自动生成结构化输出 Schema", "fallback": "default"},
@@ -452,6 +454,21 @@ class LLMGateway:
             "temperature": 0.0,
         }
 
+    def get_ark_kimi_config(self) -> dict:
+        """ARK kimi-k2.5 配置，用于长文本 ingest 等需要长上下文的场景。"""
+        ark_key = os.getenv("ARK_API_KEY", "")
+        if not ark_key:
+            raise ValueError("No ARK API key found. Set ARK_API_KEY.")
+        return {
+            "provider": "ark",
+            "model_id": "kimi-k2.5",
+            "api_base": "https://ark.cn-beijing.volces.com/api/coding/v3",
+            "api_key_env": "ARK_API_KEY",
+            "api_key": ark_key,
+            "max_tokens": 4096,
+            "temperature": 0.1,
+        }
+
     def get_config(self, db: Session, model_config_id: int = None) -> dict:
         """Get model config dict from DB. Falls back to default if id not given."""
         if model_config_id:
@@ -525,6 +542,8 @@ class LLMGateway:
             return self.get_preflight_exec_config()
         elif fb == "preflight_score":
             return self.get_preflight_score_config()
+        elif fb == "ark_kimi":
+            return self.get_ark_kimi_config()
         else:
             return self.get_config(db)
 

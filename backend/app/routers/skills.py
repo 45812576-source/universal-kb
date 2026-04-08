@@ -1,7 +1,7 @@
 import logging
 import re
 
-from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, Request, UploadFile
 
 logger = logging.getLogger(__name__)
 from sqlalchemy.exc import IntegrityError
@@ -2393,6 +2393,259 @@ async def trigger_security_scan(
         "approval_id": approval.id if approval else None,
         "scan_result": result,
     }
+
+
+# ─── Long text ingest pipeline ────────────────────────────────────────────────
+
+
+class IngestPasteBody(BaseModel):
+    content: str
+
+
+@router.post("/{skill_id}/ingest-paste")
+async def ingest_paste(
+    skill_id: int,
+    body: IngestPasteBody,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """长文本预处理管线：意图识别 → 拆块存储 → 关系分析，返回 SSE 事件流。"""
+    import json
+    from pathlib import Path
+    from fastapi.responses import StreamingResponse
+
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+    _check_skill_write_access(skill, user)
+
+    content = body.content
+    if not content or not content.strip():
+        raise HTTPException(400, "内容不能为空")
+
+    latest = skill.versions[0] if skill.versions else None
+    system_prompt_preview = (latest.system_prompt[:2000] if latest and latest.system_prompt else "")
+
+    def _sse(event: str, data: dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    async def generate():
+        try:
+            # ── Step A: 意图识别 + 内容拆块 ──
+            yield _sse("stage", {"stage": "ingest_parsing", "label": "识别内容类型..."})
+
+            parse_prompt = f"""你是内容分析助手。用户在 Skill Studio 中粘贴了一段长文本，请识别意图并拆分为独立内容块。
+
+当前 Skill 信息：
+- 名称：{skill.name}
+- 描述：{skill.description or '无'}
+
+用户粘贴的内容：
+---
+{content}
+---
+
+请返回 JSON：
+{{
+  "user_intent": "用户的操作意图（一句话，如'提供了 input schema 定义'）",
+  "blocks": [
+    {{
+      "suggested_filename": "语义化文件名.ext（如 input-schema.json, competitor-prompt.md）",
+      "content": "该块的完整内容（不要截断）",
+      "block_type": "json-schema | prompt | knowledge | example | config | other"
+    }}
+  ]
+}}
+
+规则：
+1. 分离"用户说明文字"和"内容体"，说明文字融入 user_intent，不要存为块
+2. 如果内容本身是一个整体（如完整 JSON），不要强行拆分，存为单个块
+3. filename 要语义化，扩展名准确（JSON 内容用 .json，prompt/文档用 .md，纯文本用 .txt）
+4. content 必须是完整原文，不能截断或摘要
+5. 只返回 JSON，不要其他文字"""
+
+            parse_config = llm_gateway.resolve_config(db, "studio.ingest_parse")
+            parse_result, _ = await llm_gateway.chat(
+                parse_config,
+                [{"role": "user", "content": parse_prompt}],
+                temperature=0.1,
+                max_tokens=8192,
+            )
+
+            # 从 LLM 响应中提取 JSON
+            parse_data = _extract_json(parse_result)
+            if not parse_data or "blocks" not in parse_data:
+                yield _sse("error", {"message": "内容分析失败：无法解析 LLM 返回结果"})
+                return
+
+            user_intent = parse_data.get("user_intent", "用户粘贴了长文本内容")
+            blocks = parse_data["blocks"]
+
+            if not blocks:
+                yield _sse("error", {"message": "内容分析失败：未识别到有效内容块"})
+                return
+
+            # ── 存储每个块为子文件 ──
+            yield _sse("stage", {"stage": "ingest_saving", "label": "存储子文件..."})
+
+            saved_files = []
+            files = list(skill.source_files or [])
+            for block in blocks:
+                filename = Path(block.get("suggested_filename", "untitled.txt")).name
+                if not filename or filename.startswith("."):
+                    filename = "untitled.txt"
+                block_content = block.get("content", "")
+                block_type = block.get("block_type", "other")
+
+                path = _safe_file_path(skill_id, filename)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(block_content, encoding="utf-8")
+
+                size = len(block_content.encode("utf-8"))
+                rel_path = f"uploads/skills/{skill_id}/{path.name}"
+
+                # 更新 source_files（去重）
+                found = False
+                for f in files:
+                    if f.get("filename") == path.name:
+                        f["size"] = size
+                        found = True
+                        break
+                if not found:
+                    files.append({
+                        "filename": path.name,
+                        "path": rel_path,
+                        "size": size,
+                        "category": _infer_category(path.name),
+                    })
+                saved_files.append({
+                    "filename": path.name,
+                    "block_type": block_type,
+                    "size": size,
+                })
+
+            skill.source_files = files
+            db.commit()
+
+            yield _sse("ingest_files_saved", {"files": [f["filename"] for f in saved_files]})
+
+            # ── Step B: 关系分析 ──
+            yield _sse("stage", {"stage": "ingest_analyzing", "label": "分析与 Skill 的关系..."})
+
+            files_summary = "\n".join(
+                f"- {f['filename']}（{f['block_type']}）：{blocks[i].get('content', '')[:500]}"
+                for i, f in enumerate(saved_files)
+            )
+
+            analyze_prompt = f"""你是 Skill 架构分析助手。以下子文件刚从用户粘贴内容中拆分出来，请分析每个文件与当前 Skill 的关系。
+
+当前 Skill：
+- 名称：{skill.name}
+- 描述：{skill.description or '无'}
+- 主 Prompt（前 2000 字符）：
+{system_prompt_preview}
+
+已存储的子文件：
+{files_summary}
+
+用户原始意图：{user_intent}
+
+请返回 JSON：
+{{
+  "blocks": [
+    {{
+      "filename": "input-schema.json",
+      "relation": "该文件定义了 Skill 的输入数据结构",
+      "suggested_role": "input_definition | knowledge | reference | example"
+    }}
+  ],
+  "summary": "一段完整的摘要（包含用户意图 + 各文件角色 + 建议操作），将发送给 Studio Agent 继续交互"
+}}
+
+summary 格式要求：
+- 开头复述用户意图
+- 列出每个文件名及其角色
+- 提出下一步建议（如"建议在主 prompt 中引用 input-schema.json 作为输入定义"）
+- 只返回 JSON，不要其他文字"""
+
+            analyze_config = llm_gateway.resolve_config(db, "studio.ingest_analyze")
+            analyze_result, _ = await llm_gateway.chat(
+                analyze_config,
+                [{"role": "user", "content": analyze_prompt}],
+                temperature=0.1,
+                max_tokens=2048,
+            )
+
+            analyze_data = _extract_json(analyze_result)
+            if not analyze_data:
+                # 分析失败但文件已保存，返回基础结果
+                file_list = "、".join(f["filename"] for f in saved_files)
+                fallback_summary = f"{user_intent}。已存储为子文件：{file_list}。请检查文件内容并决定如何在 Skill 中使用。"
+                # 接入 memo（无 suggested_role）
+                _notify_memo(db, skill_id, user_intent, saved_files, user)
+                yield _sse("ingest_result", {
+                    "user_intent": user_intent,
+                    "blocks": saved_files,
+                    "summary": fallback_summary,
+                })
+                return
+
+            # 合并关系信息到 blocks
+            relation_map = {b["filename"]: b for b in analyze_data.get("blocks", [])}
+            for f in saved_files:
+                rel = relation_map.get(f["filename"], {})
+                f["relation"] = rel.get("relation", "")
+                f["suggested_role"] = rel.get("suggested_role", "")
+
+            summary = analyze_data.get("summary", "")
+            if not summary:
+                file_list = "、".join(f["filename"] for f in saved_files)
+                summary = f"{user_intent}。已存储为子文件：{file_list}。"
+
+            # 接入 memo（含 suggested_role）
+            _notify_memo(db, skill_id, user_intent, saved_files, user)
+
+            yield _sse("ingest_result", {
+                "user_intent": user_intent,
+                "blocks": saved_files,
+                "summary": summary,
+            })
+
+        except Exception as e:
+            logger.exception("ingest-paste pipeline error")
+            yield _sse("error", {"message": f"长文本分析失败：{str(e)}"})
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+def _notify_memo(db: Session, skill_id: int, user_intent: str, saved_files: list[dict], user: User):
+    """将 ingest 结果写入 memo，推进任务、记录日志。失败不阻塞主流程。"""
+    try:
+        from app.services.skill_memo_service import ingest_from_paste
+        ingest_from_paste(db, skill_id, user_intent, saved_files, user.id)
+    except Exception:
+        logger.warning("ingest_paste memo notification failed", exc_info=True)
+
+
+def _extract_json(text: str) -> dict | None:
+    """从 LLM 响应中提取 JSON 对象（兼容 ```json 代码块和裸 JSON）。"""
+    import json
+    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+    start = text.find("{")
+    if start >= 0:
+        end = text.rfind("}")
+        if end > start:
+            try:
+                return json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+    return None
 
 
 # ─── Usage stats (super_admin only) ──────────────────────────────────────────
