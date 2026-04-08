@@ -199,7 +199,28 @@ def list_skills(
     elif scope == "company":
         q = q.filter(Skill.scope == "company", Skill.status == SkillStatus.PUBLISHED)
 
-    return [_skill_summary(s) for s in q.order_by(Skill.updated_at.desc()).all()]
+    skills = q.order_by(Skill.updated_at.desc()).all()
+
+    # 批量查询调用次数，避免 N+1
+    skill_ids = [s.id for s in skills]
+    usage_map: dict[int, int] = {}
+    if skill_ids:
+        from sqlalchemy import func as _func
+        from app.models.skill import SkillExecutionLog
+        rows = (
+            db.query(SkillExecutionLog.skill_id, _func.count(SkillExecutionLog.id))
+            .filter(SkillExecutionLog.skill_id.in_(skill_ids))
+            .group_by(SkillExecutionLog.skill_id)
+            .all()
+        )
+        usage_map = {sid: cnt for sid, cnt in rows}
+
+    result = []
+    for s in skills:
+        summary = _skill_summary(s)
+        summary["usage_count"] = usage_map.get(s.id, 0)
+        result.append(summary)
+    return result
 
 
 MAX_EMPLOYEE_UNPUBLISHED_SKILLS = 3
@@ -802,6 +823,12 @@ async def upload_skill_zip(
         _zip_approval_id = None
         if initial_stage:
             from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus as AStatus
+            # Fix 6: 自动采集证据包
+            try:
+                from app.services.approval_templates import get_auto_evidence
+                auto_ep = get_auto_evidence("skill_publish", "skill", skill_id, db)
+            except Exception:
+                auto_ep = None
             approval = ApprovalRequest(
                 request_type=ApprovalRequestType.SKILL_PUBLISH,
                 target_id=skill_id,
@@ -809,6 +836,7 @@ async def upload_skill_zip(
                 requester_id=user.id,
                 status=AStatus.PENDING,
                 stage=initial_stage,
+                evidence_pack=auto_ep if auto_ep else None,
             )
             db.add(approval)
             db.flush()
@@ -1607,6 +1635,11 @@ def add_version(
             .first()
         )
         if not existing_approval:
+            try:
+                from app.services.approval_templates import get_auto_evidence
+                auto_ep = get_auto_evidence("skill_version_change", "skill", skill_id, db)
+            except Exception:
+                auto_ep = None
             approval = ApprovalRequest(
                 request_type=ApprovalRequestType.SKILL_VERSION_CHANGE,
                 target_id=skill_id,
@@ -1614,6 +1647,7 @@ def add_version(
                 requester_id=user.id,
                 status=ApprovalStatus.PENDING,
                 stage="dept_pending",
+                evidence_pack=auto_ep if auto_ep else None,
             )
             db.add(approval)
             db.flush()
@@ -1688,6 +1722,11 @@ def transfer_ownership(
     if existing:
         raise HTTPException(400, "已有待审批的转让申请")
 
+    try:
+        from app.services.approval_templates import get_auto_evidence
+        auto_ep = get_auto_evidence("skill_ownership_transfer", "skill", skill_id, db)
+    except Exception:
+        auto_ep = None
     approval = ApprovalRequest(
         request_type=ApprovalRequestType.SKILL_OWNERSHIP_TRANSFER,
         target_id=skill_id,
@@ -1696,6 +1735,7 @@ def transfer_ownership(
         status=ApprovalStatus.PENDING,
         stage="dept_pending",
         conditions=[{"new_owner_id": new_owner_id}],
+        evidence_pack=auto_ep if auto_ep else None,
     )
     db.add(approval)
     db.commit()
@@ -1807,12 +1847,18 @@ def update_status(
             .first()
         )
         if not existing_approval:
+            try:
+                from app.services.approval_templates import get_auto_evidence
+                auto_ep = get_auto_evidence("skill_publish", "skill", skill_id, db)
+            except Exception:
+                auto_ep = None
             approval = ApprovalRequest(
                 request_type=ApprovalRequestType.SKILL_PUBLISH,
                 target_id=skill_id,
                 target_type="skill",
                 requester_id=user.id,
                 status=ApprovalStatus.PENDING,
+                evidence_pack=auto_ep if auto_ep else None,
             )
             db.add(approval)
             db.flush()

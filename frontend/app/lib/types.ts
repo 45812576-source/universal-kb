@@ -102,6 +102,7 @@ export interface Skill {
   knowledge_tags: string[];
   current_version: number;
   department_id?: number | null;
+  usage_count?: number;
 }
 
 export type ReviewStage =

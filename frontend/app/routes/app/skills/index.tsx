@@ -66,8 +66,13 @@ function SkillCard({ skill, showActions, user }: { skill: Skill & { scope?: stri
             {tag}
           </span>
         ))}
-        <span className="ml-auto text-[9px] font-bold uppercase text-gray-400">
-          v{skill.current_version}
+        <span className="ml-auto flex items-center gap-2">
+          {(skill as any).usage_count > 0 && (
+            <span className="text-[9px] font-bold text-gray-400">{(skill as any).usage_count} 次调用</span>
+          )}
+          <span className="text-[9px] font-bold uppercase text-gray-400">
+            v{skill.current_version}
+          </span>
         </span>
       </div>
 
