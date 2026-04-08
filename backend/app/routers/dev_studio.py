@@ -2301,12 +2301,26 @@ def _user_opencode_cwd(user_id: int) -> Optional[str]:
 
 def _user_workdir(user: User) -> str:
     """返回当前用户的 project 目录路径（用户可见文件）。
-    优先使用 opencode 进程的实际 CWD，确保与 opencode 文件树一致。
-    回退到 project/ 目录（并确保布局完整）。
+
+    优先级：
+    1. inst["workdir"] — 启动 opencode 时已确定的 workspace root，
+       直接取其 project/ 子目录，与 opencode cwd 完全一致。
+    2. /proc/<pid>/cwd — Linux 上从运行进程读取（兜底）。
+    3. 回退到 workspace_root_for_user + ensure_workspace_layout。
     """
+    # 优先从内存中的实例信息获取（启动时 cwd=project_dir，此处保持一致）
+    inst = _user_instances.get(user.id)
+    if inst and inst.get("workdir"):
+        project_dir = _workspace_project_dir(inst["workdir"])
+        if os.path.isdir(project_dir):
+            return project_dir
+
+    # 兜底：通过 /proc 读取（Linux）
     cwd = _user_opencode_cwd(user.id)
     if cwd:
         return cwd
+
+    # 最终回退：重新计算
     workdir = _workspace_root_for_user(user.id, user.display_name or "")
     project_dir, _ = ensure_workspace_layout(workdir, display_name=user.display_name or "")
     return project_dir
