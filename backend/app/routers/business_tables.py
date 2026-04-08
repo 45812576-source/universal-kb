@@ -1,5 +1,7 @@
 """Business tables management API."""
 from typing import Optional
+from urllib.parse import quote_plus, urlparse, urlunparse
+
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -15,6 +17,25 @@ from app.services.llm_gateway import llm_gateway
 from app.services.lark_client import LarkConfigError, LarkAuthError
 
 router = APIRouter(prefix="/api/business-tables", tags=["business-tables"])
+
+
+def _safe_db_url(raw_url: str) -> str:
+    """对数据库连接字符串中的密码做 URL 编码，防止密码含 @ 等特殊字符时解析错误。"""
+    from sqlalchemy.engine.url import make_url
+    try:
+        u = make_url(raw_url)
+        if u.password:
+            # 重建 URL，密码部分 quote_plus 编码
+            userinfo = f"{quote_plus(u.username or '')}:{quote_plus(u.password)}"
+            port_str = f":{u.port}" if u.port else ""
+            query_str = "&".join(f"{k}={v}" for k, v in (u.query or {}).items())
+            rebuilt = f"{u.drivername}://{userinfo}@{u.host or ''}{port_str}/{u.database or ''}"
+            if query_str:
+                rebuilt += f"?{query_str}"
+            return rebuilt
+        return raw_url
+    except Exception:
+        return raw_url
 
 
 def _flatten_bitable_cell(v):
@@ -455,7 +476,7 @@ def import_external_table(
         raise HTTPException(400, f"表 '{safe_name}' 已存在")
 
     try:
-        ext_engine = create_engine(req.db_url, connect_args={"connect_timeout": 10})
+        ext_engine = create_engine(_safe_db_url(req.db_url), connect_args={"connect_timeout": 10})
     except Exception as e:
         raise HTTPException(400, f"数据库连接字符串无效: {e}")
 
@@ -870,7 +891,7 @@ def probe_external_table(
     """Connect to an external DB, fetch schema + first 20 rows. Does NOT persist anything."""
     from sqlalchemy import create_engine, inspect, text as sa_text
     try:
-        engine = create_engine(req.db_url, connect_args={"connect_timeout": 5})
+        engine = create_engine(_safe_db_url(req.db_url), connect_args={"connect_timeout": 5})
         with engine.connect() as conn:
             insp = inspect(engine)
             cols = insp.get_columns(req.table_name)
