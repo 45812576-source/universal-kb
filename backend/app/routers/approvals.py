@@ -204,12 +204,22 @@ class ApprovalRequestCreate(BaseModel):
     target_id: Optional[int] = None
     target_type: Optional[str] = None
     reason: Optional[str] = None
+    evidence_pack: Optional[dict] = None
+    risk_level: Optional[str] = None
+    impact_summary: Optional[str] = None
 
 
 class ApprovalActionCreate(BaseModel):
-    action: str  # "approve" | "reject" | "add_conditions"
+    action: str  # "approve" | "reject" | "add_conditions" | "request_more_info" | "approve_with_conditions"
     comment: Optional[str] = None
     conditions: Optional[list] = None
+    decision_payload: Optional[dict] = None
+    checklist_result: Optional[list] = None
+
+
+class SupplementEvidenceRequest(BaseModel):
+    evidence_pack: dict  # 补充的证据
+    comment: Optional[str] = None
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -329,6 +339,22 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
             reason = cond["reason"]
             break
 
+    # V2: 模板 + 证据完整性
+    from app.services.approval_templates import get_template, check_evidence_completeness
+    request_type_str = r.request_type.value if hasattr(r.request_type, "value") else str(r.request_type)
+    review_template = get_template(request_type_str)
+    ep = getattr(r, "evidence_pack", None)
+    missing = check_evidence_completeness(request_type_str, ep)
+
+    # Fix 3: 提取最近一次 request_more_info 的内容
+    needs_info_comment = None
+    stage_val = getattr(r, "stage", None)
+    if stage_val == "needs_info" and r.actions:
+        for act in reversed(r.actions):
+            if act.action == ApprovalActionType.REQUEST_MORE_INFO and not (act.comment or "").startswith("[补充证据]"):
+                needs_info_comment = act.comment
+                break
+
     return {
         "id": r.id,
         "request_type": r.request_type,
@@ -338,13 +364,21 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
         "requester_id": r.requester_id,
         "requester_name": r.requester.display_name if r.requester else None,
         "status": r.status,
-        "stage": getattr(r, "stage", None),
+        "stage": stage_val,
+        "needs_info_comment": needs_info_comment,
         "reason": reason,
         "conditions": r.conditions or [],
         "security_scan_result": getattr(r, "security_scan_result", None),
         "dept_approved_policy": getattr(r, "dept_approved_policy", None),
         "sandbox_report_id": getattr(r, "sandbox_report_id", None),
         "sandbox_report_hash": getattr(r, "sandbox_report_hash", None),
+        # V2 新增
+        "evidence_pack": ep,
+        "risk_level": getattr(r, "risk_level", None),
+        "impact_summary": getattr(r, "impact_summary", None),
+        "review_template": review_template,
+        "evidence_complete": len(missing) == 0,
+        "missing_evidence": missing,
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "actions": [
             {
@@ -353,6 +387,8 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
                 "actor_name": a.actor.display_name if a.actor else None,
                 "action": a.action,
                 "comment": a.comment,
+                "decision_payload": getattr(a, "decision_payload", None),
+                "checklist_result": getattr(a, "checklist_result", None),
                 "created_at": a.created_at.isoformat() if a.created_at else None,
             }
             for a in (r.actions or [])
@@ -436,6 +472,7 @@ def pending_count(
             db.query(ApprovalRequest)
             .filter(
                 ApprovalRequest.status == ApprovalStatus.PENDING,
+                ApprovalRequest.stage != "needs_info",
                 ApprovalRequest.request_type == ApprovalRequestType.KNOWLEDGE_EDIT,
                 ApprovalRequest.target_id.in_(my_entry_ids),
             )
@@ -531,11 +568,29 @@ def incoming_approvals(
     items = (
         db.query(ApprovalRequest)
         .filter(ApprovalRequest.status == ApprovalStatus.PENDING)
+        .filter(ApprovalRequest.stage != "needs_info")  # 待补资料的不出现在审批人列表
         .filter(or_(*conditions))
         .order_by(ApprovalRequest.created_at.desc())
         .all()
     )
     return [_req(r, db) for r in items]
+
+
+@router.get("/templates")
+def list_approval_templates():
+    """返回全部审批模板定义（前端唯一真源）"""
+    from app.services.approval_templates import APPROVAL_TEMPLATES
+    return APPROVAL_TEMPLATES
+
+
+@router.get("/templates/{request_type}")
+def get_approval_template(request_type: str):
+    """返回指定类型的审批模板定义"""
+    from app.services.approval_templates import get_template
+    tpl = get_template(request_type)
+    if not tpl:
+        raise HTTPException(404, f"未找到类型 {request_type} 的审批模板")
+    return tpl
 
 
 @router.get("/{request_id}")
@@ -560,9 +615,21 @@ def create_approval(
     user: User = Depends(get_current_user),
 ):
     """发起审批申请"""
+    from app.services.approval_templates import get_auto_evidence, check_evidence_completeness
+
     conditions = None
     if req.reason:
         conditions = [{"reason": req.reason}]
+
+    # 自动采集证据 + 合并用户提交的
+    auto_evidence = get_auto_evidence(req.request_type, req.target_type, req.target_id, db)
+    merged_evidence = {**auto_evidence, **(req.evidence_pack or {})}
+
+    # 校验证据完整性（缺必填项返回 400）
+    missing = check_evidence_completeness(req.request_type, merged_evidence)
+    if missing:
+        raise HTTPException(400, f"证据包缺少必填项: {', '.join(missing)}")
+
     r = ApprovalRequest(
         request_type=req.request_type,
         target_id=req.target_id,
@@ -570,6 +637,9 @@ def create_approval(
         requester_id=user.id,
         status=ApprovalStatus.PENDING,
         conditions=conditions,
+        evidence_pack=merged_evidence if merged_evidence else None,
+        risk_level=req.risk_level,
+        impact_summary=req.impact_summary,
     )
     db.add(r)
     db.commit()
@@ -607,16 +677,46 @@ async def act_on_approval(
         "approve": ApprovalActionType.APPROVE,
         "reject": ApprovalActionType.REJECT,
         "add_conditions": ApprovalActionType.ADD_CONDITIONS,
+        "request_more_info": ApprovalActionType.REQUEST_MORE_INFO,
+        "approve_with_conditions": ApprovalActionType.APPROVE_WITH_CONDITIONS,
     }
     action_enum = action_map.get(req.action)
     if not action_enum:
         raise HTTPException(400, f"未知操作：{req.action}")
+
+    # 审批通过前校验证据完整性
+    if req.action in ("approve", "approve_with_conditions"):
+        from app.services.approval_templates import check_evidence_completeness, get_template
+        request_type_str = r.request_type.value if hasattr(r.request_type, "value") else str(r.request_type)
+        missing = check_evidence_completeness(request_type_str, getattr(r, "evidence_pack", None))
+        if missing:
+            raise HTTPException(400, f"证据包缺少必填项，无法通过: {', '.join(missing)}")
+
+        # Fix 2: 审批清单硬约束 — 所有清单项必须已确认
+        tpl = get_template(request_type_str)
+        if tpl and tpl.get("review_checklist"):
+            checklist = req.checklist_result or []
+            checklist_len = len(tpl["review_checklist"])
+            if len(checklist) != checklist_len:
+                raise HTTPException(400, f"审批清单未完成：需要 {checklist_len} 项，提交了 {len(checklist)} 项")
+            rejected_items = [c for c in checklist if isinstance(c, dict) and c.get("status") == "rejected"]
+            need_info_items = [c for c in checklist if isinstance(c, dict) and c.get("status") == "need_info"]
+            if rejected_items:
+                raise HTTPException(400, f"审批清单有 {len(rejected_items)} 项未通过，无法批准。请选择驳回或要求补充信息")
+            if need_info_items:
+                raise HTTPException(400, f"审批清单有 {len(need_info_items)} 项待补充，无法批准。请选择要求补充信息")
+
+    # request_more_info 校验：至少需要 comment 说明需要什么
+    if req.action == "request_more_info" and not req.comment:
+        raise HTTPException(400, "要求补充信息时必须说明需要补充哪些内容")
 
     a = ApprovalAction(
         request_id=request_id,
         actor_id=user.id,
         action=action_enum,
         comment=req.comment,
+        decision_payload=req.decision_payload,
+        checklist_result=req.checklist_result,
     )
     db.add(a)
 
@@ -880,6 +980,77 @@ async def act_on_approval(
         r.status = ApprovalStatus.CONDITIONS
         if req.conditions:
             r.conditions = req.conditions
+    elif req.action == "request_more_info":
+        # Fix 3: 设置 stage 为 needs_info，让发起人看到需要补充什么
+        r.stage = "needs_info"
+    elif req.action == "approve_with_conditions":
+        # ── 高风险类型禁止 approve_with_conditions（执行层未打通） ──
+        blocked_types = {
+            ApprovalRequestType.EXPORT_SENSITIVE,
+            ApprovalRequestType.ELEVATE_DISCLOSURE,
+            ApprovalRequestType.GRANT_ACCESS,
+            ApprovalRequestType.POLICY_CHANGE,
+            ApprovalRequestType.FIELD_SENSITIVITY_CHANGE,
+            ApprovalRequestType.SMALL_SAMPLE_CHANGE,
+            ApprovalRequestType.SCOPE_CHANGE,
+            ApprovalRequestType.MASK_OVERRIDE,
+            ApprovalRequestType.SCHEMA_APPROVAL,
+        }
+        if r.request_type in blocked_types:
+            raise HTTPException(
+                400,
+                f"类型 {r.request_type.value} 不支持附条件通过（条件执行层尚未对接）。请选择「通过」或「驳回」。"
+            )
+        # 结构化条件校验
+        if not req.conditions or len(req.conditions) == 0:
+            raise HTTPException(400, "附条件通过必须至少包含一个条件")
+        valid_types = {"scope_limit", "effective_until", "requires_followup_review", "allowed_targets", "custom"}
+        for cond in req.conditions:
+            if not isinstance(cond, dict) or cond.get("type") not in valid_types:
+                raise HTTPException(400, f"条件类型无效，允许: {', '.join(valid_types)}")
+            if not cond.get("label") or not cond.get("value"):
+                raise HTTPException(400, "每个条件必须包含 label 和 value")
+
+        r.status = ApprovalStatus.APPROVED
+        existing = r.conditions or []
+        r.conditions = existing + [{"type": "approval_conditions", "structured": True, "items": req.conditions}]
+
+        # ── 条件下沉到执行层 ──
+        scope_limit_cond = next((c for c in req.conditions if c["type"] == "scope_limit"), None)
+        effective_until_cond = next((c for c in req.conditions if c["type"] == "effective_until"), None)
+
+        # 驱动发布
+        if r.target_type == "skill" and r.target_id:
+            from app.models.skill import Skill, SkillStatus
+            skill = db.get(Skill, r.target_id)
+            if skill and skill.status.value == "reviewing":
+                skill.status = SkillStatus.PUBLISHED
+                # scope_limit 执行：限制发布范围
+                if scope_limit_cond:
+                    scope_val = scope_limit_cond.get("value", "company")
+                    skill.scope = scope_val if scope_val in ("personal", "department", "company") else "company"
+                else:
+                    skill.scope = "company"
+                _apply_scan_policy(r.target_id, r, user, db)
+                from app.routers.skills import _cascade_tool_status_on_publish
+                _cascade_tool_status_on_publish(r.target_id, db)
+                # effective_until 执行：写入 Skill 的 conditions_meta
+                if effective_until_cond and effective_until_cond.get("expires_at"):
+                    skill_conditions = skill.conditions_meta if hasattr(skill, "conditions_meta") and skill.conditions_meta else {}
+                    skill_conditions["expires_at"] = effective_until_cond["expires_at"]
+                    if hasattr(skill, "conditions_meta"):
+                        skill.conditions_meta = skill_conditions
+        elif r.target_type == "tool" and r.target_id:
+            from app.models.tool import ToolRegistry
+            tool = db.get(ToolRegistry, r.target_id)
+            if tool and tool.status == "reviewing":
+                tool.status = "published"
+                tool.is_active = True
+        elif r.target_type == "webapp" and r.target_id:
+            from app.models.web_app import WebApp
+            webapp = db.get(WebApp, r.target_id)
+            if webapp and webapp.status == "reviewing":
+                webapp.status = "published"
 
     db.commit()
     db.refresh(r)
@@ -896,4 +1067,43 @@ async def act_on_approval(
     except Exception:
         pass
 
+    return _req(r, db)
+
+
+@router.post("/{request_id}/supplement")
+def supplement_evidence(
+    request_id: int,
+    req: SupplementEvidenceRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Fix 3: 发起人补充证据（仅 needs_info 阶段可用）"""
+    r = db.get(ApprovalRequest, request_id)
+    if not r:
+        raise HTTPException(404, "审批申请不存在")
+    if r.requester_id != user.id:
+        raise HTTPException(403, "只有申请发起人可以补充证据")
+    if r.status != ApprovalStatus.PENDING:
+        raise HTTPException(400, "审批已完结，无法补充证据")
+    if getattr(r, "stage", None) != "needs_info":
+        raise HTTPException(400, "当前阶段不需要补充证据")
+
+    # 合并新证据到已有 evidence_pack
+    existing_ep = getattr(r, "evidence_pack", None) or {}
+    merged = {**existing_ep, **req.evidence_pack}
+    r.evidence_pack = merged
+
+    # 恢复 stage 为 dept_pending（回到审批队列）
+    r.stage = "dept_pending"
+
+    # 记录补充动作
+    a = ApprovalAction(
+        request_id=request_id,
+        actor_id=user.id,
+        action=ApprovalActionType.REQUEST_MORE_INFO,  # 复用类型，comment 区分
+        comment=f"[补充证据] {req.comment}" if req.comment else "[补充证据]",
+    )
+    db.add(a)
+    db.commit()
+    db.refresh(r)
     return _req(r, db)
