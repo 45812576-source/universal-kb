@@ -119,3 +119,103 @@ def test_list_folders_includes_visible_system_folder_for_entry(client, db):
     assert resp.status_code == 200
     folder_ids = {item["id"] for item in resp.json()}
     assert system_folder.id in folder_ids
+
+
+# ---------- visibility_scope="private" (workdir_sync) ----------
+
+
+def test_private_entry_invisible_to_other_employee(client, db):
+    """private 条目即使 APPROVED，其他员工也看不到"""
+    dept = _make_dept(db, "私有测试部门A")
+    owner = _make_user(db, "priv_owner", Role.EMPLOYEE, dept.id)
+    other = _make_user(db, "priv_other", Role.EMPLOYEE, dept.id)
+    db.add_all([
+        KnowledgeEntry(title="私有开发工地", content="x", category="experience",
+                       status=KnowledgeStatus.APPROVED, review_stage=ReviewStage.APPROVED,
+                       created_by=owner.id, department_id=dept.id,
+                       source_type="workdir_sync", visibility_scope="private"),
+        KnowledgeEntry(title="普通已通过", content="x", category="experience",
+                       status=KnowledgeStatus.APPROVED, review_stage=ReviewStage.APPROVED,
+                       created_by=owner.id, department_id=dept.id),
+    ])
+    db.commit()
+
+    # 其他员工看不到 private 条目
+    token = _login(client, "priv_other")
+    resp = client.get("/api/knowledge", headers=_auth(token))
+    titles = _titles(resp)
+    assert "私有开发工地" not in titles
+    assert "普通已通过" in titles
+
+
+def test_private_entry_visible_to_creator(client, db):
+    """创建者自己能看到自己的 private 条目"""
+    dept = _make_dept(db, "私有测试部门B")
+    owner = _make_user(db, "priv_creator", Role.EMPLOYEE, dept.id)
+    entry = KnowledgeEntry(title="我的开发工地", content="x", category="experience",
+                           status=KnowledgeStatus.APPROVED, review_stage=ReviewStage.APPROVED,
+                           created_by=owner.id, department_id=dept.id,
+                           source_type="workdir_sync", visibility_scope="private")
+    db.add(entry)
+    db.commit()
+
+    token = _login(client, "priv_creator")
+    resp = client.get("/api/knowledge", headers=_auth(token))
+    titles = _titles(resp)
+    assert "我的开发工地" in titles
+
+    # 详情也可访问
+    detail = client.get(f"/api/knowledge/{entry.id}", headers=_auth(token))
+    assert detail.status_code == 200
+
+
+def test_private_entry_invisible_to_dept_admin_of_other_user(client, db):
+    """部门管理员也看不到别人的 private 条目（即使同部门）"""
+    dept = _make_dept(db, "私有测试部门C")
+    owner = _make_user(db, "priv_emp", Role.EMPLOYEE, dept.id)
+    admin = _make_user(db, "priv_admin", Role.DEPT_ADMIN, dept.id)
+    db.add(KnowledgeEntry(title="员工私有文档", content="x", category="experience",
+                          status=KnowledgeStatus.APPROVED, review_stage=ReviewStage.APPROVED,
+                          created_by=owner.id, department_id=dept.id,
+                          source_type="workdir_sync", visibility_scope="private"))
+    db.commit()
+
+    token = _login(client, "priv_admin")
+    resp = client.get("/api/knowledge", headers=_auth(token))
+    titles = _titles(resp)
+    assert "员工私有文档" not in titles
+
+
+def test_private_entry_visible_to_super_admin(client, db):
+    """超管能看到所有 private 条目"""
+    dept = _make_dept(db, "私有测试部门D")
+    owner = _make_user(db, "priv_emp2", Role.EMPLOYEE, dept.id)
+    sa = _make_user(db, "priv_sa", Role.SUPER_ADMIN, dept.id)
+    entry = KnowledgeEntry(title="超管可见私有", content="x", category="experience",
+                           status=KnowledgeStatus.APPROVED, review_stage=ReviewStage.APPROVED,
+                           created_by=owner.id, department_id=dept.id,
+                           source_type="workdir_sync", visibility_scope="private")
+    db.add(entry)
+    db.commit()
+
+    token = _login(client, "priv_sa")
+    resp = client.get("/api/knowledge", headers=_auth(token))
+    titles = _titles(resp)
+    assert "超管可见私有" in titles
+
+
+def test_private_entry_detail_forbidden_for_other_employee(client, db):
+    """其他员工通过详情接口也无法访问 private 条目"""
+    dept = _make_dept(db, "私有测试部门E")
+    owner = _make_user(db, "priv_detail_owner", Role.EMPLOYEE, dept.id)
+    other = _make_user(db, "priv_detail_other", Role.EMPLOYEE, dept.id)
+    entry = KnowledgeEntry(title="私有详情不可见", content="x", category="experience",
+                           status=KnowledgeStatus.APPROVED, review_stage=ReviewStage.APPROVED,
+                           created_by=owner.id, department_id=dept.id,
+                           source_type="workdir_sync", visibility_scope="private")
+    db.add(entry)
+    db.commit()
+
+    token = _login(client, "priv_detail_other")
+    detail = client.get(f"/api/knowledge/{entry.id}", headers=_auth(token))
+    assert detail.status_code == 403

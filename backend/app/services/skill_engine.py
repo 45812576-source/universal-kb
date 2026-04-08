@@ -626,7 +626,7 @@ class SkillEngine:
                 vs, vs_creator = scope_info
                 if vs == "project" and not project_id:
                     continue  # 非项目上下文跳过项目级知识
-                if vs == "owner_only" and vs_creator != user_id:
+                if vs in ("owner_only", "private") and vs_creator != user_id:
                     continue
 
             # 已发布 Skill 运行时召回约束：不在已审集合中的 D2+ 文件跳过

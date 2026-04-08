@@ -173,6 +173,7 @@ def run_workdir_kb_sync(db) -> None:
                 file_type=mime if oss_key else None,
                 file_ext=ext if oss_key else None,
                 file_size=file_size,
+                visibility_scope="private",
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow(),
             )

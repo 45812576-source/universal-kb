@@ -9,7 +9,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy import inspect
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.orm import Session
@@ -343,19 +343,30 @@ def _apply_knowledge_visibility(query, user: User):
     """
     if user.role == Role.SUPER_ADMIN:
         return query
+    _approved_non_private = and_(
+        KnowledgeEntry.status == KnowledgeStatus.APPROVED,
+        or_(
+            KnowledgeEntry.visibility_scope.is_(None),
+            KnowledgeEntry.visibility_scope != "private",
+        ),
+    )
+    _not_private = or_(
+        KnowledgeEntry.visibility_scope.is_(None),
+        KnowledgeEntry.visibility_scope != "private",
+    )
     if user.role == Role.DEPT_ADMIN:
         return query.filter(
             or_(
                 KnowledgeEntry.created_by == user.id,
-                KnowledgeEntry.department_id == user.department_id,
-                KnowledgeEntry.status == KnowledgeStatus.APPROVED,
+                and_(KnowledgeEntry.department_id == user.department_id, _not_private),
+                _approved_non_private,
             )
         )
-    # EMPLOYEE：只看自己的 + 已审批的
+    # EMPLOYEE：只看自己的 + 已审批且非 private 的
     return query.filter(
         or_(
             KnowledgeEntry.created_by == user.id,
-            KnowledgeEntry.status == KnowledgeStatus.APPROVED,
+            _approved_non_private,
         )
     )
 
@@ -363,12 +374,16 @@ def _apply_knowledge_visibility(query, user: User):
 def _can_view_entry(entry: KnowledgeEntry, user: User) -> bool:
     if user.role == Role.SUPER_ADMIN:
         return True
+    if entry.created_by == user.id:
+        return True
+    # private 条目仅创建者可见
+    if entry.visibility_scope == "private":
+        return False
     if user.role == Role.EMPLOYEE:
-        return entry.created_by == user.id or entry.status == KnowledgeStatus.APPROVED
+        return entry.status == KnowledgeStatus.APPROVED
     if user.role == Role.DEPT_ADMIN:
         return (
-            entry.created_by == user.id
-            or entry.department_id == user.department_id
+            entry.department_id == user.department_id
             or entry.status == KnowledgeStatus.APPROVED
         )
     return False
