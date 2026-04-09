@@ -325,6 +325,23 @@ def get_messages(
     ]
 
 
+@router.delete("/{conv_id}/messages")
+def clear_messages(
+    conv_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """清空对话的所有消息（仅对话所有者可操作）。"""
+    conv = db.get(Conversation, conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    if conv.user_id != user.id:
+        raise HTTPException(403, "无权操作该对话")
+    deleted = db.query(Message).filter(Message.conversation_id == conv_id).delete()
+    db.commit()
+    return {"ok": True, "deleted": deleted}
+
+
 @router.post("/{conv_id}/messages")
 async def send_message(
     conv_id: int,
