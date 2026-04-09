@@ -7,7 +7,7 @@ import secrets
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import and_, or_
 from sqlalchemy import inspect
@@ -2129,6 +2129,132 @@ class LarkBatchImportRequest(BaseModel):
     folder_id: Optional[int] = None
     sync_interval: int = 0
     category: str = "experience"
+
+
+async def _run_lark_import(job_id: int, url: str, title: str | None, folder_id: int | None,
+                            category: str, sync_interval: int, user_id: int):
+    """后台任务：调用 lark_doc_importer.import_doc 完成飞书导入。"""
+    from app.database import SessionLocal
+    from app.services.lark_doc_importer import lark_doc_importer
+    from app.models.knowledge_job import KnowledgeJob
+
+    db = SessionLocal()
+    try:
+        job = db.query(KnowledgeJob).filter(KnowledgeJob.id == job_id).first()
+        if not job:
+            return
+
+        job.status = "running"
+        job.phase = "parse_url"
+        job.started_at = datetime.datetime.utcnow()
+        db.commit()
+
+        # 需要 user 对象来调用 import_doc
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            job.status = "failed"
+            job.error_message = "用户不存在"
+            job.phase = "failed"
+            db.commit()
+            return
+
+        def _update_phase(phase: str):
+            job.phase = phase
+            db.commit()
+
+        entry = await lark_doc_importer.import_doc(
+            db=db,
+            user=user,
+            url=url,
+            title=title,
+            folder_id=folder_id,
+            category=category,
+            sync_interval=sync_interval,
+            on_phase=_update_phase,
+        )
+
+        job.status = "success"
+        job.phase = "done"
+        job.knowledge_id = entry.id
+        job.finished_at = datetime.datetime.utcnow()
+        job.payload = {
+            "knowledge_id": entry.id,
+            "title": entry.title,
+            "source_type": entry.source_type,
+            "doc_render_status": entry.doc_render_status,
+            "folder_id": entry.folder_id,
+        }
+        db.commit()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Lark import job {job_id} failed: {e}")
+        try:
+            job = db.query(KnowledgeJob).filter(KnowledgeJob.id == job_id).first()
+            if job:
+                job.status = "failed"
+                job.phase = "failed"
+                job.error_message = str(e)
+                job.finished_at = datetime.datetime.utcnow()
+                db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+@router.post("/import-from-lark/jobs")
+async def create_lark_import_job(
+    req: LarkImportRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """创建异步飞书导入任务，立即返回 job_id。"""
+    from app.models.knowledge_job import KnowledgeJob
+
+    if not req.url or not req.url.strip():
+        raise HTTPException(400, "URL 不能为空")
+
+    job = KnowledgeJob(
+        job_type="lark_import",
+        status="queued",
+        phase="parse_url",
+        trigger_source="upload",
+        created_by=user.id,
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    background_tasks.add_task(
+        _run_lark_import, job.id, req.url, req.title, req.folder_id,
+        req.category, req.sync_interval, user.id,
+    )
+
+    return {"job_id": job.id}
+
+
+@router.get("/import-from-lark/jobs/{job_id}")
+def get_lark_import_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """查询飞书导入任务状态。"""
+    from app.models.knowledge_job import KnowledgeJob
+
+    job = db.query(KnowledgeJob).filter(KnowledgeJob.id == job_id).first()
+    if not job:
+        raise HTTPException(404, "任务不存在")
+    if job.created_by and job.created_by != user.id:
+        raise HTTPException(403, "无权查看此任务")
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "phase": job.phase,
+        "error": job.error_message,
+        "result": job.payload,
+    }
 
 
 @router.post("/import-from-lark")

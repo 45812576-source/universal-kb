@@ -210,21 +210,41 @@ class BitableSync:
         owner_id: int | None = None,
         triggered_by: int | None = None,
         trigger_source: str = "manual",
+        existing_job: TableSyncJob | None = None,
     ) -> dict:
-        """全量同步：DROP 重建 + 插入全部记录。"""
+        """全量同步：DROP 重建 + 插入全部记录。
+
+        如果传入 existing_job，则复用该 job 记录（不再内部创建新 job）。
+        """
         # 注册/更新 BusinessTable（需要先有 bt 才能建 sync job）
         bt = self._register_table(db, table_name, display_name or table_name, app_token, table_id, "", owner_id)
-        job = self._create_sync_job(db, bt, "full_sync", triggered_by, trigger_source)
+        if existing_job is not None:
+            job = existing_job
+            job.table_id = bt.id
+            job.status = "running"
+            job.started_at = datetime.datetime.utcnow()
+            bt.sync_status = "syncing"
+            db.flush()
+        else:
+            job = self._create_sync_job(db, bt, "full_sync", triggered_by, trigger_source)
+            job.stage = "queued"
         db.commit()
 
         try:
+            job.stage = "fetch_fields"
+            db.commit()
             token = await self._get_token()
             fields = await self._fetch_fields(token, app_token, table_id)
+
+            job.stage = "fetch_records"
+            db.commit()
             records, fetch_stats = await self._fetch_records(token, app_token, table_id)
 
             col_map = self._build_col_map(fields)
 
             # 建表
+            job.stage = "create_table"
+            db.commit()
             col_defs = ["  `_record_id` VARCHAR(100) PRIMARY KEY COMMENT '飞书记录ID'"]
             for f in fields:
                 col = col_map[f["field_name"]]
@@ -237,9 +257,12 @@ class BitableSync:
             db.execute(text(ddl))
             db.commit()
 
+            job.stage = "insert_records"
+            db.commit()
             inserted, updated = self._upsert_records(db, table_name, fields, records, col_map)
 
             # 更新 DDL
+            job.stage = "register"
             bt.ddl_sql = ddl
 
             # 字段元信息落库
@@ -252,6 +275,7 @@ class BitableSync:
                 "total_fields": len(fields), "total_records": len(records),
                 "fetch_stats": fetch_stats,
             }
+            job.stage = "done"
             self._finish_sync_job(db, bt, job, sync_status, stats)
 
             # 确保默认系统视图存在
@@ -284,6 +308,7 @@ class BitableSync:
             }
         except Exception as e:
             error_type = "auth_error" if "token" in str(e).lower() else "network_error" if "timeout" in str(e).lower() else "unknown_error"
+            job.stage = "failed"
             self._finish_sync_job(db, bt, job, "failed", error_message=str(e), error_type=error_type)
             db.commit()
             raise
@@ -384,6 +409,12 @@ class BitableSync:
         existing = db.query(BusinessTable).filter(BusinessTable.table_name == table_name).first()
         now = int(time.time())
         if existing:
+            # 如果同名表属于别人（且当前请求指定了 owner），拒绝覆盖
+            if owner_id and existing.owner_id and existing.owner_id != owner_id:
+                raise ValueError(
+                    f"物理表名 '{table_name}' 已被其他用户占用，"
+                    f"请在「显示名称」或「sync_table_name」中指定一个不同的名称"
+                )
             existing.display_name = display_name
             existing.description = f"飞书多维表格同步 | app_token={app_token} | table_id={table_id}"
             if owner_id:

@@ -2,7 +2,7 @@
 from typing import Optional
 from urllib.parse import quote_plus, urlparse, urlunparse
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -10,7 +10,7 @@ from sqlalchemy import text
 from app.database import get_db
 from app.dependencies import get_current_user, require_role
 from app.utils.sql_safe import qi
-from app.models.business import BusinessTable, DataOwnership, VisibilityLevel, SkillDataQuery
+from app.models.business import BusinessTable, DataOwnership, TableSyncJob, VisibilityLevel, SkillDataQuery
 from app.models.user import User, Role, Department
 from app.models.skill import Skill
 from app.services.llm_gateway import llm_gateway
@@ -540,6 +540,45 @@ async def resolve_wiki(
     }
 
 
+class ListBitableTablesRequest(BaseModel):
+    app_token: str
+
+
+@router.post("/list-bitable-tables")
+async def list_bitable_tables(
+    req: ListBitableTablesRequest,
+    user: User = Depends(get_current_user),
+):
+    """根据 app_token 列出该多维表格下的所有数据表。"""
+    from app.services.lark_client import lark_client
+    try:
+        token = await lark_client.get_tenant_access_token()
+    except LarkConfigError:
+        raise HTTPException(503, "飞书集成尚未配置，请联系管理员")
+    except LarkAuthError:
+        raise HTTPException(502, "飞书认证失败，请检查应用配置")
+
+    import httpx
+    base = "https://open.feishu.cn/open-apis"
+    headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"}
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            f"{base}/bitable/v1/apps/{req.app_token}/tables",
+            headers=headers,
+            params={"page_size": 100},
+        )
+        data = r.json()
+        if data.get("code") != 0:
+            raise HTTPException(400, f"获取表列表失败: {data.get('msg')} (code={data.get('code')})")
+        tables = [
+            {"table_id": t["table_id"], "name": t.get("name", t["table_id"])}
+            for t in data.get("data", {}).get("items", [])
+        ]
+
+    return {"tables": tables}
+
+
 @router.post("/probe-bitable")
 async def probe_bitable(
     req: ProbeBitableRequest,
@@ -588,159 +627,154 @@ async def probe_bitable(
     }
 
 
-@router.post("/sync-bitable")
-async def sync_bitable(
+async def _run_bitable_sync(job_id: int, app_token: str, table_id: str, table_name: str,
+                             display_name: str, owner_id: int | None):
+    """后台任务：查出已有的 TableSyncJob，传给 full_sync 复用，不再创建第二个 job。"""
+    from app.database import SessionLocal
+    from app.services.bitable_sync import bitable_sync
+
+    db = SessionLocal()
+    try:
+        existing_job = db.query(TableSyncJob).filter(TableSyncJob.id == job_id).first()
+        if not existing_job:
+            return
+        await bitable_sync.full_sync(
+            db=db,
+            app_token=app_token,
+            table_id=table_id,
+            table_name=table_name,
+            display_name=display_name,
+            owner_id=owner_id,
+            triggered_by=owner_id,
+            trigger_source="manual",
+            existing_job=existing_job,
+        )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Bitable sync job {job_id} failed: {e}")
+    finally:
+        db.close()
+
+
+@router.post("/sync-bitable/jobs")
+async def create_sync_job(
     req: SyncBitableRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Full sync: fetch ALL records from Feishu Bitable → create/replace local MySQL table → register."""
-    import json as _json
-    import re, time
-    from app.services.bitable_sync import bitable_sync, _BITABLE_TYPE_MAP
+    """创建异步同步任务，立即返回 job_id。"""
+    import re
+    from app.services.bitable_sync import bitable_sync
 
     try:
-        token = await bitable_reader.get_token()
+        await bitable_reader.get_token()
     except LarkConfigError:
         raise HTTPException(503, "飞书集成尚未配置，请联系管理员")
     except LarkAuthError:
         raise HTTPException(502, "飞书认证失败，请检查应用配置")
 
-    # 1. Fields
-    try:
-        fields = await bitable_reader.fetch_fields(token, req.app_token, req.table_id)
-    except PermissionError as e:
-        raise HTTPException(403, _json.dumps(
-            {"error": str(e), "stage": "fetch_fields", "suggestion": str(e)},
-            ensure_ascii=False,
-        ))
-    except RuntimeError as e:
-        raise HTTPException(400, _json.dumps(
-            {"error": str(e), "stage": "fetch_fields", "suggestion": "请检查多维表格权限或链接是否正确"},
-            ensure_ascii=False,
-        ))
-
-    # 2. All records (adaptive page size)
-    try:
-        all_records, fetch_stats = await bitable_reader.fetch_records_adaptive(
-            token, req.app_token, req.table_id,
-        )
-    except PermissionError as e:
-        raise HTTPException(403, _json.dumps(
-            {"error": str(e), "stage": "fetch_records", "suggestion": str(e)},
-            ensure_ascii=False,
-        ))
-    except Exception as e:
-        raise HTTPException(400, _json.dumps(
-            {"error": f"获取记录失败: {e}", "stage": "fetch_records",
-             "suggestion": "请检查多维表格权限或缩小字段范围"},
-            ensure_ascii=False,
-        ))
-
-    # 3. Derive target table name
     safe_name = req.sync_table_name.strip() if req.sync_table_name.strip() else ""
     if not safe_name:
         safe_name = f"bitable_{re.sub(r'[^a-z0-9_]', '_', req.table_id.lower()[:30])}"
-
     display = req.display_name.strip() or safe_name
 
-    # 4. Build DDL
-    col_defs = ["  `_record_id` VARCHAR(100) PRIMARY KEY COMMENT '飞书记录ID'"]
-    field_names = []
-    col_map = {}
-    for f in fields:
-        fn = f["field_name"]
-        field_names.append(fn)
-        col = BitableReader.sanitize_col(fn)
-        col_map[fn] = col
-        mysql_type = _BITABLE_TYPE_MAP.get(f.get("type", 1), "TEXT")
-        col_defs.append(f"  `{col}` {mysql_type} COMMENT '{fn}'")
-    col_defs.append("  `_synced_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
-    ddl = f"CREATE TABLE IF NOT EXISTS {qi(safe_name, '表名')} (\n" + ",\n".join(col_defs) + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
-
-    # 5. Create/reset table
     try:
-        db.execute(text(f"DROP TABLE IF EXISTS {qi(safe_name, '表名')}"))
-        db.execute(text(ddl))
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(500, f"本地建表失败，请联系管理员检查数据库: {e}")
-
-    # 6. Insert records
-    inserted = 0
-    for rec in all_records:
-        record_id = rec.get("record_id", "")
-        flds = rec.get("fields", {})
-        row_data = {"_record_id": record_id}
-        for fn in field_names:
-            col = col_map[fn]
-            row_data[col] = BitableReader.flatten_value(flds.get(fn))
-        cols_sql = ", ".join(f"`{k}`" for k in row_data)
-        placeholders = ", ".join(f":{k}" for k in row_data)
-        try:
-            db.execute(text(f"INSERT INTO {qi(safe_name, '表名')} ({cols_sql}) VALUES ({placeholders})"), row_data)
-            inserted += 1
-        except Exception:
-            pass
+        bt = bitable_sync._register_table(db, safe_name, display, req.app_token, req.table_id, "", user.id)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    job = TableSyncJob(
+        table_id=bt.id,
+        source_type="lark_bitable",
+        job_type="full_sync",
+        status="queued",
+        stage="queued",
+        triggered_by=user.id,
+        trigger_source="manual",
+    )
+    db.add(job)
     db.commit()
+    db.refresh(job)
 
-    # 7. Register (upsert) with source_type + source_ref
-    existing = db.query(BusinessTable).filter(BusinessTable.table_name == safe_name).first()
-    if existing:
-        existing.display_name = display
-        existing.description = f"飞书多维表格同步 | app_token={req.app_token} | table_id={req.table_id}"
-        existing.owner_id = user.id
-        rules = dict(existing.validation_rules or {})
-        rules.update({"bitable_app_token": req.app_token, "bitable_table_id": req.table_id, "last_synced_at": int(time.time())})
-        rules.setdefault("row_scope", "private")
-        rules.setdefault("column_scope", "private")
-        from sqlalchemy.orm.attributes import flag_modified
-        flag_modified(existing, "validation_rules")
-        existing.validation_rules = rules
-        existing.source_type = "lark_bitable"
-        existing.source_ref = {"app_token": req.app_token, "table_id": req.table_id}
-        bt = existing
-    else:
-        bt = BusinessTable(
-            table_name=safe_name,
-            display_name=display,
-            description=f"飞书多维表格同步 | app_token={req.app_token} | table_id={req.table_id}",
-            ddl_sql=ddl,
-            validation_rules={
-                "bitable_app_token": req.app_token,
-                "bitable_table_id": req.table_id,
-                "last_synced_at": int(time.time()),
-                "row_scope": "private",
-                "column_scope": "private",
-            },
-            owner_id=user.id,
-            source_type="lark_bitable",
-            source_ref={"app_token": req.app_token, "table_id": req.table_id},
-        )
-        db.add(bt)
-    db.commit()
-    db.refresh(bt)
+    background_tasks.add_task(
+        _run_bitable_sync, job.id, req.app_token, req.table_id, safe_name, display, user.id,
+    )
 
-    # 触发治理分类 job
-    from app.models.knowledge_job import KnowledgeJob
-    db.add(KnowledgeJob(
-        subject_type="business_table", subject_id=bt.id,
-        job_type="governance_classify", trigger_source="upload",
-    ))
-    db.commit()
+    return {"job_id": job.id, "table_id": bt.id, "table_name": safe_name}
 
-    degraded_msg = f"（分页已降级到 {fetch_stats['effective_page_size']}）" if fetch_stats.get("degraded") else ""
+
+@router.get("/sync-bitable/jobs/{job_id}")
+def get_sync_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """查询同步任务状态。"""
+    from app.models.user import Role
+    job = db.query(TableSyncJob).filter(TableSyncJob.id == job_id).first()
+    if not job:
+        raise HTTPException(404, "任务不存在")
+    # 权限校验：只允许任务发起人或管理员查看
+    if user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN) and job.triggered_by != user.id:
+        raise HTTPException(403, "无权查看此任务")
     return {
-        "ok": True,
-        "table_name": safe_name,
-        "id": bt.id,
-        "inserted": inserted,
-        "total_fields": len(fields),
-        "effective_page_size": fetch_stats.get("effective_page_size"),
-        "degraded": fetch_stats.get("degraded", False),
-        "sync_stats": fetch_stats,
+        "job_id": job.id,
+        "status": job.status,
+        "stage": job.stage,
+        "error": job.error_message,
+        "error_type": job.error_type,
+        "result": job.result_summary,
+        "stats": job.stats,
+        "created_at": job.started_at,
+        "updated_at": job.finished_at,
     }
+
+
+@router.post("/sync-bitable")
+async def sync_bitable(
+    req: SyncBitableRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """兼容老接口：改为创建异步 job 并返回 job_id，不再同步等待。"""
+    import re
+    from app.services.bitable_sync import bitable_sync
+
+    try:
+        await bitable_reader.get_token()
+    except LarkConfigError:
+        raise HTTPException(503, "飞书集成尚未配置，请联系管理员")
+    except LarkAuthError:
+        raise HTTPException(502, "飞书认证失败，请检查应用配置")
+
+    safe_name = req.sync_table_name.strip() if req.sync_table_name.strip() else ""
+    if not safe_name:
+        safe_name = f"bitable_{re.sub(r'[^a-z0-9_]', '_', req.table_id.lower()[:30])}"
+    display = req.display_name.strip() or safe_name
+
+    try:
+        bt = bitable_sync._register_table(db, safe_name, display, req.app_token, req.table_id, "", user.id)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    job = TableSyncJob(
+        table_id=bt.id,
+        source_type="lark_bitable",
+        job_type="full_sync",
+        status="queued",
+        stage="queued",
+        triggered_by=user.id,
+        trigger_source="manual",
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    background_tasks.add_task(
+        _run_bitable_sync, job.id, req.app_token, req.table_id, safe_name, display, user.id,
+    )
+
+    return {"job_id": job.id, "table_id": bt.id, "table_name": safe_name}
 
 
 @router.post("/probe")
@@ -1192,6 +1226,7 @@ def drop_column(
 
 class PatchTableRequest(BaseModel):
     display_name: str = None
+    description: str = None               # 表描述
     hidden_fields: list[str] = None       # stored in validation_rules["hidden_fields"]
     folder_id: int = None                 # stored in validation_rules["folder_id"]
     sort_order: int = None                # stored in validation_rules["sort_order"]
@@ -1216,6 +1251,8 @@ def patch_business_table(
         raise HTTPException(404, "Business table not found")
     if req.display_name is not None:
         bt.display_name = req.display_name
+    if req.description is not None:
+        bt.description = req.description
     rules = dict(bt.validation_rules or {})
     if req.hidden_fields is not None:
         rules["hidden_fields"] = req.hidden_fields

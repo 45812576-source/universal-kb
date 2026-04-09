@@ -216,6 +216,7 @@ class TableSyncJob(Base):
     source_type = Column(String(20), nullable=True)  # lark_bitable | mysql | ...
     job_type = Column(String(30), nullable=False)  # full_sync | incremental_sync | schema_refresh | field_profile_refresh
     status = Column(String(20), default="queued")  # queued | running | success | partial_success | failed | cancelled
+    stage = Column(String(30), nullable=True)  # queued | fetch_fields | fetch_records | create_table | insert_records | register | done | failed
     error_type = Column(String(30), nullable=True)  # auth_error | network_error | schema_error | storage_error | unknown_error
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)

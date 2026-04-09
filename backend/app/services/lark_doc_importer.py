@@ -12,7 +12,7 @@ import os
 import re
 import tempfile
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from sqlalchemy.orm import Session
 
@@ -184,14 +184,19 @@ class LarkDocImporter:
         folder_id: Optional[int] = None,
         category: str = "experience",
         sync_interval: int = 0,
+        on_phase: Optional[Callable[[str], None]] = None,
     ) -> KnowledgeEntry:
         """完整导入一个飞书文档到知识库。根据类型自动分发到三种策略。
 
         权限 fallback：默认用 tenant_access_token，遇权限错误自动切换 user_access_token 重试。
+        on_phase: 可选回调，用于报告当前阶段（如 "parse_url", "resolve_wiki", "exporting" 等）。
         """
         from app.services.lark_client import lark_client, LarkPermissionError
 
+        _report = on_phase or (lambda _: None)
+
         # 1. 解析链接
+        _report("parse_url")
         token, api_type, extra_params = self.parse_lark_url(url)
 
         # 默认不使用 user token
@@ -200,6 +205,7 @@ class LarkDocImporter:
         # 2. wiki → 解析为实际文档 token
         wiki_title = None
         if api_type == "wiki":
+            _report("resolve_wiki")
             try:
                 node = await lark_client.get_wiki_node(token)
             except (PermissionError, LarkPermissionError):
@@ -215,7 +221,7 @@ class LarkDocImporter:
             return await self._dispatch_strategy(
                 db, user, url, token, api_type, title, wiki_title,
                 folder_id, category, effective_token,
-                extra_params=extra_params,
+                extra_params=extra_params, on_phase=_report,
             )
         except (PermissionError, LarkPermissionError):
             if effective_token:
@@ -225,7 +231,7 @@ class LarkDocImporter:
             return await self._dispatch_strategy(
                 db, user, url, token, api_type, title, wiki_title,
                 folder_id, category, effective_token,
-                extra_params=extra_params,
+                extra_params=extra_params, on_phase=_report,
             )
 
     async def _get_user_token_or_raise(self, db: Session, user) -> str:
@@ -241,13 +247,14 @@ class LarkDocImporter:
     async def _dispatch_strategy(
         self, db, user, url, token, api_type, title, wiki_title,
         folder_id, category, access_token, *, extra_params=None,
+        on_phase: Optional[Callable[[str], None]] = None,
     ) -> KnowledgeEntry:
         """根据 api_type 分发到三种策略。"""
         if api_type in _EXPORTABLE_TYPES:
             return await self._strategy_export(
                 db, user, url, token, api_type, title, wiki_title,
                 folder_id, category, access_token=access_token,
-                extra_params=extra_params,
+                extra_params=extra_params, on_phase=on_phase,
             )
         elif api_type in _DIRECT_DOWNLOAD_TYPES:
             return await self._strategy_download(
@@ -265,6 +272,7 @@ class LarkDocImporter:
     async def _strategy_export(
         self, db, user, url, token, api_type, title, wiki_title, folder_id, category,
         *, access_token: str | None = None, extra_params: dict | None = None,
+        on_phase: Optional[Callable[[str], None]] = None,
     ) -> KnowledgeEntry:
         """doc/docx/sheet/bitable → export_tasks → 下载 → 提取文本 → 入库。
         bitable 导出失败时 fallback 到 records 拉取。"""
@@ -276,9 +284,11 @@ class LarkDocImporter:
         from app.services.review_policy import review_policy
         from app.utils.file_parser import extract_text, extract_html
 
+        _report = on_phase or (lambda _: None)
         file_ext_str = _EXPORT_EXT_MAP[api_type]
 
         # 创建导出任务 → 轮询 → 下载
+        _report("exporting")
         try:
             ticket = await lark_client.create_export_task(token, api_type, file_ext_str, access_token=access_token)
             file_bytes = await lark_client.poll_and_download_export(ticket, doc_token=token, access_token=access_token)
@@ -293,6 +303,7 @@ class LarkDocImporter:
             raise
 
         # 写临时文件 → 提取文本
+        _report("downloading")
         ext = f".{file_ext_str}"
         tmp_dir = tempfile.mkdtemp()
         tmp_path = os.path.join(tmp_dir, f"lark_import{ext}")
@@ -331,6 +342,7 @@ class LarkDocImporter:
         capture_mode = "upload" if (sensitive_flags or strategic_flags) else "upload_ai_clean"
 
         # 创建 KnowledgeEntry
+        _report("generating_doc")
         entry = self._build_entry(
             db, user, url, token, api_type, title, wiki_title, folder_id, category,
             content=content,

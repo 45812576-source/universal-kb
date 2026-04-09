@@ -29,6 +29,7 @@ class KnowledgeJob(Base):
     # upload | retry | scheduled
     trigger_source = Column(String(20), default="upload")
     payload = Column(JSON, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)

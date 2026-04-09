@@ -13,6 +13,7 @@ from app.config import settings
 from app.models.user import User, Role, Department
 from app.models.skill import ModelConfig, Skill, SkillStatus, SkillMode, SkillVersion
 import app.models.sandbox  # noqa: F401 — ensure sandbox tables exist in test DB
+import app.models.knowledge_job  # noqa: F401 — ensure knowledge_jobs table exists in test DB
 from app.services.auth_service import hash_password
 
 # Use an in-memory SQLite for speed; override as needed
