@@ -38,101 +38,7 @@ def _safe_db_url(raw_url: str) -> str:
         return raw_url
 
 
-def _flatten_bitable_cell(v):
-    """将飞书多维表格单元格的原始值展平为可读字符串或基础类型。
-
-    覆盖类型：
-      type=1  多行文本    -> list of {text, type}
-      type=2  数字        -> float
-      type=3  单选        -> str
-      type=4  多选        -> list of str
-      type=5  日期        -> ms timestamp -> 北京时间字符串
-      type=11 人员        -> list of {name, ...}
-      type=17 附件        -> list of {name, ...}
-      type=18 单向关联    -> {link_record_ids: [...]}
-      type=19 查找引用    -> {type, value: [...]}  value 内容与对应字段类型一致
-      type=20 公式/查找   -> {type, value: [...]}  同上
-    """
-    import datetime
-
-    if v is None:
-        return None
-
-    # ── 查找引用 / 公式（type=19/20）：外层是 {type, value:[...]} ──
-    if isinstance(v, dict) and "type" in v and "value" in v:
-        inner_type = v["type"]
-        inner_vals = v["value"]
-        if not isinstance(inner_vals, list) or not inner_vals:
-            return None
-        # 对 value 数组里每一项递归解析，再拼接
-        parts = []
-        for item in inner_vals:
-            parts.append(_flatten_bitable_cell_inner(item, inner_type))
-        result = "、".join(str(p) for p in parts if p not in (None, ""))
-        return result if result else None
-
-    # ── 单向/双向关联 {link_record_ids: [...]} ──
-    if isinstance(v, dict) and "link_record_ids" in v:
-        ids = v["link_record_ids"]
-        if not ids:
-            return None
-        return "、".join(str(i) for i in ids)
-
-    # ── 普通 list（多行文本 type=1、附件 type=17 等）──
-    if isinstance(v, list):
-        parts = []
-        for item in v:
-            if isinstance(item, dict):
-                if "text" in item:
-                    parts.append(str(item["text"]))
-                elif "name" in item:
-                    parts.append(str(item["name"]))
-                else:
-                    parts.append(str(item))
-            else:
-                parts.append(str(item))
-        return "".join(parts) if parts else None
-
-    # ── 毫秒时间戳（type=5 日期直接返回数字）──
-    if isinstance(v, (int, float)) and v > 1e12:
-        dt = datetime.datetime.fromtimestamp(v / 1000, tz=datetime.timezone(datetime.timedelta(hours=8)))
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    # ── 基础类型 str/int/float/bool ──
-    return v
-
-
-def _flatten_bitable_cell_inner(item, field_type: int):
-    """处理 value 数组内的单个元素（用于查找引用/公式字段）。"""
-    import datetime
-
-    if item is None:
-        return None
-
-    # type=5 日期：ms 时间戳
-    if field_type == 5 and isinstance(item, (int, float)):
-        dt = datetime.datetime.fromtimestamp(item / 1000, tz=datetime.timezone(datetime.timedelta(hours=8)))
-        return dt.strftime("%Y-%m-%d")
-
-    # type=11 人员：{name, ...}
-    if field_type == 11 and isinstance(item, dict):
-        return item.get("name") or item.get("display_name") or item.get("id", "")
-
-    # type=1 多行文本：{text, type}
-    if isinstance(item, dict) and "text" in item:
-        return str(item["text"])
-
-    # type=17 附件：{name, ...}
-    if isinstance(item, dict) and "name" in item:
-        return str(item["name"])
-
-    # 数字/字符串/布尔直接返回
-    if isinstance(item, (int, float)):
-        return str(item) if field_type not in (2, 20) else item
-    if isinstance(item, str):
-        return item
-
-    return str(item)
+from app.services.bitable_reader import bitable_reader, BitableReader
 
 
 
@@ -640,50 +546,39 @@ async def probe_bitable(
     user: User = Depends(get_current_user),
 ):
     """Preview a Feishu Bitable table: fetch fields + first 20 records. Does NOT persist."""
-    from app.services.lark_client import lark_client
     try:
-        token = await lark_client.get_tenant_access_token()
+        token = await bitable_reader.get_token()
     except LarkConfigError:
         raise HTTPException(503, "飞书集成尚未配置，请联系管理员")
     except LarkAuthError:
         raise HTTPException(502, "飞书认证失败，请检查应用配置")
 
-    base = "https://open.feishu.cn/open-apis"
-    headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"}
+    try:
+        fields = await bitable_reader.fetch_fields(token, req.app_token, req.table_id)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
 
-    import httpx
-    async with httpx.AsyncClient(timeout=15) as client:
-        # 1. Get fields
-        r = await client.get(
-            f"{base}/bitable/v1/apps/{req.app_token}/tables/{req.table_id}/fields",
-            headers=headers,
-            params={"page_size": 100},
-        )
-        data = r.json()
-        if data.get("code") != 0:
-            raise HTTPException(400, f"获取字段失败: {data.get('msg')} (code={data.get('code')})")
-        fields = data["data"]["items"]
-        columns = [
-            {"name": f["field_name"], "type": f.get("type", 1), "nullable": True, "comment": ""}
-            for f in fields
-        ]
+    columns = [
+        {"name": f["field_name"], "type": f.get("type", 1), "nullable": True, "comment": ""}
+        for f in fields
+    ]
 
-        # 2. Get first 20 records via search
-        r2 = await client.post(
-            f"{base}/bitable/v1/apps/{req.app_token}/tables/{req.table_id}/records/search",
-            headers=headers,
-            json={"page_size": 20},
-        )
-        data2 = r2.json()
-        if data2.get("code") != 0:
-            raise HTTPException(400, f"获取记录失败: {data2.get('msg')} (code={data2.get('code')})")
-        records = data2["data"]["items"]
-        field_names = [c["name"] for c in columns]
-        preview_rows = []
-        for rec in records:
-            row = {fn: rec.get("fields", {}).get(fn) for fn in field_names}
-            flat = {k: _flatten_bitable_cell(v) for k, v in row.items()}
-            preview_rows.append(flat)
+    try:
+        data = await bitable_reader.fetch_records_page(token, req.app_token, req.table_id, page_size=20)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except Exception as e:
+        raise HTTPException(400, f"获取记录失败: {e}")
+
+    records = data.get("items") or []
+    field_names = [c["name"] for c in columns]
+    preview_rows = []
+    for rec in records:
+        row = {fn: rec.get("fields", {}).get(fn) for fn in field_names}
+        flat = {k: BitableReader.flatten_value(v) for k, v in row.items()}
+        preview_rows.append(flat)
 
     return {
         "app_token": req.app_token,
@@ -693,37 +588,6 @@ async def probe_bitable(
     }
 
 
-# Bitable field type → MySQL type mapping
-_BITABLE_TYPE_MAP = {
-    1: "TEXT",        # 多行文本
-    2: "DOUBLE",      # 数字
-    3: "VARCHAR(50)", # 单选
-    4: "TEXT",        # 多选 (JSON array)
-    5: "DATETIME",    # 日期
-    7: "TINYINT(1)",  # 复选框
-    11: "TEXT",       # 人员
-    13: "TEXT",       # 电话
-    15: "TEXT",       # URL
-    17: "TEXT",       # 附件
-    18: "TEXT",       # 单向关联
-    19: "BIGINT",     # 查找引用
-    20: "DOUBLE",     # 公式
-    21: "DOUBLE",     # 双向关联
-    22: "BIGINT",     # 创建时间
-    23: "BIGINT",     # 最后更新时间
-    24: "TEXT",       # 创建人
-    25: "TEXT",       # 修改人
-    1001: "TEXT",     # 自动编号
-    1002: "TEXT",     # 条码
-    1003: "TEXT",     # 进度
-    1004: "DOUBLE",   # 货币
-    1005: "DOUBLE",   # 评分
-    1006: "TEXT",     # 邮件
-    1007: "TEXT",     # 地理位置
-    1008: "TEXT",     # 群组
-}
-
-
 @router.post("/sync-bitable")
 async def sync_bitable(
     req: SyncBitableRequest,
@@ -731,51 +595,47 @@ async def sync_bitable(
     user: User = Depends(get_current_user),
 ):
     """Full sync: fetch ALL records from Feishu Bitable → create/replace local MySQL table → register."""
-    from app.services.lark_client import lark_client
+    import json as _json
     import re, time
+    from app.services.bitable_sync import bitable_sync, _BITABLE_TYPE_MAP
 
     try:
-        token = await lark_client.get_tenant_access_token()
+        token = await bitable_reader.get_token()
     except LarkConfigError:
         raise HTTPException(503, "飞书集成尚未配置，请联系管理员")
     except LarkAuthError:
         raise HTTPException(502, "飞书认证失败，请检查应用配置")
 
-    base = "https://open.feishu.cn/open-apis"
-    headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"}
+    # 1. Fields
+    try:
+        fields = await bitable_reader.fetch_fields(token, req.app_token, req.table_id)
+    except PermissionError as e:
+        raise HTTPException(403, _json.dumps(
+            {"error": str(e), "stage": "fetch_fields", "suggestion": str(e)},
+            ensure_ascii=False,
+        ))
+    except RuntimeError as e:
+        raise HTTPException(400, _json.dumps(
+            {"error": str(e), "stage": "fetch_fields", "suggestion": "请检查多维表格权限或链接是否正确"},
+            ensure_ascii=False,
+        ))
 
-    import httpx
-    async with httpx.AsyncClient(timeout=30) as client:
-        # 1. Fields
-        r = await client.get(
-            f"{base}/bitable/v1/apps/{req.app_token}/tables/{req.table_id}/fields",
-            headers=headers,
-            params={"page_size": 100},
+    # 2. All records (adaptive page size)
+    try:
+        all_records, fetch_stats = await bitable_reader.fetch_records_adaptive(
+            token, req.app_token, req.table_id,
         )
-        fdata = r.json()
-        if fdata.get("code") != 0:
-            raise HTTPException(400, f"获取字段失败: {fdata.get('msg')}")
-        fields = fdata["data"]["items"]
-
-        # 2. All records (paginated)
-        all_records = []
-        page_token = None
-        while True:
-            body = {"page_size": 500}
-            if page_token:
-                body["page_token"] = page_token
-            r2 = await client.post(
-                f"{base}/bitable/v1/apps/{req.app_token}/tables/{req.table_id}/records/search",
-                headers=headers,
-                json=body,
-            )
-            rdata = r2.json()
-            if rdata.get("code") != 0:
-                raise HTTPException(400, f"获取记录失败: {rdata.get('msg')}")
-            all_records.extend(rdata["data"]["items"])
-            if not rdata["data"].get("has_more"):
-                break
-            page_token = rdata["data"].get("page_token")
+    except PermissionError as e:
+        raise HTTPException(403, _json.dumps(
+            {"error": str(e), "stage": "fetch_records", "suggestion": str(e)},
+            ensure_ascii=False,
+        ))
+    except Exception as e:
+        raise HTTPException(400, _json.dumps(
+            {"error": f"获取记录失败: {e}", "stage": "fetch_records",
+             "suggestion": "请检查多维表格权限或缩小字段范围"},
+            ensure_ascii=False,
+        ))
 
     # 3. Derive target table name
     safe_name = req.sync_table_name.strip() if req.sync_table_name.strip() else ""
@@ -787,21 +647,16 @@ async def sync_bitable(
     # 4. Build DDL
     col_defs = ["  `_record_id` VARCHAR(100) PRIMARY KEY COMMENT '飞书记录ID'"]
     field_names = []
+    col_map = {}
     for f in fields:
         fn = f["field_name"]
         field_names.append(fn)
-        # sanitize column name for MySQL
-        col = re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fff]", "_", fn)
+        col = BitableReader.sanitize_col(fn)
+        col_map[fn] = col
         mysql_type = _BITABLE_TYPE_MAP.get(f.get("type", 1), "TEXT")
         col_defs.append(f"  `{col}` {mysql_type} COMMENT '{fn}'")
     col_defs.append("  `_synced_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
     ddl = f"CREATE TABLE IF NOT EXISTS {qi(safe_name, '表名')} (\n" + ",\n".join(col_defs) + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
-
-    # col name mapping: field_name → mysql col name
-    col_map = {}
-    for f in fields:
-        fn = f["field_name"]
-        col_map[fn] = re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fff]", "_", fn)
 
     # 5. Create/reset table
     try:
@@ -813,7 +668,6 @@ async def sync_bitable(
         raise HTTPException(500, f"本地建表失败，请联系管理员检查数据库: {e}")
 
     # 6. Insert records
-    import json as _json
     inserted = 0
     for rec in all_records:
         record_id = rec.get("record_id", "")
@@ -821,15 +675,7 @@ async def sync_bitable(
         row_data = {"_record_id": record_id}
         for fn in field_names:
             col = col_map[fn]
-            v = flds.get(fn)
-            # flatten
-            if isinstance(v, list) and v and isinstance(v[0], dict) and "text" in v[0]:
-                v = "".join(item.get("text", "") for item in v)
-            elif isinstance(v, dict) and "text" in v:
-                v = v["text"]
-            elif isinstance(v, (list, dict)):
-                v = _json.dumps(v, ensure_ascii=False)
-            row_data[col] = v
+            row_data[col] = BitableReader.flatten_value(flds.get(fn))
         cols_sql = ", ".join(f"`{k}`" for k in row_data)
         placeholders = ", ".join(f":{k}" for k in row_data)
         try:
@@ -839,7 +685,7 @@ async def sync_bitable(
             pass
     db.commit()
 
-    # 7. Register (upsert)
+    # 7. Register (upsert) with source_type + source_ref
     existing = db.query(BusinessTable).filter(BusinessTable.table_name == safe_name).first()
     if existing:
         existing.display_name = display
@@ -852,6 +698,8 @@ async def sync_bitable(
         from sqlalchemy.orm.attributes import flag_modified
         flag_modified(existing, "validation_rules")
         existing.validation_rules = rules
+        existing.source_type = "lark_bitable"
+        existing.source_ref = {"app_token": req.app_token, "table_id": req.table_id}
         bt = existing
     else:
         bt = BusinessTable(
@@ -867,6 +715,8 @@ async def sync_bitable(
                 "column_scope": "private",
             },
             owner_id=user.id,
+            source_type="lark_bitable",
+            source_ref={"app_token": req.app_token, "table_id": req.table_id},
         )
         db.add(bt)
     db.commit()
@@ -880,7 +730,17 @@ async def sync_bitable(
     ))
     db.commit()
 
-    return {"ok": True, "table_name": safe_name, "id": bt.id, "inserted": inserted, "total_fields": len(fields)}
+    degraded_msg = f"（分页已降级到 {fetch_stats['effective_page_size']}）" if fetch_stats.get("degraded") else ""
+    return {
+        "ok": True,
+        "table_name": safe_name,
+        "id": bt.id,
+        "inserted": inserted,
+        "total_fields": len(fields),
+        "effective_page_size": fetch_stats.get("effective_page_size"),
+        "degraded": fetch_stats.get("degraded", False),
+        "sync_stats": fetch_stats,
+    }
 
 
 @router.post("/probe")

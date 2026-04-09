@@ -104,28 +104,28 @@ class TestTypeMapping:
 class TestParseLarkUrl:
 
     def test_docx_url(self, importer):
-        token, api_type = importer.parse_lark_url("https://abc.feishu.cn/docx/AbcDef123")
+        token, api_type, _ = importer.parse_lark_url("https://abc.feishu.cn/docx/AbcDef123")
         assert token == "AbcDef123"
         assert api_type == "docx"
 
     def test_sheets_url_normalizes(self, importer):
         """sheets URL 应归一化为 sheet。"""
-        token, api_type = importer.parse_lark_url("https://abc.feishu.cn/sheets/Token123")
+        token, api_type, _ = importer.parse_lark_url("https://abc.feishu.cn/sheets/Token123")
         assert api_type == "sheet"
 
     def test_base_url_normalizes(self, importer):
         """base URL 应归一化为 bitable。"""
-        token, api_type = importer.parse_lark_url("https://abc.feishu.cn/base/Token123")
+        token, api_type, _ = importer.parse_lark_url("https://abc.feishu.cn/base/Token123")
         assert api_type == "bitable"
 
     def test_pure_wiki_url(self, importer):
-        token, api_type = importer.parse_lark_url("https://abc.feishu.cn/wiki/WikiToken123")
+        token, api_type, _ = importer.parse_lark_url("https://abc.feishu.cn/wiki/WikiToken123")
         assert token == "WikiToken123"
         assert api_type == "wiki"
 
     def test_share_form_url(self, importer):
         """问卷分享链接应解析为 survey。"""
-        token, api_type = importer.parse_lark_url(
+        token, api_type, _ = importer.parse_lark_url(
             "https://qnyspu28uo.feishu.cn/share/base/form/shrcnEppSqiaiCN"
         )
         assert token == "shrcnEppSqiaiCN"

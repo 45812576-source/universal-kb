@@ -134,29 +134,36 @@ async def get_valid_user_token(db: Session, user) -> str | None:
 
 class LarkDocImporter:
 
-    def parse_lark_url(self, url: str) -> tuple[str, str]:
-        """解析飞书链接 → (token, api_type)。
+    def parse_lark_url(self, url: str) -> tuple[str, str, dict]:
+        """解析飞书链接 → (token, api_type, extra_params)。
 
         Returns:
-            (token, api_type) 如 ("AbcDef123", "docx")
+            (token, api_type, extra_params) 如 ("AbcDef123", "docx", {})
+            bitable 类型时 extra_params 含 {"table_id": "tblXXX"}（从 URL ?table= 解析）
         Raises:
             ValueError: 链接格式不支持
         """
         # 问卷分享链接（优先匹配，避免被主正则的 /base/ 吃掉）
         m = _LARK_SHARE_FORM_RE.search(url)
         if m:
-            return m.group("token"), "survey"
+            return m.group("token"), "survey", {}
 
         m = _LARK_URL_RE.search(url)
         if m:
             token = m.group("token")
             url_type = m.group("type")
-            return token, _normalize_type(url_type)
+            api_type = _normalize_type(url_type)
+            extra: dict = {}
+            if api_type == "bitable":
+                tm = re.search(r"[?&]table=([A-Za-z0-9]+)", url)
+                if tm:
+                    extra["table_id"] = tm.group(1)
+            return token, api_type, extra
 
         # 纯 wiki 链接
         m = _LARK_WIKI_RE.search(url)
         if m:
-            return m.group("token"), "wiki"
+            return m.group("token"), "wiki", {}
 
         # 飞书文件夹链接 — 不支持导入，给明确提示
         if re.search(r"feishu\.cn/drive/folder/", url) or re.search(r"larksuite\.com/drive/folder/", url):
@@ -185,7 +192,7 @@ class LarkDocImporter:
         from app.services.lark_client import lark_client, LarkPermissionError
 
         # 1. 解析链接
-        token, api_type = self.parse_lark_url(url)
+        token, api_type, extra_params = self.parse_lark_url(url)
 
         # 默认不使用 user token
         effective_token: str | None = None
@@ -208,6 +215,7 @@ class LarkDocImporter:
             return await self._dispatch_strategy(
                 db, user, url, token, api_type, title, wiki_title,
                 folder_id, category, effective_token,
+                extra_params=extra_params,
             )
         except (PermissionError, LarkPermissionError):
             if effective_token:
@@ -217,6 +225,7 @@ class LarkDocImporter:
             return await self._dispatch_strategy(
                 db, user, url, token, api_type, title, wiki_title,
                 folder_id, category, effective_token,
+                extra_params=extra_params,
             )
 
     async def _get_user_token_or_raise(self, db: Session, user) -> str:
@@ -231,13 +240,14 @@ class LarkDocImporter:
 
     async def _dispatch_strategy(
         self, db, user, url, token, api_type, title, wiki_title,
-        folder_id, category, access_token,
+        folder_id, category, access_token, *, extra_params=None,
     ) -> KnowledgeEntry:
         """根据 api_type 分发到三种策略。"""
         if api_type in _EXPORTABLE_TYPES:
             return await self._strategy_export(
                 db, user, url, token, api_type, title, wiki_title,
                 folder_id, category, access_token=access_token,
+                extra_params=extra_params,
             )
         elif api_type in _DIRECT_DOWNLOAD_TYPES:
             return await self._strategy_download(
@@ -254,9 +264,10 @@ class LarkDocImporter:
 
     async def _strategy_export(
         self, db, user, url, token, api_type, title, wiki_title, folder_id, category,
-        *, access_token: str | None = None,
+        *, access_token: str | None = None, extra_params: dict | None = None,
     ) -> KnowledgeEntry:
-        """doc/docx/sheet/bitable → export_tasks → 下载 → 提取文本 → 入库。"""
+        """doc/docx/sheet/bitable → export_tasks → 下载 → 提取文本 → 入库。
+        bitable 导出失败时 fallback 到 records 拉取。"""
         from app.services.lark_client import lark_client
         from app.services.oss_service import generate_oss_key, upload_file as oss_upload
         from app.services.knowledge_namer import auto_name
@@ -268,8 +279,18 @@ class LarkDocImporter:
         file_ext_str = _EXPORT_EXT_MAP[api_type]
 
         # 创建导出任务 → 轮询 → 下载
-        ticket = await lark_client.create_export_task(token, api_type, file_ext_str, access_token=access_token)
-        file_bytes = await lark_client.poll_and_download_export(ticket, doc_token=token, access_token=access_token)
+        try:
+            ticket = await lark_client.create_export_task(token, api_type, file_ext_str, access_token=access_token)
+            file_bytes = await lark_client.poll_and_download_export(ticket, doc_token=token, access_token=access_token)
+        except Exception as export_error:
+            if api_type == "bitable":
+                logger.warning(f"Bitable export 失败，尝试 records fallback: {export_error}")
+                return await self._bitable_records_fallback(
+                    db, user, url, token, api_type, title, wiki_title,
+                    folder_id, category, extra_params, access_token,
+                    export_error=export_error,
+                )
+            raise
 
         # 写临时文件 → 提取文本
         ext = f".{file_ext_str}"
@@ -339,6 +360,67 @@ class LarkDocImporter:
         self._enqueue_jobs(db, entry)
 
         # 审核流程
+        entry = submit_knowledge(db, entry)
+        return entry
+
+    # ── Bitable fallback：导出失败时改用 records API ──────────────────────
+
+    async def _bitable_records_fallback(
+        self, db, user, url, token, api_type, title, wiki_title,
+        folder_id, category, extra_params, access_token, *, export_error,
+    ) -> KnowledgeEntry:
+        """bitable 导出失败时 fallback 到 records 拉取。
+        缺 table_id 时自动调用 tables list API 获取。
+        """
+        from app.services.bitable_reader import bitable_reader
+        from app.services.knowledge_service import submit_knowledge
+
+        app_token = token  # parse_lark_url 对 bitable 返回的 token 就是 app_token
+        table_id = (extra_params or {}).get("table_id")
+
+        effective_token = access_token or await bitable_reader.get_token()
+
+        # 缺 table_id 时自动列表
+        if not table_id:
+            try:
+                tables = await bitable_reader.fetch_table_list(effective_token, app_token)
+            except Exception as e:
+                raise RuntimeError(
+                    f"多维表格导出失败且无法获取数据表列表: export={export_error}, list={e}"
+                )
+            if not tables:
+                raise RuntimeError(f"多维表格导出失败且该表格内无数据表: {export_error}")
+            table_id = tables[0]["table_id"]
+            if len(tables) > 1:
+                table_names = "、".join(t["name"] for t in tables[:5])
+                logger.info(
+                    f"Bitable fallback: 多维表格含 {len(tables)} 个数据表（{table_names}），"
+                    f"自动选择第一个: {tables[0]['name']} ({table_id})"
+                )
+
+        fields = await bitable_reader.fetch_fields(effective_token, app_token, table_id)
+        records, stats = await bitable_reader.fetch_records_adaptive(effective_token, app_token, table_id)
+
+        if not records:
+            raise RuntimeError(f"多维表格导出和记录拉取均失败: export={export_error}, records={stats.get('errors')}")
+
+        content_html = bitable_reader.records_to_html_table(fields, records)
+        content = bitable_reader.records_to_text(fields, records)
+
+        entry = self._build_entry(
+            db, user, url, token, api_type, title, wiki_title, folder_id, category,
+            content=content, content_html=content_html,
+            capture_mode="upload_ai_clean",
+            oss_key=None, file_type=None, file_ext=None, file_size=0,
+            doc_render_mode="lark_bitable_import",
+        )
+        db.add(entry)
+        db.flush()
+
+        if content:
+            await self._ai_enrich(entry, content, url, None, title, db)
+        self._enqueue_jobs(db, entry)
+
         entry = submit_knowledge(db, entry)
         return entry
 

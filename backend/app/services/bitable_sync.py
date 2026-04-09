@@ -2,22 +2,18 @@
 from __future__ import annotations
 
 import datetime
-import json
 import logging
-import re
 import time
 from typing import Optional
 
-import httpx
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.models.business import BusinessTable, TableField, TableSyncJob
+from app.services.bitable_reader import bitable_reader, BitableReader, BitableRecordError
 from app.utils.sql_safe import qi
 
 logger = logging.getLogger(__name__)
-
-_LARK_API_BASE = "https://open.feishu.cn/open-apis"
 
 # Bitable field type → MySQL type mapping
 _BITABLE_TYPE_MAP = {
@@ -40,40 +36,13 @@ _BITABLE_TO_FIELD_TYPE = {
 }
 
 
-def _flatten_value(v):
-    """将飞书多维表格单元格展平为 MySQL 可存储值。"""
-    if v is None:
-        return None
-    if isinstance(v, list) and v and isinstance(v[0], dict) and "text" in v[0]:
-        return "".join(item.get("text", "") for item in v)
-    if isinstance(v, dict) and "text" in v:
-        return v["text"]
-    if isinstance(v, (list, dict)):
-        return json.dumps(v, ensure_ascii=False)
-    return v
-
-
-def _sanitize_col(field_name: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fff]", "_", field_name)
-
-
 class BitableSync:
 
     async def _get_token(self) -> str:
-        from app.services.lark_client import lark_client
-        return await lark_client.get_tenant_access_token()
+        return await bitable_reader.get_token()
 
     async def _fetch_fields(self, token: str, app_token: str, table_id: str) -> list[dict]:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(
-                f"{_LARK_API_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
-                headers={"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"},
-                params={"page_size": 100},
-            )
-            data = r.json()
-            if data.get("code") != 0:
-                raise RuntimeError(f"获取字段失败: {data.get('msg')}")
-            return data["data"]["items"]
+        return await bitable_reader.fetch_fields(token, app_token, table_id)
 
     async def _fetch_records(
         self,
@@ -81,46 +50,14 @@ class BitableSync:
         app_token: str,
         table_id: str,
         since_ts: Optional[int] = None,
-    ) -> list[dict]:
-        """拉取记录。since_ts 不为 None 时只拉 last_modified_time > since_ts 的记录（增量）。"""
-        headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"}
-        all_records = []
-        page_token = None
-
-        while True:
-            body: dict = {"page_size": 500}
-            if page_token:
-                body["page_token"] = page_token
-            # 增量过滤：按最后修改时间
-            if since_ts:
-                body["filter"] = {
-                    "conjunction": "and",
-                    "conditions": [{
-                        "field_name": "最后更新时间",
-                        "operator": "isGreater",
-                        "value": [str(since_ts * 1000)],  # 飞书用毫秒
-                    }],
-                }
-
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(
-                    f"{_LARK_API_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/records/search",
-                    headers=headers,
-                    json=body,
-                )
-                data = r.json()
-                if data.get("code") != 0:
-                    raise RuntimeError(f"获取记录失败: {data.get('msg')}")
-                items = data.get("data", {}).get("items", [])
-                all_records.extend(items)
-                if not data["data"].get("has_more"):
-                    break
-                page_token = data["data"].get("page_token")
-
-        return all_records
+    ) -> tuple[list[dict], dict]:
+        """拉取记录（自适应降级）。返回 (records, stats)。"""
+        return await bitable_reader.fetch_records_adaptive(
+            token, app_token, table_id, since_ts=since_ts,
+        )
 
     def _build_col_map(self, fields: list[dict]) -> dict[str, str]:
-        return {f["field_name"]: _sanitize_col(f["field_name"]) for f in fields}
+        return {f["field_name"]: BitableReader.sanitize_col(f["field_name"]) for f in fields}
 
     def _create_sync_job(
         self, db: Session, bt: BusinessTable, job_type: str, triggered_by: int | None = None,
@@ -173,7 +110,7 @@ class BitableSync:
             fname = f["field_name"]
             ftype_code = f.get("type", 1)
             field_type = _BITABLE_TO_FIELD_TYPE.get(ftype_code, "text")
-            col_name = _sanitize_col(fname)
+            col_name = BitableReader.sanitize_col(fname)
             seen.add(fname)
 
             # 提取枚举值（single_select / multi_select）
@@ -238,8 +175,8 @@ class BitableSync:
             flds = rec.get("fields", {})
             row_data = {"_record_id": record_id}
             for fn in field_names:
-                col = col_map.get(fn, _sanitize_col(fn))
-                row_data[col] = _flatten_value(flds.get(fn))
+                col = col_map.get(fn, BitableReader.sanitize_col(fn))
+                row_data[col] = BitableReader.flatten_value(flds.get(fn))
 
             cols_sql = ", ".join(f"`{k}`" for k in row_data)
             placeholders = ", ".join(f":{k}" for k in row_data)
@@ -283,7 +220,7 @@ class BitableSync:
         try:
             token = await self._get_token()
             fields = await self._fetch_fields(token, app_token, table_id)
-            records = await self._fetch_records(token, app_token, table_id)
+            records, fetch_stats = await self._fetch_records(token, app_token, table_id)
 
             col_map = self._build_col_map(fields)
 
@@ -308,8 +245,14 @@ class BitableSync:
             # 字段元信息落库
             self._persist_schema_fields(db, bt, fields)
 
-            stats = {"inserted": inserted, "updated": updated, "total_fields": len(fields), "total_records": len(records)}
-            self._finish_sync_job(db, bt, job, "success", stats)
+            sync_status = "success"
+
+            stats = {
+                "inserted": inserted, "updated": updated,
+                "total_fields": len(fields), "total_records": len(records),
+                "fetch_stats": fetch_stats,
+            }
+            self._finish_sync_job(db, bt, job, sync_status, stats)
 
             # 确保默认系统视图存在
             try:
@@ -335,6 +278,9 @@ class BitableSync:
                 "updated": updated,
                 "mode": "full",
                 "sync_job_id": job.id,
+                "effective_page_size": fetch_stats.get("effective_page_size"),
+                "degraded": fetch_stats.get("degraded", False),
+                "sync_stats": fetch_stats,
             }
         except Exception as e:
             error_type = "auth_error" if "token" in str(e).lower() else "network_error" if "timeout" in str(e).lower() else "unknown_error"
@@ -367,7 +313,10 @@ class BitableSync:
         try:
             token = await self._get_token()
             fields = await self._fetch_fields(token, app_token, table_id)
-            records = await self._fetch_records(token, app_token, table_id, since_ts=last_synced if last_synced else None)
+            records, fetch_stats = await self._fetch_records(
+                token, app_token, table_id,
+                since_ts=last_synced if last_synced else None,
+            )
 
             col_map = self._build_col_map(fields)
             inserted, updated = self._upsert_records(db, bt.table_name, fields, records, col_map)
@@ -381,8 +330,11 @@ class BitableSync:
             # 字段元信息落库
             self._persist_schema_fields(db, bt, fields)
 
-            stats = {"inserted": inserted, "updated": updated, "total_fetched": len(records)}
-            self._finish_sync_job(db, bt, job, "success", stats)
+            has_fatal = any(e.get("fatal") for e in fetch_stats.get("errors", []))
+            sync_status = "partial_success" if (records and has_fatal) else "success"
+
+            stats = {"inserted": inserted, "updated": updated, "total_fetched": len(records), "fetch_stats": fetch_stats}
+            self._finish_sync_job(db, bt, job, sync_status, stats)
 
             # 确保默认系统视图存在
             try:
@@ -408,6 +360,9 @@ class BitableSync:
                 "total_fetched": len(records),
                 "mode": "incremental" if last_synced else "full_initial",
                 "sync_job_id": job.id,
+                "effective_page_size": fetch_stats.get("effective_page_size"),
+                "degraded": fetch_stats.get("degraded", False),
+                "sync_stats": fetch_stats,
             }
         except Exception as e:
             error_type = "auth_error" if "token" in str(e).lower() else "network_error" if "timeout" in str(e).lower() else "unknown_error"
