@@ -181,10 +181,13 @@ def _user_opencode_db_path(workdir: str) -> Optional[str]:
 
 
 def _sanitize_opencode_db(workdir: str, project_dir: str) -> None:
-    """启动前清理 opencode.db，确保 project worktree 和 session directory 正确。
+    """启动前修正 opencode.db 中 global project 的 worktree 指向。
 
-    防御性清理：删除多余 project 记录、修正 global project 的 worktree、
-    修正所有 session 的 directory，确保每次启动 opencode 看到干净状态。
+    【重要】不修改已有 session 的 directory 和 project_id。
+    历史 session 保留原始 directory 上下文，OpenCode UI 依赖这些值区分不同 session。
+    只做以下最小修正：
+    - 确保 global project 的 worktree 指向当前正确的 project_dir
+    - 将 project_id 为空的 session 归入 global（防止 orphan session 不可见）
     """
     db_path = _user_opencode_db_path(workdir)
     if not db_path or not os.path.exists(db_path):
@@ -195,32 +198,35 @@ def _sanitize_opencode_db(workdir: str, project_dir: str) -> None:
         logger = logging.getLogger(__name__)
         con = sqlite3.connect(db_path, timeout=5)
         try:
-            # 检查表是否存在（首次启动可能还没有 schema）
             tables = {r[0] for r in con.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()}
             changed = False
             if "project" in tables:
-                # 删除非 global 的脏 project 记录
-                cur = con.execute("DELETE FROM project WHERE id != 'global'")
-                if cur.rowcount > 0:
-                    logger.info(f"[SanitizeDB] 删除 {cur.rowcount} 条非 global project 记录: {workdir}")
+                # 确保 global project 存在且 worktree 正确
+                row = con.execute("SELECT worktree FROM project WHERE id='global'").fetchone()
+                if row is None:
+                    # global project 不存在，创建之
+                    con.execute(
+                        "INSERT INTO project (id, worktree) VALUES ('global', ?)",
+                        (project_dir,),
+                    )
+                    logger.info(f"[SanitizeDB] 创建 global project: {project_dir}")
                     changed = True
-                # 确保 global project 的 worktree 正确
-                cur = con.execute(
-                    "UPDATE project SET worktree=? WHERE id='global' AND worktree!=?",
-                    (project_dir, project_dir),
-                )
-                if cur.rowcount > 0:
-                    logger.info(f"[SanitizeDB] 修正 global worktree -> {project_dir}")
+                elif row[0] != project_dir:
+                    con.execute(
+                        "UPDATE project SET worktree=? WHERE id='global'",
+                        (project_dir,),
+                    )
+                    logger.info(f"[SanitizeDB] 修正 global worktree: {row[0]} -> {project_dir}")
                     changed = True
             if "session" in tables:
+                # 只修复 project_id 为空的 orphan session，不动其他 session 的 directory
                 cur = con.execute(
-                    "UPDATE session SET directory=?, project_id='global' WHERE directory!=? OR project_id!='global'",
-                    (project_dir, project_dir),
+                    "UPDATE session SET project_id='global' WHERE project_id IS NULL OR project_id=''",
                 )
                 if cur.rowcount > 0:
-                    logger.info(f"[SanitizeDB] 修正 {cur.rowcount} 条 session directory -> {project_dir}")
+                    logger.info(f"[SanitizeDB] 修正 {cur.rowcount} 条 orphan session 归入 global")
                     changed = True
             if changed:
                 con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -229,7 +235,7 @@ def _sanitize_opencode_db(workdir: str, project_dir: str) -> None:
             con.close()
     except Exception as e:
         import logging
-        logging.getLogger(__name__).debug(f"[SanitizeDB] 清理失败（非致命）: {workdir}: {e}")
+        logging.getLogger(__name__).debug(f"[SanitizeDB] 修正失败（非致命）: {workdir}: {e}")
 
 
 # ─── 旧布局残留检测 + 迁移 ──────────────────────────────────────────────────
@@ -432,49 +438,107 @@ def ensure_workspace_layout(workdir: str, display_name: str = "") -> tuple[str, 
 
 
 def _cleanup_workspace_if_needed(workdir: str, max_bytes: int) -> None:
-    """若 workdir 总大小超过 max_bytes，删最老 session 直到达标。同步函数，可在启动前直接调用。"""
-    import sqlite3 as _sqlite3
+    """若 workdir 总大小超过 max_bytes，按严格白名单清理可再生内容。
+
+    【重要】绝不删除 opencode.db 中的 session/message/part 数据。
+    【重要】不做全工作区递归扫描，只清理以下白名单路径：
+    """
     import logging
     logger = logging.getLogger(__name__)
 
     ws_bytes = _dir_size_bytes(workdir)
     if ws_bytes <= max_bytes:
         return
+
+    name = os.path.basename(workdir)
+    logger.info(
+        f"[DiskCleaner] {name}: workspace {ws_bytes / 1024**3:.2f}GB 超过 "
+        f"{max_bytes / 1024**3:.2f}GB 上限，开始白名单清理"
+    )
+    freed = 0
+
+    project_dir = _workspace_project_dir(workdir)
+
+    # ── 白名单：每项是 (绝对路径, 清理方式) ──
+    # "rmtree"  = 删除整个目录内容（保留目录本身）
+    # "glob"    = 删除目录下匹配扩展名的文件（不递归）
+    _CLEANABLE: list[tuple[str, str]] = [
+        # 1. runtime/cache/ — OpenCode 运行时缓存，可完全重建
+        (os.path.join(workdir, "runtime", "cache"), "rmtree"),
+        # 2. project/__pycache__/ — Python 字节码缓存
+        (os.path.join(project_dir, "__pycache__"), "rmtree"),
+        # 3. project/node_modules/.cache/ — 构建工具缓存
+        (os.path.join(project_dir, "node_modules", ".cache"), "rmtree"),
+        # 4. project/.next/ — Next.js 构建产物
+        (os.path.join(project_dir, ".next"), "rmtree"),
+        # 5. project/dist/ — 通用构建产物
+        (os.path.join(project_dir, "dist"), "rmtree"),
+        # 6. project/build/ — 通用构建产物
+        (os.path.join(project_dir, "build"), "rmtree"),
+    ]
+
+    # ── 白名单路径内的文件级清理 ──
+    _FILE_CLEAN_DIRS: list[tuple[str, set[str]]] = [
+        # runtime/ 目录下的日志和临时文件（不递归进 data/config/ 等子目录）
+        (os.path.join(workdir, "runtime"), {".log", ".tmp"}),
+        # project/ 目录下的日志和临时文件（仅顶层）
+        (project_dir, {".log", ".tmp"}),
+    ]
+
+    # 执行目录级清理
+    for target_path, mode in _CLEANABLE:
+        if not os.path.isdir(target_path):
+            continue
+        if mode == "rmtree":
+            try:
+                before = _dir_size_bytes(target_path)
+                shutil.rmtree(target_path, ignore_errors=True)
+                freed += before
+                logger.debug(f"[DiskCleaner] 清理目录: {target_path} ({before / 1024**2:.1f}MB)")
+            except OSError:
+                pass
+
+    # 执行文件级清理（仅扫描指定目录的顶层文件，不递归）
+    for dir_path, exts in _FILE_CLEAN_DIRS:
+        if not os.path.isdir(dir_path):
+            continue
+        try:
+            for entry in os.scandir(dir_path):
+                if entry.is_file(follow_symlinks=False) and os.path.splitext(entry.name)[1] in exts:
+                    try:
+                        size = entry.stat().st_size
+                        os.remove(entry.path)
+                        freed += size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    # WAL checkpoint（不删数据，只合并 WAL 回主库释放磁盘）
     db_path = _user_opencode_db_path(workdir)
-    if not os.path.exists(db_path):
-        return
-    try:
-        con = _sqlite3.connect(db_path)
-        deleted = 0
-        while ws_bytes > max_bytes:
-            row = con.execute(
-                "SELECT id FROM session ORDER BY time_updated ASC LIMIT 1"
-            ).fetchone()
-            if not row:
-                # session 已删完但仍超限，说明存在大文件，不能继续清理
-                logger.warning(
-                    f"[DbCleaner] {os.path.basename(workdir)}: session 已删完但 workspace 仍超限 "
-                    f"({ws_bytes / 1024**3:.2f}GB > {max_bytes / 1024**3:.2f}GB)，"
-                    f"可能存在用户上传的大文件"
-                )
-                break
-            sid = row[0]
-            con.execute("DELETE FROM part WHERE session_id = ?", (sid,))
-            con.execute("DELETE FROM message WHERE session_id = ?", (sid,))
-            con.execute("DELETE FROM session WHERE id = ?", (sid,))
-            con.commit()
-            deleted += 1
-            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            con.execute("VACUUM")
-            ws_bytes = _dir_size_bytes(workdir)
-        con.close()
-        name = os.path.basename(workdir)
-        logger.info(
-            f"[DbCleaner] {name}: 删除 {deleted} 个旧 session，"
-            f"workspace 现在 {ws_bytes / 1024**3:.2f}GB"
+    if db_path and os.path.exists(db_path):
+        try:
+            import sqlite3 as _sqlite3
+            wal_path = db_path + "-wal"
+            wal_size = os.path.getsize(wal_path) if os.path.exists(wal_path) else 0
+            if wal_size > 10 * 1024 * 1024:  # WAL > 10MB 时做 checkpoint
+                con = _sqlite3.connect(db_path, timeout=5)
+                con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                con.close()
+                freed += wal_size
+        except Exception:
+            pass
+
+    ws_bytes_after = _dir_size_bytes(workdir)
+    logger.info(
+        f"[DiskCleaner] {name}: 清理完成，释放约 {freed / 1024**2:.1f}MB，"
+        f"workspace 现在 {ws_bytes_after / 1024**3:.2f}GB"
+    )
+    if ws_bytes_after > max_bytes:
+        logger.warning(
+            f"[DiskCleaner] {name}: 清理后仍超限 ({ws_bytes_after / 1024**3:.2f}GB)，"
+            f"可能存在用户上传的大文件，需管理员手动检查"
         )
-    except Exception as e:
-        logger.warning(f"[DbCleaner] {os.path.basename(workdir)} 清理失败: {e}")
 
 
 async def _db_cleaner() -> None:
@@ -602,7 +666,11 @@ def _mark_registry_unhealthy(user_id: int) -> None:
 
 
 async def _idle_reaper() -> None:
-    """后台任务：每2分钟扫一遍，回收空闲实例 + 杀掉内存超限实例 + 重启抖动保护。"""
+    """后台任务：每2分钟扫一遍，回收空闲实例 + 杀掉内存超限实例 + 重启抖动保护。
+
+    注意：此 reaper 只管理 _user_instances 中的 OpenCode 进程。
+    Skill Studio 的 runtime_status 为 "n/a"，不参与进程管理，不受此 reaper 影响。
+    """
     import logging
     logger = logging.getLogger(__name__)
     while True:
@@ -1308,7 +1376,12 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             if _cwd_ok:
                 inst["last_active"] = _time.time()
                 return {"port": inst["port"], "url": "/opencode"}
-            # cwd 不对，杀掉旧进程，下方代码会重新启动
+            # cwd 不对 → 标记注册表 stopped，杀掉旧进程，下方代码会按注册表固定工作区干净重启
+            import logging as _cwd_lg
+            _cwd_lg.getLogger(__name__).warning(
+                f"[_ensure_user_instance] user={user_id} cwd 不匹配注册表，杀掉旧进程并重启"
+            )
+            _mark_registry_stopped(user_id)
             try:
                 for _pid_str in _lsof.stdout.strip().split('\n'):
                     if _pid_str.strip().isdigit():
@@ -1322,6 +1395,14 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
         workdir = _get_registry_workspace_root(user_id)
         if not workdir:
             workdir = _workspace_root_for_user(user_id, display_name)
+
+        # 注册表一致性校验：如果注册表 project_dir 不存在于磁盘，重建目录
+        _reg_project_dir = _get_registry_project_dir(user_id)
+        if _reg_project_dir and not os.path.isdir(_reg_project_dir):
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                f"[_ensure_user_instance] user={user_id} 注册表 project_dir 不存在于磁盘，将重建: {_reg_project_dir}"
+            )
 
         # 统一初始化入口：迁移旧布局 + 创建 project/runtime 目录结构
         loop = asyncio.get_event_loop()
@@ -1682,8 +1763,9 @@ def dev_studio_entry(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """返回稳定的工作区入口：注册表 + conversation + runtime 状态。"""
+    """返回稳定的工作区入口：注册表 + conversation + runtime 状态 + opencode.db 全量 session。"""
     from app.services.studio_registry import resolve_entry
+    from dataclasses import asdict
     entry = resolve_entry(db, user, "opencode")
     return {
         "registration_id": entry.registration_id,
@@ -1694,6 +1776,59 @@ def dev_studio_entry(
         "runtime_port": entry.runtime_port,
         "generation": entry.generation,
         "needs_recover": entry.needs_recover,
+        "recent_conversation_ids": entry.recent_conversation_ids,
+        "last_active_at": entry.last_active_at,
+        "opencode_sessions": [asdict(s) for s in entry.opencode_sessions],
+        "opencode_session_count": entry.opencode_session_count,
+    }
+
+
+@router.post("/entry")
+async def dev_studio_entry_start(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """统一入口 — 返回注册表信息并自动启动/恢复 runtime。
+
+    前端只需调此一个 API，不再需要先 GET /entry 再 GET /instance。
+    返回值同 GET /entry，额外包含 port + url（runtime 就绪后）。
+    """
+    from app.services.studio_registry import resolve_entry
+    from dataclasses import asdict
+    entry = resolve_entry(db, user, "opencode")
+
+    # 自动启动 runtime
+    port = None
+    url = None
+    runtime_error = None
+    try:
+        info = await _ensure_user_instance(user.id, display_name=user.display_name or "")
+        port = info["port"]
+        url = info["url"]
+        runtime_status = "running"
+    except HTTPException as e:
+        runtime_error = e.detail
+        runtime_status = entry.runtime_status
+    except Exception as e:
+        runtime_error = str(e)
+        runtime_status = entry.runtime_status
+
+    return {
+        "registration_id": entry.registration_id,
+        "conversation_id": entry.conversation_id,
+        "workspace_root": entry.workspace_root,
+        "project_dir": entry.project_dir,
+        "runtime_status": runtime_status,
+        "runtime_port": port or entry.runtime_port,
+        "generation": entry.generation,
+        "needs_recover": False if runtime_status == "running" else entry.needs_recover,
+        "recent_conversation_ids": entry.recent_conversation_ids,
+        "last_active_at": entry.last_active_at,
+        "opencode_sessions": [asdict(s) for s in entry.opencode_sessions],
+        "opencode_session_count": entry.opencode_session_count,
+        "port": port,
+        "url": url,
+        "runtime_error": runtime_error,
     }
 
 
@@ -1702,17 +1837,274 @@ def dev_studio_health(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """返回当前用户 opencode 运行时状态。"""
+    """返回当前用户 opencode 运行时状态。SUPER_ADMIN 额外返回调试字段。"""
     from app.services.studio_registry import get_registration
     reg = get_registration(db, user.id, "opencode")
     if not reg:
         return {"runtime_status": "unregistered", "generation": 0}
-    return {
+    result = {
         "runtime_status": reg.runtime_status,
         "runtime_port": reg.runtime_port,
         "generation": reg.generation,
         "last_active_at": reg.last_active_at.isoformat() if reg.last_active_at else None,
     }
+    # SUPER_ADMIN 额外返回调试信息
+    if user.role == Role.SUPER_ADMIN:
+        inst = _user_instances.get(user.id)
+        pid = None
+        if inst and inst.get("proc") and inst["proc"].returncode is None:
+            pid = inst["proc"].pid
+        result["debug"] = {
+            "workspace_root": reg.workspace_root,
+            "project_dir": reg.project_dir,
+            "runtime_pid": pid,
+            "port": reg.runtime_port,
+            "last_recovered_at": reg.last_recovered_at.isoformat() if reg.last_recovered_at else None,
+            "last_verified_at": reg.last_verified_at.isoformat() if reg.last_verified_at else None,
+        }
+    return result
+
+
+# ─── GET /sessions — OpenCode session 分页列表（用户可用）─────────────────────
+
+@router.get("/sessions")
+def dev_studio_sessions(
+    offset: int = 0,
+    limit: int = 20,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """返回当前用户 opencode.db 中的 session 列表，分页支持。
+
+    用于前端侧边栏展示全量历史会话，支持无限滚动加载。
+    """
+    import sqlite3
+
+    from app.services.studio_registry import get_registration, OpenCodeSessionInfo
+    reg = get_registration(db, user.id, "opencode")
+    if not reg:
+        return {"sessions": [], "total": 0, "offset": offset, "limit": limit}
+
+    db_path = _user_opencode_db_path(reg.workspace_root)
+    if not db_path or not os.path.exists(db_path):
+        return {"sessions": [], "total": 0, "offset": offset, "limit": limit}
+
+    try:
+        con = sqlite3.connect(db_path, timeout=5)
+        con.row_factory = sqlite3.Row
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        if "session" not in tables:
+            con.close()
+            return {"sessions": [], "total": 0, "offset": offset, "limit": limit}
+
+        total = con.execute("SELECT COUNT(*) FROM session").fetchone()[0]
+        has_message = "message" in tables
+
+        if has_message:
+            rows = con.execute(
+                "SELECT s.id, s.title, s.directory, s.project_id, "
+                "s.time_created, s.time_updated, COUNT(m.id) AS msg_count "
+                "FROM session s LEFT JOIN message m ON m.session_id = s.id "
+                "GROUP BY s.id "
+                "ORDER BY s.time_updated DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT id, title, directory, project_id, "
+                "time_created, time_updated, 0 AS msg_count "
+                "FROM session ORDER BY time_updated DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+
+        sessions = [
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "directory": row["directory"],
+                "message_count": row["msg_count"],
+                "created_at": row["time_created"],
+                "updated_at": row["time_updated"],
+            }
+            for row in rows
+        ]
+        con.close()
+        return {"sessions": sessions, "total": total, "offset": offset, "limit": limit}
+    except Exception as e:
+        return {"sessions": [], "total": 0, "offset": offset, "limit": limit, "error": str(e)}
+
+
+# ─── GET /session-audit — OpenCode session 只读诊断 ──────────────────────────
+
+@router.get("/session-audit")
+def dev_studio_session_audit(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """直接读取用户 opencode.db，返回真实 session 列表。
+
+    不依赖 le-desk Conversation 表，直接反映 OpenCode 自身的 session 状态。
+    SUPER_ADMIN 可通过 ?user_id=N 查看其他用户。
+    """
+    from fastapi import Query
+    import sqlite3
+
+    target_user_id = user.id
+
+    # 读取 workspace_root
+    from app.services.studio_registry import get_registration
+    reg = get_registration(db, target_user_id, "opencode")
+    if not reg:
+        return {"error": "该用户没有 OpenCode 注册记录", "sessions": []}
+
+    db_path = _user_opencode_db_path(reg.workspace_root)
+    if not db_path or not os.path.exists(db_path):
+        return {
+            "workspace_root": reg.workspace_root,
+            "db_exists": False,
+            "sessions": [],
+        }
+
+    try:
+        con = sqlite3.connect(db_path, timeout=5)
+        con.row_factory = sqlite3.Row
+
+        # 检查表是否存在
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+
+        sessions = []
+        total_messages = 0
+        if "session" in tables:
+            rows = con.execute(
+                "SELECT id, title, directory, project_id, time_created, time_updated "
+                "FROM session ORDER BY time_updated DESC"
+            ).fetchall()
+            for row in rows:
+                msg_count = 0
+                if "message" in tables:
+                    msg_row = con.execute(
+                        "SELECT COUNT(*) FROM message WHERE session_id=?", (row["id"],)
+                    ).fetchone()
+                    msg_count = msg_row[0] if msg_row else 0
+                total_messages += msg_count
+                sessions.append({
+                    "id": row["id"],
+                    "title": row["title"],
+                    "directory": row["directory"],
+                    "project_id": row["project_id"],
+                    "created_at": row["time_created"],
+                    "updated_at": row["time_updated"],
+                    "message_count": msg_count,
+                })
+
+        # DB 文件大小
+        db_size_mb = round(os.path.getsize(db_path) / 1024 / 1024, 2)
+        wal_path = db_path + "-wal"
+        wal_size_mb = round(os.path.getsize(wal_path) / 1024 / 1024, 2) if os.path.exists(wal_path) else 0
+
+        con.close()
+        return {
+            "workspace_root": reg.workspace_root,
+            "project_dir": reg.project_dir,
+            "db_exists": True,
+            "db_size_mb": db_size_mb,
+            "wal_size_mb": wal_size_mb,
+            "session_count": len(sessions),
+            "total_messages": total_messages,
+            "sessions": sessions,
+        }
+    except Exception as e:
+        return {
+            "workspace_root": reg.workspace_root,
+            "db_exists": True,
+            "error": str(e),
+            "sessions": [],
+        }
+
+
+@router.get("/session-audit/{target_user_id}")
+def dev_studio_session_audit_admin(
+    target_user_id: int,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: Session = Depends(get_db),
+):
+    """管理员版：查看指定用户的 OpenCode session 诊断。"""
+    import sqlite3
+
+    from app.services.studio_registry import get_registration
+    reg = get_registration(db, target_user_id, "opencode")
+    if not reg:
+        return {"error": "该用户没有 OpenCode 注册记录", "sessions": []}
+
+    db_path = _user_opencode_db_path(reg.workspace_root)
+    if not db_path or not os.path.exists(db_path):
+        return {
+            "user_id": target_user_id,
+            "workspace_root": reg.workspace_root,
+            "db_exists": False,
+            "sessions": [],
+        }
+
+    try:
+        con = sqlite3.connect(db_path, timeout=5)
+        con.row_factory = sqlite3.Row
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+
+        sessions = []
+        total_messages = 0
+        if "session" in tables:
+            rows = con.execute(
+                "SELECT id, title, directory, project_id, time_created, time_updated "
+                "FROM session ORDER BY time_updated DESC"
+            ).fetchall()
+            for row in rows:
+                msg_count = 0
+                if "message" in tables:
+                    msg_row = con.execute(
+                        "SELECT COUNT(*) FROM message WHERE session_id=?", (row["id"],)
+                    ).fetchone()
+                    msg_count = msg_row[0] if msg_row else 0
+                total_messages += msg_count
+                sessions.append({
+                    "id": row["id"],
+                    "title": row["title"],
+                    "directory": row["directory"],
+                    "project_id": row["project_id"],
+                    "created_at": row["time_created"],
+                    "updated_at": row["time_updated"],
+                    "message_count": msg_count,
+                })
+
+        db_size_mb = round(os.path.getsize(db_path) / 1024 / 1024, 2)
+        wal_path = db_path + "-wal"
+        wal_size_mb = round(os.path.getsize(wal_path) / 1024 / 1024, 2) if os.path.exists(wal_path) else 0
+        con.close()
+
+        return {
+            "user_id": target_user_id,
+            "workspace_root": reg.workspace_root,
+            "project_dir": reg.project_dir,
+            "db_exists": True,
+            "db_size_mb": db_size_mb,
+            "wal_size_mb": wal_size_mb,
+            "session_count": len(sessions),
+            "total_messages": total_messages,
+            "sessions": sessions,
+        }
+    except Exception as e:
+        return {
+            "user_id": target_user_id,
+            "workspace_root": reg.workspace_root,
+            "db_exists": True,
+            "error": str(e),
+            "sessions": [],
+        }
 
 
 # ─── POST /restart — 强制重启当前用户的 opencode 实例 ─────────────────────────

@@ -15,6 +15,17 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class OpenCodeSessionInfo:
+    """opencode.db 中单个 session 的摘要信息。"""
+    id: str
+    title: Optional[str]
+    directory: Optional[str]
+    message_count: int
+    created_at: Optional[str]
+    updated_at: Optional[str]
+
+
+@dataclass
 class StudioEntryResolution:
     registration_id: int
     conversation_id: int
@@ -24,6 +35,10 @@ class StudioEntryResolution:
     runtime_port: Optional[int]
     generation: int
     needs_recover: bool
+    recent_conversation_ids: list  # le-desk Conversation 的 id（兼容历史）
+    last_active_at: Optional[str]  # ISO 格式最近活跃时间
+    opencode_sessions: list  # opencode.db 中的全量 session 摘要
+    opencode_session_count: int  # opencode.db session 总数
 
 
 def resolve_entry(
@@ -99,10 +114,37 @@ def resolve_entry(
     else:
         target_conv_id = reg.primary_conversation_id
 
-    reg.last_active_at = datetime.datetime.utcnow()
+    now = datetime.datetime.utcnow()
+    reg.last_active_at = now
+    reg.last_verified_at = now
+
+    # 查询该用户所有活跃的同 workspace_type conversation，返回最近 5 个 id
+    ws = (
+        db.query(Workspace)
+        .filter(Workspace.workspace_type == workspace_type)
+        .first()
+    )
+    recent_conversation_ids: list[int] = []
+    if ws:
+        recent_convs = (
+            db.query(Conversation.id)
+            .filter(
+                Conversation.user_id == user.id,
+                Conversation.workspace_id == ws.id,
+                Conversation.is_active == True,
+            )
+            .order_by(Conversation.updated_at.desc())
+            .limit(5)
+            .all()
+        )
+        recent_conversation_ids = [row[0] for row in recent_convs]
+
     db.commit()
 
     needs_recover = reg.runtime_status in ("stopped", "unhealthy")
+
+    # 读取 opencode.db 真实 session 列表
+    opencode_sessions, opencode_session_count = _read_opencode_sessions(reg.workspace_root)
 
     return StudioEntryResolution(
         registration_id=reg.id,
@@ -113,6 +155,10 @@ def resolve_entry(
         runtime_port=reg.runtime_port,
         generation=reg.generation,
         needs_recover=needs_recover,
+        recent_conversation_ids=recent_conversation_ids,
+        last_active_at=reg.last_active_at.isoformat() if reg.last_active_at else None,
+        opencode_sessions=opencode_sessions,
+        opencode_session_count=opencode_session_count,
     )
 
 
@@ -463,3 +509,71 @@ def migrate_skill_conversations(db: Session, user: User) -> dict:
         f"migrated={migrated} skills={list(skill_ids_seen)}"
     )
     return {"migrated": migrated, "skills": list(skill_ids_seen)}
+
+
+def _read_opencode_sessions(workspace_root: str, limit: int = 20) -> tuple[list, int]:
+    """读取 opencode.db 的 session 摘要，返回 (最近 N 条 session, 总数)。
+
+    使用聚合 SQL 一次性获取 message count，不逐 session 查询。
+    不修改任何数据，纯只读。失败时返回空列表。
+    """
+    import os
+    import sqlite3
+
+    from app.routers.dev_studio import _user_opencode_db_path
+
+    db_path = _user_opencode_db_path(workspace_root)
+    if not db_path or not os.path.exists(db_path):
+        return [], 0
+
+    try:
+        con = sqlite3.connect(db_path, timeout=5)
+        con.row_factory = sqlite3.Row
+
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+
+        if "session" not in tables:
+            con.close()
+            return [], 0
+
+        # 总数
+        total = con.execute("SELECT COUNT(*) FROM session").fetchone()[0]
+
+        # 聚合 SQL：LEFT JOIN message 一次性获取每个 session 的 message count
+        has_message = "message" in tables
+        if has_message:
+            rows = con.execute(
+                "SELECT s.id, s.title, s.directory, s.project_id, "
+                "s.time_created, s.time_updated, COUNT(m.id) AS msg_count "
+                "FROM session s LEFT JOIN message m ON m.session_id = s.id "
+                "GROUP BY s.id "
+                "ORDER BY s.time_updated DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT id, title, directory, project_id, "
+                "time_created, time_updated, 0 AS msg_count "
+                "FROM session ORDER BY time_updated DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+
+        sessions = [
+            OpenCodeSessionInfo(
+                id=row["id"],
+                title=row["title"],
+                directory=row["directory"],
+                message_count=row["msg_count"],
+                created_at=row["time_created"],
+                updated_at=row["time_updated"],
+            )
+            for row in rows
+        ]
+
+        con.close()
+        return sessions, total
+    except Exception as e:
+        logger.debug(f"[StudioRegistry] 读取 opencode.db session 失败: {workspace_root}: {e}")
+        return [], 0

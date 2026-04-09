@@ -64,6 +64,7 @@ class StudioRegistration(Base):
     generation = Column(Integer, default=0)
     last_active_at = Column(DateTime, nullable=True)
     last_recovered_at = Column(DateTime, nullable=True)
+    last_verified_at = Column(DateTime, nullable=True)   # 上次 entry 校验通过时间
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     user = relationship("User", foreign_keys=[user_id])

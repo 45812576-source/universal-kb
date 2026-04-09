@@ -408,11 +408,17 @@ class TestEnsureUserInstancePaths:
         assert not os.path.exists(os.path.join(workspace, "project", ".bin"))
 
     def test_no_runtime_dirs_in_project(self, workspace):
-        """project/ 下不应有任何运行时目录。"""
+        """project/ 下不应有运行时实体目录（.opencode symlink 除外，它指向 runtime/）。"""
         project_dir, _ = ensure_workspace_layout(workspace)
         entries = set(os.listdir(project_dir))
-        runtime_dirs = {".local", ".config", ".bin", ".opencode"}
+        # .opencode 是设计上的 symlink（project/.opencode → runtime/config/opencode/），
+        # 让 OpenCode 在 cwd 下找到配置。它不是实体目录，排除检查。
+        runtime_dirs = {".local", ".config", ".bin"}
         assert entries.isdisjoint(runtime_dirs), f"Found runtime dirs in project: {entries & runtime_dirs}"
+        # .opencode 如果存在，必须是 symlink 而非实体目录
+        oc_path = os.path.join(project_dir, ".opencode")
+        if os.path.exists(oc_path):
+            assert os.path.islink(oc_path), ".opencode in project/ should be a symlink, not a real directory"
 
 
 # ─── RUNTIME_IGNORE_DIRS consistency ──────────────────────────────────────────
