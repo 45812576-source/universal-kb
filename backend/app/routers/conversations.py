@@ -271,6 +271,7 @@ def list_conversations(
 @router.get("/{conv_id}/messages")
 def get_messages(
     conv_id: int,
+    skill_id: Optional[int] = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -288,6 +289,15 @@ def get_messages(
             raise HTTPException(403, "无权访问该对话")
     elif conv.user_id != user.id:
         raise HTTPException(404, "Conversation not found")
+
+    messages = conv.messages
+    # 按 skill_id 过滤（Skill Studio 视图模式）
+    if skill_id is not None:
+        messages = [
+            m for m in messages
+            if m.metadata_ and m.metadata_.get("skill_id") == skill_id
+        ]
+
     owner = db.get(User, conv.user_id) if conv.user_id else None
     return [
         {
@@ -299,7 +309,7 @@ def get_messages(
             "sender_id": conv.user_id,
             "sender_name": owner.display_name if owner else None,
         }
-        for m in conv.messages
+        for m in messages
     ]
 
 
@@ -331,6 +341,8 @@ async def send_message(
     _user_msg_meta: dict = {}
     if req.selected_skill_id is not None:
         _user_msg_meta["skill_id"] = req.selected_skill_id
+    if _ws_obj and _ws_obj.workspace_type == "skill_studio":
+        _user_msg_meta["studio_scope"] = "skill_studio"
     user_msg = Message(
         conversation_id=conv_id,
         role=MessageRole.USER,
@@ -397,13 +409,15 @@ async def send_message(
     # Extract token usage from guide_meta
     llm_usage = guide_meta.pop("llm_usage", {})
     msg_metadata = {
-        "skill_id": conv.skill_id,
+        "skill_id": req.selected_skill_id or conv.skill_id,
         "skill_name": skill_name,
         "model_id": llm_usage.get("model_id"),
         "input_tokens": llm_usage.get("input_tokens", 0),
         "output_tokens": llm_usage.get("output_tokens", 0),
         **guide_meta,
     }
+    if _ws_obj and _ws_obj.workspace_type == "skill_studio":
+        msg_metadata["studio_scope"] = "skill_studio"
 
     # Persist assistant response
     assistant_msg = Message(
@@ -451,12 +465,27 @@ async def stream_message(
         if _ws_pre and _ws_pre.workspace_type == "sandbox" and not req.force_skill_id:
             raise HTTPException(400, "沙盒测试工作台仅用于测试指定 Skill，请从技能列表发起测试")
 
+    # 判断 workspace_type 以便补齐 studio_scope
+    _ws_type_stream = None
+    if conv.workspace_id:
+        from app.models.workspace import Workspace as _WsTypeModel
+        _ws_t = db.get(_WsTypeModel, conv.workspace_id)
+        if _ws_t:
+            _ws_type_stream = _ws_t.workspace_type
+
     # Persist user message — commit immediately so it survives if SSE is dropped mid-stream
+    _user_meta: dict = {}
+    if req.selected_skill_id:
+        _user_meta["skill_id"] = req.selected_skill_id
+    if _ws_type_stream == "skill_studio":
+        _user_meta["studio_scope"] = "skill_studio"
+    if req.editor_prompt:
+        _user_meta["editor_target"] = True
     user_msg = Message(
         conversation_id=conv_id,
         role=MessageRole.USER,
         content=req.content,
-        metadata_={"skill_id": req.selected_skill_id} if req.selected_skill_id else {},
+        metadata_=_user_meta,
     )
     db.add(user_msg)
     db.commit()
@@ -732,13 +761,15 @@ async def stream_message(
                 response_text, early_meta = prep.early_return
                 llm_usage = early_meta.pop("llm_usage", {})
                 msg_metadata = {
-                    "skill_id": conv.skill_id,
+                    "skill_id": req.selected_skill_id or conv.skill_id,
                     "skill_name": skill_name,
                     "model_id": llm_usage.get("model_id"),
                     "input_tokens": llm_usage.get("input_tokens", 0),
                     "output_tokens": llm_usage.get("output_tokens", 0),
                     **early_meta,
                 }
+                if _ws_type_stream == "skill_studio":
+                    msg_metadata["studio_scope"] = "skill_studio"
                 assistant_msg = Message(
                     conversation_id=conv_id,
                     role=MessageRole.ASSISTANT,
@@ -855,10 +886,12 @@ async def stream_message(
 
             # Build metadata
             msg_metadata = {
-                "skill_id": conv.skill_id,
+                "skill_id": req.selected_skill_id or conv.skill_id,
                 "skill_name": skill_name,
                 **tool_meta,
             }
+            if _ws_type_stream == "skill_studio":
+                msg_metadata["studio_scope"] = "skill_studio"
 
             # Persist assistant message
             assistant_msg = Message(
