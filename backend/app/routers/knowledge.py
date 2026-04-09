@@ -1171,7 +1171,7 @@ class FolderMove(BaseModel):
     parent_id: Optional[int] = None
 
 
-def _folder_dict(f: KnowledgeFolder) -> dict:
+def _folder_dict(f: KnowledgeFolder, *, visibility: str = "own") -> dict:
     return {
         "id": f.id,
         "name": f.name,
@@ -1179,6 +1179,7 @@ def _folder_dict(f: KnowledgeFolder) -> dict:
         "sort_order": f.sort_order,
         "created_by": f.created_by,
         "is_system": bool(f.is_system),
+        "visibility": visibility,
         "taxonomy_board": f.taxonomy_board,
         "taxonomy_code": f.taxonomy_code,
         "created_at": f.created_at.isoformat(),
@@ -1193,9 +1194,13 @@ def list_folders(
 ):
     """返回文件夹列表（扁平列表，前端自行构建树）。
 
-    规则：
-    - owner_only=true：只返回当前用户自己创建的文件夹（"我的知识"视图）
-    - owner_only=false（默认）：用户自建 + 系统归档树 + 可见文档所在文件夹
+    每个文件夹带 visibility 字段标记可见原因：
+    - "own"：当前用户自己创建的
+    - "system"：系统归档目录
+    - "visible_doc"：因包含对当前用户可见的文档而可见（他人文件夹）
+
+    前端"我的整理"视图应只显示 own 类型，
+    visible_doc 类型的文件夹中的文档应平铺到根级或单独展示。
     """
     if owner_only:
         folders = (
@@ -1204,8 +1209,9 @@ def list_folders(
             .order_by(KnowledgeFolder.sort_order, KnowledgeFolder.id)
             .all()
         )
-        return [_folder_dict(f) for f in folders]
+        return [_folder_dict(f, visibility="own") for f in folders]
 
+    # 找出因文档可见而需要显示的文件夹 id
     visible_folder_ids = {
         folder_id
         for (folder_id,) in _apply_knowledge_visibility(
@@ -1215,21 +1221,44 @@ def list_folders(
         if folder_id is not None
     }
 
-    folder_filter = (KnowledgeFolder.created_by == user.id) | (KnowledgeFolder.is_system == 1)
-    if visible_folder_ids:
-        folder_filter = folder_filter | (KnowledgeFolder.id.in_(visible_folder_ids))
-
-    folders = (
+    # 自建文件夹
+    own_folders = (
         db.query(KnowledgeFolder)
-        .filter(folder_filter)
-        .order_by(
-            KnowledgeFolder.is_system.desc(),
-            KnowledgeFolder.sort_order,
-            KnowledgeFolder.id,
-        )
+        .filter(KnowledgeFolder.created_by == user.id)
+        .order_by(KnowledgeFolder.sort_order, KnowledgeFolder.id)
         .all()
     )
-    return [_folder_dict(f) for f in folders]
+    own_ids = {f.id for f in own_folders}
+
+    # 系统文件夹
+    system_folders = (
+        db.query(KnowledgeFolder)
+        .filter(KnowledgeFolder.is_system == 1)
+        .order_by(KnowledgeFolder.sort_order, KnowledgeFolder.id)
+        .all()
+    )
+    system_ids = {f.id for f in system_folders}
+
+    # 因文档可见而需要的其他人文件夹（排除已在 own/system 中的）
+    extra_ids = visible_folder_ids - own_ids - system_ids
+    extra_folders = []
+    if extra_ids:
+        extra_folders = (
+            db.query(KnowledgeFolder)
+            .filter(KnowledgeFolder.id.in_(extra_ids))
+            .order_by(KnowledgeFolder.sort_order, KnowledgeFolder.id)
+            .all()
+        )
+
+    result = []
+    for f in own_folders:
+        result.append(_folder_dict(f, visibility="own"))
+    for f in system_folders:
+        if f.id not in own_ids:  # 避免重复
+            result.append(_folder_dict(f, visibility="system"))
+    for f in extra_folders:
+        result.append(_folder_dict(f, visibility="visible_doc"))
+    return result
 
 
 @router.post("/ensure-my-folder")

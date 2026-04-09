@@ -121,6 +121,89 @@ def test_list_folders_includes_visible_system_folder_for_entry(client, db):
     assert system_folder.id in folder_ids
 
 
+def test_other_user_folder_not_leaked_as_own(client, db):
+    """他人文件夹中有对我可见的已审批文档时，该文件夹不应标记为 own，
+    前端"我的整理"视图据此过滤，防止泄漏他人目录结构。"""
+    dept = _make_dept(db, "泄漏测试部门")
+    me = _make_user(db, "leak_me", Role.EMPLOYEE, dept.id)
+    other = _make_user(db, "leak_other", Role.EMPLOYEE, dept.id)
+
+    # 我自己的文件夹
+    my_folder = KnowledgeFolder(name="我的笔记", parent_id=None, created_by=me.id)
+    # 他人的文件夹
+    other_folder = KnowledgeFolder(name="他的笔记", parent_id=None, created_by=other.id)
+    db.add_all([my_folder, other_folder])
+    db.flush()
+
+    # 他人文件夹里有一篇已审批文档（对我可见）
+    db.add(KnowledgeEntry(
+        title="他人已审批文档", content="x", category="experience",
+        status=KnowledgeStatus.APPROVED, review_stage=ReviewStage.APPROVED,
+        created_by=other.id, department_id=dept.id, folder_id=other_folder.id,
+    ))
+    db.commit()
+
+    token = _login(client, "leak_me")
+    resp = client.get("/api/knowledge/folders", headers=_auth(token))
+    assert resp.status_code == 200
+    folders_by_id = {item["id"]: item for item in resp.json()}
+
+    # 我自己的文件夹 → visibility=own
+    assert my_folder.id in folders_by_id
+    assert folders_by_id[my_folder.id]["visibility"] == "own"
+
+    # 他人文件夹因可见文档被返回 → visibility=visible_doc（不是 own）
+    assert other_folder.id in folders_by_id
+    assert folders_by_id[other_folder.id]["visibility"] == "visible_doc"
+
+
+def test_super_admin_other_folders_marked_visible_doc(client, db):
+    """super_admin 能看到所有文档，但他人文件夹应标记为 visible_doc 而非 own。"""
+    dept = _make_dept(db, "超管泄漏测试部门")
+    admin = _make_user(db, "leak_admin", Role.SUPER_ADMIN, dept.id)
+    other = _make_user(db, "leak_admin_other", Role.EMPLOYEE, dept.id)
+
+    other_folder = KnowledgeFolder(name="员工笔记", parent_id=None, created_by=other.id)
+    db.add(other_folder)
+    db.flush()
+
+    db.add(KnowledgeEntry(
+        title="员工文档", content="x", category="experience",
+        status=KnowledgeStatus.PENDING,
+        created_by=other.id, department_id=dept.id, folder_id=other_folder.id,
+    ))
+    db.commit()
+
+    token = _login(client, "leak_admin")
+    resp = client.get("/api/knowledge/folders", headers=_auth(token))
+    assert resp.status_code == 200
+    folders_by_id = {item["id"]: item for item in resp.json()}
+
+    assert other_folder.id in folders_by_id
+    assert folders_by_id[other_folder.id]["visibility"] == "visible_doc"
+
+
+def test_owner_only_returns_only_own_folders(client, db):
+    """owner_only=true 模式只返回自己创建的文件夹，visibility 全部为 own。"""
+    dept = _make_dept(db, "OwnerOnly测试部门")
+    me = _make_user(db, "oo_me", Role.EMPLOYEE, dept.id)
+    other = _make_user(db, "oo_other", Role.EMPLOYEE, dept.id)
+
+    my_f = KnowledgeFolder(name="我的", parent_id=None, created_by=me.id)
+    other_f = KnowledgeFolder(name="他的", parent_id=None, created_by=other.id)
+    db.add_all([my_f, other_f])
+    db.commit()
+
+    token = _login(client, "oo_me")
+    resp = client.get("/api/knowledge/folders?owner_only=true", headers=_auth(token))
+    assert resp.status_code == 200
+    items = resp.json()
+    ids = {item["id"] for item in items}
+    assert my_f.id in ids
+    assert other_f.id not in ids
+    assert all(item["visibility"] == "own" for item in items)
+
+
 # ---------- visibility_scope="private" (workdir_sync) ----------
 
 
