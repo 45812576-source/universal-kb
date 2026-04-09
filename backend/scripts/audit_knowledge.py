@@ -61,7 +61,12 @@ def main():
         for e in fake_ready:
             print(f"  #{e.id} \"{e.title[:40]}\" mode={e.doc_render_mode} oss={bool(e.oss_key)}")
         if FIX and fake_ready:
+            from app.services.doc_renderer import enforce_no_ready_empty, ONLYOFFICE_EXTS
             for e in fake_ready:
+                # 先用系统禁令检查（可能 onlyoffice 可用）
+                enforce_no_ready_empty(e)
+                if e.doc_render_status == "ready":
+                    continue  # onlyoffice 可用，不算 fake ready
                 if e.oss_key:
                     # 有 OSS 文件但正文空，标记为 pending 让 worker 重新渲染
                     e.doc_render_status = "pending"

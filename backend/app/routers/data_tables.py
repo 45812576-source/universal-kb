@@ -1,8 +1,12 @@
 """Business data CRUD API — row-level read/write with audit logging."""
+import csv
 import datetime
 import decimal
+import io
+import json as _json
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -699,3 +703,75 @@ def delete_row(
     except Exception as e:
         db.rollback()
         raise HTTPException(400, str(e))
+
+
+# ── 导出接口 ────────────────────────────────────────────────────────────────────
+
+@router.get("/{table_name}/export")
+def export_rows(
+    table_name: str,
+    format: str = Query("csv", pattern="^(csv|excel|json)$"),
+    max_rows: int = Query(10000, ge=1, le=100000),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """导出表数据为 CSV / Excel / JSON 格式。复用 list_rows 的权限逻辑。"""
+    bt = _get_registered_table(db, table_name)
+
+    from app.models.user import Role as _Role
+    is_admin = user.role in (_Role.SUPER_ADMIN, _Role.DEPT_ADMIN)
+    has_new_policy = (
+        db.query(TableRoleGroup).filter(TableRoleGroup.table_id == bt.id).first()
+        is not None
+    )
+
+    if has_new_policy and not is_admin:
+        result = _list_rows_new_policy(db, bt, user, 1, max_rows, 0, None)
+    else:
+        result = _list_rows_legacy(db, bt, user, 1, max_rows, 0, None, is_admin)
+
+    columns = result["columns"]
+    rows = result["rows"]
+
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: str(v) if v is not None else "" for k, v in row.items()})
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{table_name}.csv"'},
+        )
+
+    if format == "json":
+        content = _json.dumps(rows, ensure_ascii=False, default=str, indent=2)
+        return StreamingResponse(
+            iter([content]),
+            media_type="application/json; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{table_name}.json"'},
+        )
+
+    # Excel
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        raise HTTPException(500, "服务端缺少 openpyxl 依赖，无法导出 Excel")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = table_name[:31]
+    ws.append(columns)
+    for row in rows:
+        ws.append([row.get(c) for c in columns])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{table_name}.xlsx"'},
+    )

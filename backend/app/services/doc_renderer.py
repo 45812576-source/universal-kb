@@ -16,6 +16,29 @@ from app.utils.time_utils import utcnow
 
 logger = logging.getLogger(__name__)
 
+
+def enforce_no_ready_empty(entry: KnowledgeEntry) -> None:
+    """系统禁令：ready 状态必须有可展示内容，否则降级为 failed。
+
+    ready 条件（满足其一即可）：
+    - content_html 非空
+    - content 非空
+    - can_open_onlyoffice（由 oss_key + 扩展名决定）
+    """
+    if entry.doc_render_status != "ready":
+        return
+    has_html = bool(entry.content_html and entry.content_html.strip())
+    has_text = bool(entry.content and entry.content.strip())
+    ext = (entry.file_ext or "").lower()
+    has_onlyoffice = bool(entry.oss_key and ext in ONLYOFFICE_EXTS)
+    has_pdf = bool(entry.oss_key and ext == ".pdf")
+    has_docx_oss = bool(getattr(entry, "docx_oss_key", None))
+
+    if not (has_html or has_text or has_onlyoffice or has_pdf or has_docx_oss):
+        entry.doc_render_status = "failed"
+        entry.doc_render_error = "状态异常：标记为 ready 但无可展示内容"
+        logger.warning(f"enforce_no_ready_empty: entry {entry.id} downgraded to failed")
+
 # 文件扩展名 → 渲染模式映射
 _EXT_RENDER_MODE = {
     ".md": "native_html",
@@ -116,7 +139,11 @@ def render_entry(db: Session, entry_id: int) -> dict:
                 entry.doc_render_mode = None
 
         _update_phase("persisting")
-        entry.doc_render_error = None
+        # 只在成功时清空错误原因，失败路径的 error 必须保留
+        if entry.doc_render_status == "ready":
+            entry.doc_render_error = None
+        # 系统禁令：ready 必须有内容
+        enforce_no_ready_empty(entry)
         entry.last_rendered_at = utcnow()
 
         # 渲染成功后生成 document blocks
@@ -176,7 +203,11 @@ def render_from_path(db: Session, entry: KnowledgeEntry, file_path: str) -> None
             entry.doc_render_status = "failed"
             entry.doc_render_error = "文件内容为空，无法渲染"
 
-        entry.doc_render_error = None
+        # 只在成功时清空错误原因，失败路径的 error 必须保留
+        if entry.doc_render_status == "ready":
+            entry.doc_render_error = None
+        # 系统禁令：ready 必须有内容
+        enforce_no_ready_empty(entry)
         entry.last_rendered_at = utcnow()
 
     except Exception as e:
