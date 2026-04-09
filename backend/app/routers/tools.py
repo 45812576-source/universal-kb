@@ -831,6 +831,12 @@ def bind_skill_tool(
     db: Session = Depends(get_db),
     user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
 ):
+    from app.models.skill import Skill
+    if not db.get(Skill, skill_id):
+        raise HTTPException(404, "Skill not found")
+    if not db.get(ToolRegistry, tool_id):
+        raise HTTPException(404, "Tool not found")
+
     existing = db.query(SkillTool).filter(
         SkillTool.skill_id == skill_id,
         SkillTool.tool_id == tool_id,
@@ -841,8 +847,12 @@ def bind_skill_tool(
     db.add(link)
 
     # 自动完成 memo 中 tool_bound 类型任务 + 清除关联 notice
-    from app.services.skill_memo_service import resolve_tool_bound_tasks
-    memo_updated = resolve_tool_bound_tasks(db, skill_id)
+    memo_updated = False
+    try:
+        from app.services.skill_memo_service import resolve_tool_bound_tasks
+        memo_updated = resolve_tool_bound_tasks(db, skill_id)
+    except Exception:
+        pass  # memo 处理失败不阻塞绑定
 
     db.commit()
     return {"ok": True, "memo_updated": memo_updated}
