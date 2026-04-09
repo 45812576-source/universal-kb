@@ -5,6 +5,7 @@ from app.models.knowledge_understanding import KnowledgeUnderstandingProfile  # 
 from app.models.knowledge_share import KnowledgeShareLink  # noqa: F401
 from app.models.knowledge_governance import GovernanceObjective, GovernanceDepartmentMission, GovernanceKR, GovernanceRequiredElement, GovernanceResourceLibrary, GovernanceObjectType, GovernanceSuggestionTask, GovernanceFieldTemplate, GovernanceObject, GovernanceObjectFacet, GovernanceFeedbackEvent, GovernanceStrategyStat  # noqa: F401
 from app.models.knowledge_admin import KnowledgeFolderGrant, KnowledgeFolderAuditLog, KnowledgeRerunJob  # noqa: F401
+from app.models.knowledge_permission import KnowledgePermissionGrant, PermissionChangeRequest  # noqa: F401
 from app.models.knowledge_tag import KnowledgeTag, KnowledgeTagRelation  # noqa: F401
 from app.models.knowledge_block import KnowledgeDocumentBlock, KnowledgeChunkMapping  # noqa: F401
 from app.models.knowledge_filing import KnowledgeFilingSuggestion, KnowledgeFilingAction  # noqa: F401
@@ -27,6 +28,14 @@ from app.models.pev_job import PEVJob, PEVStep, PEVJobStatus, PEVStepStatus  # n
 from app.models.event_bus import UnifiedEvent  # noqa: F401
 from app.models.lark_approval import LarkApprovalInstance  # noqa: F401
 from app.models.skill_memo import SkillMemo  # noqa: F401
+from app.models.org_management import (  # noqa: F401
+    OrgImportSession, OrgChangeEvent,
+    OkrPeriod, OkrObjective, OkrKeyResult,
+    KpiAssignment, DeptMissionDetail, BizProcess, BizTerminology,
+    DataAssetOwnership, DeptCollaborationLink, PositionAccessRule,
+    OrgBaseline, PositionCompetencyModel, ResourceLibraryDefinition,
+    KrResourceMapping, CollabProtocol, OrgChangeImpact,
+)
 from app.models.permission import (  # noqa: F401
     Position, DataDomain, DataScopePolicy,
     MaskAction, PublishScope,

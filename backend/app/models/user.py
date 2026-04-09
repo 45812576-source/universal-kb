@@ -1,7 +1,7 @@
 import datetime
 import enum
 
-from sqlalchemy import Boolean, Column, DateTime, Enum, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Boolean, Column, Date, DateTime, Enum, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -22,6 +22,15 @@ class Department(Base):
     category = Column(String(50))  # 后台/前台/中台
     business_unit = Column(String(100))  # 事业部/中心
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    # ── 组织管理增强字段 ──
+    code = Column(String(50), unique=True, nullable=True)  # 部门编码
+    level = Column(String(30), nullable=True)  # 集团/事业部/中心/部门/组
+    headcount_budget = Column(Integer, nullable=True)  # 编制人数
+    lifecycle_status = Column(String(20), default="active")  # active/preparing/frozen/dissolved
+    established_at = Column(Date, nullable=True)  # 成立日期
+    dissolved_at = Column(Date, nullable=True)  # 撤销日期
+    sort_order = Column(Integer, default=0)  # 显示排序
 
     parent = relationship("Department", remote_side=[id], back_populates="children")
     children = relationship("Department", back_populates="parent")
@@ -56,6 +65,14 @@ class User(Base):
     lark_access_token = Column(Text, nullable=True)
     lark_refresh_token = Column(Text, nullable=True)
     lark_token_expires_at = Column(DateTime, nullable=True)
+
+    # ── 组织管理增强字段 ──
+    employee_no = Column(String(50), unique=True, nullable=True)  # 工号
+    employee_status = Column(String(20), default="active")  # active/probation/resigned/transferred
+    job_title = Column(String(100), nullable=True)  # 正式职称
+    job_level = Column(String(20), nullable=True)  # 职级（P5/M3 等）
+    entry_date = Column(Date, nullable=True)  # 入职日期
+    exit_date = Column(Date, nullable=True)  # 离职日期
 
     department = relationship("Department", back_populates="users", foreign_keys=[department_id])
     managed_department = relationship("Department", foreign_keys=[managed_department_id])

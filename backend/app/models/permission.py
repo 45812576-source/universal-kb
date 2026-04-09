@@ -19,6 +19,14 @@ class Position(Base):
     description = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
+    # ── 组织管理增强字段 ──
+    code = Column(String(50), unique=True, nullable=True)  # 岗位编码
+    kpi_template = Column(JSON, default=list)  # KPI 指标模板
+    evaluation_cycle = Column(String(20), nullable=True)  # month/quarter/half_year/year
+    required_data_domains = Column(JSON, default=list)  # 该岗位需要的数据域列表
+    deliverables = Column(JSON, default=list)  # 岗位标准交付物
+    sort_order = Column(Integer, default=0)
+
     department = relationship("Department")
     users = relationship("User", back_populates="position")
 
@@ -354,6 +362,7 @@ class ApprovalRequestType(str, enum.Enum):
     POLICY_CHANGE = "policy_change"
     FIELD_SENSITIVITY_CHANGE = "field_sensitivity_change"
     SMALL_SAMPLE_CHANGE = "small_sample_change"
+    PERMISSION_CHANGE = "permission_change"
 
 
 class ApprovalStatus(str, enum.Enum):

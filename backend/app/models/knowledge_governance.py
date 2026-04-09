@@ -51,6 +51,11 @@ class GovernanceDepartmentMission(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
+    # ── 组织管理增强字段 ──
+    source = Column(String(20), default="ai")  # ai/manual/import — 数据来源
+    confirmed_by = Column(Integer, ForeignKey("users.id"), nullable=True)  # 确认人
+    confirmed_at = Column(DateTime, nullable=True)  # 确认时间
+
 
 class GovernanceKR(Base):
     __tablename__ = "governance_krs"
