@@ -37,6 +37,7 @@ from app.models.org_management import (  # noqa: F401
     OrgBaseline, PositionCompetencyModel, ResourceLibraryDefinition,
     KrResourceMapping, CollabProtocol, OrgChangeImpact,
 )
+from app.models.opencode import StudioRegistration  # noqa: F401
 from app.models.permission import (  # noqa: F401
     Position, DataDomain, DataScopePolicy,
     MaskAction, PublishScope,

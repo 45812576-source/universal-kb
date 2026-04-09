@@ -23,9 +23,9 @@ from app.models.user import User, Role
 
 router = APIRouter(prefix="/api/dev-studio", tags=["dev-studio"])
 
-# ─── 按用户隔离的实例池 ────────────────────────────────────────────────────────
-# 每个 user_id 对应独立的 opencode 进程 + workdir + 端口
-# 结构：{user_id: {"proc": Process, "port": int, "workdir": str, "lock": Lock, "last_active": float}}
+# ─── 按用户隔离的实例池（进程句柄缓存，非状态真相源）──────────────────────────
+# 仅缓存运行态进程句柄和异步锁，workdir/port/status 的真相源是 StudioRegistration 注册表。
+# 结构：{user_id: {"proc": Process|None, "port": int, "workdir": str|None, "lock": Lock, "last_active": float}}
 _user_instances: dict = {}
 _instances_lock: object = None   # 全局 asyncio.Lock，保护 _user_instances 写入
 
@@ -454,6 +454,62 @@ def _get_proc_tree_rss_mb(pid: int) -> int:
         return 0
 
 
+def _mark_registry_stopped(user_id: int) -> None:
+    """将注册表中的 runtime_status 标记为 stopped（fire-and-forget）。"""
+    try:
+        from app.database import SessionLocal as _RSL
+        from app.services.studio_registry import update_runtime_status as _urt
+        _rdb = _RSL()
+        try:
+            _urt(_rdb, user_id, "opencode", "stopped")
+        finally:
+            _rdb.close()
+    except Exception:
+        pass
+
+
+def _get_registry_project_dir(user_id: int) -> Optional[str]:
+    """从注册表读 project_dir，失败返回 None。"""
+    try:
+        from app.database import SessionLocal as _RSL
+        from app.models.opencode import StudioRegistration as _SR
+        _rdb = _RSL()
+        try:
+            _reg = (
+                _rdb.query(_SR)
+                .filter(_SR.user_id == user_id, _SR.workspace_type == "opencode")
+                .first()
+            )
+            if _reg and _reg.project_dir and os.path.isdir(_reg.project_dir):
+                return _reg.project_dir
+        finally:
+            _rdb.close()
+    except Exception:
+        pass
+    return None
+
+
+def _get_registry_workspace_root(user_id: int) -> Optional[str]:
+    """从注册表读 workspace_root，失败返回 None。"""
+    try:
+        from app.database import SessionLocal as _RSL
+        from app.models.opencode import StudioRegistration as _SR
+        _rdb = _RSL()
+        try:
+            _reg = (
+                _rdb.query(_SR)
+                .filter(_SR.user_id == user_id, _SR.workspace_type == "opencode")
+                .first()
+            )
+            if _reg and _reg.workspace_root:
+                return _reg.workspace_root
+        finally:
+            _rdb.close()
+    except Exception:
+        pass
+    return None
+
+
 async def _idle_reaper() -> None:
     """后台任务：每2分钟扫一遍，回收空闲实例 + 杀掉内存超限实例。"""
     import logging
@@ -474,6 +530,7 @@ async def _idle_reaper() -> None:
                 except Exception:
                     pass
                 inst["proc"] = None
+                _mark_registry_stopped(uid)
                 continue
             # 内存超限强杀
             rss = _get_proc_tree_rss_mb(proc.pid)
@@ -484,6 +541,7 @@ async def _idle_reaper() -> None:
                 except Exception:
                     pass
                 inst["proc"] = None
+                _mark_registry_stopped(uid)
                 continue
             # fd 泄漏强杀（pty 不释放导致 /dev/ptmx fd 堆积）
             try:
@@ -499,6 +557,7 @@ async def _idle_reaper() -> None:
                 except Exception:
                     pass
                 inst["proc"] = None
+                _mark_registry_stopped(uid)
 
         # ── 游离进程扫描（安全版）──
         # 收集所有托管进程及其子进程树的 PID
@@ -548,14 +607,26 @@ async def _idle_reaper() -> None:
                 if _m:
                     _orphan_uid = int(_m.group(1))
                     if _orphan_uid not in _user_instances:
+                        _orphan_port = _port_for_user(_orphan_uid)
                         _user_instances[_orphan_uid] = {
                             "proc": None,
-                            "port": _port_for_user(_orphan_uid),
+                            "port": _orphan_port,
                             "workdir": None,
                             "lock": asyncio.Lock(),
                             "last_active": _time.time(),
                         }
-                        logger.info(f"[Reaper] 认领 user={_orphan_uid} 的遗留进程 pid={pid}，纳入管理")
+                        # 同步注册表：标记 running + port
+                        try:
+                            from app.database import SessionLocal as _OSL
+                            from app.services.studio_registry import update_runtime_status as _o_urt
+                            _odb = _OSL()
+                            try:
+                                _o_urt(_odb, _orphan_uid, "opencode", "running", port=_orphan_port)
+                            finally:
+                                _odb.close()
+                        except Exception:
+                            pass
+                        logger.info(f"[Reaper] 认领 user={_orphan_uid} 的遗留进程 pid={pid}，纳入管理+注册表")
                         continue
                 # 真正的游离进程
                 logger.warning(f"[Reaper] 游离进程 pid={pid}（cwd={cwd}），强制终止")
@@ -589,14 +660,26 @@ def _kill_orphan_opencode_procs():
             if _m:
                 _uid = int(_m.group(1))
                 if _uid not in _user_instances:
+                    _startup_port = _port_for_user(_uid)
                     _user_instances[_uid] = {
                         "proc": None,
-                        "port": _port_for_user(_uid),
+                        "port": _startup_port,
                         "workdir": None,
                         "lock": asyncio.Lock(),
                         "last_active": _time.time(),
                     }
-                    logger.info(f"[Startup] 认领遗留进程 user={_uid} pid={pid} cwd={cwd}")
+                    # 同步注册表
+                    try:
+                        from app.database import SessionLocal as _SSL
+                        from app.services.studio_registry import update_runtime_status as _s_urt
+                        _sdb = _SSL()
+                        try:
+                            _s_urt(_sdb, _uid, "opencode", "running", port=_startup_port)
+                        finally:
+                            _sdb.close()
+                    except Exception:
+                        pass
+                    logger.info(f"[Startup] 认领遗留进程 user={_uid} pid={pid} cwd={cwd}，注册表已同步")
                 else:
                     logger.debug(f"[Startup] pid={pid} 属于已托管 user={_uid}，跳过")
             else:
@@ -641,6 +724,7 @@ async def shutdown_all_instances() -> None:
             except Exception:
                 pass
         inst["proc"] = None
+        _mark_registry_stopped(uid)
 
 OPENCODE_BASE_PORT = 17171   # user_id=1 → 17172, user_id=2 → 17173, ...
 
@@ -689,11 +773,20 @@ def _all_opencode_db_paths() -> list[str]:
             seen.add(p)
             paths.append(p)
 
-    # 各用户独立目录（内存中已知实例）
-    for uid, inst in list(_user_instances.items()):
-        wdir = inst.get("workdir") or os.path.join(_studio_root, f"user_{uid}")
-        _add(_user_opencode_db_path(wdir))
-    # 扫描 studio_root 下所有用户目录（兼容重启后 _user_instances 为空的情况）
+    # 从注册表读所有 opencode workspace_root
+    try:
+        from app.database import SessionLocal as _DbPSL
+        from app.models.opencode import StudioRegistration as _DbPSR
+        _dbp = _DbPSL()
+        try:
+            for _reg in _dbp.query(_DbPSR).filter(_DbPSR.workspace_type == "opencode").all():
+                if _reg.workspace_root:
+                    _add(_user_opencode_db_path(_reg.workspace_root))
+        finally:
+            _dbp.close()
+    except Exception:
+        pass
+    # 扫描 studio_root 下所有用户目录（兜底，覆盖未注册的旧目录）
     if os.path.isdir(_studio_root):
         for name in os.listdir(_studio_root):
             wdir = os.path.join(_studio_root, name)
@@ -768,11 +861,24 @@ async def _bailian_usage_monitor() -> None:
                 ark_key = os.environ.get("ARK_API_KEY", "")
                 # 只更新配置文件，不主动杀进程（避免中断用户当前操作）。
                 # 下次用户调用 /instance 时，_ensure_user_instance 检测到配置变化会自动重启。
-                for uid, inst in list(_user_instances.items()):
-                    wdir = inst.get("workdir")
-                    if not wdir:
-                        continue
-                    _write_opencode_config(wdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=True)
+                # 从注册表读所有 opencode workspace_root（不依赖内存 _user_instances）
+                try:
+                    from app.database import SessionLocal as _MonSL
+                    from app.models.opencode import StudioRegistration as _MonSR
+                    _mon_db = _MonSL()
+                    try:
+                        for _mreg in _mon_db.query(_MonSR).filter(
+                            _MonSR.workspace_type == "opencode",
+                            _MonSR.workspace_root != "",
+                        ).all():
+                            _write_opencode_config(
+                                _mreg.workspace_root,
+                                bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=True,
+                            )
+                    finally:
+                        _mon_db.close()
+                except Exception as _me:
+                    logger.warning(f"[BailianMonitor] 写配置失败: {_me}")
         except Exception as e:
             logging.getLogger(__name__).warning(f"[BailianMonitor] 采样失败: {e}")
 
@@ -1076,7 +1182,10 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
         # 后端重启后 _user_instances 内存清空，但 opencode 进程可能仍在跑。
         # 若 proc 为 None 但固定端口已有进程在监听，检查 cwd 是否正确再决定复用或重启。
         if proc is None and _port_open(inst["port"]):
-            _expected_cwd = _workspace_project_dir(_workspace_root_for_user(user_id, display_name))
+            # 优先从注册表读 expected_cwd，避免重算
+            _expected_cwd = _get_registry_project_dir(user_id)
+            if not _expected_cwd:
+                _expected_cwd = _workspace_project_dir(_workspace_root_for_user(user_id, display_name))
             # 通过端口找到占用该端口的进程，检查其 cwd
             _cwd_ok = False
             try:
@@ -1103,8 +1212,10 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             import asyncio as _aio
             await _aio.sleep(1)  # 等端口释放
 
-        # 每用户独立持久化 workdir，用姓名命名（重启后保留文件和 session 历史）
-        workdir = _workspace_root_for_user(user_id, display_name)
+        # 优先从注册表读 workdir（持久化真相源），回退到重算
+        workdir = _get_registry_workspace_root(user_id)
+        if not workdir:
+            workdir = _workspace_root_for_user(user_id, display_name)
 
         # 统一初始化入口：迁移旧布局 + 创建 project/runtime 目录结构
         loop = asyncio.get_event_loop()
@@ -1200,6 +1311,7 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             # 配置有变化，终止旧进程，下方代码负责重启
             proc.terminate()
             inst["proc"] = None
+            _mark_registry_stopped(user_id)
 
         # 活跃进程数上限检查（已有进程的用户不受限，仅限新启动）
         active_count = sum(
@@ -1247,6 +1359,19 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             cors_args += ["--cors", origin]
 
         port = inst["port"]
+
+        # 标记注册表：starting
+        try:
+            from app.database import SessionLocal as _StartSL
+            from app.services.studio_registry import update_runtime_status as _start_urt
+            _start_db = _StartSL()
+            try:
+                _start_urt(_start_db, user_id, "opencode", "starting", port=port)
+            finally:
+                _start_db.close()
+        except Exception:
+            pass
+
         new_proc = await asyncio.create_subprocess_exec(
             opencode_bin, "web",
             "--port", str(port),
@@ -1262,11 +1387,24 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
         if not ready:
             if new_proc.returncode is None:
                 new_proc.terminate()
+            _mark_registry_stopped(user_id)
             raise HTTPException(503, "opencode web 启动超时，请重试")
 
         inst["proc"] = new_proc
         inst["workdir"] = workdir
         inst["last_active"] = _time.time()
+
+        # 更新注册表：running + port + generation+1
+        try:
+            from app.database import SessionLocal as _RegSL
+            from app.services.studio_registry import update_runtime_status as _update_rt
+            _reg_db = _RegSL()
+            try:
+                _update_rt(_reg_db, user_id, "opencode", "running", port=port, bump_generation=True)
+            finally:
+                _reg_db.close()
+        except Exception:
+            pass  # 注册表更新失败不阻塞启动
 
         # 启动百炼用量监控（全局只跑一个）
         if _usage_counter["monitor_task"] is None or _usage_counter["monitor_task"].done():
@@ -1322,12 +1460,18 @@ async def set_provider_fallback(
             _write_opencode_config(wdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=enable)
             _updated_wdirs.add(wdir)
 
-    # 对活跃实例：按用户授权补写 lemondata key + 终止进程使新配置生效
-    for uid, inst in list(_user_instances.items()):
-        wdir = inst.get("workdir")
-        if not wdir:
-            continue
-        # 按用户授权决定是否传入 lemondata key
+    # 从注册表读所有 opencode 用户，按授权补写 lemondata key + 终止活跃进程使配置生效
+    from app.models.opencode import StudioRegistration as _FbSR
+    _fb_db = _SL()
+    try:
+        _fb_regs = _fb_db.query(_FbSR).filter(
+            _FbSR.workspace_type == "opencode", _FbSR.workspace_root != ""
+        ).all()
+        _fb_uid_wdir = {r.user_id: r.workspace_root for r in _fb_regs}
+    finally:
+        _fb_db.close()
+
+    for uid, wdir in _fb_uid_wdir.items():
         _uid_lemondata_key = ""
         if _lemondata_raw:
             _db = _SL()
@@ -1345,12 +1489,15 @@ async def set_provider_fallback(
             finally:
                 _db.close()
         if _uid_lemondata_key:
-            # 有 lemondata 授权的用户需要重写含 key 的配置
             _write_opencode_config(wdir, bailian_key=bailian_key, ark_key=ark_key, use_ark_fallback=enable, lemondata_key=_uid_lemondata_key)
-        proc = inst.get("proc")
-        if proc is not None and proc.returncode is None:
-            proc.terminate()
-            inst["proc"] = None
+        # 终止活跃进程使新配置生效
+        inst = _user_instances.get(uid)
+        if inst:
+            proc = inst.get("proc")
+            if proc is not None and proc.returncode is None:
+                proc.terminate()
+                inst["proc"] = None
+                _mark_registry_stopped(uid)
 
     return {
         "fallback_enabled": enable,
@@ -1419,6 +1566,46 @@ async def get_instance(
     return {"url": info["url"], "port": info["port"], "status": "ready"}
 
 
+# ─── GET /entry — 统一入口 API（前端唯一入口）────────────────────────────────
+
+@router.get("/entry")
+def dev_studio_entry(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """返回稳定的工作区入口：注册表 + conversation + runtime 状态。"""
+    from app.services.studio_registry import resolve_entry
+    entry = resolve_entry(db, user, "opencode")
+    return {
+        "registration_id": entry.registration_id,
+        "conversation_id": entry.conversation_id,
+        "workspace_root": entry.workspace_root,
+        "project_dir": entry.project_dir,
+        "runtime_status": entry.runtime_status,
+        "runtime_port": entry.runtime_port,
+        "generation": entry.generation,
+        "needs_recover": entry.needs_recover,
+    }
+
+
+@router.get("/health")
+def dev_studio_health(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """返回当前用户 opencode 运行时状态。"""
+    from app.services.studio_registry import get_registration
+    reg = get_registration(db, user.id, "opencode")
+    if not reg:
+        return {"runtime_status": "unregistered", "generation": 0}
+    return {
+        "runtime_status": reg.runtime_status,
+        "runtime_port": reg.runtime_port,
+        "generation": reg.generation,
+        "last_active_at": reg.last_active_at.isoformat() if reg.last_active_at else None,
+    }
+
+
 # ─── POST /restart — 强制重启当前用户的 opencode 实例 ─────────────────────────
 
 @router.post("/restart")
@@ -1430,6 +1617,7 @@ async def restart_instance(user: User = Depends(get_current_user)):
         if proc is not None and proc.returncode is None:
             proc.terminate()
             inst["proc"] = None
+            _mark_registry_stopped(user.id)
     info = await _ensure_user_instance(user.id, display_name=user.display_name or "")
     return {"status": "restarted", "port": info["port"]}
 
@@ -2273,63 +2461,32 @@ async def analyze_project(
 
 # ─── Workdir File Manager ──────────────────────────────────────────────────────
 
-def _user_opencode_cwd(user_id: int) -> Optional[str]:
-    """尝试从运行中的 opencode 实例获取其实际 CWD（Linux /proc）。
-    用于确保文件管理器和 opencode 看到同一个目录。
-
-    路径 1：inst 里有 proc 对象 → 直接读 /proc/<pid>/cwd
-    路径 2：后端重启后 proc 为 None，但端口上有旧进程 → lsof 找 PID 再读 cwd
-    """
-    inst = _user_instances.get(user_id)
-
-    # 路径 1：有 proc 对象
-    if inst:
-        proc = inst.get("proc")
-        if proc is not None and proc.returncode is None:
-            try:
-                cwd = os.readlink(f"/proc/{proc.pid}/cwd")
-                if os.path.isdir(cwd):
-                    return cwd
-            except Exception:
-                pass
-
-    # 路径 2：通过端口找进程 PID
-    port = _port_for_user(user_id)
-    try:
-        import subprocess as _sp
-        result = _sp.run(["lsof", "-ti", f":{port}"], capture_output=True, text=True, timeout=3)
-        for pid_str in result.stdout.strip().split('\n'):
-            if pid_str.strip().isdigit():
-                cwd = os.readlink(f"/proc/{pid_str.strip()}/cwd")
-                if os.path.isdir(cwd):
-                    return cwd
-    except Exception:
-        pass
-    return None
-
-
 def _user_workdir(user: User) -> str:
     """返回当前用户的 project 目录路径（用户可见文件）。
 
     优先级：
-    1. inst["workdir"] — 启动 opencode 时已确定的 workspace root，
-       直接取其 project/ 子目录，与 opencode cwd 完全一致。
-    2. /proc/<pid>/cwd — Linux 上从运行进程读取（兜底）。
-    3. 回退到 workspace_root_for_user + ensure_workspace_layout。
+    1. 注册表 project_dir — 持久化的单一真相源。
+    2. 回退到 workspace_root_for_user + ensure_workspace_layout（首次使用、迁移场景）。
     """
-    # 优先从内存中的实例信息获取（启动时 cwd=project_dir，此处保持一致）
-    inst = _user_instances.get(user.id)
-    if inst and inst.get("workdir"):
-        project_dir = _workspace_project_dir(inst["workdir"])
-        if os.path.isdir(project_dir):
-            return project_dir
+    # 从注册表读取（持久化，后端重启后仍有效）
+    try:
+        from app.database import SessionLocal as _WdSL
+        from app.models.opencode import StudioRegistration as _SR
+        _wdb = _WdSL()
+        try:
+            _reg = (
+                _wdb.query(_SR)
+                .filter(_SR.user_id == user.id, _SR.workspace_type == "opencode")
+                .first()
+            )
+            if _reg and _reg.project_dir and os.path.isdir(_reg.project_dir):
+                return _reg.project_dir
+        finally:
+            _wdb.close()
+    except Exception:
+        pass
 
-    # 兜底：通过 /proc 读取（Linux）
-    cwd = _user_opencode_cwd(user.id)
-    if cwd:
-        return cwd
-
-    # 最终回退：重新计算
+    # 回退：首次使用或注册表尚未初始化
     workdir = _workspace_root_for_user(user.id, user.display_name or "")
     project_dir, _ = ensure_workspace_layout(workdir, display_name=user.display_name or "")
     return project_dir

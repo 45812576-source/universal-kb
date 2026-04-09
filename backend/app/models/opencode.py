@@ -46,6 +46,29 @@ class OpenCodeUsageCache(Base):
     user = relationship("User", foreign_keys=[user_id])
 
 
+class StudioRegistration(Base):
+    """统一实例注册表 — workspace 是持久身份对象，进程只是可回收壳。"""
+    __tablename__ = "studio_instance_registrations"
+    __table_args__ = (
+        UniqueConstraint("user_id", "workspace_type", name="uq_user_workspace_type"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    workspace_type = Column(String(20), nullable=False)  # "opencode" | "skill_studio"
+    workspace_root = Column(String(1024), nullable=False)  # user_<id> 根目录
+    project_dir = Column(String(1024), nullable=False)     # workspace_root/project
+    primary_conversation_id = Column(Integer, ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True)
+    runtime_port = Column(Integer, nullable=True)
+    runtime_status = Column(String(20), default="stopped")  # stopped|starting|running|unhealthy
+    generation = Column(Integer, default=0)
+    last_active_at = Column(DateTime, nullable=True)
+    last_recovered_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
 class UserModelGrant(Base):
     """记录哪些用户被授权使用受限模型（如 lemondata/gpt-5.4）。"""
     __tablename__ = "user_model_grants"

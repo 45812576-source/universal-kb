@@ -110,6 +110,27 @@ class SendMessage(BaseModel):
         return v
 
 
+@router.get("/studio-entry")
+def studio_entry(
+    type: str = "skill_studio",
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """统一 Studio 入口 API — 返回注册表 + conversation + runtime 状态。"""
+    from app.services.studio_registry import resolve_entry
+    entry = resolve_entry(db, user, type)
+    return {
+        "registration_id": entry.registration_id,
+        "conversation_id": entry.conversation_id,
+        "workspace_root": entry.workspace_root,
+        "project_dir": entry.project_dir,
+        "runtime_status": entry.runtime_status,
+        "runtime_port": entry.runtime_port,
+        "generation": entry.generation,
+        "needs_recover": entry.needs_recover,
+    }
+
+
 class ConversationCreate(BaseModel):
     workspace_id: Optional[int] = None
     project_id: Optional[int] = None
