@@ -35,6 +35,9 @@ VALID_TASK_TYPES = {
     "analyze_import", "define_goal", "edit_skill_md", "create_file",
     "update_file", "bind_tool", "create_tool_placeholder", "run_test",
     "fix_after_test", "adopt_feedback_change",
+    # 结构化整改任务类型
+    "fix_prompt_logic", "fix_input_slot", "fix_tool_usage",
+    "fix_knowledge_binding", "fix_permission_handling", "run_targeted_retest",
 }
 
 VALID_TASK_STATUSES = {"todo", "in_progress", "done", "skipped"}
@@ -818,6 +821,9 @@ def record_test_result(
     details: dict | None = None,
     suggested_followups: list[dict] | None = None,
     user_id: int | None = None,
+    structured_issues: list[dict] | None = None,
+    structured_fix_plan: list[dict] | None = None,
+    source_report_id: int | None = None,
 ) -> dict:
     """测试流程结束后统一回写 memo。"""
     memo = db.query(SkillMemo).filter(SkillMemo.skill_id == skill_id).first()
@@ -836,34 +842,87 @@ def record_test_result(
         "details": details or {},
         "created_at": _now_iso(),
         "followup_task_ids": [],
+        "source_report_id": source_report_id,
     }
 
     generated_task_ids = []
 
-    if status == "failed" and suggested_followups:
-        # 根据失败原因生成 fix_after_test 任务
-        for followup in suggested_followups:
-            task_id = _new_id("task")
-            generated_task_ids.append(task_id)
-            payload.setdefault("tasks", []).append({
-                "id": task_id,
-                "title": followup.get("title", "修复测试问题"),
-                "type": followup.get("type", "fix_after_test"),
-                "status": "todo",
-                "priority": "high",
-                "source": "test_failure",
-                "description": summary,
-                "target_files": followup.get("target_files", []),
-                "acceptance_rule": {"mode": "all_target_files_saved_nonempty"},
-                "depends_on": [],
-                "started_at": None,
-                "completed_at": None,
-                "completed_by": None,
-                "result_summary": None,
-            })
+    if status == "failed":
+        # 优先使用结构化 fix_plan 生成精细任务
+        if structured_fix_plan:
+            for fp_item in structured_fix_plan:
+                task_id = _new_id("task")
+                generated_task_ids.append(task_id)
+
+                # 映射 action_type 到 task type
+                action_type = fp_item.get("action_type", "fix_after_test")
+                task_type = action_type if action_type in VALID_TASK_TYPES else "fix_after_test"
+
+                payload.setdefault("tasks", []).append({
+                    "id": task_id,
+                    "title": fp_item.get("title", "修复测试问题")[:200],
+                    "type": task_type,
+                    "status": "todo",
+                    "priority": "high" if fp_item.get("priority") == "p0" else "medium" if fp_item.get("priority") == "p1" else "low",
+                    "source": "test_failure",
+                    "description": fp_item.get("suggested_changes", summary),
+                    "target_files": [],
+                    "acceptance_rule": {"mode": "custom", "text": fp_item.get("acceptance_rule", "")},
+                    "depends_on": [],
+                    "started_at": None,
+                    "completed_at": None,
+                    "completed_by": None,
+                    "result_summary": None,
+                    # 结构化整改字段
+                    "problem_refs": fp_item.get("problem_ids", []),
+                    "target_kind": fp_item.get("target_kind", "unknown"),
+                    "target_ref": fp_item.get("target_ref", ""),
+                    "retest_scope": fp_item.get("retest_scope", []),
+                    "acceptance_rule_text": fp_item.get("acceptance_rule", ""),
+                    "source_report_id": source_report_id,
+                })
+
+        elif suggested_followups:
+            # fallback: 旧逻辑
+            for followup in suggested_followups:
+                task_id = _new_id("task")
+                generated_task_ids.append(task_id)
+                payload.setdefault("tasks", []).append({
+                    "id": task_id,
+                    "title": followup.get("title", "修复测试问题"),
+                    "type": followup.get("type", "fix_after_test"),
+                    "status": "todo",
+                    "priority": "high",
+                    "source": "test_failure",
+                    "description": summary,
+                    "target_files": followup.get("target_files", []),
+                    "acceptance_rule": {"mode": "all_target_files_saved_nonempty"},
+                    "depends_on": [],
+                    "started_at": None,
+                    "completed_at": None,
+                    "completed_by": None,
+                    "result_summary": None,
+                })
+
         test_record["followup_task_ids"] = generated_task_ids
         memo.lifecycle_stage = "fixing"
         memo.status_summary = f"测试未通过：{summary}"
+
+        # 写入 persistent_notices
+        payload.setdefault("persistent_notices", [])
+        # 清除旧的测试相关 notice
+        payload["persistent_notices"] = [
+            n for n in payload["persistent_notices"]
+            if n.get("source") != "sandbox_test"
+        ]
+        payload["persistent_notices"].append({
+            "id": _new_id("notice"),
+            "title": "沙盒测试未通过，请按整改计划逐项修复",
+            "level": "warning",
+            "source": "sandbox_test",
+            "created_at": _now_iso(),
+            "dismissible": False,
+        })
     elif status == "passed":
         # 标记 run_test 类型任务为完成
         for t in payload.get("tasks", []):

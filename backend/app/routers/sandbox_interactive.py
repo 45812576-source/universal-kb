@@ -1318,17 +1318,228 @@ async def run_tests(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """生成测试矩阵并执行。"""
+    """生成测试矩阵并执行（分段可恢复，断点续跑）。"""
     session = db.get(SandboxTestSession, session_id)
     if not session:
         raise HTTPException(404, "测试会话不存在")
-    # 允许从 CASE_GENERATION / PERMISSION_REVIEW 启动，也允许已完成的 session 重跑
-    allow_status = (SessionStatus.READY_TO_RUN, SessionStatus.DRAFT, SessionStatus.COMPLETED)
-    allow_step = (SessionStep.CASE_GENERATION, SessionStep.PERMISSION_REVIEW, SessionStep.DONE)
+    allow_status = (SessionStatus.READY_TO_RUN, SessionStatus.DRAFT, SessionStatus.COMPLETED, SessionStatus.RUNNING)
+    allow_step = (SessionStep.CASE_GENERATION, SessionStep.PERMISSION_REVIEW, SessionStep.DONE, SessionStep.EXECUTION, SessionStep.EVALUATION)
     if session.status not in allow_status or session.current_step not in allow_step:
         raise HTTPException(400, f"当前状态不允许执行测试: step={session.current_step.value}, status={session.status.value}")
 
-    # 提取上次 baseline（重跑前读取，清理后不可用）
+    # 提取上次 baseline
+    previous_deductions = _extract_previous_deductions(session, db)
+
+    # 全量重跑时清理旧数据（只在从 DONE 状态进入且 case_generation 非 completed 时清理）
+    step_statuses = dict(session.step_statuses or {})
+    is_fresh_rerun = session.current_step == SessionStep.DONE and step_statuses.get("case_generation", {}).get("status") != "completed"
+    if is_fresh_rerun:
+        for case in list(session.cases):
+            db.delete(case)
+        if session.report_id:
+            old_report = db.get(SandboxTestReport, session.report_id)
+            if old_report:
+                db.delete(old_report)
+            session.report_id = None
+
+    session.current_step = SessionStep.EXECUTION
+    session.status = SessionStatus.RUNNING
+    db.commit()
+
+    def _step_completed(step_name: str) -> bool:
+        return step_statuses.get(step_name, {}).get("status") == "completed"
+
+    def _mark_step(step_name: str, status: str, **kwargs):
+        nonlocal step_statuses
+        base = step_statuses.get(step_name, {"started_at": None, "finished_at": None, "error_code": None, "error_message": None, "retryable": False})
+        if status == "running":
+            base = {"status": "running", "started_at": _now_iso(), "finished_at": None, "error_code": None, "error_message": None, "retryable": False}
+        elif status == "completed":
+            base = {**base, "status": "completed", "finished_at": _now_iso()}
+        elif status == "failed":
+            base = {**base, "status": "failed", "finished_at": _now_iso(), "error_code": kwargs.get("error_code", "internal"), "error_message": kwargs.get("error_message", "")[:500], "retryable": kwargs.get("retryable", True)}
+        step_statuses[step_name] = base
+        session.step_statuses = step_statuses
+        flag_modified(session, "step_statuses")
+        db.commit()
+
+    # ── 阶段 1: case_generation（可跳过） ──
+    semantic_combos = None
+    system_prompt = None
+    test_input_text = None
+
+    if _step_completed("case_generation"):
+        # 恢复中间产物：从 DB 重建 semantic_combos
+        semantic_combos, _ = _generate_semantic_matrix(session)
+        test_input_text = _build_test_input_from_evidence(session, db)
+        system_prompt = _get_system_prompt_for_session(session, db)
+        logger.info("sandbox run: skipping case_generation (already completed) for session %s", session_id)
+    else:
+        _mark_step("case_generation", "running")
+        try:
+            semantic_combos, theoretical = _generate_semantic_matrix(session)
+            session.theoretical_combo_count = theoretical
+            session.semantic_combo_count = len(semantic_combos)
+
+            MAX_SEMANTIC_COMBOS = 50
+            if len(semantic_combos) > MAX_SEMANTIC_COMBOS:
+                session.status = SessionStatus.BLOCKED
+                session.blocked_reason = (
+                    f"权限语义组合数 {len(semantic_combos)} 超过阈值 {MAX_SEMANTIC_COMBOS}，"
+                    "需要拆分权限策略或缩小测试范围后重试"
+                )
+                session.current_step = SessionStep.PERMISSION_REVIEW
+                _mark_step("case_generation", "failed", error_code="combo_exceeded", error_message=session.blocked_reason, retryable=False)
+                return _serialize_session(session)
+
+            test_input_text = _build_test_input_from_evidence(session, db)
+            if session.status == SessionStatus.CANNOT_TEST:
+                _mark_step("case_generation", "failed", error_code="cannot_test", error_message="真实取数失败", retryable=False)
+                return _serialize_session(session)
+
+            system_prompt = _get_system_prompt_for_session(session, db)
+            _mark_step("case_generation", "completed")
+        except Exception as e:
+            _mark_step("case_generation", "failed", error_code="internal", error_message=str(e))
+            return _serialize_session(session)
+
+    # ── 阶段 2: case_execution（可跳过，从 DB 恢复 cases） ──
+    cases = None
+
+    if _step_completed("case_execution"):
+        # 恢复: 从 DB 读取已持久化的 cases
+        cases = (
+            db.query(SandboxTestCase)
+            .filter(SandboxTestCase.session_id == session_id)
+            .order_by(SandboxTestCase.case_index)
+            .all()
+        )
+        logger.info("sandbox run: skipping case_execution (already completed, %d cases) for session %s", len(cases), session_id)
+    else:
+        _mark_step("case_execution", "running")
+        try:
+            cases = await _step_case_execution(session, session_id, semantic_combos, system_prompt, test_input_text, db)
+            session.executed_case_count = len(cases)
+            session.current_step = SessionStep.EVALUATION
+            _mark_step("case_execution", "completed")
+        except Exception as e:
+            _mark_step("case_execution", "failed", error_code="llm_error", error_message=str(e))
+            return _serialize_session(session)
+
+    # ── 阶段 3: evaluation（可跳过，从 report 恢复） ──
+    evaluation = None
+
+    if _step_completed("evaluation"):
+        # 恢复: _evaluate_session 调 LLM，不能重跑。从已有 report 或 session 字段恢复。
+        evaluation = _recover_evaluation_from_session(session, db)
+        if evaluation is None:
+            # 无法恢复，必须重跑
+            logger.warning("sandbox run: cannot recover evaluation for session %s, re-running", session_id)
+            _mark_step("evaluation", "running")
+            try:
+                evaluation = await _evaluate_session(session, cases, db, previous_deductions=previous_deductions)
+                session.quality_passed = evaluation["quality_passed"]
+                session.usability_passed = evaluation["usability_passed"]
+                session.anti_hallucination_passed = evaluation["anti_hallucination_passed"]
+                session.approval_eligible = all([
+                    evaluation["quality_passed"],
+                    evaluation["usability_passed"],
+                    evaluation["anti_hallucination_passed"],
+                ])
+                _mark_step("evaluation", "completed")
+            except Exception as e:
+                _mark_step("evaluation", "failed", error_code="eval_error", error_message=str(e))
+                return _serialize_session(session)
+        else:
+            logger.info("sandbox run: recovered evaluation from report for session %s", session_id)
+    else:
+        _mark_step("evaluation", "running")
+        try:
+            evaluation = await _evaluate_session(session, cases, db, previous_deductions=previous_deductions)
+            session.quality_passed = evaluation["quality_passed"]
+            session.usability_passed = evaluation["usability_passed"]
+            session.anti_hallucination_passed = evaluation["anti_hallucination_passed"]
+            session.approval_eligible = all([
+                evaluation["quality_passed"],
+                evaluation["usability_passed"],
+                evaluation["anti_hallucination_passed"],
+            ])
+            _mark_step("evaluation", "completed")
+        except Exception as e:
+            _mark_step("evaluation", "failed", error_code="eval_error", error_message=str(e))
+            return _serialize_session(session)
+
+    # ── 阶段 4: report_generation（可跳过） ──
+    report = None
+
+    if _step_completed("report_generation") and session.report_id:
+        report = db.get(SandboxTestReport, session.report_id)
+        logger.info("sandbox run: skipping report_generation (already completed) for session %s", session_id)
+    else:
+        _mark_step("report_generation", "running")
+        try:
+            from app.services.sandbox_report import generate_report
+            report = await generate_report(session, cases, evaluation, db)
+            session.report_id = report.id
+            session.current_step = SessionStep.DONE
+            session.status = SessionStatus.COMPLETED
+            session.completed_at = datetime.datetime.utcnow()
+            _mark_step("report_generation", "completed")
+        except Exception as e:
+            _mark_step("report_generation", "failed", error_code="report_error", error_message=str(e))
+            return _serialize_session(session)
+
+    # ── 阶段 5: memo_sync（可跳过，失败不影响报告但必须标 failed） ──
+    if _step_completed("memo_sync"):
+        logger.info("sandbox run: skipping memo_sync (already completed) for session %s", session_id)
+    else:
+        _mark_step("memo_sync", "running")
+        memo_sync_ok = True
+
+        if session.target_type == "skill":
+            try:
+                _sync_memo_from_evaluation(session, evaluation, report, db)
+            except Exception as e:
+                logger.warning("同步 fix_plan 到 memo 失败: %s", e)
+                _mark_step("memo_sync", "failed", error_code="memo_error", error_message=str(e), retryable=True)
+                memo_sync_ok = False
+
+        if memo_sync_ok:
+            _mark_step("memo_sync", "completed")
+
+    return _serialize_session(session)
+
+
+def _recover_evaluation_from_session(session: SandboxTestSession, db: Session) -> dict | None:
+    """从已有 report 或 session 字段恢复 evaluation dict，避免重调 LLM。"""
+    # 优先从 report.part3_evaluation 恢复
+    if session.report_id:
+        report = db.get(SandboxTestReport, session.report_id)
+        if report and report.part3_evaluation:
+            p3 = report.part3_evaluation
+            return {
+                "quality_passed": p3.get("quality", {}).get("passed", False),
+                "quality_detail": p3.get("quality", {}).get("detail", {}),
+                "usability_passed": p3.get("usability", {}).get("passed", False),
+                "usability_detail": p3.get("usability", {}).get("detail", {}),
+                "anti_hallucination_passed": p3.get("anti_hallucination", {}).get("passed", False),
+                "anti_hallucination_detail": p3.get("anti_hallucination", {}).get("detail", {}),
+            }
+    # fallback: 从 session 字段恢复（只有 passed 标记，没有 detail）
+    if session.quality_passed is not None:
+        return {
+            "quality_passed": session.quality_passed,
+            "quality_detail": {},
+            "usability_passed": session.usability_passed or False,
+            "usability_detail": {},
+            "anti_hallucination_passed": session.anti_hallucination_passed or False,
+            "anti_hallucination_detail": {},
+        }
+    return None
+
+
+def _extract_previous_deductions(session: SandboxTestSession, db: Session) -> list | None:
+    """提取上次 baseline deductions。"""
     previous_deductions = None
     if session.current_step == SessionStep.DONE and session.report_id:
         old_report = db.get(SandboxTestReport, session.report_id)
@@ -1336,7 +1547,6 @@ async def run_tests(
             qd = old_report.part3_evaluation.get("quality_detail", {})
             previous_deductions = qd.get("top_deductions")
     if not previous_deductions:
-        # 新 session：查同 target 最近一次已完成 session 的 report
         prev_session = (
             db.query(SandboxTestSession)
             .filter(
@@ -1353,80 +1563,75 @@ async def run_tests(
             if prev_report and prev_report.part3_evaluation:
                 qd = prev_report.part3_evaluation.get("quality_detail", {})
                 previous_deductions = qd.get("top_deductions")
+    return previous_deductions
 
-    # 重跑时清理旧的测试用例和报告，并升级到最新版本
-    if session.current_step == SessionStep.DONE:
-        for case in list(session.cases):
-            db.delete(case)
-        if session.report_id:
-            old_report = db.get(SandboxTestReport, session.report_id)
-            if old_report:
-                db.delete(old_report)
-            session.report_id = None
-        # 升级到最新版本，确保评估纳入最新提交的 prompt 和文件
-        if session.target_type == "skill":
-            latest_ver = (
-                db.query(SkillVersion)
-                .filter(SkillVersion.skill_id == session.target_id)
-                .order_by(SkillVersion.version.desc())
-                .first()
-            )
-            if latest_ver and latest_ver.version != session.target_version:
-                logger.info(
-                    "sandbox rerun: upgrading skill %s from v%s to v%s",
-                    session.target_id, session.target_version, latest_ver.version,
-                )
-                session.target_version = latest_ver.version
 
-    session.current_step = SessionStep.EXECUTION
-    session.status = SessionStatus.RUNNING
-    db.commit()
+def _sync_memo_from_evaluation(session: SandboxTestSession, evaluation: dict, report: SandboxTestReport, db: Session):
+    """将测试结果同步到 Skill Memo。"""
+    from app.services.skill_memo_service import record_test_result
+    quality_detail = evaluation.get("quality_detail", {})
+    avg_score = quality_detail.get("avg_score", 0)
+    top_deductions = quality_detail.get("top_deductions", [])
 
-    # 1. 生成语义矩阵
-    semantic_combos, theoretical = _generate_semantic_matrix(session)
-    session.theoretical_combo_count = theoretical
-    session.semantic_combo_count = len(semantic_combos)
+    main_issues = [d.get("reason", "") for d in top_deductions[:3] if d.get("reason")]
+    summary_text = f"综合分 {avg_score}"
+    if main_issues:
+        summary_text += f"，主问题：{'；'.join(main_issues)}"
 
-    # 阈值检查
-    MAX_SEMANTIC_COMBOS = 50
-    if len(semantic_combos) > MAX_SEMANTIC_COMBOS:
-        session.status = SessionStatus.BLOCKED
-        session.blocked_reason = (
-            f"权限语义组合数 {len(semantic_combos)} 超过阈值 {MAX_SEMANTIC_COMBOS}，"
-            "需要拆分权限策略或缩小测试范围后重试"
-        )
-        session.current_step = SessionStep.PERMISSION_REVIEW
-        db.commit()
-        return _serialize_session(session)
+    suggested_followups = []
+    for d in top_deductions:
+        title = f"修复: [{d.get('dimension', '')}] {d.get('reason', '未知问题')}"
+        if d.get("fix_suggestion"):
+            title += f" → {d['fix_suggestion']}"
+        suggested_followups.append({"title": title[:200], "type": "fix_after_test"})
 
-    # 2. 构建测试输入（来自测试人确认的真实来源，不由 LLM 生成）
-    test_input_text = _build_test_input_from_evidence(session, db)
+    structured_issues = None
+    structured_fix_plan = None
+    if report and report.part3_evaluation:
+        structured_issues = report.part3_evaluation.get("issues")
+        structured_fix_plan = report.part3_evaluation.get("fix_plan_structured")
 
-    # 如果真实取数失败，session 已被标记为 cannot_test
-    if session.status == SessionStatus.CANNOT_TEST:
-        db.commit()
-        return _serialize_session(session)
+    record_test_result(
+        db=db,
+        skill_id=session.target_id,
+        source="sandbox_interactive",
+        version=session.target_version,
+        status="passed" if session.approval_eligible else "failed",
+        summary=summary_text,
+        details=evaluation,
+        suggested_followups=suggested_followups if not session.approval_eligible else None,
+        user_id=session.tester_id,
+        structured_issues=structured_issues,
+        structured_fix_plan=structured_fix_plan,
+        source_report_id=report.id if report else None,
+    )
 
-    # 3. 获取 system_prompt — 始终使用最新版本，确保用户中途保存的改动被纳入
+
+def _now_iso() -> str:
+    return datetime.datetime.utcnow().isoformat()
+
+
+def _get_system_prompt_for_session(session: SandboxTestSession, db: Session) -> str:
+    """获取 session 锁定版本的 system_prompt。"""
     system_prompt = ""
     if session.target_type == "skill":
         skill = db.get(Skill, session.target_id)
         if skill:
-            # 总是取最新版本，而非锁定的版本
-            latest_ver = (
+            ver = (
                 db.query(SkillVersion)
-                .filter(SkillVersion.skill_id == skill.id)
-                .order_by(SkillVersion.version.desc())
+                .filter(SkillVersion.skill_id == skill.id, SkillVersion.version == session.target_version)
                 .first()
             )
-            if latest_ver:
-                if latest_ver.version != session.target_version:
-                    logger.info(
-                        "sandbox run: using latest skill %s v%s (session locked v%s)",
-                        skill.id, latest_ver.version, session.target_version,
-                    )
-                    session.target_version = latest_ver.version
-                system_prompt = latest_ver.system_prompt or ""
+            if not ver:
+                # fallback: 取最新版本
+                ver = (
+                    db.query(SkillVersion)
+                    .filter(SkillVersion.skill_id == skill.id)
+                    .order_by(SkillVersion.version.desc())
+                    .first()
+                )
+            if ver:
+                system_prompt = ver.system_prompt or ""
                 from app.services.skill_engine import _read_source_files
                 file_ctx = _read_source_files(skill.id, skill.source_files or [])
                 if file_ctx:
@@ -1450,13 +1655,22 @@ async def run_tests(
                 f"## 前置条件\n{precond_text}\n\n"
                 f"请模拟该工具的典型调用场景，验证输出是否符合预期格式和业务逻辑。"
             )
+    return system_prompt
 
-    # 4. 逐用例执行
+
+async def _step_case_execution(
+    session: SandboxTestSession,
+    session_id: int,
+    semantic_combos: list[dict],
+    system_prompt: str,
+    test_input_text: str,
+    db: Session,
+) -> list[SandboxTestCase]:
+    """执行所有测试用例。"""
     from app.services.llm_gateway import llm_gateway
     cases = []
 
     for idx, combo in enumerate(semantic_combos):
-        # 构建权限注入后的 prompt
         permission_injection = (
             f"\n\n## 当前权限上下文\n"
             f"- 行级可见范围: {combo['row_visibility']}\n"
@@ -1475,7 +1689,7 @@ async def run_tests(
             tool_precondition=combo["tool_precondition"],
             input_provenance={s["slot_key"]: f"{s.get('chosen_source')}:{s.get('evidence_ref', '')}" for s in (session.detected_slots or []) if s.get("chosen_source")},
             test_input=test_input_text,
-            system_prompt_used=full_prompt[:5000],  # 截断存储
+            system_prompt_used=full_prompt[:5000],
         )
 
         if combo["tool_precondition"] == "precondition_failed":
@@ -1497,7 +1711,7 @@ async def run_tests(
                 )
                 case.llm_response = response
                 case.execution_duration_ms = int((time.time() - t0) * 1000)
-                case.verdict = CaseVerdict.PASSED  # 暂标记，evaluation 阶段会重新判定
+                case.verdict = CaseVerdict.PASSED
             except Exception as e:
                 case.llm_response = f"执行错误: {e}"
                 case.execution_duration_ms = int((time.time() - t0) * 1000)
@@ -1507,71 +1721,76 @@ async def run_tests(
         db.add(case)
         cases.append(case)
 
-    session.executed_case_count = len(cases)
-    session.current_step = SessionStep.EVALUATION
+    return cases
+
+
+@router.post("/{session_id}/retry-from-step")
+async def retry_from_step(
+    session_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """从失败的阶段重新执行。"""
+    body = await request.json()
+    step = body.get("step")
+    valid_steps = ("case_generation", "case_execution", "evaluation", "report_generation", "memo_sync")
+    if step not in valid_steps:
+        raise HTTPException(400, f"无效阶段: {step}，可选: {valid_steps}")
+
+    session = db.get(SandboxTestSession, session_id)
+    if not session:
+        raise HTTPException(404, "测试会话不存在")
+
+    step_statuses = dict(session.step_statuses or {})
+    step_info = step_statuses.get(step, {})
+    if step_info.get("status") != "failed":
+        raise HTTPException(400, f"阶段 {step} 当前状态为 {step_info.get('status', 'unknown')}，只能重试 failed 状态的阶段")
+
+    # 重置失败阶段及其后续阶段
+    step_order = list(valid_steps)
+    reset_from = step_order.index(step)
+    for s in step_order[reset_from:]:
+        if s in step_statuses:
+            step_statuses[s] = {"status": "pending", "started_at": None, "finished_at": None, "error_code": None, "error_message": None, "retryable": False}
+    session.step_statuses = step_statuses
+    flag_modified(session, "step_statuses")
+    session.status = SessionStatus.RUNNING
     db.commit()
 
-    # 5. 评价阶段
-    evaluation = await _evaluate_session(session, cases, db, previous_deductions=previous_deductions)
-    session.quality_passed = evaluation["quality_passed"]
-    session.usability_passed = evaluation["usability_passed"]
-    session.anti_hallucination_passed = evaluation["anti_hallucination_passed"]
-    session.approval_eligible = all([
-        evaluation["quality_passed"],
-        evaluation["usability_passed"],
-        evaluation["anti_hallucination_passed"],
-    ])
-    # 6. 生成报告（在标记 DONE 之前，确保报告生成成功）
-    from app.services.sandbox_report import generate_report
-    report = await generate_report(session, cases, evaluation, db)
-    session.report_id = report.id
+    # 重新调用 run_tests（它会检测 step_statuses 中哪些已完成并跳过）
+    return await run_tests(session_id, db, user)
 
-    session.current_step = SessionStep.DONE
-    session.status = SessionStatus.COMPLETED
-    session.completed_at = datetime.datetime.utcnow()
-    db.commit()
 
-    # 7. 同步 fix_plan 到 Skill Memo（仅 skill 类型）
+@router.post("/{session_id}/upgrade-and-rerun")
+async def upgrade_and_rerun(
+    session_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """显式升级到最新版本后重跑测试。"""
+    session = db.get(SandboxTestSession, session_id)
+    if not session:
+        raise HTTPException(404, "测试会话不存在")
+    if session.status != SessionStatus.COMPLETED:
+        raise HTTPException(400, "只有已完成的 session 才能升级重跑")
+
     if session.target_type == "skill":
-        try:
-            from app.services.skill_memo_service import record_test_result
-            quality_detail = evaluation.get("quality_detail", {})
-            avg_score = quality_detail.get("avg_score", 0)
-            top_deductions = quality_detail.get("top_deductions", [])
-            fix_plan = quality_detail.get("fix_plan", [])
-
-            # 摘要：综合分 + 主问题
-            main_issues = [d.get("reason", "") for d in top_deductions[:3] if d.get("reason")]
-            summary_text = f"综合分 {avg_score}"
-            if main_issues:
-                summary_text += f"，主问题：{'；'.join(main_issues)}"
-
-            # 将 top_deductions + fix_plan 转为 suggested_followups
-            suggested_followups = []
-            for d in top_deductions:
-                title = f"修复: [{d.get('dimension', '')}] {d.get('reason', '未知问题')}"
-                if d.get("fix_suggestion"):
-                    title += f" → {d['fix_suggestion']}"
-                suggested_followups.append({
-                    "title": title[:200],
-                    "type": "fix_after_test",
-                })
-
-            record_test_result(
-                db=db,
-                skill_id=session.target_id,
-                source="sandbox_interactive",
-                version=session.target_version,
-                status="passed" if session.approval_eligible else "failed",
-                summary=summary_text,
-                details=evaluation,
-                suggested_followups=suggested_followups if not session.approval_eligible else None,
-                user_id=session.tester_id,
+        latest_ver = (
+            db.query(SkillVersion)
+            .filter(SkillVersion.skill_id == session.target_id)
+            .order_by(SkillVersion.version.desc())
+            .first()
+        )
+        if latest_ver and latest_ver.version != session.target_version:
+            logger.info(
+                "sandbox upgrade-and-rerun: upgrading skill %s from v%s to v%s",
+                session.target_id, session.target_version, latest_ver.version,
             )
-        except Exception as e:
-            logger.warning("同步 fix_plan 到 memo 失败: %s", e)
+            session.target_version = latest_ver.version
+            db.commit()
 
-    return _serialize_session(session)
+    return await run_tests(session_id, db, user)
 
 
 @router.get("/{session_id}/report")
@@ -1613,6 +1832,216 @@ async def get_report(
         "knowledge_entry_id": report.knowledge_entry_id,
         "created_at": report.created_at.isoformat() if report.created_at else None,
     }
+
+
+@router.get("/{session_id}/issues")
+async def get_issues(
+    session_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """返回结构化问题清单。"""
+    session = db.get(SandboxTestSession, session_id)
+    if not session:
+        raise HTTPException(404, "测试会话不存在")
+    if not session.report_id:
+        raise HTTPException(400, "测试报告尚未生成")
+    report = db.get(SandboxTestReport, session.report_id)
+    if not report:
+        raise HTTPException(404, "测试报告不存在")
+    p3 = report.part3_evaluation or {}
+    return {
+        "issues": p3.get("issues", []),
+        "retest_recommendations": p3.get("retest_recommendations", []),
+    }
+
+
+@router.get("/{session_id}/fix-plan")
+async def get_fix_plan(
+    session_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """返回结构化整改计划。"""
+    session = db.get(SandboxTestSession, session_id)
+    if not session:
+        raise HTTPException(404, "测试会话不存在")
+    if not session.report_id:
+        raise HTTPException(400, "测试报告尚未生成")
+    report = db.get(SandboxTestReport, session.report_id)
+    if not report:
+        raise HTTPException(404, "测试报告不存在")
+    p3 = report.part3_evaluation or {}
+    return {
+        "fix_plan": p3.get("fix_plan_structured", []),
+        "issues": p3.get("issues", []),
+    }
+
+
+class TargetedRerunRequest(BaseModel):
+    fix_plan_item_ids: Optional[List[str]] = None
+    issue_ids: Optional[List[str]] = None
+
+
+@router.post("/{session_id}/targeted-rerun")
+async def targeted_rerun(
+    session_id: int,
+    body: TargetedRerunRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """局部回归测试：只重跑与指定 issues/fix_plan 关联的 case。"""
+    parent_session = db.get(SandboxTestSession, session_id)
+    if not parent_session:
+        raise HTTPException(404, "测试会话不存在")
+    if not parent_session.report_id:
+        raise HTTPException(400, "原测试报告尚未生成")
+
+    report = db.get(SandboxTestReport, parent_session.report_id)
+    if not report:
+        raise HTTPException(404, "测试报告不存在")
+
+    p3 = report.part3_evaluation or {}
+    all_issues = p3.get("issues", [])
+    all_fix_plan = p3.get("fix_plan_structured", [])
+
+    # 确定要覆盖的 issue_ids
+    target_issue_ids = set()
+    if body.issue_ids:
+        target_issue_ids.update(body.issue_ids)
+    if body.fix_plan_item_ids:
+        for fp in all_fix_plan:
+            if fp.get("id") in body.fix_plan_item_ids:
+                target_issue_ids.update(fp.get("problem_ids", []))
+
+    if not target_issue_ids:
+        raise HTTPException(400, "未找到关联的问题，无法确定重测范围")
+
+    # 从 issues 中提取关联的 case indices
+    target_case_indices = set()
+    for issue in all_issues:
+        if issue.get("issue_id") in target_issue_ids:
+            target_case_indices.update(issue.get("source_cases", []))
+
+    if not target_case_indices:
+        # 如果没有关联的 case，全量重跑
+        target_case_indices = set(range(parent_session.executed_case_count or 0))
+
+    # 从原 session 的 case 中提取子矩阵的权限组合
+    parent_cases = (
+        db.query(SandboxTestCase)
+        .filter(SandboxTestCase.session_id == session_id)
+        .order_by(SandboxTestCase.case_index)
+        .all()
+    )
+
+    sub_combos = []
+    for ci in sorted(target_case_indices):
+        if ci < len(parent_cases):
+            c = parent_cases[ci]
+            sub_combos.append({
+                "row_visibility": c.row_visibility,
+                "field_output_semantic": c.field_output_semantic,
+                "group_semantic": c.group_semantic,
+                "tool_precondition": c.tool_precondition,
+            })
+
+    if not sub_combos:
+        raise HTTPException(400, "无法构建子测试矩阵")
+
+    # 创建子 session
+    child_session = SandboxTestSession(
+        target_type=parent_session.target_type,
+        target_id=parent_session.target_id,
+        target_version=parent_session.target_version,
+        target_name=parent_session.target_name,
+        tester_id=user.id,
+        status=SessionStatus.RUNNING,
+        current_step=SessionStep.EXECUTION,
+        detected_slots=parent_session.detected_slots,
+        tool_review=parent_session.tool_review,
+        permission_snapshot=parent_session.permission_snapshot,
+        theoretical_combo_count=len(sub_combos),
+        semantic_combo_count=len(sub_combos),
+        parent_session_id=parent_session.id,
+        rerun_scope={"issue_ids": list(target_issue_ids), "case_indices": sorted(target_case_indices)},
+    )
+    db.add(child_session)
+    db.flush()
+
+    # 获取 system prompt
+    system_prompt = _get_system_prompt_for_session(child_session, db)
+    test_input_text = _build_test_input_from_evidence(child_session, db)
+
+    if child_session.status == SessionStatus.CANNOT_TEST:
+        db.commit()
+        return _serialize_session(child_session)
+
+    # 执行子矩阵
+    cases = await _step_case_execution(child_session, child_session.id, sub_combos, system_prompt, test_input_text, db)
+    child_session.executed_case_count = len(cases)
+    child_session.current_step = SessionStep.EVALUATION
+    db.commit()
+
+    # 评价
+    evaluation = await _evaluate_session(child_session, cases, db)
+    child_session.quality_passed = evaluation["quality_passed"]
+    child_session.usability_passed = evaluation["usability_passed"]
+    child_session.anti_hallucination_passed = evaluation["anti_hallucination_passed"]
+    child_session.approval_eligible = all([
+        evaluation["quality_passed"],
+        evaluation["usability_passed"],
+        evaluation["anti_hallucination_passed"],
+    ])
+
+    # 生成报告
+    from app.services.sandbox_report import generate_report
+    child_report = await generate_report(child_session, cases, evaluation, db)
+    child_session.report_id = child_report.id
+    child_session.current_step = SessionStep.DONE
+    child_session.status = SessionStatus.COMPLETED
+    child_session.completed_at = datetime.datetime.utcnow()
+    db.commit()
+
+    # 返回覆盖情况
+    covered_issues = list(target_issue_ids)
+    all_issue_ids = {i["issue_id"] for i in all_issues}
+    remaining_issues = list(all_issue_ids - target_issue_ids)
+
+    return {
+        **_serialize_session(child_session),
+        "covered_issues": covered_issues,
+        "remaining_issues": remaining_issues,
+        "parent_session_id": parent_session.id,
+    }
+
+
+class TargetedRerunByReportRequest(BaseModel):
+    issue_ids: Optional[List[str]] = None
+    fix_plan_item_ids: Optional[List[str]] = None
+
+
+@router.post("/by-report/{report_id}/targeted-rerun")
+async def targeted_rerun_by_report(
+    report_id: int,
+    body: TargetedRerunByReportRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """通过 report_id 发起局部重测（Skill Studio 整改场景）。"""
+    report = db.get(SandboxTestReport, report_id)
+    if not report:
+        raise HTTPException(404, "测试报告不存在")
+    # 委托给 session-based targeted-rerun
+    return await targeted_rerun(
+        session_id=report.session_id,
+        body=TargetedRerunRequest(
+            issue_ids=body.issue_ids,
+            fix_plan_item_ids=body.fix_plan_item_ids,
+        ),
+        db=db,
+        user=user,
+    )
 
 
 @router.post("/{session_id}/submit-approval")
@@ -2242,6 +2671,8 @@ def _serialize_session(session: SandboxTestSession) -> dict:
         "anti_hallucination_passed": session.anti_hallucination_passed,
         "approval_eligible": session.approval_eligible,
         "report_id": session.report_id,
+        "step_statuses": session.step_statuses,
+        "parent_session_id": session.parent_session_id,
         "created_at": session.created_at.isoformat() if session.created_at else None,
         "completed_at": session.completed_at.isoformat() if session.completed_at else None,
     }

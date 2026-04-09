@@ -737,14 +737,57 @@ def _build_memo_context(memo_data: dict | None) -> str:
         recent_progress=recent_desc,
     )
 
-    # fixing 阶段 + 最近测试失败 → 追加 fix plan 提示
+    # fixing 阶段 + 最近测试失败 → 追加结构化 fix context
     if memo_data.get("lifecycle_stage") == "fixing" and latest_test and latest_test.get("status") == "failed":
         details = latest_test.get("details", {})
         quality_detail = details.get("quality_detail", {})
         avg_score = quality_detail.get("avg_score", "N/A")
         top_deductions = quality_detail.get("top_deductions", [])
 
-        if top_deductions:
+        # 尝试获取结构化 fix tasks
+        tasks = payload.get("tasks", [])
+        fix_tasks = [t for t in tasks if t.get("type", "").startswith("fix_") and t.get("status") in ("todo", "in_progress")]
+
+        if fix_tasks:
+            lines = []
+            for i, task in enumerate(fix_tasks, 1):
+                line = f"{i}. [{task.get('type', '')}] {task.get('title', '')}"
+                target = task.get("target_ref", "")
+                if target:
+                    line += f" (目标: {target})"
+                acceptance = task.get("acceptance_rule_text", "")
+                if acceptance:
+                    line += f"\n   验收标准: {acceptance}"
+                lines.append(line)
+
+            # 找到当前任务
+            current_id = payload.get("current_task_id")
+            current_fix = next((t for t in fix_tasks if t.get("id") == current_id), fix_tasks[0] if fix_tasks else None)
+
+            fix_section = (
+                f"\n\n## 沙盒测试整改模式\n"
+                f"上次沙盒测试未通过（综合分 {avg_score}），共 {len(fix_tasks)} 项待修复：\n"
+                + "\n".join(lines)
+            )
+            if current_fix:
+                fix_section += (
+                    f"\n\n### 当前整改任务\n"
+                    f"- 任务: {current_fix.get('title', '')}\n"
+                    f"- 类型: {current_fix.get('type', '')}\n"
+                    f"- 目标: {current_fix.get('target_ref', '未指定')}\n"
+                    f"- 验收: {current_fix.get('acceptance_rule_text', '未指定')}\n"
+                )
+            fix_section += (
+                "\n\n### 你的行为指引\n"
+                "1. 先复述失败主因，让用户确认理解一致\n"
+                "2. 建议从当前整改任务开始修复\n"
+                "3. 根据 target_ref 指向具体文件位置\n"
+                "4. 修改后推动任务完成，建议进行局部重测\n"
+            )
+            base += fix_section
+
+        elif top_deductions:
+            # fallback: 旧逻辑
             lines = []
             for i, d in enumerate(top_deductions, 1):
                 dim = d.get("dimension", "unknown")

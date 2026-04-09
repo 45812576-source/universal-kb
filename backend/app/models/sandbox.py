@@ -152,6 +152,22 @@ class SandboxTestSession(Base):
     anti_hallucination_passed = Column(Boolean, nullable=True)
     approval_eligible = Column(Boolean, nullable=True)
 
+    # 分段执行状态
+    step_statuses = Column(JSON, default=dict)
+    """
+    {
+      "case_generation": {"status": "completed", "started_at": "...", "finished_at": "...", "error": null},
+      "case_execution": {"status": "failed", "started_at": "...", "error_code": "llm_timeout", "error_message": "...", "retryable": true},
+      "evaluation": {...},
+      "report_generation": {...},
+      "memo_sync": {...},
+    }
+    """
+
+    # targeted rerun 支持
+    parent_session_id = Column(Integer, ForeignKey("sandbox_test_sessions.id"), nullable=True)
+    rerun_scope = Column(JSON, nullable=True)  # {"issue_ids": [...], "case_indices": [...]}
+
     # 报告引用
     report_id = Column(Integer, ForeignKey("sandbox_test_reports.id", use_alter=True), nullable=True)
 

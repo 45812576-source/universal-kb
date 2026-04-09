@@ -1,9 +1,9 @@
 """沙盒测试报告生成 + 知识库持久化。
 
-报告三部分：
+报告四层结构：
   Part 1 — Q1/Q2/Q3 检测结果（含证据化审批字段）
   Part 2 — 权限穷尽测试用例矩阵（含评分细项）
-  Part 3 — 质量/易用性/反幻觉三项评价 + Top Issues + Fix Plan
+  Part 3 — 质量/易用性/反幻觉三项评价 + 结构化问题清单 + 结构化 fix_plan + 重测建议
 
 报告不可变，生成后写入知识库，不覆盖旧报告。
 """
@@ -13,6 +13,8 @@ import datetime
 import hashlib
 import json
 import logging
+import re
+import uuid
 
 from sqlalchemy.orm import Session
 
@@ -25,6 +27,173 @@ from app.models.sandbox import (
 from app.models.knowledge import KnowledgeEntry, KnowledgeStatus
 
 logger = logging.getLogger(__name__)
+
+
+# ── target_kind 推断 ────────────────────────────────────────────────────────
+
+_TARGET_KIND_PATTERNS = [
+    (re.compile(r"(prompt|指令|系统提示|system.?prompt|提示词)", re.I), "skill_prompt", "SKILL.md"),
+    (re.compile(r"(知识|引用|reference|knowledge|RAG|检索)", re.I), "knowledge_reference", None),
+    (re.compile(r"(工具|调用|tool|API|函数)", re.I), "tool_binding", None),
+    (re.compile(r"(输入|slot|参数|input)", re.I), "input_slot_definition", None),
+    (re.compile(r"(权限|permission|脱敏|mask|可见)", re.I), "permission_config", None),
+]
+
+
+def _infer_target_kind(reason: str) -> tuple[str, str | None]:
+    """从扣分原因推断整改目标类型和引用。"""
+    for pattern, kind, ref in _TARGET_KIND_PATTERNS:
+        if pattern.search(reason):
+            return kind, ref
+    return "unknown", None
+
+
+def _extract_structured_issues(
+    evaluation: dict,
+    cases: list[SandboxTestCase],
+) -> list[dict]:
+    """从 evaluation 中聚合结构化问题清单 (SandboxIssue[])。"""
+    issues = []
+    issue_idx = 0
+
+    # 从质量扣分项
+    for d in evaluation.get("quality_detail", {}).get("top_deductions", []):
+        reason = d.get("reason", "")
+        target_kind, target_ref = _infer_target_kind(reason)
+
+        # 从 case_scores 中找到关联的 case
+        source_cases = []
+        for i, cs in enumerate(evaluation.get("quality_detail", {}).get("case_scores", [])):
+            if cs.get("reason") and reason[:20] in cs.get("reason", ""):
+                source_cases.append(i)
+
+        # 从关联 case 中提取 evidence
+        evidence_snippets = []
+        for ci in source_cases[:3]:
+            if ci < len(cases):
+                c = cases[ci]
+                if c.llm_response:
+                    evidence_snippets.append(c.llm_response[:200])
+                if c.verdict_reason:
+                    evidence_snippets.append(c.verdict_reason[:200])
+
+        # retest_scope: 从关联 case 推导权限组合
+        retest_scope = []
+        for ci in source_cases:
+            if ci < len(cases):
+                c = cases[ci]
+                combo_key = f"{c.row_visibility}|{c.field_output_semantic}|{c.group_semantic}"
+                if combo_key not in retest_scope:
+                    retest_scope.append(combo_key)
+
+        severity = "critical" if abs(d.get("points", 0)) >= 15 else "major" if abs(d.get("points", 0)) >= 8 else "minor"
+
+        issues.append({
+            "issue_id": f"issue_{uuid.uuid4().hex[:8]}",
+            "severity": severity,
+            "dimension": d.get("dimension", ""),
+            "reason": reason,
+            "impact": f"扣分 {d.get('points', 0)} 分",
+            "source_cases": source_cases,
+            "evidence_snippets": evidence_snippets[:5],
+            "fix_suggestion": d.get("fix_suggestion", ""),
+            "target_kind": target_kind,
+            "target_ref": target_ref or "",
+            "retest_scope": retest_scope,
+        })
+        issue_idx += 1
+
+    # 从易用性
+    usability = evaluation.get("usability_detail", {})
+    if usability.get("reason"):
+        target_kind, target_ref = _infer_target_kind(usability["reason"])
+        issues.append({
+            "issue_id": f"issue_{uuid.uuid4().hex[:8]}",
+            "severity": "major",
+            "dimension": "usability",
+            "reason": usability["reason"],
+            "impact": "易用性未达标",
+            "source_cases": [],
+            "evidence_snippets": [],
+            "fix_suggestion": usability.get("fix_suggestion", ""),
+            "target_kind": target_kind,
+            "target_ref": target_ref or "",
+            "retest_scope": [],
+        })
+
+    # 从反幻觉行为验证
+    for bc in evaluation.get("anti_hallucination_detail", {}).get("behavior_checks", []):
+        if not bc.get("passed"):
+            reason = f"缺证据场景编造: {bc.get('prompt', '')[:80]}"
+            evidence = []
+            if bc.get("response_preview"):
+                evidence.append(bc["response_preview"][:200])
+            issues.append({
+                "issue_id": f"issue_{uuid.uuid4().hex[:8]}",
+                "severity": "critical",
+                "dimension": "anti_hallucination",
+                "reason": reason,
+                "impact": "模型在缺证据时编造回答",
+                "source_cases": [],
+                "evidence_snippets": evidence,
+                "fix_suggestion": "在 prompt 中强化拒答指令",
+                "target_kind": "skill_prompt",
+                "target_ref": "SKILL.md",
+                "retest_scope": [],
+            })
+
+    return issues
+
+
+def _extract_structured_fix_plan(
+    issues: list[dict],
+    evaluation: dict,
+) -> list[dict]:
+    """从结构化问题清单生成结构化整改计划 (SandboxFixPlanItem[])。"""
+    fix_items = []
+
+    # 按 severity 排序: critical > major > minor
+    severity_order = {"critical": 0, "major": 1, "minor": 2}
+    sorted_issues = sorted(issues, key=lambda x: severity_order.get(x.get("severity", "minor"), 2))
+
+    for idx, issue in enumerate(sorted_issues):
+        priority = "p0" if issue["severity"] == "critical" else "p1" if issue["severity"] == "major" else "p2"
+
+        # 根据 target_kind 生成 acceptance_rule
+        acceptance_rules = {
+            "skill_prompt": f"prompt 中需包含对应限制或指令",
+            "knowledge_reference": "知识引用配置正确，RAG 能命中预期条目",
+            "tool_binding": "工具绑定正确，调用链路无报错",
+            "input_slot_definition": "输入槽位定义完整，来源覆盖所有必填字段",
+            "permission_config": "权限配置与业务预期一致",
+            "unknown": "对应评分维度分数 ≥ 70",
+        }
+
+        # 推断 action_type
+        action_types = {
+            "skill_prompt": "fix_prompt_logic",
+            "knowledge_reference": "fix_knowledge_binding",
+            "tool_binding": "fix_tool_usage",
+            "input_slot_definition": "fix_input_slot",
+            "permission_config": "fix_permission_handling",
+            "unknown": "fix_prompt_logic",
+        }
+
+        fix_items.append({
+            "id": f"fix_{uuid.uuid4().hex[:8]}",
+            "title": f"修复: [{issue['dimension']}] {issue['reason'][:80]}",
+            "priority": priority,
+            "problem_ids": [issue["issue_id"]],
+            "action_type": action_types.get(issue["target_kind"], "fix_prompt_logic"),
+            "target_kind": issue["target_kind"],
+            "target_ref": issue["target_ref"],
+            "suggested_changes": issue.get("fix_suggestion", ""),
+            "acceptance_rule": acceptance_rules.get(issue["target_kind"], ""),
+            "retest_scope": issue.get("retest_scope", []),
+            "estimated_gain": issue.get("impact", ""),
+        })
+
+    return fix_items
 
 
 def _extract_top_issues(evaluation: dict) -> list[dict]:
@@ -197,9 +366,28 @@ async def generate_report(
         },
     }
 
-    # ── Part 3: 评价（含 Top Issues + Fix Plan） ──
+    # ── Part 3: 评价（含 Top Issues + Fix Plan + 结构化问题清单） ──
     top_issues = _extract_top_issues(evaluation)
     fix_plan = _extract_fix_plan(evaluation)
+
+    # 结构化问题清单 & 整改计划
+    structured_issues = _extract_structured_issues(evaluation, cases)
+    structured_fix_plan = _extract_structured_fix_plan(structured_issues, evaluation)
+
+    # 重测建议: 从 issues 的 retest_scope 聚合
+    retest_recommendations = []
+    for fp_item in structured_fix_plan:
+        related_cases = []
+        for pid in fp_item.get("problem_ids", []):
+            for issue in structured_issues:
+                if issue["issue_id"] == pid:
+                    related_cases.extend(issue.get("source_cases", []))
+        if related_cases:
+            retest_recommendations.append({
+                "issue_ids": fp_item["problem_ids"],
+                "cases": sorted(set(related_cases)),
+                "reason": fp_item["title"],
+            })
 
     part3 = {
         "quality": {
@@ -215,8 +403,13 @@ async def generate_report(
             "passed": evaluation.get("anti_hallucination_passed", False),
             "detail": evaluation.get("anti_hallucination_detail", {}),
         },
+        # 向后兼容
         "top_issues": top_issues,
         "fix_plan": fix_plan,
+        # 新增结构化字段
+        "issues": structured_issues,
+        "fix_plan_structured": structured_fix_plan,
+        "retest_recommendations": retest_recommendations,
         "final_verdict": {
             "quality_passed": evaluation.get("quality_passed", False),
             "usability_passed": evaluation.get("usability_passed", False),
