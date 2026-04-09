@@ -113,12 +113,13 @@ class SendMessage(BaseModel):
 @router.get("/studio-entry")
 def studio_entry(
     type: str = "skill_studio",
+    skill_id: Optional[int] = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """统一 Studio 入口 API — 返回注册表 + conversation + runtime 状态。"""
     from app.services.studio_registry import resolve_entry
-    entry = resolve_entry(db, user, type)
+    entry = resolve_entry(db, user, type, skill_id=skill_id)
     return {
         "registration_id": entry.registration_id,
         "conversation_id": entry.conversation_id,
@@ -129,6 +130,17 @@ def studio_entry(
         "generation": entry.generation,
         "needs_recover": entry.needs_recover,
     }
+
+
+@router.post("/studio-entry/migrate-skill-conversations")
+def migrate_skill_conversations_api(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """将用户旧共享 Skill Studio 会话中的消息按 skill_id 迁移到独立 conversation。"""
+    from app.services.studio_registry import migrate_skill_conversations
+    result = migrate_skill_conversations(db, user)
+    return result
 
 
 class ConversationCreate(BaseModel):

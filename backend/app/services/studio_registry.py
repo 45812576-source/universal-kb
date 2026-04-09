@@ -30,6 +30,7 @@ def resolve_entry(
     db: Session,
     user: User,
     workspace_type: str,
+    skill_id: Optional[int] = None,
 ) -> StudioEntryResolution:
     """查或创建注册表记录 + 确保 conversation 存在，返回稳定入口。
 
@@ -88,6 +89,12 @@ def resolve_entry(
         conv = _find_or_create_conversation(db, user, workspace_type)
         reg.primary_conversation_id = conv.id
 
+    # 当指定 skill_id 时，查找/创建该 skill 的独立 conversation
+    if skill_id:
+        target_conv_id = _find_or_create_skill_conversation(db, user, workspace_type, skill_id).id
+    else:
+        target_conv_id = reg.primary_conversation_id
+
     reg.last_active_at = datetime.datetime.utcnow()
     db.commit()
 
@@ -95,7 +102,7 @@ def resolve_entry(
 
     return StudioEntryResolution(
         registration_id=reg.id,
-        conversation_id=reg.primary_conversation_id,
+        conversation_id=target_conv_id,
         workspace_root=reg.workspace_root,
         project_dir=reg.project_dir,
         runtime_status=reg.runtime_status,
@@ -149,6 +156,51 @@ def _find_or_create_conversation(
     conv = Conversation(
         user_id=user.id,
         title=f"{workspace_type} 会话",
+    )
+    db.add(conv)
+    db.flush()
+    return conv
+
+
+def _find_or_create_skill_conversation(
+    db: Session, user: User, workspace_type: str, skill_id: int
+) -> Conversation:
+    """查找或创建某个 Skill 的独立 conversation。"""
+    ws = (
+        db.query(Workspace)
+        .filter(Workspace.workspace_type == workspace_type)
+        .first()
+    )
+    ws_id = ws.id if ws else None
+
+    # 按 user_id + workspace_id + skill_id 精确匹配
+    filters = [
+        Conversation.user_id == user.id,
+        Conversation.skill_id == skill_id,
+        Conversation.is_active == True,
+    ]
+    if ws_id:
+        filters.append(Conversation.workspace_id == ws_id)
+
+    existing = (
+        db.query(Conversation)
+        .filter(*filters)
+        .order_by(Conversation.updated_at.desc())
+        .first()
+    )
+    if existing:
+        return existing
+
+    # 创建新 conversation
+    from app.models.skill import Skill as SkillModel
+    skill = db.get(SkillModel, skill_id)
+    title = f"Skill Studio - {skill.name}" if skill else f"Skill Studio - Skill #{skill_id}"
+
+    conv = Conversation(
+        user_id=user.id,
+        workspace_id=ws_id,
+        skill_id=skill_id,
+        title=title,
     )
     db.add(conv)
     db.flush()
@@ -338,3 +390,83 @@ def migrate_existing_users(db: Session) -> dict:
     db.commit()
     logger.info(f"[StudioRegistry] 迁移完成: migrated={migrated}, errors={len(errors)}")
     return {"migrated": migrated, "errors": errors}
+
+
+def migrate_skill_conversations(db: Session, user: User) -> dict:
+    """将用户旧共享 Skill Studio conversation 中按 metadata.skill_id 标记的消息
+    迁移到各 Skill 的独立 conversation。
+
+    幂等：同一消息不会被重复迁移（按 conversation_id 判断归属）。
+    """
+    from app.models.conversation import Message
+
+    ws = (
+        db.query(Workspace)
+        .filter(Workspace.workspace_type == "skill_studio")
+        .first()
+    )
+    if not ws:
+        return {"migrated": 0, "skills": []}
+
+    # 找到用户在 skill_studio workspace 下、没有 skill_id 的 conversation（即旧共享会话）
+    shared_convs = (
+        db.query(Conversation)
+        .filter(
+            Conversation.user_id == user.id,
+            Conversation.workspace_id == ws.id,
+            Conversation.skill_id == None,
+            Conversation.is_active == True,
+        )
+        .all()
+    )
+    if not shared_convs:
+        return {"migrated": 0, "skills": []}
+
+    shared_conv_ids = [c.id for c in shared_convs]
+
+    # 扫描这些 conversation 中所有含 skill_id 的消息（MySQL JSON 兼容）
+    from sqlalchemy import func, cast, Integer
+    msgs = (
+        db.query(Message)
+        .filter(
+            Message.conversation_id.in_(shared_conv_ids),
+            func.json_extract(Message.metadata_, "$.skill_id").isnot(None),
+        )
+        .order_by(Message.created_at.asc())
+        .all()
+    )
+
+    migrated = 0
+    skill_ids_seen = set()
+    # 缓存 skill_id -> target conversation
+    _conv_cache: dict[int, Conversation] = {}
+
+    for msg in msgs:
+        meta = msg.metadata_ or {}
+        skill_id = meta.get("skill_id")
+        if not skill_id:
+            continue
+
+        # 获取或创建该 skill 的独立 conversation
+        if skill_id not in _conv_cache:
+            _conv_cache[skill_id] = _find_or_create_skill_conversation(
+                db, user, "skill_studio", skill_id
+            )
+
+        target_conv = _conv_cache[skill_id]
+
+        # 如果消息已经在目标 conversation 里就跳过（幂等）
+        if msg.conversation_id == target_conv.id:
+            continue
+
+        # 移动消息到目标 conversation
+        msg.conversation_id = target_conv.id
+        migrated += 1
+        skill_ids_seen.add(skill_id)
+
+    db.commit()
+    logger.info(
+        f"[StudioRegistry] Skill conversation 迁移: user={user.id} "
+        f"migrated={migrated} skills={list(skill_ids_seen)}"
+    )
+    return {"migrated": migrated, "skills": list(skill_ids_seen)}
