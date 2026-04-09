@@ -1827,6 +1827,29 @@ async def get_report(
     if not report:
         raise HTTPException(404, "测试报告不存在")
 
+    # 补充 case 明细
+    cases = (
+        db.query(SandboxTestCase)
+        .filter(SandboxTestCase.session_id == session.id)
+        .order_by(SandboxTestCase.case_index)
+        .all()
+    )
+    case_list = [
+        {
+            "case_index": c.case_index,
+            "row_visibility": c.row_visibility,
+            "field_output_semantic": c.field_output_semantic,
+            "group_semantic": c.group_semantic,
+            "tool_precondition": c.tool_precondition,
+            "test_input": c.test_input,
+            "llm_response": c.llm_response,
+            "verdict": c.verdict.value if c.verdict else None,
+            "verdict_reason": c.verdict_reason,
+            "execution_duration_ms": c.execution_duration_ms,
+        }
+        for c in cases
+    ]
+
     return {
         "report_id": report.id,
         "session_id": report.session_id,
@@ -1838,6 +1861,7 @@ async def get_report(
         "part1_evidence_check": report.part1_evidence_check,
         "part2_test_matrix": report.part2_test_matrix,
         "part3_evaluation": report.part3_evaluation,
+        "cases": case_list,
         "theoretical_combo_count": report.theoretical_combo_count,
         "semantic_combo_count": report.semantic_combo_count,
         "executed_case_count": report.executed_case_count,
