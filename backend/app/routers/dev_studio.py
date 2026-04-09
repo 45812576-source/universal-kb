@@ -1610,14 +1610,42 @@ def dev_studio_health(
 
 @router.post("/restart")
 async def restart_instance(user: User = Depends(get_current_user)):
-    """强制杀掉当前用户的 opencode 进程，下次 /instance 请求时重新启动。"""
+    """强制杀掉当前用户的 opencode 进程，等端口释放后重新启动。"""
+    import signal as _sig
+
     inst = _user_instances.get(user.id)
+    port = _port_for_user(user.id)
+
+    # 1. 杀掉已知的托管进程
     if inst:
         proc = inst.get("proc")
         if proc is not None and proc.returncode is None:
-            proc.terminate()
+            try:
+                proc.kill()  # SIGKILL 确保立即终止
+            except Exception:
+                pass
             inst["proc"] = None
             _mark_registry_stopped(user.id)
+
+    # 2. 杀掉端口上所有残留进程（包括孤儿）
+    try:
+        import subprocess as _sp
+        _lsof = _sp.run(["lsof", "-ti", f":{port}"], capture_output=True, text=True, timeout=5)
+        for _pid_str in _lsof.stdout.strip().splitlines():
+            if _pid_str.strip().isdigit():
+                try:
+                    os.kill(int(_pid_str.strip()), _sig.SIGKILL)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 3. 等端口释放
+    for _ in range(10):
+        if not _port_open(port):
+            break
+        await asyncio.sleep(0.5)
+
     info = await _ensure_user_instance(user.id, display_name=user.display_name or "")
     return {"status": "restarted", "port": info["port"]}
 
