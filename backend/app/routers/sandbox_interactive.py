@@ -53,6 +53,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/sandbox/interactive", tags=["sandbox-interactive"])
 
 
+def _check_session_access(session: SandboxTestSession, user: User) -> None:
+    """校验当前用户是否有权访问该测试会话。tester 本人或管理员可访问。"""
+    if user.role == Role.SUPER_ADMIN:
+        return
+    if session.tester_id == user.id:
+        return
+    raise HTTPException(403, "无权访问该测试会话")
+
+
 # ─── Pydantic Schemas ────────────────────────────────────────────────────────
 
 class StartRequest(BaseModel):
@@ -813,6 +822,7 @@ async def get_session(
     session = db.get(SandboxTestSession, session_id)
     if not session:
         raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
     return _serialize_session(session)
 
 
@@ -827,6 +837,7 @@ async def submit_input_slots(
     session = db.get(SandboxTestSession, session_id)
     if not session:
         raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
     if session.current_step != SessionStep.INPUT_SLOT_REVIEW:
         raise HTTPException(400, f"当前步骤不是 input_slot_review，而是 {session.current_step.value}")
 
@@ -1090,6 +1101,7 @@ async def submit_tool_review(
     session = db.get(SandboxTestSession, session_id)
     if not session:
         raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
     if session.current_step != SessionStep.TOOL_REVIEW:
         raise HTTPException(400, f"当前步骤不是 tool_review，而是 {session.current_step.value}")
 
@@ -1223,6 +1235,7 @@ async def submit_permission_review(
     session = db.get(SandboxTestSession, session_id)
     if not session:
         raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
     if session.current_step != SessionStep.PERMISSION_REVIEW:
         raise HTTPException(400, f"当前步骤不是 permission_review，而是 {session.current_step.value}")
 
@@ -1322,6 +1335,7 @@ async def run_tests(
     session = db.get(SandboxTestSession, session_id)
     if not session:
         raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
     allow_status = (SessionStatus.READY_TO_RUN, SessionStatus.DRAFT, SessionStatus.COMPLETED, SessionStatus.RUNNING)
     allow_step = (SessionStep.CASE_GENERATION, SessionStep.PERMISSION_REVIEW, SessionStep.DONE, SessionStep.EXECUTION, SessionStep.EVALUATION)
     if session.status not in allow_status or session.current_step not in allow_step:
@@ -1741,6 +1755,7 @@ async def retry_from_step(
     session = db.get(SandboxTestSession, session_id)
     if not session:
         raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
 
     step_statuses = dict(session.step_statuses or {})
     step_info = step_statuses.get(step, {})
@@ -1772,6 +1787,7 @@ async def upgrade_and_rerun(
     session = db.get(SandboxTestSession, session_id)
     if not session:
         raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
     if session.status != SessionStatus.COMPLETED:
         raise HTTPException(400, "只有已完成的 session 才能升级重跑")
 
@@ -1803,6 +1819,7 @@ async def get_report(
     session = db.get(SandboxTestSession, session_id)
     if not session:
         raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
     if not session.report_id:
         raise HTTPException(400, "测试报告尚未生成")
 
@@ -1844,6 +1861,7 @@ async def get_issues(
     session = db.get(SandboxTestSession, session_id)
     if not session:
         raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
     if not session.report_id:
         raise HTTPException(400, "测试报告尚未生成")
     report = db.get(SandboxTestReport, session.report_id)
@@ -1866,6 +1884,7 @@ async def get_fix_plan(
     session = db.get(SandboxTestSession, session_id)
     if not session:
         raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
     if not session.report_id:
         raise HTTPException(400, "测试报告尚未生成")
     report = db.get(SandboxTestReport, session.report_id)
@@ -1894,6 +1913,7 @@ async def targeted_rerun(
     parent_session = db.get(SandboxTestSession, session_id)
     if not parent_session:
         raise HTTPException(404, "测试会话不存在")
+    _check_session_access(parent_session, user)
     if not parent_session.report_id:
         raise HTTPException(400, "原测试报告尚未生成")
 
@@ -2032,6 +2052,10 @@ async def targeted_rerun_by_report(
     report = db.get(SandboxTestReport, report_id)
     if not report:
         raise HTTPException(404, "测试报告不存在")
+    # 校验权限：通过 report 关联的 session 检查
+    _session = db.get(SandboxTestSession, report.session_id)
+    if _session:
+        _check_session_access(_session, user)
     # 委托给 session-based targeted-rerun
     return await targeted_rerun(
         session_id=report.session_id,
@@ -2054,6 +2078,7 @@ async def submit_approval(
     session = db.get(SandboxTestSession, session_id)
     if not session:
         raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
     if not session.approval_eligible:
         raise HTTPException(400, "测试未通过全部三项评价，无法提交审批")
     if not session.report_id:
