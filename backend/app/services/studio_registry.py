@@ -38,11 +38,12 @@ def resolve_entry(
     - 同一 (user, workspace_type) 永远返回同一 registration
     - primary_conversation_id 始终有效
     - workspace_root/project_dir 始终存在于磁盘
-    - skill_studio 与 opencode 共用同一用户工程文件区
+    - skill_studio 使用独立 project_dir（workspace_root/skill_studio/），与 opencode cwd 隔离
     """
     from app.routers.dev_studio import (
         _workspace_root_for_user,
         _workspace_project_dir,
+        _workspace_skill_studio_dir,
         ensure_workspace_layout,
     )
 
@@ -57,9 +58,12 @@ def resolve_entry(
 
     # 首次：创建注册记录
     if reg is None:
-        # skill_studio 与 opencode 共用同一 workspace_root/project_dir
         workspace_root = _workspace_root_for_user(user.id, user.display_name or "")
-        project_dir = _workspace_project_dir(workspace_root)
+        # skill_studio 使用独立目录，不再与 opencode 共用 project_dir
+        if workspace_type == "skill_studio":
+            project_dir = _workspace_skill_studio_dir(workspace_root)
+        else:
+            project_dir = _workspace_project_dir(workspace_root)
 
         # skill_studio 没有独立 runtime，标记 n/a
         reg = StudioRegistration(
@@ -246,7 +250,7 @@ def update_runtime_status(
 
 
 def resolve_studio_project_dir(db: Session, user_id: int, workspace_type: str) -> Optional[str]:
-    """返回该用户工作台的 project_dir。skill_studio 与 opencode 共用同一目录。"""
+    """返回该用户工作台的 project_dir。skill_studio 使用独立目录，不再与 opencode 共用。"""
     reg = (
         db.query(StudioRegistration)
         .filter(
@@ -257,18 +261,7 @@ def resolve_studio_project_dir(db: Session, user_id: int, workspace_type: str) -
     )
     if reg and reg.project_dir:
         return reg.project_dir
-    # fallback: 如果 skill_studio 未注册但 opencode 已注册，共用
-    if workspace_type == "skill_studio":
-        oc_reg = (
-            db.query(StudioRegistration)
-            .filter(
-                StudioRegistration.user_id == user_id,
-                StudioRegistration.workspace_type == "opencode",
-            )
-            .first()
-        )
-        if oc_reg and oc_reg.project_dir:
-            return oc_reg.project_dir
+    # skill_studio 不再 fallback 到 opencode 的 project_dir
     return None
 
 
@@ -288,7 +281,7 @@ def get_registration(
 
 def migrate_existing_users(db: Session) -> dict:
     """迁移现有用户数据到注册表。返回 {migrated: int, errors: [...]}。"""
-    from app.routers.dev_studio import _workspace_root_for_user, _workspace_project_dir
+    from app.routers.dev_studio import _workspace_root_for_user, _workspace_project_dir, _workspace_skill_studio_dir
 
     migrated = 0
     errors = []
@@ -370,9 +363,9 @@ def migrate_existing_users(db: Session) -> dict:
                 if existing:
                     continue
 
-                # skill_studio 与 opencode 共用同一工程文件区
+                # skill_studio 使用独立目录
                 workspace_root = _workspace_root_for_user(c.user_id)
-                project_dir = _workspace_project_dir(workspace_root)
+                project_dir = _workspace_skill_studio_dir(workspace_root)
                 reg = StudioRegistration(
                     user_id=c.user_id,
                     workspace_type="skill_studio",

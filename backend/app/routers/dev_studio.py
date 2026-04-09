@@ -147,6 +147,11 @@ def _workspace_project_dir(workdir: str) -> str:
     return os.path.join(workdir, "project")
 
 
+def _workspace_skill_studio_dir(workdir: str) -> str:
+    """返回用户工作区的 skill_studio 子目录（Skill Studio 专用写入区，与 OpenCode cwd 隔离）。"""
+    return os.path.join(workdir, "skill_studio")
+
+
 def _workspace_runtime_dir(workdir: str) -> str:
     """返回用户工作区的 runtime 子目录（OpenCode 运行时数据）。"""
     return os.path.join(workdir, "runtime")
@@ -173,6 +178,58 @@ def _user_opencode_db_path(workdir: str) -> Optional[str]:
     if os.path.exists(old_path):
         return old_path
     return new_path  # 新布局路径作为默认
+
+
+def _sanitize_opencode_db(workdir: str, project_dir: str) -> None:
+    """启动前清理 opencode.db，确保 project worktree 和 session directory 正确。
+
+    防御性清理：删除多余 project 记录、修正 global project 的 worktree、
+    修正所有 session 的 directory，确保每次启动 opencode 看到干净状态。
+    """
+    db_path = _user_opencode_db_path(workdir)
+    if not db_path or not os.path.exists(db_path):
+        return
+    try:
+        import sqlite3
+        import logging
+        logger = logging.getLogger(__name__)
+        con = sqlite3.connect(db_path, timeout=5)
+        try:
+            # 检查表是否存在（首次启动可能还没有 schema）
+            tables = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            changed = False
+            if "project" in tables:
+                # 删除非 global 的脏 project 记录
+                cur = con.execute("DELETE FROM project WHERE id != 'global'")
+                if cur.rowcount > 0:
+                    logger.info(f"[SanitizeDB] 删除 {cur.rowcount} 条非 global project 记录: {workdir}")
+                    changed = True
+                # 确保 global project 的 worktree 正确
+                cur = con.execute(
+                    "UPDATE project SET worktree=? WHERE id='global' AND worktree!=?",
+                    (project_dir, project_dir),
+                )
+                if cur.rowcount > 0:
+                    logger.info(f"[SanitizeDB] 修正 global worktree -> {project_dir}")
+                    changed = True
+            if "session" in tables:
+                cur = con.execute(
+                    "UPDATE session SET directory=?, project_id='global' WHERE directory!=? OR project_id!='global'",
+                    (project_dir, project_dir),
+                )
+                if cur.rowcount > 0:
+                    logger.info(f"[SanitizeDB] 修正 {cur.rowcount} 条 session directory -> {project_dir}")
+                    changed = True
+            if changed:
+                con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            con.commit()
+        finally:
+            con.close()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).debug(f"[SanitizeDB] 清理失败（非致命）: {workdir}: {e}")
 
 
 # ─── 旧布局残留检测 + 迁移 ──────────────────────────────────────────────────
@@ -330,6 +387,11 @@ def ensure_workspace_layout(workdir: str, display_name: str = "") -> tuple[str, 
     for subdir in ("inbox", "work", "export", "archive"):
         os.makedirs(os.path.join(project_dir, subdir), exist_ok=True)
 
+    # Skill Studio 隔离写入区（不在 OpenCode cwd 下，避免触发 file watcher / git 索引）
+    skill_studio_dir = _workspace_skill_studio_dir(workdir)
+    for subdir in ("inbox", "data"):
+        os.makedirs(os.path.join(skill_studio_dir, subdir), exist_ok=True)
+
     # 首次创建：初始化 README
     if is_new:
         readme = os.path.join(project_dir, "README.md")
@@ -435,8 +497,12 @@ async def _db_cleaner() -> None:
             logging.getLogger(__name__).warning(f"[DbCleaner] 扫描失败: {e}")
 
 
-MAX_RSS_MB = 500  # 单实例内存硬上限（含 Go 主进程 + Node 启动器），超过则强制重启
+MAX_RSS_MB = 350  # 单实例内存硬上限（单 worker 后降低阈值），超过则强制重启
 MAX_FD_COUNT = 500   # 单实例 fd 上限，pty 泄漏时 fd 会持续累积，超过则强制重启
+
+# 重启抖动保护：记录每用户 1h 内重启次数，超过阈值冻结该实例
+_MAX_RESTARTS_PER_HOUR = 3
+_restart_history: dict[int, list[float]] = {}  # {user_id: [timestamp, ...]}
 
 
 def _get_proc_tree_rss_mb(pid: int) -> int:
@@ -510,8 +576,33 @@ def _get_registry_workspace_root(user_id: int) -> Optional[str]:
     return None
 
 
+def _record_restart(user_id: int) -> bool:
+    """记录一次重启事件，返回是否已超过 1h 内重启阈值（应冻结）。"""
+    now = _time.time()
+    history = _restart_history.setdefault(user_id, [])
+    history.append(now)
+    # 清理 1h 前的记录
+    cutoff = now - 3600
+    _restart_history[user_id] = [t for t in history if t > cutoff]
+    return len(_restart_history[user_id]) > _MAX_RESTARTS_PER_HOUR
+
+
+def _mark_registry_unhealthy(user_id: int) -> None:
+    """将注册表中的 runtime_status 标记为 unhealthy。"""
+    try:
+        from app.database import SessionLocal as _USL
+        from app.services.studio_registry import update_runtime_status as _u_urt
+        _udb = _USL()
+        try:
+            _u_urt(_udb, user_id, "opencode", "unhealthy")
+        finally:
+            _udb.close()
+    except Exception:
+        pass
+
+
 async def _idle_reaper() -> None:
-    """后台任务：每2分钟扫一遍，回收空闲实例 + 杀掉内存超限实例。"""
+    """后台任务：每2分钟扫一遍，回收空闲实例 + 杀掉内存超限实例 + 重启抖动保护。"""
     import logging
     logger = logging.getLogger(__name__)
     while True:
@@ -521,7 +612,7 @@ async def _idle_reaper() -> None:
             proc = inst.get("proc")
             if proc is None or proc.returncode is not None:
                 continue
-            # 空闲超时回收
+            # 空闲超时回收（不计入重启抖动）
             last = inst.get("last_active", now)
             if now - last > IDLE_TIMEOUT_SECONDS:
                 logger.info(f"[Reaper] user={uid} 空闲超时，终止进程")
@@ -541,7 +632,15 @@ async def _idle_reaper() -> None:
                 except Exception:
                     pass
                 inst["proc"] = None
-                _mark_registry_stopped(uid)
+                inst["last_restart_reason"] = f"RSS={rss}MB>{MAX_RSS_MB}MB"
+                # 抖动保护：超过阈值则冻结为 unhealthy
+                if _record_restart(uid):
+                    logger.error(
+                        f"[Reaper] user={uid} 1h 内重启超 {_MAX_RESTARTS_PER_HOUR} 次，冻结为 unhealthy"
+                    )
+                    _mark_registry_unhealthy(uid)
+                else:
+                    _mark_registry_stopped(uid)
                 continue
             # fd 泄漏强杀（pty 不释放导致 /dev/ptmx fd 堆积）
             try:
@@ -557,7 +656,14 @@ async def _idle_reaper() -> None:
                 except Exception:
                     pass
                 inst["proc"] = None
-                _mark_registry_stopped(uid)
+                inst["last_restart_reason"] = f"fd={fd_count}>{MAX_FD_COUNT}"
+                if _record_restart(uid):
+                    logger.error(
+                        f"[Reaper] user={uid} 1h 内重启超 {_MAX_RESTARTS_PER_HOUR} 次，冻结为 unhealthy"
+                    )
+                    _mark_registry_unhealthy(uid)
+                else:
+                    _mark_registry_stopped(uid)
 
         # ── 游离进程扫描（安全版）──
         # 收集所有托管进程及其子进程树的 PID
@@ -1228,6 +1334,9 @@ async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
             None, _cleanup_workspace_if_needed, workdir, WORKSPACE_MAX_GB * 1024 ** 3
         )
 
+        # 启动前清理 opencode.db 中的脏数据（旧 project / 错误 directory）
+        await loop.run_in_executor(None, _sanitize_opencode_db, workdir, project_dir)
+
         # .gitignore 只在内容变更时写入，避免 mtime 变化触发状态刷新
         _gitignore_path = os.path.join(project_dir, ".gitignore")
         _gitignore_content = (
@@ -1777,8 +1886,8 @@ def create_tool_task(
     req: ToolTaskRequest,
     user: User = Depends(get_current_user),
 ):
-    """从 Skill Studio 发起工具开发任务，在用户 workdir 写入 TOOL_REQUEST.md。"""
-    workdir = _user_workdir(user)
+    """从 Skill Studio 发起工具开发任务，写入 skill_studio/inbox/（与 OpenCode cwd 隔离）。"""
+    ss_dir = _user_skill_studio_dir(user)
 
     schema_text = ""
     if req.expected_schema:
@@ -1800,7 +1909,7 @@ def create_tool_task(
 
 保存为 Tool，回到 Skill Studio 绑定到源 Skill。
 """
-    inbox_dir = os.path.join(workdir, "inbox")
+    inbox_dir = os.path.join(ss_dir, "inbox")
     os.makedirs(inbox_dir, exist_ok=True)
     dest = os.path.join(inbox_dir, "TOOL_REQUEST.md")
     with open(dest, "w", encoding="utf-8") as f:
@@ -2108,19 +2217,17 @@ async def transfer_table(
         content = "\n".join(lines)
         ext = "sql"
 
-    # 5. 确定用户 workdir（指向 project/ 子目录）
-    workdir = _user_workdir(user)
-
-    # 6. 系统生成文件统一落到 inbox/
-    inbox_dir = os.path.join(workdir, "inbox")
-    os.makedirs(inbox_dir, exist_ok=True)
+    # 5. 系统生成数据文件落到 skill_studio/data/（与 OpenCode cwd 隔离）
+    ss_dir = _user_skill_studio_dir(user)
+    data_dir = os.path.join(ss_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
 
     if req.filename:
         safe_filename = os.path.basename(req.filename)
     else:
         safe_filename = f"{table_name}.{ext}"
 
-    dest = os.path.join(inbox_dir, safe_filename)
+    dest = os.path.join(data_dir, safe_filename)
     with open(dest, "w", encoding="utf-8", newline="" if fmt == "csv" else "\n") as f:
         f.write(content)
 
@@ -2129,7 +2236,7 @@ async def transfer_table(
         "filename": safe_filename,
         "rows": len(rows),
         "format": fmt,
-        "workdir": workdir,
+        "workdir": ss_dir,
     }
 
 
@@ -2518,6 +2625,38 @@ def _user_workdir(user: User) -> str:
     workdir = _workspace_root_for_user(user.id, user.display_name or "")
     project_dir, _ = ensure_workspace_layout(workdir, display_name=user.display_name or "")
     return project_dir
+
+
+def _user_skill_studio_dir(user: User) -> str:
+    """返回当前用户的 skill_studio 隔离目录（Skill Studio 写入文件用，不在 OpenCode cwd 下）。
+
+    优先级同 _user_workdir：注册表 workspace_root → 回退重算。
+    """
+    try:
+        from app.database import SessionLocal as _SsSL
+        from app.models.opencode import StudioRegistration as _SR
+        _sdb = _SsSL()
+        try:
+            _reg = (
+                _sdb.query(_SR)
+                .filter(_SR.user_id == user.id, _SR.workspace_type == "opencode")
+                .first()
+            )
+            if _reg and _reg.workspace_root:
+                ss_dir = _workspace_skill_studio_dir(_reg.workspace_root)
+                os.makedirs(ss_dir, exist_ok=True)
+                return ss_dir
+        finally:
+            _sdb.close()
+    except Exception:
+        pass
+
+    # 回退
+    workdir = _workspace_root_for_user(user.id, user.display_name or "")
+    ensure_workspace_layout(workdir, display_name=user.display_name or "")
+    ss_dir = _workspace_skill_studio_dir(workdir)
+    os.makedirs(ss_dir, exist_ok=True)
+    return ss_dir
 
 
 def _safe_path(workdir: str, rel: str) -> str:
@@ -2954,3 +3093,51 @@ def get_data_view_detail(
         },
         "preview": preview,
     }
+
+
+# ─── Admin: 运维诊断接口 ─────────────────────────────────────────────────────
+
+@router.get("/admin/instances")
+def admin_list_instances(
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """返回所有活跃 opencode 实例的资源快照，供运维排查内存/fd 泄漏。"""
+    now = _time.time()
+    result = []
+    for uid, inst in _user_instances.items():
+        proc = inst.get("proc")
+        pid = proc.pid if proc and proc.returncode is None else None
+        rss_mb = 0
+        fd_count = 0
+        if pid:
+            rss_mb = _get_proc_tree_rss_mb(pid)
+            try:
+                fd_count = len(os.listdir(f"/proc/{pid}/fd"))
+            except Exception:
+                fd_count = 0
+
+        # 1h 内重启次数
+        cutoff = now - 3600
+        restart_count = len([t for t in _restart_history.get(uid, []) if t > cutoff])
+
+        # 状态判定
+        if pid is None:
+            status = "stopped"
+        elif restart_count > _MAX_RESTARTS_PER_HOUR:
+            status = "unhealthy"
+        else:
+            status = "running"
+
+        result.append({
+            "user_id": uid,
+            "pid": pid,
+            "port": inst.get("port"),
+            "cwd": inst.get("workdir"),
+            "rss_mb": rss_mb,
+            "fd_count": fd_count,
+            "restart_count_1h": restart_count,
+            "last_restart_reason": inst.get("last_restart_reason", ""),
+            "last_active": inst.get("last_active", 0),
+            "status": status,
+        })
+    return result
