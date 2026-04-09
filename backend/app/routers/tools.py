@@ -276,24 +276,37 @@ def delete_tool(
     if user.role != Role.SUPER_ADMIN and tool.created_by != user.id:
         raise HTTPException(status_code=403, detail="无权删除此工具")
 
-    # 清理 sandbox 测试数据（外键链：session → report/case/evidence）
+    # 级联清理关联记录（外键约束）
     from sqlalchemy import text
     tid = tool_id
-    # 其他 session（如 skill）的 evidence 可能引用此 tool_id，置空即可
-    db.execute(text("UPDATE sandbox_test_evidences SET tool_id = NULL WHERE tool_id = :tid"), {"tid": tid})
-    # 删除以此 tool 为 target 的完整 session 链
-    db.execute(text(
-        "UPDATE sandbox_test_sessions SET report_id = NULL"
-        " WHERE report_id IN (SELECT id FROM sandbox_test_reports WHERE session_id IN"
-        " (SELECT id FROM sandbox_test_sessions WHERE target_type = 'tool' AND target_id = :tid))"
-    ), {"tid": tid})
-    db.execute(text("DELETE FROM sandbox_test_reports WHERE session_id IN (SELECT id FROM sandbox_test_sessions WHERE target_type = 'tool' AND target_id = :tid)"), {"tid": tid})
-    db.execute(text("DELETE FROM sandbox_test_cases WHERE session_id IN (SELECT id FROM sandbox_test_sessions WHERE target_type = 'tool' AND target_id = :tid)"), {"tid": tid})
-    db.execute(text("DELETE FROM sandbox_test_evidences WHERE session_id IN (SELECT id FROM sandbox_test_sessions WHERE target_type = 'tool' AND target_id = :tid)"), {"tid": tid})
-    db.execute(text("DELETE FROM sandbox_test_sessions WHERE target_type = 'tool' AND target_id = :tid"), {"tid": tid})
+    # workspace / skill / user 绑定
+    db.execute(text("DELETE FROM workspace_tools WHERE tool_id = :tid"), {"tid": tid})
+    db.execute(text("DELETE FROM skill_tools WHERE tool_id = :tid"), {"tid": tid})
+    db.execute(text("DELETE FROM user_saved_tools WHERE tool_id = :tid"), {"tid": tid})
+    db.execute(text("DELETE FROM tool_versions WHERE tool_id = :tid"), {"tid": tid})
+    # 清理 sandbox 测试数据（表可能尚未创建，安全跳过）
+    _sandbox_stmts = [
+        "UPDATE sandbox_test_evidences SET tool_id = NULL WHERE tool_id = :tid",
+        ("UPDATE sandbox_test_sessions SET report_id = NULL"
+         " WHERE report_id IN (SELECT id FROM sandbox_test_reports WHERE session_id IN"
+         " (SELECT id FROM sandbox_test_sessions WHERE target_type = 'tool' AND target_id = :tid))"),
+        "DELETE FROM sandbox_test_reports WHERE session_id IN (SELECT id FROM sandbox_test_sessions WHERE target_type = 'tool' AND target_id = :tid)",
+        "DELETE FROM sandbox_test_cases WHERE session_id IN (SELECT id FROM sandbox_test_sessions WHERE target_type = 'tool' AND target_id = :tid)",
+        "DELETE FROM sandbox_test_evidences WHERE session_id IN (SELECT id FROM sandbox_test_sessions WHERE target_type = 'tool' AND target_id = :tid)",
+        "DELETE FROM sandbox_test_sessions WHERE target_type = 'tool' AND target_id = :tid",
+    ]
+    for stmt in _sandbox_stmts:
+        try:
+            db.execute(text(stmt), {"tid": tid})
+        except Exception:
+            pass  # 表不存在时安全跳过
 
-    db.delete(tool)
-    db.commit()
+    try:
+        db.delete(tool)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"删除失败，数据库约束错误：{e}")
     return {"ok": True}
 
 

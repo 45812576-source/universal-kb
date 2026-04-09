@@ -2262,16 +2262,21 @@ def delete_skill(
     db.execute(text("DELETE FROM skill_versions WHERE skill_id = :sid"), {"sid": sid})
     # conversations 置空 skill_id（保留对话记录）
     db.execute(text("UPDATE conversations SET skill_id = NULL WHERE skill_id = :sid"), {"sid": sid})
-    # sandbox 测试数据（session → report/case/evidence 有外键链）
-    db.execute(text(
-        "UPDATE sandbox_test_sessions SET report_id = NULL"
-        " WHERE report_id IN (SELECT id FROM sandbox_test_reports WHERE session_id IN"
-        " (SELECT id FROM sandbox_test_sessions WHERE target_type = 'skill' AND target_id = :sid))"
-    ), {"sid": sid})
-    db.execute(text("DELETE FROM sandbox_test_reports WHERE session_id IN (SELECT id FROM sandbox_test_sessions WHERE target_type = 'skill' AND target_id = :sid)"), {"sid": sid})
-    db.execute(text("DELETE FROM sandbox_test_cases WHERE session_id IN (SELECT id FROM sandbox_test_sessions WHERE target_type = 'skill' AND target_id = :sid)"), {"sid": sid})
-    db.execute(text("DELETE FROM sandbox_test_evidences WHERE session_id IN (SELECT id FROM sandbox_test_sessions WHERE target_type = 'skill' AND target_id = :sid)"), {"sid": sid})
-    db.execute(text("DELETE FROM sandbox_test_sessions WHERE target_type = 'skill' AND target_id = :sid"), {"sid": sid})
+    # sandbox 测试数据（表可能尚未创建，安全跳过）
+    _sandbox_stmts = [
+        ("UPDATE sandbox_test_sessions SET report_id = NULL"
+         " WHERE report_id IN (SELECT id FROM sandbox_test_reports WHERE session_id IN"
+         " (SELECT id FROM sandbox_test_sessions WHERE target_type = 'skill' AND target_id = :sid))"),
+        "DELETE FROM sandbox_test_reports WHERE session_id IN (SELECT id FROM sandbox_test_sessions WHERE target_type = 'skill' AND target_id = :sid)",
+        "DELETE FROM sandbox_test_cases WHERE session_id IN (SELECT id FROM sandbox_test_sessions WHERE target_type = 'skill' AND target_id = :sid)",
+        "DELETE FROM sandbox_test_evidences WHERE session_id IN (SELECT id FROM sandbox_test_sessions WHERE target_type = 'skill' AND target_id = :sid)",
+        "DELETE FROM sandbox_test_sessions WHERE target_type = 'skill' AND target_id = :sid",
+    ]
+    for stmt in _sandbox_stmts:
+        try:
+            db.execute(text(stmt), {"sid": sid})
+        except Exception:
+            pass  # 表不存在时安全跳过
     # 清理附属文件目录（如果有）
     from pathlib import Path as _Path
     from app.config import settings
