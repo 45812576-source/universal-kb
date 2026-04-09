@@ -5,6 +5,11 @@
 
 from alembic import op
 
+revision = "z7a8b9c0d1e9"
+down_revision = "z7a8b9c0d1e8"
+branch_labels = None
+depends_on = None
+
 
 def upgrade() -> None:
     new_action_types = "'approve','reject','add_conditions','request_more_info','approve_with_conditions','supplement'"

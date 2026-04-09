@@ -1,4 +1,5 @@
 """审批流 API"""
+import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -311,6 +312,21 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
                 "html_code": (webapp.html_code or "")[:3000],
                 "creator_name": creator.display_name if creator else None,
                 "status": webapp.status,
+            }
+    elif r.target_type == "permission_change" and r.target_id:
+        from app.models.knowledge_permission import PermissionChangeRequest as PCR
+        pcr = db.get(PCR, r.target_id)
+        if pcr:
+            target_user = db.get(User, pcr.target_user_id)
+            target_detail = {
+                "target_user_id": pcr.target_user_id,
+                "target_user_name": target_user.display_name if target_user else None,
+                "domain": pcr.domain.value if pcr.domain else None,
+                "action_key": pcr.action_key,
+                "current_value": pcr.current_value,
+                "target_value": pcr.target_value,
+                "reason": pcr.reason,
+                "risk_note": pcr.risk_note,
             }
     elif r.target_type == "knowledge" and r.target_id:
         from app.models.knowledge import KnowledgeEntry
@@ -969,6 +985,19 @@ async def act_on_approval(
                         new_owner_id = cond.get("new_owner_id")
                 if skill and new_owner_id:
                     skill.created_by = new_owner_id
+        elif r.request_type == ApprovalRequestType.PERMISSION_CHANGE:
+            # 权限变更：通过 → 执行实际变更并同步 PermissionChangeRequest 状态
+            r.status = ApprovalStatus.APPROVED
+            if r.target_id:
+                from app.models.knowledge_permission import PermissionChangeRequest as PCR, PermissionChangeStatus
+                from app.routers.permission_changes import apply_permission_change
+                pcr = db.get(PCR, r.target_id)
+                if pcr and pcr.status == PermissionChangeStatus.PENDING:
+                    pcr.status = PermissionChangeStatus.APPROVED
+                    pcr.reviewer_id = user.id
+                    pcr.review_comment = req.comment
+                    pcr.reviewed_at = datetime.datetime.utcnow()
+                    apply_permission_change(pcr, db, user.id)
         else:
             # 其他审批类型，保持原逻辑
             r.status = ApprovalStatus.APPROVED
@@ -1018,6 +1047,15 @@ async def act_on_approval(
             webapp = db.get(WebApp, r.target_id)
             if webapp and webapp.status == "reviewing":
                 webapp.status = "draft"
+        # permission_change 拒绝 → 同步 PermissionChangeRequest 状态
+        if r.request_type == ApprovalRequestType.PERMISSION_CHANGE and r.target_id:
+            from app.models.knowledge_permission import PermissionChangeRequest as PCR, PermissionChangeStatus
+            pcr = db.get(PCR, r.target_id)
+            if pcr and pcr.status == PermissionChangeStatus.PENDING:
+                pcr.status = PermissionChangeStatus.REJECTED
+                pcr.reviewer_id = user.id
+                pcr.review_comment = req.comment
+                pcr.reviewed_at = datetime.datetime.utcnow()
         # knowledge_review 拒绝 → reject_knowledge
         if r.request_type == ApprovalRequestType.KNOWLEDGE_REVIEW and r.target_id:
             from app.models.knowledge import KnowledgeEntry, KnowledgeStatus

@@ -563,6 +563,10 @@ def get_user_features(
     return {"feature_flags": flags}
 
 
+# 高风险 feature flags — 变更需走 permission_changes 工单，不允许直接写
+_HIGH_RISK_FLAGS = {"dev_studio", "webapp_publish", "feishu_sync"}
+
+
 @router.put("/users/{uid}/features")
 def update_user_features(
     uid: int,
@@ -570,13 +574,24 @@ def update_user_features(
     db: Session = Depends(get_db),
     current: User = Depends(require_role(Role.SUPER_ADMIN)),
 ):
-    """更新指定用户的功能开关（仅超管）。"""
+    """更新指定用户的功能开关（仅超管）。
+    高风险 flag 变更必须走 /admin/permission-changes 工单流程。
+    """
     user = db.get(User, uid)
     if not user:
         raise HTTPException(404, "用户不存在")
-    # 只允许已知 key
     allowed_keys = set(_DEFAULT_FEATURE_FLAGS.keys())
     filtered = {k: bool(v) for k, v in body.feature_flags.items() if k in allowed_keys}
+
+    # 拦截高风险 flag 变更
+    current_flags = {**_DEFAULT_FEATURE_FLAGS, **(user.feature_flags or {})}
+    for k, v in filtered.items():
+        if k in _HIGH_RISK_FLAGS and current_flags.get(k) != v:
+            raise HTTPException(
+                403,
+                f"高风险功能开关 '{k}' 的变更需通过权限变更工单流程（POST /admin/permission-changes）"
+            )
+
     user.feature_flags = {**(user.feature_flags or {}), **filtered}
     db.commit()
     db.refresh(user)

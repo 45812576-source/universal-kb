@@ -10,6 +10,11 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects.mysql import JSON
 
+revision = "z7a8b9c0d1e8"
+down_revision = "z7a8b9c0d1e7"
+branch_labels = None
+depends_on = None
+
 
 def upgrade() -> None:
     # ── 扩展 ApprovalRequestType 枚举 ──

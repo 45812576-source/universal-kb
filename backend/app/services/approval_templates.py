@@ -362,6 +362,26 @@ APPROVAL_TEMPLATES: dict[str, dict[str, Any]] = {
         "post_approve": "应用新保护配置",
         "post_reject": "保持当前配置",
     },
+    "permission_change": {
+        "decision_focus": "用户权限变更的合理性与安全影响",
+        "required_evidence": [
+            {"key": "domain", "label": "权限域", "required": True, "auto": True},
+            {"key": "action_key", "label": "变更项", "required": True, "auto": True},
+            {"key": "current_value", "label": "当前状态", "required": True, "auto": True},
+            {"key": "target_value", "label": "目标状态", "required": True, "auto": True},
+            {"key": "reason", "label": "变更原因", "required": False, "auto": False},
+            {"key": "risk_note", "label": "风险说明", "required": False, "auto": False},
+        ],
+        "review_checklist": [
+            "变更原因合理，有业务必要性",
+            "权限范围符合最小权限原则",
+            "不会导致安全风险扩大",
+        ],
+        "approval_criteria": "变更合理、范围适当、风险可控",
+        "rejection_criteria": "原因不充分 / 权限范围过大 / 存在安全隐患",
+        "post_approve": "自动写入权限变更",
+        "post_reject": "保持当前权限不变",
+    },
 }
 
 
