@@ -2274,8 +2274,8 @@ async def dev_studio_session_resume(
 ):
     """恢复到指定 OpenCode session。
 
-    通过 OpenCode RPC 调 session/set，不再由前端直接打不稳定 RPC。
-    如果 opencode 未运行，自动启动后再切换。
+    通过 opencode HTTP API 查询 session slug，返回给前端用于 iframe 导航。
+    如果 opencode 未运行，自动启动。
     """
     # 确保 opencode 在跑（未运行会自动启动）
     try:
@@ -2285,21 +2285,23 @@ async def dev_studio_session_resume(
         return {
             "ok": False,
             "resumed_session_id": None,
+            "slug": None,
             "runtime_status": "stopped",
             "error_code": "runtime_start_failed",
             "error_message": f"OpenCode 启动失败: {e.detail}",
         }
 
-    # 调 OpenCode RPC
+    # 从 opencode HTTP API 获取 session slug（前端用 slug 导航 iframe）
     import httpx
-    rpc_url = f"http://127.0.0.1:{port}/session/set"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(rpc_url, json={"id": session_id})
+            resp = await client.get(f"http://127.0.0.1:{port}/session/{session_id}")
             if resp.status_code < 300:
+                data = resp.json()
                 return {
                     "ok": True,
                     "resumed_session_id": session_id,
+                    "slug": data.get("slug"),
                     "runtime_status": "running",
                     "error_code": None,
                     "error_message": None,
@@ -2308,25 +2310,19 @@ async def dev_studio_session_resume(
                 return {
                     "ok": False,
                     "resumed_session_id": None,
+                    "slug": None,
                     "runtime_status": "running",
-                    "error_code": "rpc_error",
-                    "error_message": f"OpenCode RPC 返回 {resp.status_code}: {resp.text[:200]}",
+                    "error_code": "session_not_found",
+                    "error_message": f"Session 不存在或已删除",
                 }
-    except httpx.TimeoutException:
-        return {
-            "ok": False,
-            "resumed_session_id": None,
-            "runtime_status": "running",
-            "error_code": "rpc_timeout",
-            "error_message": "OpenCode RPC 超时，运行时可能卡住",
-        }
     except Exception as e:
         return {
             "ok": False,
             "resumed_session_id": None,
-            "runtime_status": reg.runtime_status,
+            "slug": None,
+            "runtime_status": "running",
             "error_code": "rpc_unavailable",
-            "error_message": f"无法连接 OpenCode RPC: {e}",
+            "error_message": f"无法连接 OpenCode: {e}",
         }
 
 
