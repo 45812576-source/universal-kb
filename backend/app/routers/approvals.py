@@ -380,6 +380,8 @@ def _req(r: ApprovalRequest, db: Session) -> dict:
         "target_detail": target_detail,
         "requester_id": r.requester_id,
         "requester_name": r.requester.display_name if r.requester else None,
+        "assigned_approver_id": r.assigned_approver_id,
+        "assigned_approver_name": r.assigned_approver.display_name if r.assigned_approver_id and r.assigned_approver else None,
         "status": r.status,
         "stage": stage_val,
         "needs_info_comment": needs_info_comment,
@@ -565,10 +567,15 @@ def incoming_approvals(
             (ApprovalRequest.request_type == ApprovalRequestType.KNOWLEDGE_EDIT)
             & (ApprovalRequest.target_id.in_(my_entry_ids))
         )
-    # 管理员还能看其他类型的审批
+    # 显式分配给我的审批（assigned_approver_id 精确匹配，优先级最高）
+    conditions.append(
+        (ApprovalRequest.assigned_approver_id == user.id)
+    )
+    # 管理员兜底：没有 assigned_approver_id 的历史工单仍可见
     if user.role == Role.SUPER_ADMIN:
         conditions.append(
             (ApprovalRequest.request_type != ApprovalRequestType.KNOWLEDGE_EDIT)
+            & (ApprovalRequest.assigned_approver_id.is_(None))
         )
     elif user.role == Role.DEPT_ADMIN:
         from app.models.user import User as UserModel
@@ -579,6 +586,7 @@ def incoming_approvals(
             (ApprovalRequest.request_type != ApprovalRequestType.KNOWLEDGE_EDIT)
             & (ApprovalRequest.stage == "dept_pending")
             & (ApprovalRequest.requester_id.in_(dept_user_ids))
+            & (ApprovalRequest.assigned_approver_id.is_(None))
         )
 
     if not conditions:

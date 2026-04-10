@@ -400,9 +400,12 @@ class ApprovalRequest(Base):
     evidence_pack = Column(JSON, default=None, nullable=True)
     risk_level = Column(String(20), nullable=True)        # high / medium / low
     impact_summary = Column(Text, nullable=True)
+    # 显式审批路由
+    assigned_approver_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     requester = relationship("User", foreign_keys=[requester_id])
+    assigned_approver = relationship("User", foreign_keys=[assigned_approver_id])
     actions = relationship("ApprovalAction", back_populates="request", cascade="all, delete-orphan")
 
 

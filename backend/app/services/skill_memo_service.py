@@ -824,6 +824,8 @@ def record_test_result(
     structured_issues: list[dict] | None = None,
     structured_fix_plan: list[dict] | None = None,
     source_report_id: int | None = None,
+    approval_eligible: bool | None = None,
+    blocking_reasons: list[str] | None = None,
 ) -> dict:
     """测试流程结束后统一回写 memo。"""
     memo = db.query(SkillMemo).filter(SkillMemo.skill_id == skill_id).first()
@@ -833,13 +835,19 @@ def record_test_result(
     payload = copy.deepcopy(memo.memo_payload or {})
 
     # 写入 test_history
+    record_details = details or {}
+    if approval_eligible is not None:
+        record_details["approval_eligible"] = approval_eligible
+    if blocking_reasons:
+        record_details["blocking_reasons"] = blocking_reasons
+
     test_record = {
         "id": _new_id("test"),
         "source": source,
         "version": version,
         "status": status,
         "summary": summary,
-        "details": details or {},
+        "details": record_details,
         "created_at": _now_iso(),
         "followup_task_ids": [],
         "source_report_id": source_report_id,
