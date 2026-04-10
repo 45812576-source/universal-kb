@@ -599,7 +599,7 @@ async def _db_cleaner() -> None:
             logging.getLogger(__name__).warning(f"[DbCleaner] 扫描失败: {e}")
 
 
-MAX_RSS_MB = 350  # 单实例内存硬上限（单 worker 后降低阈值），超过则强制重启
+MAX_RSS_MB = 512  # 单实例内存硬上限（opencode 正常工作约 350~420MB，留余量）
 MAX_FD_COUNT = 500   # 单实例 fd 上限，pty 泄漏时 fd 会持续累积，超过则强制重启
 
 # 重启抖动保护：记录每用户 1h 内重启次数，超过阈值冻结该实例
