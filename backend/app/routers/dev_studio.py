@@ -2519,29 +2519,49 @@ def get_latest_output(
 def dev_studio_output_files(
     user: User = Depends(get_current_user),
 ):
-    """枚举 project/output/ 下的产物文件。这是平台可下载/可保存 Skill 的唯一来源。"""
+    """枚举用户 project/ 下的所有产出文件（递归，排除系统目录）。"""
+    import datetime as _dt
+
     workdir = _user_workdir(user)
-    output_dir = os.path.join(_workspace_project_dir(workdir), "output")
-    if not os.path.isdir(output_dir):
+    project_dir = workdir  # _user_workdir 已经返回 project/ 路径
+
+    if not os.path.isdir(project_dir):
         return {"items": []}
 
+    # 跳过的目录名
+    _skip_dirs = {".git", ".opencode", "node_modules", "__pycache__", ".venv", "venv",
+                  ".next", "dist", "build", ".cache", ".bin", ".local", ".config"}
+
     items = []
-    for fname in sorted(os.listdir(output_dir)):
-        fpath = os.path.join(output_dir, fname)
-        if not os.path.isfile(fpath):
-            continue
-        stat = os.stat(fpath)
-        # 分类推断
-        ext = os.path.splitext(fname)[1].lower()
-        category = "skill" if ext == ".md" else "code" if ext in (".py", ".ts", ".js", ".json") else "other"
-        import datetime as _dt
-        items.append({
-            "path": f"output/{fname}",
-            "name": fname,
-            "size": stat.st_size,
-            "updated_at": _dt.datetime.fromtimestamp(stat.st_mtime).isoformat(),
-            "category": category,
-        })
+    for dirpath, dirnames, filenames in os.walk(project_dir):
+        # 跳过系统目录
+        dirnames[:] = [d for d in dirnames if d not in _skip_dirs]
+        for fname in filenames:
+            if fname.startswith("."):
+                continue
+            fpath = os.path.join(dirpath, fname)
+            try:
+                stat = os.stat(fpath)
+            except OSError:
+                continue
+            # 相对于 project/ 的路径
+            rel_path = os.path.relpath(fpath, project_dir)
+            ext = os.path.splitext(fname)[1].lower()
+            category = (
+                "skill" if ext == ".md" else
+                "code" if ext in (".py", ".ts", ".js", ".json", ".bat", ".command", ".sh") else
+                "data" if ext in (".csv", ".xlsx", ".xls", ".sql") else
+                "doc" if ext in (".html", ".pdf", ".docx", ".txt") else
+                "other"
+            )
+            items.append({
+                "path": rel_path,
+                "name": fname,
+                "size": stat.st_size,
+                "updated_at": _dt.datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                "category": category,
+            })
+
     # 按修改时间倒序
     items.sort(key=lambda x: x["updated_at"], reverse=True)
     return {"items": items}
