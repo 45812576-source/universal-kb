@@ -389,8 +389,8 @@ def ensure_workspace_layout(workdir: str, display_name: str = "") -> tuple[str, 
     for rd in ("data", "config", "cache", "bin"):
         os.makedirs(os.path.join(runtime_dir, rd), exist_ok=True)
 
-    # 确保四个一级业务目录始终存在
-    for subdir in ("inbox", "work", "export", "archive"):
+    # 确保一级业务目录始终存在（output 是平台产物唯一正式输出目录）
+    for subdir in ("inbox", "work", "export", "archive", "output"):
         os.makedirs(os.path.join(project_dir, subdir), exist_ok=True)
 
     # Skill Studio 隔离写入区（不在 OpenCode cwd 下，避免触发 file watcher / git 索引）
@@ -408,6 +408,7 @@ def ensure_workspace_layout(workdir: str, display_name: str = "") -> tuple[str, 
                     f"# {display_name or folder_name} 的工作台\n\n"
                     "这是你的专属开发工作台，文件会持久保存。\n\n"
                     "## 目录说明\n\n"
+                    "- **output/** — 平台正式产物（Skill/Tool 保存来源）\n"
                     "- **inbox/** — 系统生成的待处理文件\n"
                     "- **work/** — 用户上传、AI 生成的工作文件\n"
                     "- **export/** — 导出产物\n"
@@ -422,6 +423,43 @@ def ensure_workspace_layout(workdir: str, display_name: str = "") -> tuple[str, 
             _sp.run(["git", "init"], cwd=project_dir, capture_output=True, timeout=5)
         except Exception:
             pass
+
+    # 一次性迁移：散落在多处的用户产物 → project/output/（平台唯一正式输出目录）
+    _SUPERPOWER_NAMES = {
+        "dispatching-parallel-agents", "executing-plans", "finishing-a-development-branch",
+        "receiving-code-review", "requesting-code-review", "subagent-driven-development",
+        "test-driven-development", "using-git-worktrees", "using-superpowers",
+        "verification-before-completion", "writing-plans", "writing-skills",
+    }
+    output_dir = os.path.join(project_dir, "output")
+    import shutil as _shutil
+    # 迁移源1: runtime/config/opencode/skills/ 中非白名单 .md
+    runtime_skills_src = os.path.join(runtime_dir, "config", "opencode", "skills")
+    if os.path.isdir(runtime_skills_src):
+        for fname in os.listdir(runtime_skills_src):
+            if not fname.endswith(".md"):
+                continue
+            stem = fname[:-3]
+            if stem in _SUPERPOWER_NAMES:
+                continue
+            src_file = os.path.join(runtime_skills_src, fname)
+            dst_file = os.path.join(output_dir, fname)
+            if not os.path.exists(dst_file) and os.path.isfile(src_file):
+                try:
+                    _shutil.copy2(src_file, dst_file)
+                except Exception:
+                    pass
+    # 迁移源2: skill_studio/data/ 中的用户产物
+    ss_data = os.path.join(skill_studio_dir, "data")
+    if os.path.isdir(ss_data):
+        for fname in os.listdir(ss_data):
+            src_file = os.path.join(ss_data, fname)
+            dst_file = os.path.join(output_dir, fname)
+            if not os.path.exists(dst_file) and os.path.isfile(src_file):
+                try:
+                    _shutil.copy2(src_file, dst_file)
+                except Exception:
+                    pass
 
     # symlink: project/.opencode → runtime/config/opencode/
     # 让 OpenCode 在 cwd(=project/) 下的 .opencode/ 实际指向 runtime 隔离目录
@@ -1765,7 +1803,6 @@ def dev_studio_entry(
 ):
     """返回稳定的工作区入口：注册表 + conversation + runtime 状态 + opencode.db 全量 session。"""
     from app.services.studio_registry import resolve_entry
-    from dataclasses import asdict
     entry = resolve_entry(db, user, "opencode")
     return {
         "registration_id": entry.registration_id,
@@ -1778,8 +1815,11 @@ def dev_studio_entry(
         "needs_recover": entry.needs_recover,
         "recent_conversation_ids": entry.recent_conversation_ids,
         "last_active_at": entry.last_active_at,
-        "opencode_sessions": [asdict(s) for s in entry.opencode_sessions],
-        "opencode_session_count": entry.opencode_session_count,
+        "session_total": entry.session_total,
+        "session_db_health": entry.session_db_health,
+        "session_db_source": entry.session_db_source,
+        "session_db_path": entry.session_db_path,
+        "migration_state": entry.migration_state,
     }
 
 
@@ -1794,7 +1834,6 @@ async def dev_studio_entry_start(
     返回值同 GET /entry，额外包含 port + url（runtime 就绪后）。
     """
     from app.services.studio_registry import resolve_entry
-    from dataclasses import asdict
     entry = resolve_entry(db, user, "opencode")
 
     # 自动启动 runtime
@@ -1824,8 +1863,11 @@ async def dev_studio_entry_start(
         "needs_recover": False if runtime_status == "running" else entry.needs_recover,
         "recent_conversation_ids": entry.recent_conversation_ids,
         "last_active_at": entry.last_active_at,
-        "opencode_sessions": [asdict(s) for s in entry.opencode_sessions],
-        "opencode_session_count": entry.opencode_session_count,
+        "session_total": entry.session_total,
+        "session_db_health": entry.session_db_health,
+        "session_db_source": entry.session_db_source,
+        "session_db_path": entry.session_db_path,
+        "migration_state": entry.migration_state,
         "port": port,
         "url": url,
         "runtime_error": runtime_error,
@@ -1865,75 +1907,72 @@ def dev_studio_health(
     return result
 
 
-# ─── GET /sessions — OpenCode session 分页列表（用户可用）─────────────────────
+# ─── GET /runtime-health — 代理链全面探活 ─────────────────────────────────────
 
-@router.get("/sessions")
-def dev_studio_sessions(
-    offset: int = 0,
-    limit: int = 20,
+@router.get("/runtime-health")
+async def dev_studio_runtime_health(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """返回当前用户 opencode.db 中的 session 列表，分页支持。
+    """探测 OpenCode upstream 可达性、静态资源、RPC、WebSocket、session db 状态。
 
-    用于前端侧边栏展示全量历史会话，支持无限滚动加载。
+    前端用此接口做错误分类，而不是统一报"工作台服务未启动"。
     """
-    import sqlite3
+    import httpx
+    from app.services.studio_registry import get_registration, probe_session_db
 
-    from app.services.studio_registry import get_registration, OpenCodeSessionInfo
     reg = get_registration(db, user.id, "opencode")
-    if not reg:
-        return {"sessions": [], "total": 0, "offset": offset, "limit": limit}
+    if not reg or not reg.runtime_port:
+        probe = probe_session_db(reg.workspace_root) if reg else None
+        return {
+            "runtime_reachable": False,
+            "static_ok": False,
+            "rpc_ok": False,
+            "ws_ok": False,
+            "session_db_health": probe.db_health if probe else "missing",
+            "runtime_status": reg.runtime_status if reg else "unregistered",
+        }
 
-    db_path = _user_opencode_db_path(reg.workspace_root)
-    if not db_path or not os.path.exists(db_path):
-        return {"sessions": [], "total": 0, "offset": offset, "limit": limit}
+    base = f"http://127.0.0.1:{reg.runtime_port}"
+    results = {
+        "runtime_reachable": False,
+        "static_ok": False,
+        "rpc_ok": False,
+        "ws_ok": False,
+        "session_db_health": "unknown",
+        "runtime_status": reg.runtime_status,
+    }
 
+    async with httpx.AsyncClient(timeout=5) as client:
+        # 静态首页
+        try:
+            r = await client.get(f"{base}/")
+            results["runtime_reachable"] = True
+            results["static_ok"] = r.status_code == 200 and "text/html" in (r.headers.get("content-type") or "")
+        except Exception:
+            pass
+
+        # RPC 探活
+        try:
+            r = await client.get(f"{base}/session/list")
+            results["rpc_ok"] = r.status_code < 500
+        except Exception:
+            pass
+
+    # WebSocket 探活
     try:
-        con = sqlite3.connect(db_path, timeout=5)
-        con.row_factory = sqlite3.Row
-        tables = {r[0] for r in con.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
-        if "session" not in tables:
-            con.close()
-            return {"sessions": [], "total": 0, "offset": offset, "limit": limit}
+        import websockets
+        async with websockets.connect(f"ws://127.0.0.1:{reg.runtime_port}/ws", open_timeout=3):
+            results["ws_ok"] = True
+    except Exception:
+        # websockets 可能未安装或 ws 路径不同
+        results["ws_ok"] = None  # 未知
 
-        total = con.execute("SELECT COUNT(*) FROM session").fetchone()[0]
-        has_message = "message" in tables
+    # Session DB
+    probe = probe_session_db(reg.workspace_root)
+    results["session_db_health"] = probe.db_health
 
-        if has_message:
-            rows = con.execute(
-                "SELECT s.id, s.title, s.directory, s.project_id, "
-                "s.time_created, s.time_updated, COUNT(m.id) AS msg_count "
-                "FROM session s LEFT JOIN message m ON m.session_id = s.id "
-                "GROUP BY s.id "
-                "ORDER BY s.time_updated DESC LIMIT ? OFFSET ?",
-                (limit, offset),
-            ).fetchall()
-        else:
-            rows = con.execute(
-                "SELECT id, title, directory, project_id, "
-                "time_created, time_updated, 0 AS msg_count "
-                "FROM session ORDER BY time_updated DESC LIMIT ? OFFSET ?",
-                (limit, offset),
-            ).fetchall()
-
-        sessions = [
-            {
-                "id": row["id"],
-                "title": row["title"],
-                "directory": row["directory"],
-                "message_count": row["msg_count"],
-                "created_at": row["time_created"],
-                "updated_at": row["time_updated"],
-            }
-            for row in rows
-        ]
-        con.close()
-        return {"sessions": sessions, "total": total, "offset": offset, "limit": limit}
-    except Exception as e:
-        return {"sessions": [], "total": 0, "offset": offset, "limit": limit, "error": str(e)}
+    return results
 
 
 # ─── GET /session-audit — OpenCode session 只读诊断 ──────────────────────────
@@ -1959,11 +1998,15 @@ def dev_studio_session_audit(
     if not reg:
         return {"error": "该用户没有 OpenCode 注册记录", "sessions": []}
 
-    db_path = _user_opencode_db_path(reg.workspace_root)
+    from app.services.studio_registry import probe_session_db
+    probe = probe_session_db(reg.workspace_root)
+    db_path = probe.db_path
     if not db_path or not os.path.exists(db_path):
         return {
             "workspace_root": reg.workspace_root,
             "db_exists": False,
+            "db_health": probe.db_health,
+            "migration_state": probe.migration_state,
             "sessions": [],
         }
 
@@ -2006,10 +2049,16 @@ def dev_studio_session_audit(
         wal_path = db_path + "-wal"
         wal_size_mb = round(os.path.getsize(wal_path) / 1024 / 1024, 2) if os.path.exists(wal_path) else 0
 
+        # 判断 db_source
+        new_path = os.path.join(reg.workspace_root, "runtime", "data", "opencode", "opencode.db")
+        db_source = "runtime_data" if db_path == new_path else "legacy_local_share"
+
         con.close()
         return {
             "workspace_root": reg.workspace_root,
             "project_dir": reg.project_dir,
+            "opencode_db_path": db_path,
+            "db_source": db_source,
             "db_exists": True,
             "db_size_mb": db_size_mb,
             "wal_size_mb": wal_size_mb,
@@ -2020,6 +2069,7 @@ def dev_studio_session_audit(
     except Exception as e:
         return {
             "workspace_root": reg.workspace_root,
+            "opencode_db_path": db_path,
             "db_exists": True,
             "error": str(e),
             "sessions": [],
@@ -2104,6 +2154,174 @@ def dev_studio_session_audit_admin(
             "db_exists": True,
             "error": str(e),
             "sessions": [],
+        }
+
+
+# ─── GET /diagnostics — 当前用户运行时全面诊断 ────────────────────────────────
+
+@router.get("/diagnostics")
+def dev_studio_diagnostics(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """返回当前用户的运行时状态、session db 健康、output 目录状态、最近回收原因。
+
+    前端用此做全面诊断面板，不再由 /entry 承载诊断。
+    """
+    from app.services.studio_registry import get_registration, probe_session_db
+
+    reg = get_registration(db, user.id, "opencode")
+    if not reg:
+        return {"error": "未注册"}
+
+    # session db
+    probe = probe_session_db(reg.workspace_root)
+
+    # runtime 进程信息
+    inst = _user_instances.get(user.id)
+    runtime_pid = None
+    rss_mb = 0
+    fd_count = 0
+    started_at = None
+    if inst and inst.get("proc") and inst["proc"].returncode is None:
+        runtime_pid = inst["proc"].pid
+        rss_mb = _get_proc_tree_rss_mb(runtime_pid)
+        try:
+            fd_count = len(os.listdir(f"/proc/{runtime_pid}/fd"))
+        except Exception:
+            fd_count = -1  # macOS 或权限问题
+        started_at = inst.get("started_at")
+
+    last_reap_reason = (inst or {}).get("last_restart_reason", None)
+
+    # output 目录状态
+    output_dir = os.path.join(reg.project_dir, "output")
+    output_file_count = 0
+    if os.path.isdir(output_dir):
+        output_file_count = sum(1 for f in os.listdir(output_dir) if os.path.isfile(os.path.join(output_dir, f)))
+
+    return {
+        "workspace_root": reg.workspace_root,
+        "db_health": probe.db_health,
+        "db_path": probe.db_path,
+        "migration_state": probe.migration_state,
+        "session_total": probe.total,
+        "output_health": "ok" if os.path.isdir(output_dir) else "missing",
+        "output_file_count": output_file_count,
+        "runtime_status": reg.runtime_status,
+        "runtime_metrics": {
+            "pid": runtime_pid,
+            "rss_mb": rss_mb,
+            "fd_count": fd_count,
+            "started_at": started_at,
+            "max_rss_mb": MAX_RSS_MB,
+            "max_fd_count": MAX_FD_COUNT,
+        },
+        "last_reap_reason": last_reap_reason,
+    }
+
+
+# ─── GET /sessions — 分页历史会话列表（唯一 session 查询入口）────────────────
+
+@router.get("/sessions")
+def dev_studio_sessions(
+    page: int = 1,
+    page_size: int = 20,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """返回当前用户的历史 OpenCode 会话列表（分页），含 db 诊断信息。
+
+    这是前端 session 侧栏的唯一数据源。不再由 /entry 承载 session 列表。
+    """
+    from app.services.studio_registry import get_registration, read_opencode_sessions
+    from dataclasses import asdict
+
+    reg = get_registration(db, user.id, "opencode")
+    if not reg:
+        return {
+            "items": [], "total": 0, "page": page, "page_size": page_size,
+            "db_health": "missing", "db_source": "missing",
+            "db_path": None, "migration_state": "none",
+        }
+
+    sessions, total, probe = read_opencode_sessions(
+        reg.workspace_root, page=page, page_size=page_size,
+    )
+    return {
+        "items": [asdict(s) for s in sessions],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "db_path": probe.db_path,
+        "db_health": probe.db_health,
+        "db_source": probe.db_source,
+        "migration_state": probe.migration_state,
+    }
+
+
+# ─── POST /sessions/{id}/resume — 恢复指定 OpenCode session ──────────────────
+
+@router.post("/sessions/{session_id}/resume")
+async def dev_studio_session_resume(
+    session_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """恢复到指定 OpenCode session。
+
+    通过 OpenCode RPC 调 session/set，不再由前端直接打不稳定 RPC。
+    失败时返回具体错误码和信息。
+    """
+    from app.services.studio_registry import get_registration
+
+    reg = get_registration(db, user.id, "opencode")
+    if not reg or not reg.runtime_port:
+        return {
+            "ok": False,
+            "resumed_session_id": None,
+            "runtime_status": reg.runtime_status if reg else "stopped",
+            "error_code": "runtime_not_running",
+            "error_message": "OpenCode 运行时未启动，无法恢复会话",
+        }
+
+    # 调 OpenCode RPC
+    import httpx
+    rpc_url = f"http://127.0.0.1:{reg.runtime_port}/session/set"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(rpc_url, json={"id": session_id})
+            if resp.status_code < 300:
+                return {
+                    "ok": True,
+                    "resumed_session_id": session_id,
+                    "runtime_status": "running",
+                    "error_code": None,
+                    "error_message": None,
+                }
+            else:
+                return {
+                    "ok": False,
+                    "resumed_session_id": None,
+                    "runtime_status": "running",
+                    "error_code": "rpc_error",
+                    "error_message": f"OpenCode RPC 返回 {resp.status_code}: {resp.text[:200]}",
+                }
+    except httpx.TimeoutException:
+        return {
+            "ok": False,
+            "resumed_session_id": None,
+            "runtime_status": "running",
+            "error_code": "rpc_timeout",
+            "error_message": "OpenCode RPC 超时，运行时可能卡住",
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "resumed_session_id": None,
+            "runtime_status": reg.runtime_status,
+            "error_code": "rpc_unavailable",
+            "error_message": f"无法连接 OpenCode RPC: {e}",
         }
 
 
@@ -2261,7 +2479,71 @@ def get_latest_output(
             "category": "recent_output",
         })
 
+    # 额外扫描 runtime/config/opencode/skills/ 中最近修改的 .md 文件
+    runtime_skills_dir = os.path.join(
+        _workspace_runtime_config_dir(workdir), "opencode", "skills"
+    )
+    if os.path.isdir(runtime_skills_dir):
+        import glob as _glob
+        md_files = _glob.glob(os.path.join(runtime_skills_dir, "*.md"))
+        # 按修改时间倒序
+        md_files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        for md_path in md_files[:limit]:
+            if len(result) >= limit:
+                break
+            if md_path in seen_paths:
+                continue
+            seen_paths.add(md_path)
+            try:
+                with open(md_path, encoding="utf-8", errors="replace") as f:
+                    content = f.read(500_000)
+                result.append({
+                    "path": md_path,
+                    "filename": os.path.basename(md_path),
+                    "content": content,
+                    "tool": "skill_file",
+                    "session_title": "",
+                    "exists_on_disk": True,
+                    "category": "runtime_skill",
+                })
+            except Exception:
+                pass
+
     return result
+
+
+# ─── GET /output-files — 平台产物唯一目录枚举 ─────────────────────────────────
+
+@router.get("/output-files")
+def dev_studio_output_files(
+    user: User = Depends(get_current_user),
+):
+    """枚举 project/output/ 下的产物文件。这是平台可下载/可保存 Skill 的唯一来源。"""
+    workdir = _user_workdir(user)
+    output_dir = os.path.join(workdir, "output")
+    if not os.path.isdir(output_dir):
+        return {"items": []}
+
+    items = []
+    for fname in sorted(os.listdir(output_dir)):
+        fpath = os.path.join(output_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+        stat = os.stat(fpath)
+        # 分类推断
+        ext = os.path.splitext(fname)[1].lower()
+        category = "skill" if ext == ".md" else "code" if ext in (".py", ".ts", ".js", ".json") else "other"
+        import datetime as _dt
+        items.append({
+            "path": f"output/{fname}",
+            "name": fname,
+            "size": stat.st_size,
+            "updated_at": _dt.datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            "category": category,
+        })
+    # 按修改时间倒序
+    items.sort(key=lambda x: x["updated_at"], reverse=True)
+    return {"items": items}
 
 
 # ─── Tool Task (from Skill Studio) ────────────────────────────────────────────
@@ -2384,13 +2666,21 @@ def save_skill(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """整体成果保存为 Skill：支持选择文件包 + 名字 + 描述。"""
+    """整体成果保存为 Skill：优先从 project/output/ 读取文件（唯一正式产物目录）。"""
     workdir = _user_workdir(user)
+    output_dir = os.path.join(workdir, "output")
 
-    # 读取选中文件的内容，存入 source_files JSON
+    # 读取选中文件的内容
+    # 优先级：project/output/ → project/ 内原路径（兼容迁移期）
     file_entries: list[dict] = []
     for rel_path in (req.source_files or []):
-        abs_path = _safe_path(workdir, rel_path)
+        # 先在 output/ 下查找
+        stripped = os.path.basename(rel_path)  # 支持 "output/xxx.md" 或 "xxx.md"
+        output_path = os.path.join(output_dir, stripped)
+        if os.path.isfile(output_path):
+            abs_path = output_path
+        else:
+            abs_path = _safe_path(workdir, rel_path)
         if os.path.isfile(abs_path):
             try:
                 with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
@@ -3178,7 +3468,7 @@ def read_file(path: str, user: User = Depends(get_current_user)):
 
 @router.get("/workdir/download")
 def workdir_download(path: str, user: User = Depends(get_current_user)):
-    """下载 workdir 内的单个文件到本地。"""
+    """下载 workdir 内的单个文件到本地。正常路径：project/（含 output/）。"""
     from fastapi.responses import FileResponse
     workdir = _user_workdir(user)
     target = _safe_path(workdir, path)

@@ -37,8 +37,12 @@ class StudioEntryResolution:
     needs_recover: bool
     recent_conversation_ids: list  # le-desk Conversation 的 id（兼容历史）
     last_active_at: Optional[str]  # ISO 格式最近活跃时间
-    opencode_sessions: list  # opencode.db 中的全量 session 摘要
-    opencode_session_count: int  # opencode.db session 总数
+    # session 概要（entry 只给总数和健康状态，详情走 GET /sessions）
+    session_total: int = 0
+    session_db_health: str = "unknown"  # healthy | degraded | missing | error
+    session_db_source: str = "missing"  # runtime_data | migrated | missing
+    session_db_path: Optional[str] = None
+    migration_state: str = "none"  # none | migrated | needs_repair | error
 
 
 def resolve_entry(
@@ -143,8 +147,8 @@ def resolve_entry(
 
     needs_recover = reg.runtime_status in ("stopped", "unhealthy")
 
-    # 读取 opencode.db 真实 session 列表
-    opencode_sessions, opencode_session_count = _read_opencode_sessions(reg.workspace_root)
+    # 探测 session db 状态（含一次性迁移）
+    probe = probe_session_db(reg.workspace_root)
 
     return StudioEntryResolution(
         registration_id=reg.id,
@@ -157,8 +161,11 @@ def resolve_entry(
         needs_recover=needs_recover,
         recent_conversation_ids=recent_conversation_ids,
         last_active_at=reg.last_active_at.isoformat() if reg.last_active_at else None,
-        opencode_sessions=opencode_sessions,
-        opencode_session_count=opencode_session_count,
+        session_total=probe.total,
+        session_db_health=probe.db_health,
+        session_db_source=probe.db_source,
+        session_db_path=probe.db_path,
+        migration_state=probe.migration_state,
     )
 
 
@@ -511,37 +518,145 @@ def migrate_skill_conversations(db: Session, user: User) -> dict:
     return {"migrated": migrated, "skills": list(skill_ids_seen)}
 
 
-def _read_opencode_sessions(workspace_root: str, limit: int = 20) -> tuple[list, int]:
-    """读取 opencode.db 的 session 摘要，返回 (最近 N 条 session, 总数)。
+def migrate_legacy_session_db(workspace_root: str) -> str:
+    """一次性迁移 legacy opencode.db 到 runtime/data/ 唯一路径。
 
-    使用聚合 SQL 一次性获取 message count，不逐 session 查询。
-    不修改任何数据，纯只读。失败时返回空列表。
+    返回迁移状态: "none" | "migrated" | "needs_repair" | "error"
+    - none: legacy 不存在，无需迁移
+    - migrated: 本次或之前已迁移成功
+    - needs_repair: 两边都存在且不一致
+    - error: 迁移过程出错
+    """
+    import os
+    import shutil
+
+    canonical = os.path.join(workspace_root, "runtime", "data", "opencode", "opencode.db")
+    legacy = os.path.join(workspace_root, ".local", "share", "opencode", "opencode.db")
+
+    legacy_exists = os.path.exists(legacy)
+    canonical_exists = os.path.exists(canonical)
+
+    if not legacy_exists:
+        return "none"
+
+    if not canonical_exists:
+        # legacy 存在、canonical 不存在 → 迁移
+        try:
+            os.makedirs(os.path.dirname(canonical), exist_ok=True)
+            shutil.copy2(legacy, canonical)
+            # 同时迁移 WAL/SHM
+            for suffix in ("-wal", "-shm"):
+                src = legacy + suffix
+                if os.path.exists(src):
+                    shutil.copy2(src, canonical + suffix)
+            logger.info(f"[SessionDB] 迁移成功: {legacy} → {canonical}")
+            return "migrated"
+        except Exception as e:
+            logger.error(f"[SessionDB] 迁移失败: {e}")
+            return "error"
+
+    # 两边都存在 → 一致性检测
+    try:
+        import sqlite3
+        con_new = sqlite3.connect(canonical, timeout=5)
+        con_old = sqlite3.connect(legacy, timeout=5)
+        new_count = con_new.execute("SELECT COUNT(*) FROM session").fetchone()[0]
+        old_count = con_old.execute("SELECT COUNT(*) FROM session").fetchone()[0]
+        con_new.close()
+        con_old.close()
+        if new_count >= old_count:
+            # canonical 是超集或相等，视为已迁移
+            return "migrated"
+        else:
+            # canonical 比 legacy 少，说明可能漂移了
+            logger.warning(
+                f"[SessionDB] 一致性异常: canonical={new_count} < legacy={old_count}，标记 needs_repair"
+            )
+            return "needs_repair"
+    except Exception as e:
+        logger.error(f"[SessionDB] 一致性检测失败: {e}")
+        return "needs_repair"
+
+
+@dataclass
+class SessionDBProbe:
+    """session db 探测结果。"""
+    db_path: Optional[str]
+    db_health: str  # healthy | missing | error
+    db_source: str  # runtime_data | missing
+    total: int
+    error: Optional[str]
+    migration_state: str  # none | migrated | needs_repair | error
+
+
+def probe_session_db(workspace_root: str) -> SessionDBProbe:
+    """探测 session db 状态并返回诊断结果。唯一读取路径：runtime/data/opencode/opencode.db。"""
+    import os
+    import sqlite3
+
+    # 先做迁移
+    migration_state = migrate_legacy_session_db(workspace_root)
+
+    canonical = os.path.join(workspace_root, "runtime", "data", "opencode", "opencode.db")
+    if not os.path.exists(canonical):
+        return SessionDBProbe(
+            db_path=None, db_health="missing", db_source="missing",
+            total=0, error=None, migration_state=migration_state,
+        )
+
+    try:
+        con = sqlite3.connect(canonical, timeout=5)
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        if "session" not in tables:
+            con.close()
+            return SessionDBProbe(
+                db_path=canonical, db_health="healthy", db_source="runtime_data",
+                total=0, error=None, migration_state=migration_state,
+            )
+        total = con.execute("SELECT COUNT(*) FROM session").fetchone()[0]
+        con.close()
+        health = "healthy" if migration_state != "needs_repair" else "degraded"
+        return SessionDBProbe(
+            db_path=canonical, db_health=health, db_source="runtime_data",
+            total=total, error=None, migration_state=migration_state,
+        )
+    except Exception as e:
+        return SessionDBProbe(
+            db_path=canonical, db_health="error", db_source="runtime_data",
+            total=0, error=f"{type(e).__name__}: {e}", migration_state=migration_state,
+        )
+
+
+def read_opencode_sessions(
+    workspace_root: str, page: int = 1, page_size: int = 20,
+) -> tuple[list, int, SessionDBProbe]:
+    """分页读取 opencode.db 的 session 摘要。唯一路径：runtime/data/opencode/opencode.db。
+
+    返回: (sessions, total, probe)
     """
     import os
     import sqlite3
 
-    from app.routers.dev_studio import _user_opencode_db_path
-
-    db_path = _user_opencode_db_path(workspace_root)
-    if not db_path or not os.path.exists(db_path):
-        return [], 0
+    probe = probe_session_db(workspace_root)
+    if not probe.db_path or probe.db_health in ("missing", "error"):
+        return [], 0, probe
 
     try:
-        con = sqlite3.connect(db_path, timeout=5)
+        con = sqlite3.connect(probe.db_path, timeout=5)
         con.row_factory = sqlite3.Row
 
         tables = {r[0] for r in con.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()}
-
         if "session" not in tables:
             con.close()
-            return [], 0
+            return [], 0, probe
 
-        # 总数
         total = con.execute("SELECT COUNT(*) FROM session").fetchone()[0]
+        offset = (page - 1) * page_size
 
-        # 聚合 SQL：LEFT JOIN message 一次性获取每个 session 的 message count
         has_message = "message" in tables
         if has_message:
             rows = con.execute(
@@ -549,15 +664,15 @@ def _read_opencode_sessions(workspace_root: str, limit: int = 20) -> tuple[list,
                 "s.time_created, s.time_updated, COUNT(m.id) AS msg_count "
                 "FROM session s LEFT JOIN message m ON m.session_id = s.id "
                 "GROUP BY s.id "
-                "ORDER BY s.time_updated DESC LIMIT ?",
-                (limit,),
+                "ORDER BY s.time_updated DESC LIMIT ? OFFSET ?",
+                (page_size, offset),
             ).fetchall()
         else:
             rows = con.execute(
                 "SELECT id, title, directory, project_id, "
                 "time_created, time_updated, 0 AS msg_count "
-                "FROM session ORDER BY time_updated DESC LIMIT ?",
-                (limit,),
+                "FROM session ORDER BY time_updated DESC LIMIT ? OFFSET ?",
+                (page_size, offset),
             ).fetchall()
 
         sessions = [
@@ -573,7 +688,8 @@ def _read_opencode_sessions(workspace_root: str, limit: int = 20) -> tuple[list,
         ]
 
         con.close()
-        return sessions, total
+        return sessions, total, probe
     except Exception as e:
-        logger.debug(f"[StudioRegistry] 读取 opencode.db session 失败: {workspace_root}: {e}")
-        return [], 0
+        probe.db_health = "error"
+        probe.error = f"{type(e).__name__}: {e}"
+        return [], 0, probe
