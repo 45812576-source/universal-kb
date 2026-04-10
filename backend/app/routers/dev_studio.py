@@ -181,13 +181,14 @@ def _user_opencode_db_path(workdir: str) -> Optional[str]:
 
 
 def _sanitize_opencode_db(workdir: str, project_dir: str) -> None:
-    """启动前修正 opencode.db 中 global project 的 worktree 指向。
+    """启动前对 opencode.db 做最小防御性修正。
 
-    【重要】不修改已有 session 的 directory 和 project_id。
-    历史 session 保留原始 directory 上下文，OpenCode UI 依赖这些值区分不同 session。
-    只做以下最小修正：
-    - 确保 global project 的 worktree 指向当前正确的 project_dir
-    - 将 project_id 为空的 session 归入 global（防止 orphan session 不可见）
+    【关键约束】不修改 project.worktree 和 session.directory。
+    OpenCode 运行时会自行管理这两个字段，外部修改会导致 worktree/directory 不匹配，
+    session 列表消失。只做以下安全操作：
+    - 确保 global project 记录存在（首次启动时可能还没有）
+    - 删除非 global 的脏 project 记录（如旧路径残留的 /home/mo/ai-ideas 等）
+    - 将 project_id 为空的 orphan session 归入 global
     """
     db_path = _user_opencode_db_path(workdir)
     if not db_path or not os.path.exists(db_path):
@@ -203,25 +204,22 @@ def _sanitize_opencode_db(workdir: str, project_dir: str) -> None:
             ).fetchall()}
             changed = False
             if "project" in tables:
-                # 确保 global project 存在且 worktree 正确
+                # 确保 global project 存在（首次启动场景）
                 row = con.execute("SELECT worktree FROM project WHERE id='global'").fetchone()
                 if row is None:
-                    # global project 不存在，创建之
                     con.execute(
                         "INSERT INTO project (id, worktree) VALUES ('global', ?)",
                         (project_dir,),
                     )
                     logger.info(f"[SanitizeDB] 创建 global project: {project_dir}")
                     changed = True
-                elif row[0] != project_dir:
-                    con.execute(
-                        "UPDATE project SET worktree=? WHERE id='global'",
-                        (project_dir,),
-                    )
-                    logger.info(f"[SanitizeDB] 修正 global worktree: {row[0]} -> {project_dir}")
+                # 删除非 global 的脏 project 记录
+                cur = con.execute("DELETE FROM project WHERE id != 'global'")
+                if cur.rowcount > 0:
+                    logger.info(f"[SanitizeDB] 删除 {cur.rowcount} 条非 global project 记录")
                     changed = True
             if "session" in tables:
-                # 只修复 project_id 为空的 orphan session，不动其他 session 的 directory
+                # 只修复 project_id 为空的 orphan session，不动 directory
                 cur = con.execute(
                     "UPDATE session SET project_id='global' WHERE project_id IS NULL OR project_id=''",
                 )
