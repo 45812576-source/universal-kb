@@ -852,55 +852,61 @@ async def _idle_reaper() -> None:
 
 
 def _kill_orphan_opencode_procs():
-    """Startup: 扫描遗留 opencode 进程，通过 cwd 认领而非无条件杀死。"""
+    """Startup: 杀掉未托管的遗留 opencode 进程树，避免 orphan 常驻撑爆内存。"""
     import logging as _log, signal as _sig, subprocess as _sp, re as _re
     logger = _log.getLogger(__name__)
+
+    def _kill_pid_tree(_pid: int) -> None:
+        try:
+            _children = _sp.run(["pgrep", "-P", str(_pid)], capture_output=True, text=True, timeout=5)
+            for _child in _children.stdout.strip().splitlines():
+                if _child.strip().isdigit():
+                    _kill_pid_tree(int(_child.strip()))
+        except Exception:
+            pass
+        try:
+            os.kill(_pid, _sig.SIGKILL)
+        except Exception:
+            pass
+
     try:
-        result = _sp.run(["pgrep", "-f", ".opencode web"],
-                         capture_output=True, text=True, timeout=5)
+        managed_pids = set()
+        for _inst in _user_instances.values():
+            _p = _inst.get("proc")
+            if _p and _p.returncode is None:
+                managed_pids.add(_p.pid)
+
+        result = _sp.run(["pgrep", "-f", ".opencode web"], capture_output=True, text=True, timeout=5)
         for line in result.stdout.strip().splitlines():
             try:
                 pid = int(line.strip())
             except ValueError:
                 continue
+            if pid in managed_pids:
+                continue
             try:
                 cwd = os.readlink(f"/proc/{pid}/cwd")
             except Exception:
                 cwd = "unknown"
-            # 通过 cwd 提取 user_id，尝试认领到 _user_instances
+            _uid = None
             _m = _re.search(r"user_(\d+)", cwd)
             if _m:
                 _uid = int(_m.group(1))
-                if _uid not in _user_instances:
-                    _startup_port = _port_for_user(_uid)
-                    _user_instances[_uid] = {
-                        "proc": None,
-                        "port": _startup_port,
-                        "workdir": None,
-                        "lock": asyncio.Lock(),
-                        "last_active": _time.time(),
-                    }
-                    # 同步注册表
-                    try:
-                        from app.database import SessionLocal as _SSL
-                        from app.services.studio_registry import update_runtime_status as _s_urt
-                        _sdb = _SSL()
-                        try:
-                            _s_urt(_sdb, _uid, "opencode", "running", port=_startup_port)
-                        finally:
-                            _sdb.close()
-                    except Exception:
-                        pass
-                    logger.info(f"[Startup] 认领遗留进程 user={_uid} pid={pid} cwd={cwd}，注册表已同步")
-                else:
-                    logger.debug(f"[Startup] pid={pid} 属于已托管 user={_uid}，跳过")
-            else:
-                # cwd 无法识别用户，真正的游离进程
-                logger.warning(f"[Startup] orphan pid={pid} cwd={cwd}, killing")
+            logger.warning(f"[Startup] orphan pid={pid} cwd={cwd}, killing whole tree")
+            _kill_pid_tree(pid)
+            if _uid is not None:
                 try:
-                    os.kill(pid, _sig.SIGKILL)
+                    from app.database import SessionLocal as _SSL
+                    from app.services.studio_registry import update_runtime_status as _s_urt
+                    _sdb = _SSL()
+                    try:
+                        _s_urt(_sdb, _uid, "opencode", "stopped", port=None)
+                    finally:
+                        _sdb.close()
                 except Exception:
                     pass
+                if _uid in _user_instances:
+                    _user_instances[_uid]["proc"] = None
     except Exception as e:
         logger.debug(f"[Startup] orphan scan failed: {e}")
 

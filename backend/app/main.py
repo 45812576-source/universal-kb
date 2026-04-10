@@ -82,6 +82,13 @@ async def shutdown_event():
 async def startup_event():
     """Start background schedulers on app startup."""
     try:
+        from app.routers.dev_studio import _kill_orphan_opencode_procs
+        _kill_orphan_opencode_procs()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"OpenCode orphan cleanup failed: {e}")
+
+    try:
         from app.services.intel_scheduler import start_intel_scheduler
         start_intel_scheduler()
     except Exception as e:
