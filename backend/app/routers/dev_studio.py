@@ -2520,7 +2520,7 @@ def dev_studio_output_files(
 ):
     """枚举 project/output/ 下的产物文件。这是平台可下载/可保存 Skill 的唯一来源。"""
     workdir = _user_workdir(user)
-    output_dir = os.path.join(workdir, "output")
+    output_dir = os.path.join(_workspace_project_dir(workdir), "output")
     if not os.path.isdir(output_dir):
         return {"items": []}
 
@@ -2668,7 +2668,8 @@ def save_skill(
 ):
     """整体成果保存为 Skill：优先从 project/output/ 读取文件（唯一正式产物目录）。"""
     workdir = _user_workdir(user)
-    output_dir = os.path.join(workdir, "output")
+    project_dir = _workspace_project_dir(workdir)
+    output_dir = os.path.join(project_dir, "output")
 
     # 读取选中文件的内容
     # 优先级：project/output/ → project/ 内原路径（兼容迁移期）
@@ -2680,7 +2681,7 @@ def save_skill(
         if os.path.isfile(output_path):
             abs_path = output_path
         else:
-            abs_path = _safe_path(workdir, rel_path)
+            abs_path = _safe_path(project_dir, rel_path)
         if os.path.isfile(abs_path):
             try:
                 with open(abs_path, "r", encoding="utf-8", errors="replace") as f:

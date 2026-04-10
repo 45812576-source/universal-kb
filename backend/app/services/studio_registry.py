@@ -529,9 +529,31 @@ def migrate_legacy_session_db(workspace_root: str) -> str:
     """
     import os
     import shutil
+    import sqlite3
+    import time
 
     canonical = os.path.join(workspace_root, "runtime", "data", "opencode", "opencode.db")
     legacy = os.path.join(workspace_root, ".local", "share", "opencode", "opencode.db")
+
+    def _copy_db_family(src: str, dst: str) -> None:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        for suffix in ("-wal", "-shm"):
+            src_sidecar = src + suffix
+            dst_sidecar = dst + suffix
+            if os.path.exists(src_sidecar):
+                shutil.copy2(src_sidecar, dst_sidecar)
+            elif os.path.exists(dst_sidecar):
+                os.remove(dst_sidecar)
+
+    def _session_stats(path: str) -> tuple[int, int]:
+        con = sqlite3.connect(path, timeout=5)
+        try:
+            count = con.execute("SELECT COUNT(*) FROM session").fetchone()[0]
+            latest = con.execute("SELECT COALESCE(MAX(time_updated), 0) FROM session").fetchone()[0] or 0
+            return int(count), int(latest)
+        finally:
+            con.close()
 
     legacy_exists = os.path.exists(legacy)
     canonical_exists = os.path.exists(canonical)
@@ -542,13 +564,7 @@ def migrate_legacy_session_db(workspace_root: str) -> str:
     if not canonical_exists:
         # legacy 存在、canonical 不存在 → 迁移
         try:
-            os.makedirs(os.path.dirname(canonical), exist_ok=True)
-            shutil.copy2(legacy, canonical)
-            # 同时迁移 WAL/SHM
-            for suffix in ("-wal", "-shm"):
-                src = legacy + suffix
-                if os.path.exists(src):
-                    shutil.copy2(src, canonical + suffix)
+            _copy_db_family(legacy, canonical)
             logger.info(f"[SessionDB] 迁移成功: {legacy} → {canonical}")
             return "migrated"
         except Exception as e:
@@ -557,22 +573,27 @@ def migrate_legacy_session_db(workspace_root: str) -> str:
 
     # 两边都存在 → 一致性检测
     try:
-        import sqlite3
-        con_new = sqlite3.connect(canonical, timeout=5)
-        con_old = sqlite3.connect(legacy, timeout=5)
-        new_count = con_new.execute("SELECT COUNT(*) FROM session").fetchone()[0]
-        old_count = con_old.execute("SELECT COUNT(*) FROM session").fetchone()[0]
-        con_new.close()
-        con_old.close()
-        if new_count >= old_count:
+        new_count, new_latest = _session_stats(canonical)
+        old_count, old_latest = _session_stats(legacy)
+        if new_count > old_count or (new_count == old_count and new_latest >= old_latest):
             # canonical 是超集或相等，视为已迁移
             return "migrated"
-        else:
-            # canonical 比 legacy 少，说明可能漂移了
-            logger.warning(
-                f"[SessionDB] 一致性异常: canonical={new_count} < legacy={old_count}，标记 needs_repair"
-            )
-            return "needs_repair"
+
+        # canonical 比 legacy 少，或同数量但更旧：自动修复为 legacy 最新快照
+        backup = f"{canonical}.bak.{int(time.time())}"
+        try:
+            shutil.copy2(canonical, backup)
+        except Exception:
+            backup = ""
+
+        _copy_db_family(legacy, canonical)
+        logger.warning(
+            "[SessionDB] 检测到 canonical 落后，已自动修复: "
+            f"legacy_count={old_count}, canonical_count={new_count}, "
+            f"legacy_latest={old_latest}, canonical_latest={new_latest}, "
+            f"backup={backup or 'none'}"
+        )
+        return "migrated"
     except Exception as e:
         logger.error(f"[SessionDB] 一致性检测失败: {e}")
         return "needs_repair"
