@@ -2275,23 +2275,24 @@ async def dev_studio_session_resume(
     """恢复到指定 OpenCode session。
 
     通过 OpenCode RPC 调 session/set，不再由前端直接打不稳定 RPC。
-    失败时返回具体错误码和信息。
+    如果 opencode 未运行，自动启动后再切换。
     """
-    from app.services.studio_registry import get_registration
-
-    reg = get_registration(db, user.id, "opencode")
-    if not reg or not reg.runtime_port:
+    # 确保 opencode 在跑（未运行会自动启动）
+    try:
+        result = await _ensure_user_instance(user.id, user.display_name or "")
+        port = result["port"]
+    except HTTPException as e:
         return {
             "ok": False,
             "resumed_session_id": None,
-            "runtime_status": reg.runtime_status if reg else "stopped",
-            "error_code": "runtime_not_running",
-            "error_message": "OpenCode 运行时未启动，无法恢复会话",
+            "runtime_status": "stopped",
+            "error_code": "runtime_start_failed",
+            "error_message": f"OpenCode 启动失败: {e.detail}",
         }
 
     # 调 OpenCode RPC
     import httpx
-    rpc_url = f"http://127.0.0.1:{reg.runtime_port}/session/set"
+    rpc_url = f"http://127.0.0.1:{port}/session/set"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(rpc_url, json={"id": session_id})
