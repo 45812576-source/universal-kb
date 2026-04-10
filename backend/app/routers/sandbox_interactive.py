@@ -1605,6 +1605,16 @@ def _sync_memo_from_evaluation(session: SandboxTestSession, evaluation: dict, re
         structured_issues = report.part3_evaluation.get("issues")
         structured_fix_plan = report.part3_evaluation.get("fix_plan_structured")
 
+    # 提取未通过维度作为 blocking_reasons
+    blocking_reasons = []
+    if not session.approval_eligible:
+        if not session.quality_passed:
+            blocking_reasons.append("quality")
+        if not session.usability_passed:
+            blocking_reasons.append("usability")
+        if not session.anti_hallucination_passed:
+            blocking_reasons.append("anti_hallucination")
+
     record_test_result(
         db=db,
         skill_id=session.target_id,
@@ -1618,6 +1628,8 @@ def _sync_memo_from_evaluation(session: SandboxTestSession, evaluation: dict, re
         structured_issues=structured_issues,
         structured_fix_plan=structured_fix_plan,
         source_report_id=report.id if report else None,
+        approval_eligible=session.approval_eligible,
+        blocking_reasons=blocking_reasons if blocking_reasons else None,
     )
 
 
@@ -1872,6 +1884,7 @@ async def get_report(
         "report_hash": report.report_hash,
         "knowledge_entry_id": report.knowledge_entry_id,
         "created_at": report.created_at.isoformat() if report.created_at else None,
+        "supporting_findings": (report.part3_evaluation or {}).get("supporting_findings", []),
     }
 
 
@@ -2149,6 +2162,7 @@ async def submit_approval(
 
     # 创建审批请求
     from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus
+    from app.models.user import User as UserModel, Role, Department
 
     existing = db.query(ApprovalRequest).filter(
         ApprovalRequest.target_id == session.target_id,
@@ -2159,6 +2173,56 @@ async def submit_approval(
         raise HTTPException(400, "已有待审批的发布请求")
 
     req_type = ApprovalRequestType.SKILL_PUBLISH if session.target_type == "skill" else ApprovalRequestType.TOOL_PUBLISH
+
+    # ── 显式解析审批人 ──
+    assigned_approver_id = None
+    assigned_approver_name = None
+    routing_reason = ""
+    approval_stage = "dept_pending"
+
+    if user.department_id:
+        dept_admin = (
+            db.query(UserModel)
+            .filter(
+                UserModel.role == Role.DEPT_ADMIN,
+                UserModel.managed_department_id == user.department_id,
+                UserModel.is_active == True,
+            )
+            .first()
+        )
+        if dept_admin:
+            assigned_approver_id = dept_admin.id
+            assigned_approver_name = dept_admin.display_name
+            approval_stage = "dept_pending"
+            routing_reason = f"路由到部门管理员 {dept_admin.display_name}"
+        else:
+            # 部门无 DEPT_ADMIN，fallback 到 SUPER_ADMIN
+            super_admin = (
+                db.query(UserModel)
+                .filter(UserModel.role == Role.SUPER_ADMIN, UserModel.is_active == True)
+                .first()
+            )
+            if super_admin:
+                assigned_approver_id = super_admin.id
+                assigned_approver_name = super_admin.display_name
+                approval_stage = "super_pending"
+                routing_reason = f"部门无管理员，路由到超级管理员 {super_admin.display_name}"
+            else:
+                raise HTTPException(400, "未配置审批路由：无部门管理员且无超级管理员")
+    else:
+        # requester 无部门，直接找 SUPER_ADMIN
+        super_admin = (
+            db.query(UserModel)
+            .filter(UserModel.role == Role.SUPER_ADMIN, UserModel.is_active == True)
+            .first()
+        )
+        if super_admin:
+            assigned_approver_id = super_admin.id
+            assigned_approver_name = super_admin.display_name
+            approval_stage = "super_pending"
+            routing_reason = f"提交人无部门，路由到超级管理员 {super_admin.display_name}"
+        else:
+            raise HTTPException(400, "未配置审批路由：无超级管理员")
 
     sandbox_scan_data = {
         "sandbox_test_session_id": session.id,
@@ -2181,6 +2245,8 @@ async def submit_approval(
         target_type=session.target_type,
         requester_id=user.id,
         status=ApprovalStatus.PENDING,
+        stage=approval_stage,
+        assigned_approver_id=assigned_approver_id,
         security_scan_result=sandbox_scan_data,
         # Gap 4: 沙盒-审批强绑定
         sandbox_report_id=report.id if report else None,
@@ -2227,10 +2293,19 @@ async def submit_approval(
 
         asyncio.create_task(_run_scan(approval.id, session.target_id, sandbox_scan_data))
 
+    # 审计日志
+    logger.info(
+        f"审批路由: approval={approval.id} session={session.id} "
+        f"approver={assigned_approver_id} stage={approval_stage} reason={routing_reason}"
+    )
+
     return {
         "approval_request_id": approval.id,
         "session_id": session.id,
         "report_id": session.report_id,
+        "assigned_approver_id": assigned_approver_id,
+        "assigned_approver_name": assigned_approver_name,
+        "routing_reason": routing_reason,
     }
 
 
@@ -2722,6 +2797,7 @@ def _serialize_session(session: SandboxTestSession) -> dict:
         "report_id": session.report_id,
         "step_statuses": session.step_statuses,
         "parent_session_id": session.parent_session_id,
+        "final_status": "passed" if session.approval_eligible else "failed" if session.approval_eligible is not None else None,
         "created_at": session.created_at.isoformat() if session.created_at else None,
         "completed_at": session.completed_at.isoformat() if session.completed_at else None,
     }

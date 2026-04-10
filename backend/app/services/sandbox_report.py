@@ -196,6 +196,93 @@ def _extract_structured_fix_plan(
     return fix_items
 
 
+def _extract_supporting_findings(
+    evaluation: dict,
+    cases: list[SandboxTestCase],
+) -> list[dict]:
+    """从 evaluation 中提取 supporting 结论（辅助性洞察），包括通过项的亮点和各维度的补充结论。"""
+    findings: list[dict] = []
+
+    quality_detail = evaluation.get("quality_detail", {})
+
+    # 1. 从 case_scores 中提取 supporting 结论：分数 >= 70 但有改进空间的用例
+    for i, cs in enumerate(quality_detail.get("case_scores", [])):
+        score = cs.get("score", 0)
+        reason = cs.get("reason", "")
+        if not reason:
+            continue
+
+        # 只提取有实质性结论的用例（有 reason 且 score 有值）
+        deductions = cs.get("deductions", [])
+        if score >= 70 and deductions:
+            # 通过但有扣分 = supporting 结论（有改进空间）
+            evidence = []
+            if i < len(cases):
+                c = cases[i]
+                if c.llm_response:
+                    evidence.append(c.llm_response[:300])
+
+            findings.append({
+                "id": f"sf_{uuid.uuid4().hex[:8]}",
+                "title": f"用例 #{i} 综合 {score} 分 — 有改进空间",
+                "conclusion": reason,
+                "detail": "; ".join(
+                    f"[{d.get('dimension', '')}] -{d.get('points', 0)}分: {d.get('reason', '')}"
+                    for d in deductions
+                ),
+                "evidence_snippets": evidence,
+                "source_case_indexes": [i],
+                "severity": "info" if score >= 85 else "minor",
+                "recommendation": deductions[0].get("fix_suggestion", "") if deductions else "",
+            })
+
+    # 2. 易用性维度 supporting：即使通过也提供维度详情
+    usability = evaluation.get("usability_detail", {})
+    if usability.get("input_burden_score") is not None:
+        scores_desc = (
+            f"输入负担 {usability.get('input_burden_score', 'N/A')}, "
+            f"首轮成功 {usability.get('first_turn_success_score', 'N/A')}, "
+            f"精简度 {usability.get('compact_answer_score', 'N/A')}, "
+            f"安全精简 {usability.get('safe_compact_answer_score', 'N/A')}"
+        )
+        usability_passed = evaluation.get("usability_passed", False)
+        finding = {
+            "id": f"sf_{uuid.uuid4().hex[:8]}",
+            "title": "易用性维度综合",
+            "conclusion": scores_desc,
+            "severity": "info" if usability_passed else "major",
+            "source_case_indexes": [],
+            "evidence_snippets": [],
+        }
+        if usability.get("reason"):
+            finding["detail"] = usability["reason"]
+        if usability.get("fix_suggestion"):
+            finding["recommendation"] = usability["fix_suggestion"]
+        findings.append(finding)
+
+    # 3. 反幻觉维度 supporting：通过的行为验证也作为 supporting 证据
+    anti_hal = evaluation.get("anti_hallucination_detail", {})
+    passed_behaviors = [bc for bc in anti_hal.get("behavior_checks", []) if bc.get("passed")]
+    if passed_behaviors:
+        findings.append({
+            "id": f"sf_{uuid.uuid4().hex[:8]}",
+            "title": f"反幻觉行为验证 — {len(passed_behaviors)} 项通过",
+            "conclusion": "; ".join(
+                f"场景: {bc.get('prompt', '')[:60]}... → 正确拒答"
+                for bc in passed_behaviors[:3]
+            ),
+            "severity": "info",
+            "source_case_indexes": [],
+            "evidence_snippets": [
+                bc.get("response_preview", "")[:200]
+                for bc in passed_behaviors[:3]
+                if bc.get("response_preview")
+            ],
+        })
+
+    return findings
+
+
 def _extract_top_issues(evaluation: dict) -> list[dict]:
     """从 evaluation 中聚合 top issues。"""
     issues = []
@@ -370,9 +457,10 @@ async def generate_report(
     top_issues = _extract_top_issues(evaluation)
     fix_plan = _extract_fix_plan(evaluation)
 
-    # 结构化问题清单 & 整改计划
+    # 结构化问题清单 & 整改计划 & supporting 结论
     structured_issues = _extract_structured_issues(evaluation, cases)
     structured_fix_plan = _extract_structured_fix_plan(structured_issues, evaluation)
+    supporting_findings = _extract_supporting_findings(evaluation, cases)
 
     # 重测建议: 从 issues 的 retest_scope 聚合
     retest_recommendations = []
@@ -409,6 +497,7 @@ async def generate_report(
         # 新增结构化字段
         "issues": structured_issues,
         "fix_plan_structured": structured_fix_plan,
+        "supporting_findings": supporting_findings,
         "retest_recommendations": retest_recommendations,
         "final_verdict": {
             "quality_passed": evaluation.get("quality_passed", False),
@@ -817,6 +906,24 @@ def _render_report_text(
         lines += ["### Fix Plan", ""]
         for i, fix in enumerate(fix_plan, 1):
             lines.append(f"  {i}. {fix}")
+        lines.append("")
+
+    # Supporting 结论
+    supporting = part3.get("supporting_findings", [])
+    if supporting:
+        lines += ["### Supporting 结论", ""]
+        for sf in supporting:
+            sev = sf.get("severity", "info").upper()
+            lines.append(f"- **[{sev}] {sf.get('title', '')}**")
+            if sf.get("conclusion"):
+                lines.append(f"  - 结论: {sf['conclusion']}")
+            if sf.get("detail"):
+                lines.append(f"  - 详情: {sf['detail']}")
+            if sf.get("recommendation"):
+                lines.append(f"  - 建议: {sf['recommendation']}")
+            if sf.get("evidence_snippets"):
+                for snippet in sf["evidence_snippets"][:2]:
+                    lines.append(f"  - 证据: {snippet[:150]}")
         lines.append("")
 
     # 最终判定
