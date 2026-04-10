@@ -181,14 +181,13 @@ def _user_opencode_db_path(workdir: str) -> Optional[str]:
 
 
 def _sanitize_opencode_db(workdir: str, project_dir: str) -> None:
-    """启动前对 opencode.db 做最小防御性修正。
+    """启动前修正 opencode.db 中 global project 的 worktree 指向。
 
-    【关键约束】不修改 project.worktree 和 session.directory。
-    OpenCode 运行时会自行管理这两个字段，外部修改会导致 worktree/directory 不匹配，
-    session 列表消失。只做以下安全操作：
-    - 确保 global project 记录存在（首次启动时可能还没有）
-    - 删除非 global 的脏 project 记录（如旧路径残留的 /home/mo/ai-ideas 等）
-    - 将 project_id 为空的 orphan session 归入 global
+    【重要】不修改已有 session 的 directory 和 project_id。
+    历史 session 保留原始 directory 上下文，OpenCode UI 依赖这些值区分不同 session。
+    只做以下最小修正：
+    - 确保 global project 的 worktree 指向当前正确的 project_dir
+    - 将 project_id 为空的 session 归入 global（防止 orphan session 不可见）
     """
     db_path = _user_opencode_db_path(workdir)
     if not db_path or not os.path.exists(db_path):
@@ -204,9 +203,10 @@ def _sanitize_opencode_db(workdir: str, project_dir: str) -> None:
             ).fetchall()}
             changed = False
             if "project" in tables:
-                # 确保 global project 存在（首次启动场景）
+                # 确保 global project 存在且 worktree 正确
                 row = con.execute("SELECT worktree FROM project WHERE id='global'").fetchone()
                 if row is None:
+                    # global project 不存在，创建之
                     con.execute(
                         "INSERT INTO project (id, worktree) VALUES ('global', ?)",
                         (project_dir,),
@@ -214,12 +214,12 @@ def _sanitize_opencode_db(workdir: str, project_dir: str) -> None:
                     logger.info(f"[SanitizeDB] 创建 global project: {project_dir}")
                     changed = True
                 # 删除非 global 的脏 project 记录
-                cur = con.execute("DELETE FROM project WHERE id != 'global'")
-                if cur.rowcount > 0:
-                    logger.info(f"[SanitizeDB] 删除 {cur.rowcount} 条非 global project 记录")
+                cur2 = con.execute("DELETE FROM project WHERE id != 'global'")
+                if cur2.rowcount > 0:
+                    logger.info(f"[SanitizeDB] 删除 {cur2.rowcount} 条非 global project 记录")
                     changed = True
             if "session" in tables:
-                # 只修复 project_id 为空的 orphan session，不动 directory
+                # 只修复 project_id 为空的 orphan session，不动其他 session 的 directory
                 cur = con.execute(
                     "UPDATE session SET project_id='global' WHERE project_id IS NULL OR project_id=''",
                 )
@@ -869,10 +869,23 @@ def _kill_orphan_opencode_procs():
 
     try:
         managed_pids = set()
-        for _inst in _user_instances.values():
+        managed_user_cwd_markers = set()
+
+        def _collect_pid_tree(_pid: int) -> None:
+            managed_pids.add(_pid)
+            try:
+                _children = _sp.run(["pgrep", "-P", str(_pid)], capture_output=True, text=True, timeout=5)
+                for _child in _children.stdout.strip().splitlines():
+                    if _child.strip().isdigit():
+                        _collect_pid_tree(int(_child.strip()))
+            except Exception:
+                pass
+
+        for _uid, _inst in _user_instances.items():
             _p = _inst.get("proc")
             if _p and _p.returncode is None:
-                managed_pids.add(_p.pid)
+                _collect_pid_tree(_p.pid)
+            managed_user_cwd_markers.add(f"user_{_uid}/")
 
         result = _sp.run(["pgrep", "-f", ".opencode web"], capture_output=True, text=True, timeout=5)
         for line in result.stdout.strip().splitlines():
@@ -886,6 +899,9 @@ def _kill_orphan_opencode_procs():
                 cwd = os.readlink(f"/proc/{pid}/cwd")
             except Exception:
                 cwd = "unknown"
+            if any(marker in cwd for marker in managed_user_cwd_markers):
+                logger.debug(f"[Startup] pid={pid} cwd={cwd} 属于已托管用户子进程，跳过")
+                continue
             _uid = None
             _m = _re.search(r"user_(\d+)", cwd)
             if _m:
@@ -1372,6 +1388,22 @@ async def _wait_ready(port: int, retries: int = 60) -> bool:
 async def _ensure_user_instance(user_id: int, display_name: str = "") -> dict:
     """确保该用户的 opencode web 实例在跑，返回 {port, url}。每用户独立进程+workdir+端口。"""
     global _instances_lock
+    try:
+        from app.database import SessionLocal as _EntrySL
+        from app.models.user import User as _EntryUser
+        from app.services.studio_registry import resolve_entry as _resolve_entry
+        _entry_db = _EntrySL()
+        try:
+            _entry_user = _entry_db.get(_EntryUser, user_id)
+            if _entry_user is not None:
+                _resolve_entry(_entry_db, _entry_user, "opencode")
+        finally:
+            _entry_db.close()
+    except Exception:
+        logging.getLogger(__name__).warning(
+            f"[_ensure_user_instance] user={user_id} 注册表预热失败",
+            exc_info=True,
+        )
     # 延迟初始化全局锁
     if _instances_lock is None:
         _instances_lock = asyncio.Lock()
@@ -2274,10 +2306,73 @@ async def dev_studio_session_resume(
 ):
     """恢复到指定 OpenCode session。
 
-    通过 opencode HTTP API 查询 session slug，返回给前端用于 iframe 导航。
-    如果 opencode 未运行，自动启动。
+    先验证 session 确实属于当前用户 workspace；如果 runtime 状态脏了，自动重启后重试一次。
     """
-    # 确保 opencode 在跑（未运行会自动启动）
+    from app.services.studio_registry import get_registration, resolve_entry, probe_session_db
+    import httpx
+    import sqlite3
+    import subprocess as _sp
+
+    entry = resolve_entry(db, user, "opencode")
+    reg = get_registration(db, user.id, "opencode")
+    workspace_root = reg.workspace_root if reg else entry.workspace_root
+    expected_port = _port_for_user(user.id)
+
+    probe = probe_session_db(workspace_root)
+    session_belongs_to_user = False
+    if probe.db_path:
+        try:
+            con = sqlite3.connect(probe.db_path, timeout=5)
+            try:
+                row = con.execute("SELECT id FROM session WHERE id = ? LIMIT 1", (session_id,)).fetchone()
+                session_belongs_to_user = row is not None
+            finally:
+                con.close()
+        except Exception:
+            session_belongs_to_user = False
+
+    if not session_belongs_to_user:
+        return {
+            "ok": False,
+            "resumed_session_id": None,
+            "slug": None,
+            "port": None,
+            "runtime_status": reg.runtime_status if reg else "stopped",
+            "error_code": "session_not_found",
+            "error_message": "这个历史会话不属于当前用户工作区，已阻止串线恢复",
+        }
+
+    async def _fetch_slug(port: int):
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"http://127.0.0.1:{port}/session/{session_id}")
+            if resp.status_code < 300:
+                data = resp.json()
+                return data.get("slug")
+            return None
+
+    async def _restart_runtime() -> None:
+        inst = _user_instances.get(user.id)
+        if inst:
+            proc = inst.get("proc")
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            inst["proc"] = None
+        try:
+            _lsof = _sp.run(["lsof", "-ti", f":{expected_port}"], capture_output=True, text=True, timeout=5)
+            for _pid_str in _lsof.stdout.strip().splitlines():
+                if _pid_str.strip().isdigit():
+                    try:
+                        os.kill(int(_pid_str.strip()), 9)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        _mark_registry_stopped(user.id)
+        await asyncio.sleep(1)
+
     try:
         result = await _ensure_user_instance(user.id, user.display_name or "")
         port = result["port"]
@@ -2286,44 +2381,51 @@ async def dev_studio_session_resume(
             "ok": False,
             "resumed_session_id": None,
             "slug": None,
+            "port": None,
             "runtime_status": "stopped",
             "error_code": "runtime_start_failed",
             "error_message": f"OpenCode 启动失败: {e.detail}",
         }
 
-    # 从 opencode HTTP API 获取 session slug（前端用 slug 导航 iframe）
-    import httpx
+    slug = None
+    runtime_error = None
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(f"http://127.0.0.1:{port}/session/{session_id}")
-            if resp.status_code < 300:
-                data = resp.json()
-                return {
-                    "ok": True,
-                    "resumed_session_id": session_id,
-                    "slug": data.get("slug"),
-                    "runtime_status": "running",
-                    "error_code": None,
-                    "error_message": None,
-                }
-            else:
-                return {
-                    "ok": False,
-                    "resumed_session_id": None,
-                    "slug": None,
-                    "runtime_status": "running",
-                    "error_code": "session_not_found",
-                    "error_message": f"Session 不存在或已删除",
-                }
+        slug = await _fetch_slug(port)
     except Exception as e:
+        runtime_error = str(e)
+
+    if not slug:
+        await _restart_runtime()
+        try:
+            retry = await _ensure_user_instance(user.id, user.display_name or "")
+            port = retry["port"]
+            slug = await _fetch_slug(port)
+        except HTTPException as e:
+            runtime_error = e.detail
+        except Exception as e:
+            runtime_error = str(e)
+
+    if slug:
         return {
-            "ok": False,
-            "resumed_session_id": None,
-            "slug": None,
+            "ok": True,
+            "resumed_session_id": session_id,
+            "slug": slug,
+            "port": port,
             "runtime_status": "running",
-            "error_code": "rpc_unavailable",
-            "error_message": f"无法连接 OpenCode: {e}",
+            "error_code": None,
+            "error_message": None,
         }
+
+    return {
+        "ok": False,
+        "resumed_session_id": None,
+        "slug": None,
+        "port": port,
+        "runtime_status": "running",
+        "error_code": "session_not_found",
+        "error_message": runtime_error or "历史 Session 在当前 runtime 中不可用，已自动重启仍未恢复",
+    }
+
 
 
 # ─── POST /restart — 强制重启当前用户的 opencode 实例 ─────────────────────────
