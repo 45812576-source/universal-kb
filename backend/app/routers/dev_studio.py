@@ -2320,12 +2320,15 @@ async def dev_studio_session_resume(
 
     probe = probe_session_db(workspace_root)
     session_belongs_to_user = False
+    session_directory = reg.project_dir if reg else entry.project_dir
     if probe.db_path:
         try:
             con = sqlite3.connect(probe.db_path, timeout=5)
             try:
-                row = con.execute("SELECT id FROM session WHERE id = ? LIMIT 1", (session_id,)).fetchone()
+                row = con.execute("SELECT id, directory FROM session WHERE id = ? LIMIT 1", (session_id,)).fetchone()
                 session_belongs_to_user = row is not None
+                if row and len(row) > 1 and row[1]:
+                    session_directory = row[1]
             finally:
                 con.close()
         except Exception:
@@ -2335,20 +2338,23 @@ async def dev_studio_session_resume(
         return {
             "ok": False,
             "resumed_session_id": None,
-            "slug": None,
+            "route_path": None,
             "port": None,
             "runtime_status": reg.runtime_status if reg else "stopped",
             "error_code": "session_not_found",
             "error_message": "这个历史会话不属于当前用户工作区，已阻止串线恢复",
         }
 
-    async def _fetch_slug(port: int):
+    def _encode_directory_route(directory: str) -> str:
+        encoded = base64.urlsafe_b64encode(directory.encode("utf-8")).decode("ascii")
+        return encoded.rstrip("=")
+
+    route_path = f"/{_encode_directory_route(session_directory)}/session/{session_id}"
+
+    async def _session_available(port: int) -> bool:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(f"http://127.0.0.1:{port}/session/{session_id}")
-            if resp.status_code < 300:
-                data = resp.json()
-                return data.get("slug")
-            return None
+            return resp.status_code < 300
 
     async def _restart_runtime() -> None:
         inst = _user_instances.get(user.id)
@@ -2380,36 +2386,37 @@ async def dev_studio_session_resume(
         return {
             "ok": False,
             "resumed_session_id": None,
-            "slug": None,
+            "route_path": None,
             "port": None,
             "runtime_status": "stopped",
             "error_code": "runtime_start_failed",
             "error_message": f"OpenCode 启动失败: {e.detail}",
         }
 
-    slug = None
+    session_ready = False
     runtime_error = None
     try:
-        slug = await _fetch_slug(port)
+        session_ready = await _session_available(port)
     except Exception as e:
         runtime_error = str(e)
 
-    if not slug:
+    if not session_ready:
         await _restart_runtime()
         try:
             retry = await _ensure_user_instance(user.id, user.display_name or "")
             port = retry["port"]
-            slug = await _fetch_slug(port)
+            session_ready = await _session_available(port)
         except HTTPException as e:
             runtime_error = e.detail
         except Exception as e:
             runtime_error = str(e)
 
-    if slug:
+    if session_ready:
         return {
             "ok": True,
             "resumed_session_id": session_id,
-            "slug": slug,
+            "route_path": route_path,
+            "directory": session_directory,
             "port": port,
             "runtime_status": "running",
             "error_code": None,
@@ -2419,7 +2426,7 @@ async def dev_studio_session_resume(
     return {
         "ok": False,
         "resumed_session_id": None,
-        "slug": None,
+        "route_path": None,
         "port": port,
         "runtime_status": "running",
         "error_code": "session_not_found",
