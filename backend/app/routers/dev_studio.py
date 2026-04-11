@@ -207,25 +207,26 @@ def _sanitize_opencode_db(workdir: str, project_dir: str) -> None:
                 # 确保 global project 存在且 worktree 正确
                 row = con.execute("SELECT worktree FROM project WHERE id='global'").fetchone()
                 if row is None:
-                    # global project 不存在，创建之
                     con.execute(
                         "INSERT INTO project (id, worktree) VALUES ('global', ?)",
                         (project_dir,),
                     )
                     logger.info(f"[SanitizeDB] 创建 global project: {project_dir}")
                     changed = True
-                # 删除非 global 的脏 project 记录
-                cur2 = con.execute("DELETE FROM project WHERE id != 'global'")
-                if cur2.rowcount > 0:
-                    logger.info(f"[SanitizeDB] 删除 {cur2.rowcount} 条非 global project 记录")
+                elif row[0] != project_dir:
+                    con.execute("UPDATE project SET worktree=? WHERE id='global'", (project_dir,))
+                    logger.info(f"[SanitizeDB] 更新 global worktree: {row[0]} → {project_dir}")
                     changed = True
+                # 不删除非 global project — opencode 可能创建了 worktree 等额外 project
+                # 只确保 global 存在，让下面的 session 归并处理保证可见性
             if "session" in tables:
-                # 只修复 project_id 为空的 orphan session，不动其他 session 的 directory
+                # 把所有 session 归入 global，确保每条 session 都可见
+                # （非 global project 的 session 因 project 记录被清理或不一致会在 UI 中消失）
                 cur = con.execute(
-                    "UPDATE session SET project_id='global' WHERE project_id IS NULL OR project_id=''",
+                    "UPDATE session SET project_id='global' WHERE project_id IS NULL OR project_id='' OR project_id != 'global'",
                 )
                 if cur.rowcount > 0:
-                    logger.info(f"[SanitizeDB] 修正 {cur.rowcount} 条 orphan session 归入 global")
+                    logger.info(f"[SanitizeDB] 归并 {cur.rowcount} 条 session 到 global project")
                     changed = True
             if changed:
                 con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -3002,6 +3003,115 @@ def save_skill(
         "status": skill.status.value,
         "approval_id": None,
     }
+
+
+# ─── Sync Workspace Skills → DB ──────────────────────────────────────────────
+
+@router.post("/sync-skills-from-workspace")
+def sync_skills_from_workspace(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """扫描用户 workspace 中 opencode 生成的 .md skill 文件，自动注册未入库的为 Draft Skill。
+
+    调用时机：Skill Studio 初始化时调用一次，确保文件系统与 DB 一致。
+    """
+    from app.models.skill import Skill, SkillStatus, SkillVersion
+
+    workdir = _user_workdir(user)
+    ws_root = os.path.dirname(workdir) if workdir.endswith("/project") else workdir
+
+    # opencode 生成的 skill 文件所在目录
+    runtime_skills_dir = os.path.join(ws_root, "runtime", "config", "opencode", "skills")
+    output_dir = os.path.join(workdir, "output")
+
+    # 内置 superpower skill 名称 — 跳过
+    _SUPERPOWER_NAMES = {
+        "dispatching-parallel-agents", "executing-plans", "finishing-a-development-branch",
+        "receiving-code-review", "requesting-code-review", "subagent-driven-development",
+        "test-driven-development", "using-git-worktrees", "using-superpowers",
+        "verification-before-completion", "writing-plans", "writing-skills",
+    }
+
+    # 收集所有候选 .md 文件（去重）
+    candidates: dict[str, str] = {}  # filename → abs_path
+    for scan_dir in [runtime_skills_dir, output_dir]:
+        if not os.path.isdir(scan_dir):
+            continue
+        for fname in os.listdir(scan_dir):
+            if not fname.endswith(".md") or fname.startswith("."):
+                continue
+            stem = fname[:-3]
+            if stem in _SUPERPOWER_NAMES:
+                continue
+            if fname not in candidates:
+                fpath = os.path.join(scan_dir, fname)
+                if os.path.isfile(fpath):
+                    candidates[fname] = fpath
+
+    if not candidates:
+        return {"synced": 0, "skipped": 0}
+
+    # 查询用户已有 Skill 的名称集合
+    existing_names = {
+        s.name for s in db.query(Skill.name).filter(Skill.created_by == user.id).all()
+    }
+    # 查询 source_files 中已引用的文件名
+    user_skills = db.query(Skill).filter(Skill.created_by == user.id).all()
+    existing_filenames = set()
+    for s in user_skills:
+        for sf in (s.source_files or []):
+            if isinstance(sf, dict):
+                existing_filenames.add(sf.get("filename", ""))
+                existing_filenames.add(os.path.basename(sf.get("path", "")))
+
+    synced = 0
+    skipped = 0
+    for fname, fpath in candidates.items():
+        # 跳过已注册的
+        skill_name = fname[:-3].replace("-", " ").replace("_", " ").strip()
+        if fname in existing_filenames or skill_name in existing_names:
+            skipped += 1
+            continue
+
+        # 读取内容
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read(500_000)
+        except Exception:
+            continue
+        if not content.strip():
+            continue
+
+        # 创建 Draft Skill
+        skill = Skill(
+            name=skill_name,
+            description=f"从工作区文件 {fname} 自动导入",
+            scope="personal",
+            mode="hybrid",
+            created_by=user.id,
+            status=SkillStatus.DRAFT,
+            auto_inject=False,
+            source_type="local",
+            source_files=[{"filename": fname, "path": fpath}],
+        )
+        db.add(skill)
+        db.flush()
+
+        version = SkillVersion(
+            skill_id=skill.id,
+            version=1,
+            system_prompt=content,
+            change_note="从工作区自动同步",
+            created_by=user.id,
+        )
+        db.add(version)
+        synced += 1
+
+    if synced > 0:
+        db.commit()
+
+    return {"synced": synced, "skipped": skipped}
 
 
 # ─── Save to Existing Skill ──────────────────────────────────────────────────

@@ -1049,16 +1049,36 @@ async def knowledge_confirm(
             results.append({"filename": item.filename, "ok": False, "reason": "文件不存在"})
             continue
 
-        # 读文件内容
+        # 读文件内容 — 多路径搜索（workspace 迁移可能导致原路径失效）
         import os
         file_path = file_info.get("path", "")
         content = ""
-        if file_path and os.path.exists(file_path):
+        candidate_paths = [file_path] if file_path else []
+        # 如果原路径不存在，尝试 workspace 标准位置
+        if file_path and not os.path.exists(file_path):
+            fname = os.path.basename(file_path)
+            # 从 Skill 所属用户的 workspace 搜索
             try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
+                from app.routers.dev_studio import _get_registry_workspace_root
+                ws_root = _get_registry_workspace_root(user.id)
+                if ws_root:
+                    for subdir in ["project/output", "project", "skill_studio/data",
+                                   "runtime/config/opencode/skills"]:
+                        alt = os.path.join(ws_root, subdir, fname)
+                        if os.path.exists(alt):
+                            candidate_paths.insert(0, alt)
+                            break
             except Exception:
                 pass
+        for cp in candidate_paths:
+            if cp and os.path.exists(cp):
+                try:
+                    with open(cp, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    if content:
+                        break
+                except Exception:
+                    pass
 
         if not content:
             results.append({"filename": item.filename, "ok": False, "reason": "文件内容为空或无法读取"})
@@ -1117,10 +1137,13 @@ async def knowledge_confirm(
     ).delete()
     db.commit()
 
+    failed = [r for r in results if not r.get("ok")]
     return {
         "results": results,
         "knowledge_entry_ids": all_entry_ids,
         "created_entry_ids": created_entry_ids,
+        "failed_count": len(failed),
+        "failed_files": [r["filename"] for r in failed],
     }
 
 

@@ -1828,12 +1828,15 @@ def update_status(
             })
 
         # 沙盒报告版本校验：最新报告的 target_version 必须等于当前最新版本
-        from app.models.sandbox import SandboxTestReport
+        # 排除 targeted_rerun 子 session 的报告（局部重测不应覆盖完整测试结论）
+        from app.models.sandbox import SandboxTestReport, SandboxTestSession
         latest_report = (
             db.query(SandboxTestReport)
+            .join(SandboxTestSession, SandboxTestReport.session_id == SandboxTestSession.id)
             .filter(
                 SandboxTestReport.target_id == skill_id,
                 SandboxTestReport.target_type == "skill",
+                SandboxTestSession.parent_session_id.is_(None),
             )
             .order_by(SandboxTestReport.created_at.desc())
             .first()

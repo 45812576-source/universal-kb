@@ -2006,11 +2006,19 @@ async def targeted_rerun(
     if not sub_combos:
         raise HTTPException(400, "无法构建子测试矩阵")
 
-    # 创建子 session
+    # 创建子 session — 使用当前最新版本（用户可能已整改）
+    current_ver = (
+        db.query(SkillVersion)
+        .filter(SkillVersion.skill_id == parent_session.target_id)
+        .order_by(SkillVersion.version.desc())
+        .first()
+    ) if parent_session.target_type == "skill" else None
+    child_target_version = current_ver.version if current_ver else parent_session.target_version
+
     child_session = SandboxTestSession(
         target_type=parent_session.target_type,
         target_id=parent_session.target_id,
-        target_version=parent_session.target_version,
+        target_version=child_target_version,
         target_name=parent_session.target_name,
         tester_id=user.id,
         status=SessionStatus.RUNNING,

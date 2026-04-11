@@ -659,6 +659,11 @@ async def _run_bitable_sync(job_id: int, app_token: str, table_id: str, table_na
                 job.status = "failed"
                 job.error_message = str(e)[:2000]
                 job.finished_at = _dt.datetime.utcnow()
+                # 同步回写 bt.sync_status，避免前端永远卡在"同步中"
+                if job.table_id:
+                    bt = db.query(BusinessTable).filter(BusinessTable.id == job.table_id).first()
+                    if bt and bt.sync_status == "syncing":
+                        bt.sync_status = "failed"
                 db.commit()
         except Exception:
             pass
