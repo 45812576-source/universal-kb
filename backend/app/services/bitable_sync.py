@@ -246,8 +246,12 @@ class BitableSync:
             job.stage = "create_table"
             db.commit()
             col_defs = ["  `_record_id` VARCHAR(100) PRIMARY KEY COMMENT '飞书记录ID'"]
+            seen_cols = {"_record_id", "_synced_at"}
             for f in fields:
                 col = col_map[f["field_name"]]
+                if not col or col in seen_cols:
+                    continue
+                seen_cols.add(col)
                 mysql_type = _BITABLE_TYPE_MAP.get(f.get("type", 1), "TEXT")
                 col_defs.append(f"  `{col}` {mysql_type} COMMENT '{f['field_name']}'")
             col_defs.append("  `_synced_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")

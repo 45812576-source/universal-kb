@@ -235,8 +235,9 @@ class BitableReader:
 
     @staticmethod
     def sanitize_col(field_name: str) -> str:
-        """字段名清洗为合法列名"""
-        return re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fff]", "_", field_name)
+        """字段名清洗为合法列名，空名/纯符号名返回兜底列名"""
+        cleaned = re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fff]", "_", field_name).strip("_")
+        return cleaned if cleaned else f"_unnamed_{abs(hash(field_name)) % 10000}"
 
     def records_to_html_table(self, fields: list[dict], records: list[dict]) -> str:
         """将字段+记录渲染为 HTML 表格（知识库 fallback 用）"""
