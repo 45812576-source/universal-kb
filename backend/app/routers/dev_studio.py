@@ -1,5 +1,6 @@
 """Dev Studio — opencode web 全局单例进程 + save-to-tool/skill."""
 import asyncio
+import base64
 import glob as _glob
 import json
 import os
