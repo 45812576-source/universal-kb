@@ -1,6 +1,6 @@
 """add architect_workflow_states table
 
-Revision ID: a1b2c3d4e5f6
+Revision ID: z7a8b9c0d2a4
 Revises: z7a8b9c0d2a3
 Create Date: 2026-04-11 12:00:00.000000
 """
@@ -8,7 +8,7 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects.mysql import JSON
 
-revision = "a1b2c3d4e5f6"
+revision = "z7a8b9c0d2a4"
 down_revision = "z7a8b9c0d2a3"
 branch_labels = None
 depends_on = None
