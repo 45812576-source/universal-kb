@@ -856,6 +856,19 @@ def record_test_result(
     generated_task_ids = []
 
     if status == "failed":
+        # 清除旧报告产生的未完成 fix 任务，避免"整改后仍提示同一整改计划"
+        if source_report_id:
+            existing_tasks = payload.get("tasks", [])
+            for t in existing_tasks:
+                if (
+                    t.get("status") in ("todo", "in_progress")
+                    and t.get("source") == "test_failure"
+                    and t.get("source_report_id") is not None
+                    and t.get("source_report_id") != source_report_id
+                ):
+                    t["status"] = "superseded"
+                    t["result_summary"] = "已被新一轮测试报告替代"
+
         # 优先使用结构化 fix_plan 生成精细任务
         if structured_fix_plan:
             for fp_item in structured_fix_plan:

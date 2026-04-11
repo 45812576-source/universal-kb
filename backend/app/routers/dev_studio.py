@@ -1921,18 +1921,24 @@ def dev_studio_health(
     reg = get_registration(db, user.id, "opencode")
     if not reg:
         return {"runtime_status": "unregistered", "generation": 0}
+    # 检查进程是否存活
+    inst = _user_instances.get(user.id)
+    pid = None
+    process_alive = False
+    if inst and inst.get("proc"):
+        if inst["proc"].returncode is None:
+            pid = inst["proc"].pid
+            process_alive = True
+
     result = {
         "runtime_status": reg.runtime_status,
         "runtime_port": reg.runtime_port,
         "generation": reg.generation,
         "last_active_at": reg.last_active_at.isoformat() if reg.last_active_at else None,
+        "process_alive": process_alive,
     }
     # SUPER_ADMIN 额外返回调试信息
     if user.role == Role.SUPER_ADMIN:
-        inst = _user_instances.get(user.id)
-        pid = None
-        if inst and inst.get("proc") and inst["proc"].returncode is None:
-            pid = inst["proc"].pid
         result["debug"] = {
             "workspace_root": reg.workspace_root,
             "project_dir": reg.project_dir,
@@ -1942,6 +1948,87 @@ def dev_studio_health(
             "last_verified_at": reg.last_verified_at.isoformat() if reg.last_verified_at else None,
         }
     return result
+
+
+# ─── POST /session-repair — 修复丢失的 session DB ─────────────────────────────
+
+@router.post("/session-repair")
+def dev_studio_session_repair(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """扫描所有可能的 opencode.db 位置，尝试修复/迁移丢失的 session 数据。
+
+    触发场景：用户反馈旧 session 找不到时，前端调用此接口。
+    """
+    from app.services.studio_registry import (
+        get_registration, migrate_legacy_session_db, probe_session_db,
+    )
+    import sqlite3
+
+    reg = get_registration(db, user.id, "opencode")
+    if not reg or not reg.workspace_root:
+        return {"ok": False, "error": "尚未注册工作区"}
+
+    ws_root = reg.workspace_root
+
+    # 1. 触发迁移（覆盖旧目录 → 新目录）
+    migration_state = migrate_legacy_session_db(ws_root)
+
+    # 2. 探测修复后的状态
+    probe = probe_session_db(ws_root)
+
+    # 3. 额外扫描：studio_root 下可能存在的旧 display_name 目录
+    studio_root = _studio_root()
+    found_legacy_dbs = []
+    if os.path.isdir(studio_root):
+        for dirname in os.listdir(studio_root):
+            if dirname == os.path.basename(ws_root):
+                continue
+            candidate = os.path.join(studio_root, dirname)
+            if not os.path.isdir(candidate):
+                continue
+            for sub in [
+                os.path.join(candidate, "runtime", "data", "opencode", "opencode.db"),
+                os.path.join(candidate, ".local", "share", "opencode", "opencode.db"),
+            ]:
+                if os.path.exists(sub):
+                    try:
+                        con = sqlite3.connect(sub, timeout=3)
+                        count = con.execute("SELECT COUNT(*) FROM session").fetchone()[0]
+                        con.close()
+                        found_legacy_dbs.append({"path": sub, "dir": dirname, "session_count": count})
+                    except Exception:
+                        pass
+
+    # 4. 如果当前 canonical 为空但找到了 legacy DB，自动修复
+    repaired = False
+    if probe.total == 0 and found_legacy_dbs:
+        best = max(found_legacy_dbs, key=lambda x: x["session_count"])
+        if best["session_count"] > 0:
+            canonical = os.path.join(ws_root, "runtime", "data", "opencode", "opencode.db")
+            try:
+                os.makedirs(os.path.dirname(canonical), exist_ok=True)
+                shutil.copy2(best["path"], canonical)
+                for suffix in ("-wal", "-shm"):
+                    src_s = best["path"] + suffix
+                    dst_s = canonical + suffix
+                    if os.path.exists(src_s):
+                        shutil.copy2(src_s, dst_s)
+                repaired = True
+                probe = probe_session_db(ws_root)
+            except Exception:
+                pass
+
+    return {
+        "ok": True,
+        "migration_state": migration_state,
+        "db_health": probe.db_health,
+        "db_path": probe.db_path,
+        "session_total": probe.total,
+        "found_legacy_dbs": found_legacy_dbs,
+        "repaired": repaired,
+    }
 
 
 # ─── GET /runtime-health — 代理链全面探活 ─────────────────────────────────────
@@ -2629,47 +2716,100 @@ def get_latest_output(
 def dev_studio_output_files(
     user: User = Depends(get_current_user),
 ):
-    """枚举用户 project/ 下的所有产出文件（递归，排除系统目录）。"""
+    """枚举用户产出文件（project/ + skill_studio/data/ + runtime skills）。"""
     import datetime as _dt
 
     workdir = _user_workdir(user)
     project_dir = workdir  # _user_workdir 已经返回 project/ 路径
 
-    if not os.path.isdir(project_dir):
-        return {"items": []}
-
     # 跳过的目录名
     _skip_dirs = {".git", ".opencode", "node_modules", "__pycache__", ".venv", "venv",
                   ".next", "dist", "build", ".cache", ".bin", ".local", ".config"}
 
+    def _categorize(fname: str) -> str:
+        ext = os.path.splitext(fname)[1].lower()
+        return (
+            "skill" if ext == ".md" else
+            "code" if ext in (".py", ".ts", ".js", ".json", ".bat", ".command", ".sh") else
+            "data" if ext in (".csv", ".xlsx", ".xls", ".sql") else
+            "doc" if ext in (".html", ".pdf", ".docx", ".txt") else
+            "other"
+        )
+
     items = []
-    for dirpath, dirnames, filenames in os.walk(project_dir):
-        # 跳过系统目录
-        dirnames[:] = [d for d in dirnames if d not in _skip_dirs]
-        for fname in filenames:
+    seen_paths: set = set()
+
+    # ── 1) project/ 目录（主产物）──
+    if os.path.isdir(project_dir):
+        for dirpath, dirnames, filenames in os.walk(project_dir):
+            dirnames[:] = [d for d in dirnames if d not in _skip_dirs]
+            for fname in filenames:
+                if fname.startswith("."):
+                    continue
+                fpath = os.path.join(dirpath, fname)
+                try:
+                    stat = os.stat(fpath)
+                except OSError:
+                    continue
+                seen_paths.add(fpath)
+                items.append({
+                    "path": fpath,
+                    "rel_path": os.path.relpath(fpath, project_dir),
+                    "name": fname,
+                    "size": stat.st_size,
+                    "updated_at": _dt.datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                    "category": _categorize(fname),
+                    "source": "project",
+                })
+
+    # ── 2) skill_studio/data/ 目录（数据表传输等）──
+    # _user_workdir 返回 project/ 路径，其父目录即 workspace root
+    ws_root = os.path.dirname(project_dir)
+    ss_data_dir = os.path.join(ws_root, "skill_studio", "data")
+    if os.path.isdir(ss_data_dir):
+        for fname in os.listdir(ss_data_dir):
             if fname.startswith("."):
                 continue
-            fpath = os.path.join(dirpath, fname)
+            fpath = os.path.join(ss_data_dir, fname)
+            if not os.path.isfile(fpath) or fpath in seen_paths:
+                continue
             try:
                 stat = os.stat(fpath)
             except OSError:
                 continue
-            # 相对于 project/ 的路径
-            rel_path = os.path.relpath(fpath, project_dir)
-            ext = os.path.splitext(fname)[1].lower()
-            category = (
-                "skill" if ext == ".md" else
-                "code" if ext in (".py", ".ts", ".js", ".json", ".bat", ".command", ".sh") else
-                "data" if ext in (".csv", ".xlsx", ".xls", ".sql") else
-                "doc" if ext in (".html", ".pdf", ".docx", ".txt") else
-                "other"
-            )
+            seen_paths.add(fpath)
             items.append({
-                "path": rel_path,
+                "path": fpath,
+                "rel_path": f"skill_studio/data/{fname}",
                 "name": fname,
                 "size": stat.st_size,
                 "updated_at": _dt.datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                "category": category,
+                "category": _categorize(fname),
+                "source": "skill_studio",
+            })
+
+    # ── 3) runtime/config/opencode/skills/ 目录（Skill .md 文件）──
+    runtime_skills_dir = os.path.join(ws_root, "runtime", "config", "opencode", "skills")
+    if os.path.isdir(runtime_skills_dir):
+        for fname in os.listdir(runtime_skills_dir):
+            if fname.startswith(".") or not fname.lower().endswith(".md"):
+                continue
+            fpath = os.path.join(runtime_skills_dir, fname)
+            if not os.path.isfile(fpath) or fpath in seen_paths:
+                continue
+            try:
+                stat = os.stat(fpath)
+            except OSError:
+                continue
+            seen_paths.add(fpath)
+            items.append({
+                "path": fpath,
+                "rel_path": f".opencode/skills/{fname}",
+                "name": fname,
+                "size": stat.st_size,
+                "updated_at": _dt.datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                "category": "runtime_skill",
+                "source": "runtime_skill",
             })
 
     # 按修改时间倒序
@@ -3045,12 +3185,25 @@ async def transfer_table(
     with open(dest, "w", encoding="utf-8", newline="" if fmt == "csv" else "\n") as f:
         f.write(content)
 
+    # 6. 同步 copy 到 project/data/ 使其进入 output-files 索引
+    project_dir = _user_workdir(user)
+    project_data_dir = os.path.join(project_dir, "data")
+    indexed = False
+    try:
+        os.makedirs(project_data_dir, exist_ok=True)
+        project_dest = os.path.join(project_data_dir, safe_filename)
+        shutil.copy2(dest, project_dest)
+        indexed = True
+    except Exception:
+        pass
+
     return {
         "ok": True,
         "filename": safe_filename,
         "rows": len(rows),
         "format": fmt,
         "workdir": ss_dir,
+        "indexed": indexed,
     }
 
 
@@ -3600,10 +3753,24 @@ def read_file(path: str, user: User = Depends(get_current_user)):
 
 @router.get("/workdir/download")
 def workdir_download(path: str, user: User = Depends(get_current_user)):
-    """下载 workdir 内的单个文件到本地。正常路径：project/（含 output/）。"""
+    """下载 workspace 内的单个文件。支持 project/、skill_studio/、runtime/config/ 下的文件。"""
     from fastapi.responses import FileResponse
     workdir = _user_workdir(user)
-    target = _safe_path(workdir, path)
+
+    # 如果是绝对路径，校验它在 workspace 根目录范围内
+    ws_root = os.path.dirname(workdir)  # workdir 是 project/，父目录是 workspace root
+    if os.path.isabs(path):
+        target = os.path.normpath(path)
+        if not (target == ws_root or target.startswith(ws_root + os.sep)):
+            raise HTTPException(400, "路径不合法")
+    else:
+        # 相对路径：先试 project/，再试 workspace root
+        target = _safe_path(workdir, path)
+        if not os.path.exists(target):
+            alt = os.path.normpath(os.path.join(ws_root, path.lstrip("/")))
+            if alt.startswith(ws_root + os.sep) and os.path.exists(alt):
+                target = alt
+
     if not os.path.exists(target):
         raise HTTPException(404, "文件不存在")
     if os.path.isdir(target):

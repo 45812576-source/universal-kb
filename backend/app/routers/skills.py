@@ -1827,6 +1827,42 @@ def update_status(
                 "risk_summary": kr_result.get("risk_summary", {}),
             })
 
+        # 沙盒报告版本校验：最新报告的 target_version 必须等于当前最新版本
+        from app.models.sandbox import SandboxTestReport
+        latest_report = (
+            db.query(SandboxTestReport)
+            .filter(
+                SandboxTestReport.target_id == skill_id,
+                SandboxTestReport.target_type == "skill",
+            )
+            .order_by(SandboxTestReport.created_at.desc())
+            .first()
+        )
+        current_ver = (
+            db.query(SkillVersion)
+            .filter(SkillVersion.skill_id == skill_id)
+            .order_by(SkillVersion.version.desc())
+            .first()
+        )
+        current_version_num = current_ver.version if current_ver else None
+        if not latest_report:
+            raise HTTPException(
+                400,
+                f"发布前需要至少通过一次质量检测（沙盒测试）",
+            )
+        if latest_report.target_version is not None and current_version_num is not None:
+            if latest_report.target_version != current_version_num:
+                raise HTTPException(
+                    400,
+                    f"质量检测报告基于 v{latest_report.target_version}，"
+                    f"但当前 Skill 已更新到 v{current_version_num}，请重新运行质量检测",
+                )
+        if latest_report.approval_eligible is False:
+            raise HTTPException(
+                400,
+                f"最近一次质量检测结果为不可发布，请修复后重新检测",
+            )
+
     # EMPLOYEE / DEPT_ADMIN 申请发布 → 转为审核中，创建审批单等超管审批
     if status == SkillStatus.PUBLISHED.value and user.role in (Role.EMPLOYEE, Role.DEPT_ADMIN):
         if scope is not None:

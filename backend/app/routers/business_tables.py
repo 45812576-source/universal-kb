@@ -651,7 +651,17 @@ async def _run_bitable_sync(job_id: int, app_token: str, table_id: str, table_na
         )
     except Exception as e:
         import logging
+        import datetime as _dt
         logging.getLogger(__name__).error(f"Bitable sync job {job_id} failed: {e}")
+        try:
+            job = db.query(TableSyncJob).filter(TableSyncJob.id == job_id).first()
+            if job and job.status not in ("success", "partial_success", "failed", "cancelled"):
+                job.status = "failed"
+                job.error_message = str(e)[:2000]
+                job.finished_at = _dt.datetime.utcnow()
+                db.commit()
+        except Exception:
+            pass
     finally:
         db.close()
 

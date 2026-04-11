@@ -1038,6 +1038,8 @@ async def knowledge_confirm(
 
     from app.models.knowledge import KnowledgeEntry
     results = []
+    all_entry_ids: List[int] = []
+    created_entry_ids: List[int] = []
 
     for item in req.confirmations:
         # 读取文件内容
@@ -1070,6 +1072,7 @@ async def knowledge_confirm(
             (KnowledgeEntry.title == title) | (KnowledgeEntry.source_file == item.filename)
         ).first()
 
+        is_new = False
         if existing:
             existing.content = content
             existing.category = category
@@ -1091,8 +1094,12 @@ async def knowledge_confirm(
             db.add(entry)
             db.flush()
             entry_id = entry.id
+            is_new = True
 
         db.commit()
+        all_entry_ids.append(entry_id)
+        if is_new:
+            created_entry_ids.append(entry_id)
 
         # 触发向量入库
         try:
@@ -1110,7 +1117,11 @@ async def knowledge_confirm(
     ).delete()
     db.commit()
 
-    return {"results": results}
+    return {
+        "results": results,
+        "knowledge_entry_ids": all_entry_ids,
+        "created_entry_ids": created_entry_ids,
+    }
 
 
 # ─── Gap 7: Skill 自动回归测试 ──────────────────────────────────────────────
