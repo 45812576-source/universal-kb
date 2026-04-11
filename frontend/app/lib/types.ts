@@ -103,6 +103,7 @@ export interface Skill {
   current_version: number;
   department_id?: number | null;
   usage_count?: number;
+  folder_key?: string | null;
 }
 
 export type ReviewStage =
@@ -231,4 +232,120 @@ export interface UpstreamDiff {
   new_upstream_version?: string;
   diff_summary?: string;
   check_action?: string;
+}
+
+// ── Studio Types ──────────────────────────────────────────────────────────────
+
+export interface StudioRouteResult {
+  session_mode: "create_new_skill" | "optimize_existing_skill" | "audit_imported_skill";
+  active_assist_skills: string[];
+  route_reason: string;
+  next_action: "collect_requirements" | "run_audit" | "start_editing";
+  workflow_mode: "architect_mode" | "none";
+  initial_phase: string;
+}
+
+export interface StudioAuditIssue {
+  severity: "high" | "medium" | "low";
+  category: "structure" | "clarity" | "completeness" | "safety" | "performance";
+  description: string;
+}
+
+export interface StudioAuditResult {
+  verdict: "good" | "needs_work" | "poor";
+  issues: StudioAuditIssue[];
+  recommended_path: "minor_edit" | "major_rewrite" | "brainstorming_upgrade";
+  audit_id: number | null;
+}
+
+export interface StudioGovernanceCard {
+  title: string;
+  description: string;
+  severity: "high" | "medium" | "low";
+  category: string;
+  suggested_action: "staged_edit" | "manual_review" | "brainstorming";
+}
+
+export interface StudioStagedEdit {
+  id: number;
+  target_type: "system_prompt" | "source_file" | "metadata";
+  target_key: string | null;
+  summary: string;
+  risk_level: "low" | "medium" | "high";
+  diff_ops: Array<{ op: string; old?: string; new?: string }>;
+  status: "pending" | "adopted" | "rejected";
+}
+
+export type StudioStreamEventType =
+  | "route_status"
+  | "audit_summary"
+  | "governance_card"
+  | "staged_edit_notice"
+  | "fallback_text"
+  | "assist_skills_status"
+  | "architect_phase_status"
+  | "architect_question"
+  | "architect_phase_summary"
+  | "architect_structure"
+  | "architect_priority_matrix"
+  | "architect_ooda_decision"
+  | "architect_ready_for_draft";
+
+// ── Architect 工作流类型 ──
+
+export type ArchitectPhase =
+  | "phase_1_why"
+  | "phase_2_what"
+  | "phase_3_how"
+  | "ooda_iteration"
+  | "ready_for_draft";
+
+export interface ArchitectWorkflowState {
+  workflow_mode: "architect_mode" | "none";
+  workflow_phase: ArchitectPhase;
+  phase_outputs: Record<string, unknown>;
+  ooda_round: number;
+  phase_confirmed: Record<string, boolean>;
+  skill_id: number | null;
+}
+
+export interface ArchitectPhaseStatus {
+  phase: ArchitectPhase;
+  mode_source: string;
+  ooda_round: number;
+}
+
+export interface ArchitectQuestion {
+  question: string;
+  options?: string[];
+  phase: ArchitectPhase;
+  framework?: string;
+}
+
+export interface ArchitectPhaseSummary {
+  phase: ArchitectPhase;
+  outputs: Record<string, unknown>;
+  confirmed: boolean;
+}
+
+export interface ArchitectStructure {
+  type: "jtbd" | "issue_tree" | "pyramid" | "mece" | "scenario";
+  title: string;
+  data: unknown;
+}
+
+export interface ArchitectPriorityMatrix {
+  items: Array<{ label: string; priority: "P0" | "P1" | "P2"; reason: string }>;
+}
+
+export interface ArchitectOodaDecision {
+  round: number;
+  action: "continue" | "rollback" | "converged";
+  rollback_to?: ArchitectPhase;
+  reason: string;
+}
+
+export interface ArchitectReadyForDraft {
+  summary: Record<string, unknown>;
+  exit_to: "generate_draft" | "generate_governance_actions" | "minor_edit";
 }

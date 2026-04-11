@@ -58,6 +58,7 @@ def _skill_summary(s: Skill) -> dict:
         "created_by": s.created_by,
         "source_type": s.source_type or "local",
         "source_files": s.source_files or [],
+        "folder_key": s.folder_key,
     }
 
 
@@ -2750,5 +2751,165 @@ def _extract_json(text: str) -> dict | None:
     return None
 
 
-# ─── Usage stats (super_admin only) ──────────────────────────────────────────
+# ─── Studio: Rename 原子链路 ──────────────────────────────────────────────────
+
+class SkillRenameRequest(BaseModel):
+    display_name: str
+    rename_folder: bool = True
+
+
+def _slugify(name: str) -> str:
+    """将 Skill 名称转换为 folder_key（支持中文，用 hash 兜底）。"""
+    import hashlib
+    import unicodedata
+    ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", ascii_name).strip("-").lower()
+    if not slug:
+        h = hashlib.md5(name.encode()).hexdigest()[:8]
+        slug = f"skill-{h}"
+    return slug[:200]
+
+
+@router.patch("/{skill_id}/rename")
+def rename_skill(
+    skill_id: int,
+    req: SkillRenameRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """原子 rename: 更新 name；rename_folder=true 时同步 folder_key + alias。"""
+    from app.models.skill import SkillFolderAlias
+
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+    _check_skill_write_access(skill, user)
+
+    new_name = req.display_name.strip()
+    if not new_name:
+        raise HTTPException(400, "名称不能为空")
+
+    conflict = db.query(Skill).filter(Skill.name == new_name, Skill.id != skill_id).first()
+    if conflict:
+        raise HTTPException(400, f"已存在同名 Skill '{new_name}'")
+
+    previous_folder_key = skill.folder_key
+    skill.name = new_name
+
+    alias_retained = False
+    new_folder_key = previous_folder_key  # 默认不变
+
+    if req.rename_folder:
+        # 同步更新 folder_key + 建立 alias
+        new_folder_key = _slugify(new_name)
+        existing_fk = db.query(Skill).filter(Skill.folder_key == new_folder_key, Skill.id != skill_id).first()
+        if existing_fk:
+            new_folder_key = f"{new_folder_key}-{skill_id}"
+
+        skill.folder_key = new_folder_key
+
+        if previous_folder_key and previous_folder_key != new_folder_key:
+            existing_alias = db.query(SkillFolderAlias).filter(
+                SkillFolderAlias.old_folder_key == previous_folder_key
+            ).first()
+            if not existing_alias:
+                db.add(SkillFolderAlias(skill_id=skill_id, old_folder_key=previous_folder_key))
+                alias_retained = True
+
+    db.commit()
+
+    return {
+        "skill_id": skill_id,
+        "display_name": new_name,
+        "folder_key": skill.folder_key,
+        "previous_folder_key": previous_folder_key,
+        "alias_retained": alias_retained,
+        "folder_synced": req.rename_folder,
+    }
+
+
+# ─── Studio: Audit ────────────────────────────────────────────────────────────
+
+@router.post("/{skill_id}/studio-audit")
+async def studio_audit(
+    skill_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """对 Skill 执行质量审计。"""
+    from app.services.studio_auditor import run_audit
+
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+
+    result = await run_audit(db, skill_id)
+
+    return {
+        "verdict": result.verdict,
+        "issues": result.issues,
+        "recommended_path": result.recommended_path,
+        "audit_id": getattr(result, "audit_id", None),
+    }
+
+
+# ─── Studio: Governance Actions + Staged Edit ─────────────────────────────────
+
+class GovernanceActionsRequest(BaseModel):
+    audit_id: Optional[int] = None
+
+
+@router.post("/{skill_id}/governance-actions")
+async def governance_actions(
+    skill_id: int,
+    req: GovernanceActionsRequest = Body(default=GovernanceActionsRequest()),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """基于审计结果生成治理卡片 + staged edits。"""
+    from app.services.studio_governance import generate_governance_actions
+
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+
+    result = await generate_governance_actions(db, skill_id, audit_id=req.audit_id)
+
+    return {
+        "cards": result.cards,
+        "staged_edits": result.staged_edits,
+    }
+
+
+@router.post("/staged-edits/{edit_id}/adopt")
+def adopt_staged_edit_endpoint(
+    edit_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """将 staged edit 应用到正式内容，创建新版本。"""
+    from app.services.studio_governance import adopt_staged_edit
+
+    result = adopt_staged_edit(db, edit_id, user.id)
+    if not result["ok"]:
+        raise HTTPException(400, result.get("error", "adopt failed"))
+    return result
+
+
+@router.post("/staged-edits/{edit_id}/reject")
+def reject_staged_edit_endpoint(
+    edit_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """拒绝 staged edit。"""
+    from app.services.studio_governance import reject_staged_edit
+
+    result = reject_staged_edit(db, edit_id, user.id)
+    if not result["ok"]:
+        raise HTTPException(400, result.get("error", "reject failed"))
+    return result
+
+
+# ─── Usage stats (super_admin only, section 2) ───────────────────────────────
 

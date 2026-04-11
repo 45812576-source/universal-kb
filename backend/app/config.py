@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     # 百炼用量超限后自动切换到 ARK（由外部监控脚本或管理接口写入）
     BAILIAN_FALLBACK_TO_ARK: bool = False
 
+    # ── Skill Studio 结构化模式 ──────────────────────────────────────────────
+    STUDIO_STRUCTURED_MODE: str = "on"  # "off" | "on"
+
     # 百炼 Coding Plan 三窗口额度，达到任一窗口 90% 自动切换 ARK
     BAILIAN_QUOTA_5H: int = 6000    # 每 5 小时最多请求数
     BAILIAN_QUOTA_7D: int = 45000   # 每 7 天最多请求数

@@ -134,6 +134,8 @@ SLOT_REGISTRY: dict[str, dict] = {
     "studio.agent":               {"name": "Studio Agent", "category": "其他", "desc": "DevStudio 中的 AI 对话（流式+非流式）", "fallback": "default"},
     "studio.ingest_parse":        {"name": "长文本拆块", "category": "其他", "desc": "Studio 长文本粘贴：意图识别+内容拆块", "fallback": "ark_kimi"},
     "studio.ingest_analyze":      {"name": "长文本关系分析", "category": "其他", "desc": "Studio 长文本粘贴：分析子文件与 Skill 的关系", "fallback": "ark_kimi"},
+    "studio.audit":               {"name": "Skill 审计", "category": "Studio", "desc": "Studio 审计引擎：评估 Skill 质量并输出结构化问题列表", "fallback": "default"},
+    "studio.governance":          {"name": "治理动作生成", "category": "Studio", "desc": "Studio 治理引擎：基于审计结果生成治理卡片和 staged edits", "fallback": "default"},
     "task.engine":                {"name": "任务引擎", "category": "其他", "desc": "项目任务中的 AI 辅助（总结/分解任务等）", "fallback": "default"},
     "business_table.generate":    {"name": "业务表格生成", "category": "其他", "desc": "用 LLM 解析业务数据生成结构化表格", "fallback": "default"},
     "output_schema.gen":          {"name": "输出模式生成", "category": "其他", "desc": "根据描述自动生成结构化输出 Schema", "fallback": "default"},

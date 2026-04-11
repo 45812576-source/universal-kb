@@ -125,6 +125,9 @@ class Skill(Base):
     parent_skill_id = Column(Integer, ForeignKey("skills.id"), nullable=True)
     local_modified_at = Column(DateTime, nullable=True)
 
+    # Studio: 目录标识，从 name slugify 生成
+    folder_key = Column(String(200), nullable=True, unique=True)
+
 
 class SkillVersion(Base):
     __tablename__ = "skill_versions"
@@ -250,3 +253,66 @@ class SkillAttribution(Base):
 
     skill = relationship("Skill", foreign_keys=[skill_id], overlaps="attributions")
     suggestion = relationship("SkillSuggestion", foreign_keys=[suggestion_id])
+
+
+class SkillFolderAlias(Base):
+    """rename 后保留旧 folder_key 的别名映射，兼容旧路径。"""
+    __tablename__ = "skill_folder_aliases"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skill_id = Column(Integer, ForeignKey("skills.id"), nullable=False)
+    old_folder_key = Column(String(200), nullable=False, unique=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    skill = relationship("Skill", foreign_keys=[skill_id])
+
+
+class SkillAuditResult(Base):
+    """Studio 审计结果。"""
+    __tablename__ = "skill_audit_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skill_id = Column(Integer, ForeignKey("skills.id"), nullable=False)
+    session_id = Column(Integer, nullable=True)
+    quality_verdict = Column(String(20))  # "good" | "needs_work" | "poor"
+    issues = Column(JSON, default=list)  # [{"severity": "high", "category": "...", "description": "..."}]
+    recommended_path = Column(String(50))  # "minor_edit" | "major_rewrite" | "brainstorming_upgrade"
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    skill = relationship("Skill", foreign_keys=[skill_id])
+
+
+class ArchitectWorkflowState(Base):
+    """Skill Architect 工作流阶段状态 — 每个 conversation 最多一条。"""
+    __tablename__ = "architect_workflow_states"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, unique=True)
+    skill_id = Column(Integer, ForeignKey("skills.id"), nullable=True)
+    workflow_mode = Column(String(30), default="architect_mode")  # "architect_mode" | "none"
+    workflow_phase = Column(String(30), default="phase_1_why")  # phase_1_why / phase_2_what / phase_3_how / ooda_iteration / ready_for_draft
+    phase_outputs = Column(JSON, default=dict)  # {phase_1: {...}, phase_2: {...}, ...}
+    ooda_round = Column(Integer, default=0)
+    phase_confirmed = Column(JSON, default=dict)  # {phase_1_why: true, ...}
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
+class StagedEdit(Base):
+    """Studio staged edit — 待确认的修改建议。"""
+    __tablename__ = "staged_edits"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skill_id = Column(Integer, ForeignKey("skills.id"), nullable=False)
+    session_id = Column(Integer, nullable=True)
+    target_type = Column(String(30))  # "system_prompt" | "source_file" | "metadata"
+    target_key = Column(String(200), nullable=True)  # filename for source_file
+    diff_ops = Column(JSON)  # DiffOp[]
+    summary = Column(Text)
+    risk_level = Column(String(10))  # "low" | "medium" | "high"
+    status = Column(String(20), default="pending")  # "pending" | "adopted" | "rejected"
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    resolved_at = Column(DateTime, nullable=True)
+    resolved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    skill = relationship("Skill", foreign_keys=[skill_id])

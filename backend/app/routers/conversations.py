@@ -143,6 +143,147 @@ def migrate_skill_conversations_api(
     return result
 
 
+class StudioSessionRouteRequest(BaseModel):
+    skill_id: Optional[int] = None
+
+
+@router.post("/studio-sessions/{conv_id}/route")
+def studio_session_route(
+    conv_id: int,
+    req: StudioSessionRouteRequest = StudioSessionRouteRequest(),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Studio session 路由 — 根据 skill 属性返回会话模式。"""
+    from app.services.studio_router import route_session
+
+    conv = db.get(Conversation, conv_id)
+    if not conv or conv.user_id != user.id:
+        raise HTTPException(404, "Conversation not found")
+
+    skill_id = req.skill_id or conv.skill_id
+    # 取最近一条 user message 作为 intent 判断素材
+    _latest_user_msg = (
+        db.query(Message)
+        .filter(Message.conversation_id == conv_id, Message.role == MessageRole.USER)
+        .order_by(Message.created_at.desc())
+        .first()
+    )
+    _user_text = _latest_user_msg.content if _latest_user_msg else ""
+    result = route_session(db, skill_id=skill_id, user_message=_user_text)
+
+    resp = {
+        "session_mode": result.session_mode,
+        "active_assist_skills": result.active_assist_skills,
+        "route_reason": result.route_reason,
+        "next_action": result.next_action,
+        "workflow_mode": result.workflow_mode,
+        "initial_phase": result.initial_phase,
+    }
+
+    # 如果启用了 architect_mode，创建/更新持久化状态
+    if result.workflow_mode == "architect_mode":
+        from app.models.skill import ArchitectWorkflowState
+        existing = db.query(ArchitectWorkflowState).filter(
+            ArchitectWorkflowState.conversation_id == conv_id
+        ).first()
+        if not existing:
+            state = ArchitectWorkflowState(
+                conversation_id=conv_id,
+                skill_id=skill_id,
+                workflow_mode="architect_mode",
+                workflow_phase=result.initial_phase,
+            )
+            db.add(state)
+            db.commit()
+
+    return resp
+
+
+# ── Architect 状态读写 ───────────────────────────────────────────────────────
+
+
+class ArchitectStateUpdate(BaseModel):
+    workflow_phase: Optional[str] = None
+    phase_outputs: Optional[dict] = None
+    ooda_round: Optional[int] = None
+    phase_confirmed: Optional[dict] = None
+
+
+@router.get("/conversations/{conv_id}/architect-state")
+def get_architect_state(
+    conv_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """读取 architect 工作流阶段状态。"""
+    conv = db.get(Conversation, conv_id)
+    if not conv or conv.user_id != user.id:
+        raise HTTPException(404, "Conversation not found")
+
+    from app.models.skill import ArchitectWorkflowState
+    state = db.query(ArchitectWorkflowState).filter(
+        ArchitectWorkflowState.conversation_id == conv_id
+    ).first()
+    if not state:
+        return {"workflow_mode": "none"}
+
+    return {
+        "workflow_mode": state.workflow_mode,
+        "workflow_phase": state.workflow_phase,
+        "phase_outputs": state.phase_outputs or {},
+        "ooda_round": state.ooda_round,
+        "phase_confirmed": state.phase_confirmed or {},
+        "skill_id": state.skill_id,
+    }
+
+
+@router.patch("/conversations/{conv_id}/architect-state")
+def update_architect_state(
+    conv_id: int,
+    req: ArchitectStateUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """更新 architect 工作流阶段状态（阶段推进 / 确认 / OODA 轮次）。"""
+    conv = db.get(Conversation, conv_id)
+    if not conv or conv.user_id != user.id:
+        raise HTTPException(404, "Conversation not found")
+
+    from app.models.skill import ArchitectWorkflowState
+    state = db.query(ArchitectWorkflowState).filter(
+        ArchitectWorkflowState.conversation_id == conv_id
+    ).first()
+    if not state:
+        raise HTTPException(404, "No architect state for this conversation")
+
+    if req.workflow_phase is not None:
+        state.workflow_phase = req.workflow_phase
+    if req.phase_outputs is not None:
+        # merge into existing
+        existing = state.phase_outputs or {}
+        existing.update(req.phase_outputs)
+        state.phase_outputs = existing
+    if req.ooda_round is not None:
+        state.ooda_round = req.ooda_round
+    if req.phase_confirmed is not None:
+        existing = state.phase_confirmed or {}
+        existing.update(req.phase_confirmed)
+        state.phase_confirmed = existing
+
+    db.commit()
+    db.refresh(state)
+
+    return {
+        "ok": True,
+        "workflow_mode": state.workflow_mode,
+        "workflow_phase": state.workflow_phase,
+        "phase_outputs": state.phase_outputs or {},
+        "ooda_round": state.ooda_round,
+        "phase_confirmed": state.phase_confirmed or {},
+    }
+
+
 class ConversationCreate(BaseModel):
     workspace_id: Optional[int] = None
     project_id: Optional[int] = None
@@ -666,6 +807,90 @@ async def stream_message(
                             if (_m.content or "").strip()
                         ]
 
+                    # ── Studio 结构化模式（灰度开关）──
+                    from app.config import settings as _app_settings
+                    _studio_structured = _app_settings.STUDIO_STRUCTURED_MODE == "on"
+
+                    if _studio_structured:
+                        # 首轮消息触发 route（用 user_message 做 intent 判断）
+                        _msg_count_check = db.query(Message).filter(
+                            Message.conversation_id == conv_id
+                        ).count()
+                        if _msg_count_check <= 2:
+                            from app.services.studio_router import route_session
+                            _route_result = route_session(
+                                db, skill_id=req.selected_skill_id, user_message=req.content,
+                            )
+                            yield _sse("route_status", {
+                                "session_mode": _route_result.session_mode,
+                                "active_assist_skills": _route_result.active_assist_skills,
+                                "route_reason": _route_result.route_reason,
+                                "next_action": _route_result.next_action,
+                                "workflow_mode": _route_result.workflow_mode,
+                                "initial_phase": _route_result.initial_phase,
+                            })
+
+                            # 发送 assist_skills_status 事件
+                            yield _sse("assist_skills_status", {
+                                "skills": _route_result.active_assist_skills,
+                                "session_mode": _route_result.session_mode,
+                            })
+
+                            # ── Architect mode: 初始化状态 + 发送阶段事件 ──
+                            if _route_result.workflow_mode == "architect_mode":
+                                from app.models.skill import ArchitectWorkflowState
+                                _arch_state = db.query(ArchitectWorkflowState).filter(
+                                    ArchitectWorkflowState.conversation_id == conv_id
+                                ).first()
+                                if not _arch_state:
+                                    _arch_state = ArchitectWorkflowState(
+                                        conversation_id=conv_id,
+                                        skill_id=req.selected_skill_id,
+                                        workflow_mode="architect_mode",
+                                        workflow_phase=_route_result.initial_phase,
+                                    )
+                                    db.add(_arch_state)
+                                    db.commit()
+                                    db.refresh(_arch_state)
+
+                                yield _sse("architect_phase_status", {
+                                    "phase": _arch_state.workflow_phase,
+                                    "mode_source": _route_result.session_mode,
+                                    "ooda_round": _arch_state.ooda_round,
+                                })
+
+                            # 若 route 结果为 audit → 自动触发 audit → governance
+                            if _route_result.next_action == "run_audit" and req.selected_skill_id:
+                                try:
+                                    from app.services.studio_auditor import run_audit as _run_audit
+                                    _audit_result = await _run_audit(db, req.selected_skill_id)
+                                    yield _sse("audit_summary", {
+                                        "verdict": _audit_result.verdict,
+                                        "issues": _audit_result.issues,
+                                        "recommended_path": _audit_result.recommended_path,
+                                        "audit_id": getattr(_audit_result, "audit_id", None),
+                                    })
+
+                                    # audit 后自动触发 governance → 发送 card + staged edit
+                                    if _audit_result.verdict in ("needs_work", "poor"):
+                                        try:
+                                            from app.services.studio_governance import generate_governance_actions
+                                            _gov_result = await generate_governance_actions(
+                                                db, req.selected_skill_id,
+                                                audit_id=getattr(_audit_result, "audit_id", None),
+                                            )
+                                            for _card in _gov_result.cards:
+                                                yield _sse("governance_card", _card)
+                                            for _se in _gov_result.staged_edits:
+                                                yield _sse("staged_edit_notice", _se)
+                                        except Exception as _gov_err:
+                                            logger.warning(f"[studio] auto-governance failed: {_gov_err}")
+                                            yield _sse("fallback_text", {"text": f"治理建议生成失败: {_gov_err}"})
+
+                                except Exception as _audit_err:
+                                    logger.warning(f"[studio] auto-audit failed: {_audit_err}")
+                                    yield _sse("fallback_text", {"text": f"审计未能完成: {_audit_err}"})
+
                     _fast_model = llm_gateway.resolve_config(db, "conversation.main", getattr(_ws_fast, "model_config_id", None))
                     yield _sse("status", {"stage": "preparing"})
 
@@ -705,7 +930,17 @@ async def stream_message(
                         from app.services.skill_memo_service import get_memo as _get_memo
                         _memo_ctx = _get_memo(db, req.selected_skill_id)
 
-                    yield _sse("status", {"stage": "generating"})
+                    # 查询 skill 元数据（source_type 等）供路由使用
+                    _skill_metadata: dict | None = None
+                    if req.selected_skill_id:
+                        from app.models.skill import Skill as _SkillMeta
+                        _sk_meta = db.get(_SkillMeta, req.selected_skill_id)
+                        if _sk_meta:
+                            _skill_metadata = {
+                                "source_type": getattr(_sk_meta, "source_type", None),
+                                "skill_id": _sk_meta.id,
+                                "name": getattr(_sk_meta, "name", None),
+                            }
 
                     _final_content = ""
                     async for _item in _stream_with_keepalive(
@@ -724,6 +959,7 @@ async def stream_message(
                             source_files_content=_source_files_content,
                             selected_source_filename=req.selected_source_filename,
                             memo_context=_memo_ctx,
+                            skill_metadata=_skill_metadata,
                         ),
                         request=request,
                     ):
