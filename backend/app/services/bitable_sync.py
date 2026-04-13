@@ -272,11 +272,12 @@ class BitableSync:
             # 字段元信息落库
             self._persist_schema_fields(db, bt, fields)
 
-            sync_status = "success"
+            sync_status = "partial_success" if fetch_stats.get("truncated") else "success"
 
             stats = {
                 "inserted": inserted, "updated": updated,
                 "total_fields": len(fields), "total_records": len(records),
+                "truncated": fetch_stats.get("truncated", False),
                 "fetch_stats": fetch_stats,
             }
             job.stage = "done"

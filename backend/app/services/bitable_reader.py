@@ -101,6 +101,9 @@ class BitableReader:
                 raise RuntimeError(f"获取字段失败: {data.get('msg')} (code={code})")
             return data["data"]["items"]
 
+    # 默认最大拉取行数，防止超大表耗尽内存和时间
+    MAX_RECORDS = 100_000
+
     async def fetch_records_adaptive(
         self,
         token: str,
@@ -108,70 +111,142 @@ class BitableReader:
         table_id: str,
         page_sizes: tuple[int, ...] = (500, 100, 20),
         since_ts: Optional[int] = None,
+        max_records: int | None = None,
     ) -> tuple[list[dict], dict]:
         """自适应分页拉取记录。
         - 从 page_sizes[0] 开始
-        - 遇飞书错误自动降到下一档
+        - 遇飞书错误/超时自动降到下一档
         - 所有档位都失败时抛 BitableRecordError，不返回部分数据
+        - 复用同一个 httpx client 避免翻页时连接风暴
+        - max_records 限制最大拉取行数（默认 MAX_RECORDS），避免超大表同步失控
         - 返回 (records, stats)
         """
+        limit = max_records if max_records is not None else self.MAX_RECORDS
         page_size_idx = 0
         page_token = None
         all_records: list[dict] = []
         errors: list[dict] = []
         degraded = False
+        truncated = False
 
-        while True:
-            try:
-                data = await self.fetch_records_page(
-                    token, app_token, table_id,
-                    page_sizes[page_size_idx], page_token, since_ts,
-                )
-                items = data.get("items") or []
-                all_records.extend(items)
-                if not data.get("has_more"):
-                    break
-                page_token = data.get("page_token")
-            except BitableRecordError as e:
-                if page_size_idx + 1 < len(page_sizes):
-                    old_size = page_sizes[page_size_idx]
-                    page_size_idx += 1
-                    new_size = page_sizes[page_size_idx]
-                    degraded = True
-                    errors.append({
-                        "from": old_size,
-                        "to": new_size,
-                        "error": str(e),
-                    })
-                    logger.warning(
-                        f"Bitable fetch 降级: page_size {old_size} → {new_size}, "
-                        f"error={e.feishu_msg or e}"
+        async with httpx.AsyncClient(timeout=90) as client:
+            while True:
+                try:
+                    data = await self._fetch_records_page_with_client(
+                        client, token, app_token, table_id,
+                        page_sizes[page_size_idx], page_token, since_ts,
                     )
-                    continue
-                else:
-                    # 所有档位都失败 — 抛异常，丢弃已拉到的部分数据
-                    errors.append({
-                        "page_size": page_sizes[page_size_idx],
-                        "error": str(e),
-                        "fatal": True,
-                    })
-                    raise BitableRecordError(
-                        f"所有分页档位均失败，已拉取 {len(all_records)} 条但数据不完整，"
-                        f"最后错误: {e.feishu_msg or e}",
-                        feishu_code=e.feishu_code,
-                        feishu_msg=e.feishu_msg,
-                        page_token=page_token,
-                        page_size=page_sizes[page_size_idx],
-                    )
+                    items = data.get("items") or []
+                    all_records.extend(items)
+
+                    if len(all_records) % 10_000 < len(items):
+                        logger.info(
+                            f"Bitable fetch progress: {len(all_records)} records "
+                            f"(table={table_id}, page_size={page_sizes[page_size_idx]})"
+                        )
+
+                    if len(all_records) >= limit:
+                        truncated = True
+                        logger.warning(
+                            f"Bitable fetch truncated at {len(all_records)} records "
+                            f"(limit={limit}, table={table_id})"
+                        )
+                        break
+                    if not data.get("has_more"):
+                        break
+                    page_token = data.get("page_token")
+                except (BitableRecordError, httpx.TimeoutException) as e:
+                    if page_size_idx + 1 < len(page_sizes):
+                        old_size = page_sizes[page_size_idx]
+                        page_size_idx += 1
+                        new_size = page_sizes[page_size_idx]
+                        degraded = True
+                        err_msg = getattr(e, "feishu_msg", None) or str(e)
+                        errors.append({
+                            "from": old_size,
+                            "to": new_size,
+                            "error": str(e),
+                        })
+                        logger.warning(
+                            f"Bitable fetch 降级: page_size {old_size} → {new_size}, "
+                            f"error={err_msg}"
+                        )
+                        continue
+                    else:
+                        # 所有档位都失败 — 抛异常，丢弃已拉到的部分数据
+                        errors.append({
+                            "page_size": page_sizes[page_size_idx],
+                            "error": str(e),
+                            "fatal": True,
+                        })
+                        feishu_code = getattr(e, "feishu_code", None)
+                        feishu_msg = getattr(e, "feishu_msg", None) or str(e)
+                        raise BitableRecordError(
+                            f"所有分页档位均失败，已拉取 {len(all_records)} 条但数据不完整，"
+                            f"最后错误: {feishu_msg}",
+                            feishu_code=feishu_code,
+                            feishu_msg=feishu_msg,
+                            page_token=page_token,
+                            page_size=page_sizes[page_size_idx],
+                        )
 
         stats = {
             "effective_page_size": page_sizes[page_size_idx],
             "pages_fetched": len(all_records) // max(page_sizes[page_size_idx], 1) + 1,
             "degraded": degraded,
+            "truncated": truncated,
+            "max_records_limit": limit,
             "errors": errors,
             "total_records": len(all_records),
         }
         return all_records, stats
+
+    async def _fetch_records_page_with_client(
+        self,
+        client: httpx.AsyncClient,
+        token: str,
+        app_token: str,
+        table_id: str,
+        page_size: int,
+        page_token: str | None = None,
+        since_ts: int | None = None,
+    ) -> dict:
+        """使用外部传入的 client 拉取单页（翻页复用连接）。"""
+        headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"}
+        body: dict = {"page_size": page_size}
+        if page_token:
+            body["page_token"] = page_token
+        if since_ts:
+            body["filter"] = {
+                "conjunction": "and",
+                "conditions": [{
+                    "field_name": "最后更新时间",
+                    "operator": "isGreater",
+                    "value": [str(since_ts * 1000)],
+                }],
+            }
+
+        r = await client.post(
+            f"{_LARK_API_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/records/search",
+            headers=headers,
+            json=body,
+        )
+        data = r.json()
+        code = data.get("code", -1)
+        if code != 0:
+            feishu_msg = data.get("msg", "")
+            if code in _PERMISSION_ERROR_CODES:
+                raise PermissionError(
+                    _permission_error_message(code, feishu_msg)
+                )
+            raise BitableRecordError(
+                f"获取记录失败: {feishu_msg} (code={code})",
+                feishu_code=code,
+                feishu_msg=feishu_msg,
+                page_token=page_token,
+                page_size=page_size,
+            )
+        return data.get("data", {})
 
     async def fetch_records_page(
         self,
@@ -197,7 +272,7 @@ class BitableReader:
                 }],
             }
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=90) as client:
             r = await client.post(
                 f"{_LARK_API_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/records/search",
                 headers=headers,
