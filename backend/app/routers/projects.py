@@ -1,7 +1,10 @@
-"""项目模块 API 路由。"""
+"""项目模块 API 路由。
+
+G5: 新增统一观测与审计 API（runs/artifacts/replay/audit）。
+"""
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -283,6 +286,18 @@ async def generate_plan(
     """LLM 生成 workspace 规划（职责、skill、工具、流程）。"""
     project = _get_project_or_404(project_id, db)
     _require_owner(project, user)
+    # G1: 标准化入口请求（旁路接线，不改变现有执行链）
+    try:
+        from app.harness.adapters import build_project_request
+        _ = build_project_request(
+            user_id=user.id,
+            project_id=project_id,
+            user_message="generate project plan",
+            stream=False,
+            metadata={"source": "projects.generate_plan"},
+        )
+    except Exception:
+        pass
 
     if not project.members:
         raise HTTPException(400, "请先添加项目成员")
@@ -328,6 +343,17 @@ async def apply_plan(
     project.status = ProjectStatus.ACTIVE
     db.commit()
     db.refresh(project)
+
+    # G5: 注册子 sessions
+    from app.harness.profiles.project import project_orchestrator
+    project_orchestrator.ensure_project_session(user.id, project.id, db)
+    for m in project.members:
+        if m.workspace_id and m.workspace:
+            ws_type = getattr(m.workspace, "workspace_type", "chat") or "chat"
+            project_orchestrator.register_sub_session(
+                m.user_id, project.id, m.workspace_id, ws_type, db,
+            )
+
     return _project_dict(project, include_members=True)
 
 
@@ -356,6 +382,16 @@ async def apply_dev_template(
     project.status = ProjectStatus.ACTIVE
     db.commit()
     db.refresh(project)
+
+    # G5: 注册子 sessions
+    from app.harness.profiles.project import project_orchestrator
+    project_orchestrator.ensure_project_session(user.id, project.id, db)
+    project_orchestrator.register_sub_session(
+        req.requester_user_id, project.id, result["chat_workspace_id"], "chat", db,
+    )
+    project_orchestrator.register_sub_session(
+        req.developer_user_id, project.id, result["dev_workspace_id"], "opencode", db,
+    )
 
     detail = _project_dict(project, include_members=True)
     detail.update(result)
@@ -395,6 +431,7 @@ async def submit_handoff(
         project=project,
         workspace_id=chat_member.workspace_id,
         db=db,
+        user_id=user.id,
     )
 
     # 将需求注入到 dev workspace 的 system_context
@@ -638,7 +675,7 @@ async def generate_report(
         raise HTTPException(400, "report_type 必须为 daily 或 weekly")
 
     from app.services.project_engine import project_engine
-    content = await project_engine.generate_report(project, report_type, db)
+    content = await project_engine.generate_report(project, report_type, db, user_id=user.id)
     return {"ok": True, "content": content}
 
 
@@ -671,7 +708,7 @@ async def sync_context(
         raise HTTPException(403, "无权操作该项目")
 
     from app.services.project_engine import project_engine
-    await project_engine.sync_context(project, db)
+    await project_engine.sync_context(project, db, user_id=user.id)
     return {"ok": True}
 
 
@@ -965,3 +1002,198 @@ async def extract_project_tasks(
 
     db.commit()
     return {"tasks": created}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# G5: 统一观测与审计 API
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _run_dict(run) -> dict:
+    """序列化 HarnessRun。"""
+    return {
+        "run_id": run.run_id,
+        "request_id": run.request_id,
+        "session_id": run.session_id,
+        "agent_type": run.agent_type.value if run.agent_type else None,
+        "status": run.status.value,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "error": run.error,
+        "metadata": run.metadata,
+    }
+
+
+def _artifact_dict(art) -> dict:
+    """序列化 HarnessArtifact。"""
+    return {
+        "artifact_id": art.artifact_id,
+        "run_id": art.run_id,
+        "artifact_type": art.artifact_type.value,
+        "name": art.name,
+        "content_ref": art.content_ref,
+        "metadata": art.metadata,
+        "created_at": art.created_at,
+    }
+
+
+@router.get("/{project_id}/runs")
+def list_project_runs(
+    project_id: int,
+    agent_type: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    limit: int = Query(50, le=200),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """G5: 查询项目的 Harness runs。"""
+    project = _get_project_or_404(project_id, db)
+    if not _is_member_or_owner(project, user):
+        raise HTTPException(403, "无权查看该项目")
+
+    from app.harness.gateway import get_session_store
+    store = get_session_store()
+    runs = store.list_runs(
+        project_id=project_id,
+        agent_type=agent_type,
+        status=status,
+        limit=limit,
+    )
+    return [_run_dict(r) for r in runs]
+
+
+@router.get("/{project_id}/runs/{run_id}")
+def get_project_run(
+    project_id: int,
+    run_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """G5: 获取单次 run 的完整快照（含 steps/artifacts/approvals/memory_refs）。"""
+    project = _get_project_or_404(project_id, db)
+    if not _is_member_or_owner(project, user):
+        raise HTTPException(403, "无权查看该项目")
+
+    from app.harness.gateway import get_session_store
+    store = get_session_store()
+    snapshot = store.get_run_snapshot(run_id)
+    if not snapshot:
+        raise HTTPException(404, "Run 不存在")
+
+    # 验证 run 属于该 project
+    run = snapshot.get("run")
+    if run and run.session_key and run.session_key.project_id != project_id:
+        raise HTTPException(403, "该 Run 不属于此项目")
+
+    return {
+        "run": _run_dict(run) if run else None,
+        "steps": [
+            {
+                "step_id": s.step_id,
+                "step_type": s.step_type.value,
+                "seq": s.seq,
+                "started_at": s.started_at,
+                "finished_at": s.finished_at,
+                "input_summary": s.input_summary,
+                "output_summary": s.output_summary,
+                "error": s.error,
+            }
+            for s in snapshot.get("steps", [])
+        ],
+        "artifacts": [_artifact_dict(a) for a in snapshot.get("artifacts", [])],
+        "approvals": [
+            {
+                "approval_id": a.approval_id,
+                "step_id": a.step_id,
+                "reason": a.reason,
+                "status": a.status.value,
+                "requested_at": a.requested_at,
+                "decided_at": a.decided_at,
+                "decided_by": a.decided_by,
+            }
+            for a in snapshot.get("approvals", [])
+        ],
+        "memory_refs": [
+            {
+                "ref_id": m.ref_id,
+                "ref_type": m.ref_type,
+                "ref_source_id": m.ref_source_id,
+                "summary": m.summary,
+            }
+            for m in snapshot.get("memory_refs", [])
+        ],
+    }
+
+
+@router.get("/{project_id}/runs/{run_id}/replay")
+def replay_project_run(
+    project_id: int,
+    run_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """G5: 从 UnifiedEvent 表重建 run 事件序列 — 持久化 replay。"""
+    project = _get_project_or_404(project_id, db)
+    if not _is_member_or_owner(project, user):
+        raise HTTPException(403, "无权查看该项目")
+
+    from app.harness.gateway import get_session_store
+    store = get_session_store()
+    events = store.replay_from_events(run_id, db)
+    return {"run_id": run_id, "events": events}
+
+
+@router.get("/{project_id}/artifacts")
+def list_project_artifacts(
+    project_id: int,
+    artifact_type: Optional[str] = Query(None),
+    limit: int = Query(50, le=200),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """G5: 查询项目的所有 artifacts（handoff/report/file 等）。"""
+    project = _get_project_or_404(project_id, db)
+    if not _is_member_or_owner(project, user):
+        raise HTTPException(403, "无权查看该项目")
+
+    from app.harness.gateway import get_session_store
+    store = get_session_store()
+    artifacts = store.list_artifacts(
+        project_id=project_id,
+        artifact_type=artifact_type,
+        limit=limit,
+    )
+    return [_artifact_dict(a) for a in artifacts]
+
+
+@router.get("/{project_id}/audit")
+def get_project_audit(
+    project_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """G5: 项目级审计摘要 — runs 统计、artifact 统计、失败率、工具使用。"""
+    project = _get_project_or_404(project_id, db)
+    if not _is_member_or_owner(project, user):
+        raise HTTPException(403, "无权查看该项目")
+
+    from app.harness.gateway import get_session_store
+    store = get_session_store()
+    stats = store.get_audit_stats(project_id=project_id)
+    stats["project_id"] = project_id
+    stats["project_name"] = project.name
+    return stats
+
+
+@router.get("/{project_id}/sub-sessions")
+def list_project_sub_sessions(
+    project_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """G5: 查询项目子 session 列表（各 workspace 对应的 agent session）。"""
+    project = _get_project_or_404(project_id, db)
+    if not _is_member_or_owner(project, user):
+        raise HTTPException(403, "无权查看该项目")
+
+    from app.harness.profiles.project import project_orchestrator
+    return project_orchestrator.get_project_sub_sessions(user.id, project_id)

@@ -30,7 +30,7 @@ class Workspace(Base):
     welcome_message = Column(Text, default="你好，有什么可以帮你的？")
     system_context = Column(Text, nullable=True)
     model_config_id = Column(Integer, ForeignKey("model_configs.id"), nullable=True)
-    workspace_type = Column(String(20), default="chat", nullable=False)  # chat | opencode
+    workspace_type = Column(String(20), default="chat", nullable=False)  # chat | opencode | sandbox | skill_studio | project
     sort_order = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
     is_preset = Column(Boolean, default=False)

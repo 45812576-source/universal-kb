@@ -1,4 +1,8 @@
-"""项目引擎：LLM规划生成、workspace 创建、上下文同步、报告生成。"""
+"""项目引擎：LLM规划生成、workspace 创建、上下文同步、报告生成。
+
+G5: 所有写入 ProjectContext / ProjectReport 的操作同步记录 HarnessMemoryRef，
+使项目上下文纳入 Harness 统一 memory bus。
+"""
 from __future__ import annotations
 
 import datetime
@@ -8,9 +12,72 @@ import re
 
 from sqlalchemy.orm import Session
 
+from app.harness.contracts import (
+    AgentType,
+    ArtifactType,
+    HarnessArtifact,
+    HarnessMemoryRef,
+    HarnessRun,
+    HarnessSessionKey,
+    RunStatus,
+    StepType,
+    HarnessStep,
+)
+from app.harness.gateway import get_session_store
 from app.services.llm_gateway import llm_gateway
 
 logger = logging.getLogger(__name__)
+
+
+def _get_project_session_key(user_id: int, project_id: int) -> HarnessSessionKey:
+    """构造 project 类型的 session key。"""
+    return HarnessSessionKey(
+        user_id=user_id,
+        agent_type=AgentType.PROJECT,
+        project_id=project_id,
+    )
+
+
+def _record_memory_ref(
+    run_id: str,
+    ref_type: str,
+    summary: str,
+    *,
+    ref_source_id: int | None = None,
+    metadata: dict | None = None,
+    db: Session | None = None,
+) -> None:
+    """向 SessionStore 写入 HarnessMemoryRef。"""
+    store = get_session_store()
+    ref = HarnessMemoryRef(
+        run_id=run_id,
+        ref_type=ref_type,
+        ref_source_id=ref_source_id,
+        summary=summary,
+        metadata=metadata or {},
+    )
+    store.add_memory_ref(ref, db=db)
+
+
+def _record_artifact(
+    run_id: str,
+    artifact_type: ArtifactType,
+    name: str,
+    content_ref: str,
+    *,
+    metadata: dict | None = None,
+    db: Session | None = None,
+) -> None:
+    """向 SessionStore 写入 HarnessArtifact。"""
+    store = get_session_store()
+    artifact = HarnessArtifact(
+        run_id=run_id,
+        artifact_type=artifact_type,
+        name=name,
+        content_ref=content_ref,
+        metadata=metadata or {},
+    )
+    store.add_artifact(artifact, db=db)
 
 _GENERATE_PLAN_PROMPT = """你是企业项目规划助手。根据项目背景和各成员的分工描述，为每个成员设计专属 workspace 配置。
 
@@ -238,12 +305,29 @@ class ProjectEngine:
             logger.warning("apply_plan 未匹配项: %s", "; ".join(warnings))
         return {"warnings": warnings}
 
-    async def sync_context(self, project, db: Session) -> None:
-        """为每个项目 workspace 生成进度摘要并存入 project_contexts。"""
+    async def sync_context(self, project, db: Session, *, user_id: int | None = None) -> None:
+        """为每个项目 workspace 生成进度摘要并存入 project_contexts。
+
+        G5: 同步记录 HarnessMemoryRef，关联项目上下文到 Harness memory bus。
+        """
         from app.models.project import ProjectMember, ProjectContext
         from app.models.conversation import Conversation, Message
 
         model_config = llm_gateway.resolve_config(db, "project.engine")
+
+        # G5: 创建 run 追踪本次 sync
+        store = get_session_store()
+        _uid = user_id or project.owner_id
+        session_key = _get_project_session_key(_uid, project.id)
+        harness_session = store.create_or_get_session(session_key, agent_type=AgentType.PROJECT, db=db)
+        run = HarnessRun(
+            request_id="",
+            session_id=harness_session.session_id,
+            session_key=session_key,
+            agent_type=AgentType.PROJECT,
+        )
+        store.create_run(run, db=db)
+        store.update_run_status(run.run_id, RunStatus.RUNNING, db=db)
 
         for member in project.members:
             if not member.workspace_id:
@@ -304,7 +388,19 @@ class ProjectEngine:
                     workspace_id=member.workspace_id,
                     summary=summary.strip(),
                 ))
+                db.flush()
 
+            # G5: 记录 memory ref
+            _record_memory_ref(
+                run_id=run.run_id,
+                ref_type="project_context",
+                summary=f"workspace={member.workspace_id} sync: {summary.strip()[:200]}",
+                ref_source_id=member.workspace_id,
+                metadata={"workspace_id": member.workspace_id, "project_id": project.id},
+                db=db,
+            )
+
+        store.update_run_status(run.run_id, RunStatus.COMPLETED, db=db)
         db.commit()
 
     async def extract_requirements(
@@ -312,8 +408,13 @@ class ProjectEngine:
         project,
         workspace_id: int,
         db: Session,
+        *,
+        user_id: int | None = None,
     ) -> dict:
-        """从 chat workspace 对话中提取需求摘要和验收标准，存入 ProjectContext。"""
+        """从 chat workspace 对话中提取需求摘要和验收标准，存入 ProjectContext。
+
+        G5: 记录 handoff 为 HarnessArtifact + HarnessMemoryRef。
+        """
         from app.models.project import ProjectContext
         from app.models.conversation import Conversation, Message
 
@@ -387,8 +488,40 @@ class ProjectEngine:
                 handoff_status="submitted",
                 handoff_at=datetime.datetime.now(datetime.UTC),
             ))
-        db.commit()
 
+        # G5: 创建 run + artifact + memory ref
+        store = get_session_store()
+        _uid = user_id or project.owner_id
+        session_key = _get_project_session_key(_uid, project.id)
+        harness_session = store.create_or_get_session(session_key, agent_type=AgentType.PROJECT, db=db)
+        run = HarnessRun(
+            request_id="",
+            session_id=harness_session.session_id,
+            session_key=session_key,
+            agent_type=AgentType.PROJECT,
+        )
+        store.create_run(run, db=db)
+        store.update_run_status(run.run_id, RunStatus.RUNNING, db=db)
+
+        _record_artifact(
+            run_id=run.run_id,
+            artifact_type=ArtifactType.HANDOFF,
+            name=f"handoff:project={project.id}:ws={workspace_id}",
+            content_ref=json.dumps({"requirements": requirements, "acceptance_criteria": acceptance_criteria}, ensure_ascii=False),
+            metadata={"project_id": project.id, "workspace_id": workspace_id},
+            db=db,
+        )
+        _record_memory_ref(
+            run_id=run.run_id,
+            ref_type="project_context",
+            summary=f"handoff submitted: requirements={requirements[:200]}",
+            ref_source_id=workspace_id,
+            metadata={"project_id": project.id, "handoff_status": "submitted"},
+            db=db,
+        )
+        store.update_run_status(run.run_id, RunStatus.COMPLETED, db=db)
+
+        db.commit()
         return {"requirements": requirements, "acceptance_criteria": acceptance_criteria}
 
     async def apply_dev_template(
@@ -483,8 +616,13 @@ class ProjectEngine:
         project,
         report_type: str,  # "daily" | "weekly"
         db: Session,
+        *,
+        user_id: int | None = None,
     ) -> str:
-        """根据所有 workspace 压缩上下文生成日/周报。"""
+        """根据所有 workspace 压缩上下文生成日/周报。
+
+        G5: 报告作为 HarnessArtifact 记录，可追溯到 run。
+        """
         from app.models.project import ProjectContext, ProjectReport, ReportType
 
         contexts = db.query(ProjectContext).filter(
@@ -533,6 +671,38 @@ class ProjectEngine:
             period_end=period_end,
         )
         db.add(report)
+        db.flush()
+
+        # G5: 报告作为 HarnessArtifact
+        store = get_session_store()
+        _uid = user_id or project.owner_id
+        session_key = _get_project_session_key(_uid, project.id)
+        harness_session = store.create_or_get_session(session_key, agent_type=AgentType.PROJECT, db=db)
+        run = HarnessRun(
+            request_id="",
+            session_id=harness_session.session_id,
+            session_key=session_key,
+            agent_type=AgentType.PROJECT,
+        )
+        store.create_run(run, db=db)
+        store.update_run_status(run.run_id, RunStatus.RUNNING, db=db)
+
+        _record_artifact(
+            run_id=run.run_id,
+            artifact_type=ArtifactType.REPORT,
+            name=f"{report_type_label}:project={project.id}:report={report.id}",
+            content_ref=f"project_reports:{report.id}",
+            metadata={
+                "project_id": project.id,
+                "report_id": report.id,
+                "report_type": report_type,
+                "period_start": str(period_start),
+                "period_end": str(period_end),
+            },
+            db=db,
+        )
+        store.update_run_status(run.run_id, RunStatus.COMPLETED, db=db)
+
         db.commit()
         db.refresh(report)
         return content.strip()

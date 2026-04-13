@@ -100,7 +100,7 @@ class KnowledgeEntry(Base):
     #   upload_ai_clean         文件上传+AI清洗无敏感
     #   upload                  文件上传原始
     capture_mode    = Column(String(50), default="manual_form")
-    visibility_scope = Column(String(50), nullable=True, default="private")
+    visibility_scope = Column(String(50), nullable=True, default="owner_or_dept_only")
     linked_skill_codes = Column(JSON, default=list)
     applicable_departments = Column(JSON, default=list)
     applicable_roles = Column(JSON, default=list)

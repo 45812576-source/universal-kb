@@ -144,9 +144,21 @@ async def _install_dependencies(install_dir: Path, project_type: str) -> tuple[b
 
 def _find_free_port() -> int:
     import socket
-    with socket.socket() as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
+    for host in ("127.0.0.1", ""):
+        try:
+            with socket.socket() as s:
+                s.bind((host, 0))
+                return s.getsockname()[1]
+        except PermissionError:
+            continue
+        except OSError:
+            continue
+
+    fallback_base = int(os.environ.get("MCP_FALLBACK_PORT_BASE", "38080"))
+    fallback_spread = max(int(os.environ.get("MCP_FALLBACK_PORT_SPREAD", "1000")), 1)
+    port = fallback_base + (os.getpid() % fallback_spread)
+    logger.warning("[MCP] 无法探测空闲端口，回退到端口 %s", port)
+    return port
 
 
 async def _wait_for_http(url: str, timeout: int = _STARTUP_TIMEOUT) -> bool:

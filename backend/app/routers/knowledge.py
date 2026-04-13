@@ -321,14 +321,24 @@ def _entry_dict(e: KnowledgeEntry, folder_name_map: dict[int, str] | None = None
 
 
 def _knowledge_visibility_scope(e: KnowledgeEntry) -> dict:
+    scope = (e.visibility_scope or "owner_or_dept_only").strip().lower()
+    if scope in ("private", "owner_only"):
+        return {
+            "scope": scope,
+            "reason": "explicit_private_scope",
+            "owner_id": e.created_by,
+            "department_id": e.department_id,
+        }
     if e.status == KnowledgeStatus.APPROVED:
         return {
-            "scope": "approved_global",
-            "reason": "approved",
+            "scope": "all_employees",
+            "reason": "approved_shared",
+            "owner_id": e.created_by,
+            "department_id": e.department_id,
         }
     return {
         "scope": "owner_or_dept_only",
-        "reason": "pending_or_unapproved",
+        "reason": "pending_review_scope",
         "owner_id": e.created_by,
         "department_id": e.department_id,
     }
@@ -338,37 +348,31 @@ def _apply_knowledge_visibility(query, user: User):
     """视图可见性过滤，与 _can_view_entry 保持语义一致。
 
     - SUPER_ADMIN：可见全部知识
-    - DEPT_ADMIN：自己创建的 + 本部门的 + 已审批的
-    - EMPLOYEE：自己创建的 + 已审批的
+    - DEPT_ADMIN：可见自己创建的、同部门待审的、以及全部非 private 的已审批知识
+    - EMPLOYEE：可见自己创建的、以及全部非 private 的已审批知识
     """
     if user.role == Role.SUPER_ADMIN:
         return query
-    _approved_non_private = and_(
-        KnowledgeEntry.status == KnowledgeStatus.APPROVED,
-        or_(
-            KnowledgeEntry.visibility_scope.is_(None),
-            KnowledgeEntry.visibility_scope != "private",
-        ),
-    )
-    _not_private = or_(
+    non_private_clause = or_(
         KnowledgeEntry.visibility_scope.is_(None),
-        KnowledgeEntry.visibility_scope != "private",
+        KnowledgeEntry.visibility_scope.notin_(("private", "owner_only")),
     )
-    if user.role == Role.DEPT_ADMIN:
-        return query.filter(
-            or_(
-                KnowledgeEntry.created_by == user.id,
-                and_(KnowledgeEntry.department_id == user.department_id, _not_private),
-                _approved_non_private,
+    visible_clauses = [
+        KnowledgeEntry.created_by == user.id,
+        and_(
+            KnowledgeEntry.status == KnowledgeStatus.APPROVED,
+            non_private_clause,
+        ),
+    ]
+    if user.role == Role.DEPT_ADMIN and user.department_id:
+        visible_clauses.append(
+            and_(
+                KnowledgeEntry.status == KnowledgeStatus.PENDING,
+                KnowledgeEntry.department_id == user.department_id,
+                non_private_clause,
             )
         )
-    # EMPLOYEE：只看自己的 + 已审批且非 private 的
-    return query.filter(
-        or_(
-            KnowledgeEntry.created_by == user.id,
-            _approved_non_private,
-        )
-    )
+    return query.filter(or_(*visible_clauses))
 
 
 def _can_view_entry(entry: KnowledgeEntry, user: User) -> bool:
@@ -376,16 +380,22 @@ def _can_view_entry(entry: KnowledgeEntry, user: User) -> bool:
         return True
     if entry.created_by == user.id:
         return True
-    # private 条目仅创建者可见
-    if entry.visibility_scope == "private":
+
+    scope = (entry.visibility_scope or "owner_or_dept_only").strip().lower()
+    if scope in ("private", "owner_only"):
         return False
-    if user.role == Role.EMPLOYEE:
-        return entry.status == KnowledgeStatus.APPROVED
-    if user.role == Role.DEPT_ADMIN:
-        return (
-            entry.department_id == user.department_id
-            or entry.status == KnowledgeStatus.APPROVED
-        )
+
+    if entry.status == KnowledgeStatus.APPROVED:
+        return True
+
+    if (
+        user.role == Role.DEPT_ADMIN
+        and user.department_id
+        and entry.department_id == user.department_id
+        and entry.status == KnowledgeStatus.PENDING
+    ):
+        return True
+
     return False
 
 
@@ -442,6 +452,7 @@ def create_knowledge(
         created_by=user.id,
         department_id=user.department_id,
         source_type="manual",
+        visibility_scope="owner_or_dept_only",
         capture_mode="manual_form",
         folder_id=folder_id,
         doc_render_status=None,
@@ -622,6 +633,7 @@ def _create_entry_from_file(
         created_by=user.id,
         department_id=user.department_id,
         source_type="upload",
+        visibility_scope="owner_or_dept_only",
         source_file=filename,
         capture_mode=capture_mode,
         oss_key=oss_key, file_type=file_type, file_ext=ext, file_size=file_size,
@@ -952,24 +964,8 @@ def search_chunks(
     """向量语义搜索知识切片；Milvus 不可用时退化为 SQL LIKE 搜索。
     taxonomy_board: A/B/C/D/E/F 对应知识大类，空=不限。
     """
-    from sqlalchemy import or_
-
     # 先按权限过滤
-    eq = db.query(KnowledgeEntry)
-    if user.role.value == "employee":
-        eq = eq.filter(
-            or_(
-                KnowledgeEntry.created_by == user.id,
-                KnowledgeEntry.status == KnowledgeStatus.APPROVED,
-            )
-        )
-    elif user.role.value == "dept_admin":
-        eq = eq.filter(
-            or_(
-                KnowledgeEntry.department_id == user.department_id,
-                KnowledgeEntry.status == KnowledgeStatus.APPROVED,
-            )
-        )
+    eq = _apply_knowledge_visibility(db.query(KnowledgeEntry), user)
 
     # 按知识大类过滤（taxonomy_board 字段，如 "A"/"B"/"C"...）
     if taxonomy_board:

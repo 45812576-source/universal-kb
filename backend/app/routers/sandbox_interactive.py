@@ -1336,6 +1336,33 @@ async def run_tests(
     if not session:
         raise HTTPException(404, "测试会话不存在")
     _check_session_access(session, user)
+    try:
+        from app.harness.adapters import build_sandbox_request
+        _h_req = build_sandbox_request(
+            user_id=user.id,
+            target_type=session.target_type,
+            target_id=session.target_id,
+            session_id=session.id,
+            user_message="sandbox.run",
+            metadata={"source": "sandbox_interactive.run", "sandbox_mode": True},
+        )
+        _step_statuses = dict(session.step_statuses or {})
+        _step_statuses["_harness_request_id"] = _h_req.request_id
+        _step_statuses["_harness_sandbox_mode"] = _h_req.sandbox_mode
+        session.step_statuses = _step_statuses
+        flag_modified(session, "step_statuses")
+        db.flush()
+    except Exception as _h_req_err:
+        logger.warning("build_sandbox_request failed: %s", _h_req_err)
+    # G3: 通过 SandboxAgentProfile 创建 HarnessRun 并追踪每条 case
+    _harness_run = None
+    try:
+        from app.harness.profiles.sandbox import sandbox_profile
+        _harness_run = sandbox_profile.begin_run(session, user.id, db)
+        # 记录 Q1/Q2/Q3 证据为 HarnessMemoryRef
+        sandbox_profile.record_evidence_ref(_harness_run, session, db)
+    except Exception as _harness_err:
+        logger.warning("SandboxAgentProfile.begin_run failed: %s", _harness_err)
     allow_status = (SessionStatus.READY_TO_RUN, SessionStatus.DRAFT, SessionStatus.COMPLETED, SessionStatus.RUNNING)
     allow_step = (SessionStep.CASE_GENERATION, SessionStep.PERMISSION_REVIEW, SessionStep.DONE, SessionStep.EXECUTION, SessionStep.EVALUATION)
     if session.status not in allow_status or session.current_step not in allow_step:
@@ -1436,6 +1463,13 @@ async def run_tests(
             session.executed_case_count = len(cases)
             session.current_step = SessionStep.EVALUATION
             _mark_step("case_execution", "completed")
+            # G3: 记录每条 case 为 HarnessStep
+            if _harness_run and cases:
+                try:
+                    for _case in cases:
+                        sandbox_profile.record_case_step(_harness_run, _case, db)
+                except Exception:
+                    logger.warning("sandbox_profile.record_case_step failed")
         except Exception as e:
             _mark_step("case_execution", "failed", error_code="llm_error", error_message=str(e))
             return _serialize_session(session)
@@ -1499,6 +1533,12 @@ async def run_tests(
             session.status = SessionStatus.COMPLETED
             session.completed_at = datetime.datetime.utcnow()
             _mark_step("report_generation", "completed")
+            # G3: 记录报告为 HarnessArtifact
+            if _harness_run and report:
+                try:
+                    sandbox_profile.record_report_artifact(_harness_run, report, db)
+                except Exception:
+                    logger.warning("sandbox_profile.record_report_artifact failed")
         except Exception as e:
             _mark_step("report_generation", "failed", error_code="report_error", error_message=str(e))
             return _serialize_session(session)
@@ -1520,6 +1560,14 @@ async def run_tests(
 
         if memo_sync_ok:
             _mark_step("memo_sync", "completed")
+
+    # G3: 完成 HarnessRun
+    if _harness_run:
+        try:
+            _run_success = session.status == SessionStatus.COMPLETED
+            sandbox_profile.finish_run(_harness_run, _run_success, db)
+        except Exception:
+            logger.warning("sandbox_profile.finish_run failed")
 
     return _serialize_session(session)
 

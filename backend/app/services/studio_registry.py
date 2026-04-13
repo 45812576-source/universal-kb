@@ -37,6 +37,9 @@ class StudioEntryResolution:
     needs_recover: bool
     recent_conversation_ids: list  # le-desk Conversation 的 id（兼容历史）
     last_active_at: Optional[str]  # ISO 格式最近活跃时间
+    workspace_id: Optional[int] = None
+    project_id: Optional[int] = None
+    registration_key: str = "default"
     # session 概要（entry 只给总数和健康状态，详情走 GET /sessions）
     session_total: int = 0
     session_db_health: str = "unknown"  # healthy | degraded | missing | error
@@ -45,11 +48,33 @@ class StudioEntryResolution:
     migration_state: str = "none"  # none | migrated | needs_repair | error
 
 
+def _registration_key(
+    workspace_type: str,
+    *,
+    workspace_id: Optional[int] = None,
+    project_id: Optional[int] = None,
+    target_type: Optional[str] = None,
+    target_id: Optional[int] = None,
+) -> str:
+    parts = [workspace_type]
+    if workspace_id is not None:
+        parts.append(f"ws:{workspace_id}")
+    if project_id is not None:
+        parts.append(f"proj:{project_id}")
+    if target_type:
+        parts.append(f"target:{target_type}")
+    if target_id is not None:
+        parts.append(f"tid:{target_id}")
+    return ":".join(parts) if len(parts) > 1 else "default"
+
+
 def resolve_entry(
     db: Session,
     user: User,
     workspace_type: str,
     skill_id: Optional[int] = None,
+    workspace_id: Optional[int] = None,
+    project_id: Optional[int] = None,
 ) -> StudioEntryResolution:
     """查或创建注册表记录 + 确保 conversation 存在，返回稳定入口。
 
@@ -59,11 +84,19 @@ def resolve_entry(
     - workspace_root/project_dir 始终存在于磁盘
     - skill_studio 使用独立 project_dir（workspace_root/skill_studio/），与 opencode cwd 隔离
     """
-    from app.routers.dev_studio import (
+    from app.services.workdir_manager import (
         _workspace_root_for_user,
         _workspace_project_dir,
         _workspace_skill_studio_dir,
         ensure_workspace_layout,
+    )
+
+    reg_key = _registration_key(
+        workspace_type,
+        workspace_id=workspace_id,
+        project_id=project_id,
+        target_type="skill" if skill_id else None,
+        target_id=skill_id,
     )
 
     reg = (
@@ -71,9 +104,21 @@ def resolve_entry(
         .filter(
             StudioRegistration.user_id == user.id,
             StudioRegistration.workspace_type == workspace_type,
+            StudioRegistration.registration_key == reg_key,
         )
         .first()
     )
+    if reg is None and reg_key == "default":
+        reg = (
+            db.query(StudioRegistration)
+            .filter(
+                StudioRegistration.user_id == user.id,
+                StudioRegistration.workspace_type == workspace_type,
+            )
+            .first()
+        )
+        if reg is not None and getattr(reg, "registration_key", None) != "default":
+            reg = None
 
     # 首次：创建注册记录
     if reg is None:
@@ -88,6 +133,11 @@ def resolve_entry(
         reg = StudioRegistration(
             user_id=user.id,
             workspace_type=workspace_type,
+            workspace_id=workspace_id,
+            project_id=project_id,
+            target_type="skill" if skill_id else None,
+            target_id=skill_id,
+            registration_key=reg_key,
             workspace_root=workspace_root,
             project_dir=project_dir,
             runtime_status="stopped" if workspace_type == "opencode" else "n/a",
@@ -95,6 +145,23 @@ def resolve_entry(
         )
         db.add(reg)
         db.flush()
+    else:
+        changed = False
+        if getattr(reg, "registration_key", None) in (None, ""):
+            reg.registration_key = reg_key
+            changed = True
+        if workspace_id is not None and reg.workspace_id != workspace_id:
+            reg.workspace_id = workspace_id
+            changed = True
+        if project_id is not None and reg.project_id != project_id:
+            reg.project_id = project_id
+            changed = True
+        if skill_id is not None and (reg.target_type != "skill" or reg.target_id != skill_id):
+            reg.target_type = "skill"
+            reg.target_id = skill_id
+            changed = True
+        if changed:
+            db.flush()
 
     # 确保磁盘目录存在
     if reg.workspace_root:
@@ -161,6 +228,9 @@ def resolve_entry(
         needs_recover=needs_recover,
         recent_conversation_ids=recent_conversation_ids,
         last_active_at=reg.last_active_at.isoformat() if reg.last_active_at else None,
+        workspace_id=reg.workspace_id,
+        project_id=reg.project_id,
+        registration_key=reg.registration_key or "default",
         session_total=probe.total,
         session_db_health=probe.db_health,
         session_db_source=probe.db_source,
@@ -271,6 +341,7 @@ def update_runtime_status(
     status: str,
     port: Optional[int] = None,
     bump_generation: bool = False,
+    registration_key: str = "default",
 ) -> Optional[StudioRegistration]:
     """更新运行时状态。"""
     reg = (
@@ -278,9 +349,19 @@ def update_runtime_status(
         .filter(
             StudioRegistration.user_id == user_id,
             StudioRegistration.workspace_type == workspace_type,
+            StudioRegistration.registration_key == registration_key,
         )
         .first()
     )
+    if not reg and registration_key == "default":
+        reg = (
+            db.query(StudioRegistration)
+            .filter(
+                StudioRegistration.user_id == user_id,
+                StudioRegistration.workspace_type == workspace_type,
+            )
+            .first()
+        )
     if not reg:
         return None
 
@@ -302,16 +383,32 @@ def update_runtime_status(
     return reg
 
 
-def resolve_studio_project_dir(db: Session, user_id: int, workspace_type: str) -> Optional[str]:
+def resolve_studio_project_dir(
+    db: Session,
+    user_id: int,
+    workspace_type: str,
+    *,
+    registration_key: str = "default",
+) -> Optional[str]:
     """返回该用户工作台的 project_dir。skill_studio 使用独立目录，不再与 opencode 共用。"""
     reg = (
         db.query(StudioRegistration)
         .filter(
             StudioRegistration.user_id == user_id,
             StudioRegistration.workspace_type == workspace_type,
+            StudioRegistration.registration_key == registration_key,
         )
         .first()
     )
+    if not reg and registration_key == "default":
+        reg = (
+            db.query(StudioRegistration)
+            .filter(
+                StudioRegistration.user_id == user_id,
+                StudioRegistration.workspace_type == workspace_type,
+            )
+            .first()
+        )
     if reg and reg.project_dir:
         return reg.project_dir
     # skill_studio 不再 fallback 到 opencode 的 project_dir
@@ -319,22 +416,33 @@ def resolve_studio_project_dir(db: Session, user_id: int, workspace_type: str) -
 
 
 def get_registration(
-    db: Session, user_id: int, workspace_type: str
+    db: Session, user_id: int, workspace_type: str, registration_key: str = "default"
 ) -> Optional[StudioRegistration]:
     """只读查询。"""
-    return (
+    reg = (
         db.query(StudioRegistration)
         .filter(
             StudioRegistration.user_id == user_id,
             StudioRegistration.workspace_type == workspace_type,
+            StudioRegistration.registration_key == registration_key,
         )
         .first()
     )
+    if not reg and registration_key == "default":
+        return (
+            db.query(StudioRegistration)
+            .filter(
+                StudioRegistration.user_id == user_id,
+                StudioRegistration.workspace_type == workspace_type,
+            )
+            .first()
+        )
+    return reg
 
 
 def migrate_existing_users(db: Session) -> dict:
     """迁移现有用户数据到注册表。返回 {migrated: int, errors: [...]}。"""
-    from app.routers.dev_studio import _workspace_root_for_user, _workspace_project_dir, _workspace_skill_studio_dir
+    from app.services.workdir_manager import _workspace_root_for_user, _workspace_project_dir, _workspace_skill_studio_dir
 
     migrated = 0
     errors = []
@@ -377,6 +485,7 @@ def migrate_existing_users(db: Session) -> dict:
             reg = StudioRegistration(
                 user_id=m.user_id,
                 workspace_type="opencode",
+                registration_key="default",
                 workspace_root=workspace_root,
                 project_dir=project_dir,
                 primary_conversation_id=conv_id,
@@ -422,6 +531,15 @@ def migrate_existing_users(db: Session) -> dict:
                 reg = StudioRegistration(
                     user_id=c.user_id,
                     workspace_type="skill_studio",
+                    workspace_id=skill_ws.id,
+                    target_type="skill" if c.skill_id else None,
+                    target_id=c.skill_id,
+                    registration_key=_registration_key(
+                        "skill_studio",
+                        workspace_id=skill_ws.id,
+                        target_type="skill" if c.skill_id else None,
+                        target_id=c.skill_id,
+                    ),
                     workspace_root=workspace_root,
                     project_dir=project_dir,
                     primary_conversation_id=c.id,

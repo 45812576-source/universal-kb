@@ -77,10 +77,10 @@ APPROVAL_TEMPLATES: dict[str, dict[str, Any]] = {
     "tool_publish": {
         "decision_focus": "工具是否安全可发布，依赖和权限是否声明清楚",
         "required_evidence": [
-            {"key": "tool_manifest", "label": "工具 Manifest", "required": True, "auto": True},
-            {"key": "deploy_info", "label": "部署信息", "required": True, "auto": True},
+            {"key": "tool_manifest", "label": "工具 Manifest", "required": True, "auto": True, "allow_empty_dict": True},
+            {"key": "deploy_info", "label": "部署信息", "required": True, "auto": True, "allow_empty_dict": True},
             {"key": "test_result", "label": "测试结果", "required": True, "auto": True},
-            {"key": "permission_declaration", "label": "权限声明", "required": True, "auto": True},
+            {"key": "permission_declaration", "label": "权限声明", "required": True, "auto": True, "allow_empty_list": True},
             {"key": "rollback_plan", "label": "回滚方案", "required": True, "auto": False},
         ],
         "review_checklist": [
@@ -421,7 +421,10 @@ def check_evidence_completeness(request_type: str, evidence_pack: dict | None) -
     evidence = evidence_pack or {}
     missing = []
     for item in tpl.get("required_evidence", []):
-        if item["required"] and not _is_real_evidence(evidence.get(item["key"])):
+        value = evidence.get(item["key"])
+        allow_empty_dict = item.get("allow_empty_dict") and isinstance(value, dict)
+        allow_empty_list = item.get("allow_empty_list") and isinstance(value, list)
+        if item["required"] and not (_is_real_evidence(value) or allow_empty_dict or allow_empty_list):
             missing.append(item["key"])
     return missing
 

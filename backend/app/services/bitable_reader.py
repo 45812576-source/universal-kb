@@ -128,14 +128,26 @@ class BitableReader:
         errors: list[dict] = []
         degraded = False
         truncated = False
+        fetch_page_impl = getattr(self.fetch_records_page, "__func__", self.fetch_records_page)
+        use_default_fetch_page = fetch_page_impl is BitableReader.fetch_records_page
 
         async with httpx.AsyncClient(timeout=90) as client:
             while True:
                 try:
-                    data = await self._fetch_records_page_with_client(
-                        client, token, app_token, table_id,
-                        page_sizes[page_size_idx], page_token, since_ts,
-                    )
+                    if use_default_fetch_page:
+                        data = await self._fetch_records_page_with_client(
+                            client, token, app_token, table_id,
+                            page_sizes[page_size_idx], page_token, since_ts,
+                        )
+                    else:
+                        data = await self.fetch_records_page(
+                            token,
+                            app_token,
+                            table_id,
+                            page_sizes[page_size_idx],
+                            page_token=page_token,
+                            since_ts=since_ts,
+                        )
                     items = data.get("items") or []
                     all_records.extend(items)
 
@@ -311,8 +323,8 @@ class BitableReader:
     @staticmethod
     def sanitize_col(field_name: str) -> str:
         """字段名清洗为合法列名，空名/纯符号名返回兜底列名"""
-        cleaned = re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fff]", "_", field_name).strip("_")
-        return cleaned if cleaned else f"_unnamed_{abs(hash(field_name)) % 10000}"
+        cleaned = re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fff]", "_", field_name)
+        return cleaned if cleaned.strip("_") else f"_unnamed_{abs(hash(field_name)) % 10000}"
 
     def records_to_html_table(self, fields: list[dict], records: list[dict]) -> str:
         """将字段+记录渲染为 HTML 表格（知识库 fallback 用）"""

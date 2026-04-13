@@ -16,7 +16,7 @@ from unittest import mock
 import pytest
 
 # Import workspace functions directly — they are pure functions with no DB dependency
-from app.routers.dev_studio import (
+from app.services.workdir_manager import (
     _workspace_project_dir,
     _workspace_runtime_dir,
     _workspace_runtime_data_dir,
@@ -419,6 +419,36 @@ class TestEnsureUserInstancePaths:
         oc_path = os.path.join(project_dir, ".opencode")
         if os.path.exists(oc_path):
             assert os.path.islink(oc_path), ".opencode in project/ should be a symlink, not a real directory"
+
+    def test_sanitize_preserves_existing_project_ids(self, workspace):
+        """sanitize 只修复空 project_id，不归并已有项目 session。"""
+        from app.services.opencode_backend import _sanitize_opencode_db
+
+        project_dir, _ = ensure_workspace_layout(workspace)
+        db_dir = os.path.join(workspace, "runtime", "data", "opencode")
+        os.makedirs(db_dir, exist_ok=True)
+        db_path = os.path.join(db_dir, "opencode.db")
+        con = sqlite3.connect(db_path)
+        try:
+            con.execute("CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT)")
+            con.execute("CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, directory TEXT)")
+            con.execute("INSERT INTO project VALUES ('project_a', ?)", (project_dir,))
+            con.execute("INSERT INTO session VALUES ('s_project', 'project_a', ?)", (project_dir,))
+            con.execute("INSERT INTO session VALUES ('s_empty', '', ?)", (project_dir,))
+            con.commit()
+        finally:
+            con.close()
+
+        _sanitize_opencode_db(workspace, project_dir)
+
+        con = sqlite3.connect(db_path)
+        try:
+            rows = dict(con.execute("SELECT id, project_id FROM session").fetchall())
+        finally:
+            con.close()
+
+        assert rows["s_project"] == "project_a"
+        assert rows["s_empty"] == "global"
 
 
 # ─── RUNTIME_IGNORE_DIRS consistency ──────────────────────────────────────────

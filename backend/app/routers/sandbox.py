@@ -1059,7 +1059,7 @@ async def knowledge_confirm(
             fname = os.path.basename(file_path)
             # 从 Skill 所属用户的 workspace 搜索
             try:
-                from app.routers.dev_studio import _get_registry_workspace_root
+                from app.services.runtime_process_manager import _get_registry_workspace_root
                 ws_root = _get_registry_workspace_root(user.id)
                 if ws_root:
                     for subdir in ["project/output", "project", "skill_studio/data",

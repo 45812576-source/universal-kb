@@ -50,12 +50,17 @@ class StudioRegistration(Base):
     """统一实例注册表 — workspace 是持久身份对象，进程只是可回收壳。"""
     __tablename__ = "studio_instance_registrations"
     __table_args__ = (
-        UniqueConstraint("user_id", "workspace_type", name="uq_user_workspace_type"),
+        UniqueConstraint("user_id", "workspace_type", "registration_key", name="uq_user_workspace_registration_key"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     workspace_type = Column(String(20), nullable=False)  # "opencode" | "skill_studio"
+    workspace_id = Column(Integer, ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True)
+    target_type = Column(String(50), nullable=True)
+    target_id = Column(Integer, nullable=True)
+    registration_key = Column(String(255), nullable=False, default="default")
     workspace_root = Column(String(1024), nullable=False)  # user_<id> 根目录
     project_dir = Column(String(1024), nullable=False)     # workspace_root/project
     primary_conversation_id = Column(Integer, ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True)

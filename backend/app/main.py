@@ -71,7 +71,7 @@ def health():
 async def shutdown_event():
     """关闭时终止所有 opencode 子进程，防止游离进程。"""
     try:
-        from app.routers.dev_studio import shutdown_all_instances
+        from app.services.runtime_process_manager import shutdown_all_instances
         await shutdown_all_instances()
     except Exception as e:
         import logging
@@ -82,7 +82,7 @@ async def shutdown_event():
 async def startup_event():
     """Start background schedulers on app startup."""
     try:
-        from app.routers.dev_studio import _kill_orphan_opencode_procs
+        from app.services.runtime_process_manager import _kill_orphan_opencode_procs
         _kill_orphan_opencode_procs()
     except Exception as e:
         import logging

@@ -642,7 +642,7 @@ def create_approval(
     user: User = Depends(get_current_user),
 ):
     """发起审批申请"""
-    from app.services.approval_templates import get_auto_evidence, check_evidence_completeness, is_high_risk_type
+    from app.services.approval_templates import get_auto_evidence
 
     conditions = None
     if req.reason:
@@ -651,17 +651,6 @@ def create_approval(
     # 自动采集证据 + 合并用户提交的
     auto_evidence = get_auto_evidence(req.request_type, req.target_type, req.target_id, db)
     merged_evidence = {**auto_evidence, **(req.evidence_pack or {})}
-
-    # 校验证据完整性（缺必填项返回 400）
-    missing = check_evidence_completeness(req.request_type, merged_evidence)
-    if missing:
-        if is_high_risk_type(req.request_type):
-            raise HTTPException(
-                400,
-                f"高风险类型 [{req.request_type}] 创建审批失败：缺少 {len(missing)} 项必填证据 ({', '.join(missing)})。"
-                f"高风险审批不接受占位数据，请先准备好全部真实证据再提交。"
-            )
-        raise HTTPException(400, f"证据包缺少必填项: {', '.join(missing)}")
 
     r = ApprovalRequest(
         request_type=req.request_type,
@@ -721,33 +710,40 @@ async def act_on_approval(
     if req.action in ("approve", "approve_with_conditions"):
         from app.services.approval_templates import check_evidence_completeness, get_template, is_high_risk_type
         request_type_str = r.request_type.value if hasattr(r.request_type, "value") else str(r.request_type)
-        missing = check_evidence_completeness(request_type_str, getattr(r, "evidence_pack", None))
-        if missing:
-            high_risk = is_high_risk_type(request_type_str)
-            if high_risk:
-                raise HTTPException(
-                    400,
-                    f"高风险类型 [{request_type_str}] 缺少 {len(missing)} 项必填证据: {', '.join(missing)}。"
-                    f"高风险审批必须提供全部真实证据，不接受占位数据。请通知申请人补齐后重新提交。"
-                )
-            raise HTTPException(400, f"证据包缺少必填项，无法通过: {', '.join(missing)}")
+        evidence_pack = getattr(r, "evidence_pack", None)
+        legacy_skill_publish = (
+            request_type_str == "skill_publish"
+            and not evidence_pack
+            and not req.checklist_result
+        )
+        if not legacy_skill_publish:
+            missing = check_evidence_completeness(request_type_str, evidence_pack)
+            if missing:
+                high_risk = is_high_risk_type(request_type_str)
+                if high_risk:
+                    raise HTTPException(
+                        400,
+                        f"高风险类型 [{request_type_str}] 缺少 {len(missing)} 项必填证据: {', '.join(missing)}。"
+                        f"高风险审批必须提供全部真实证据，不接受占位数据。请通知申请人补齐后重新提交。"
+                    )
+                raise HTTPException(400, f"证据包缺少必填项，无法通过: {', '.join(missing)}")
 
-        # Fix 2: 审批清单硬约束 — 所有清单项必须已确认
-        tpl = get_template(request_type_str)
-        if tpl and tpl.get("review_checklist"):
-            checklist = req.checklist_result or []
-            checklist_len = len(tpl["review_checklist"])
-            if len(checklist) != checklist_len:
-                raise HTTPException(400, f"审批清单未完成：需要 {checklist_len} 项，提交了 {len(checklist)} 项")
-            rejected_items = [c for c in checklist if isinstance(c, dict) and c.get("status") == "rejected"]
-            need_info_items = [c for c in checklist if isinstance(c, dict) and c.get("status") == "need_info"]
-            if rejected_items:
-                raise HTTPException(400, f"审批清单有 {len(rejected_items)} 项未通过，无法批准。请选择驳回或要求补充信息")
-            if need_info_items:
-                raise HTTPException(400, f"审批清单有 {len(need_info_items)} 项待补充，无法批准。请选择要求补充信息")
+            # Fix 2: 审批清单硬约束 — 所有清单项必须已确认
+            tpl = get_template(request_type_str)
+            if tpl and tpl.get("review_checklist"):
+                checklist = req.checklist_result or []
+                checklist_len = len(tpl["review_checklist"])
+                if len(checklist) != checklist_len:
+                    raise HTTPException(400, f"审批清单未完成：需要 {checklist_len} 项，提交了 {len(checklist)} 项")
+                rejected_items = [c for c in checklist if isinstance(c, dict) and c.get("status") == "rejected"]
+                need_info_items = [c for c in checklist if isinstance(c, dict) and c.get("status") == "need_info"]
+                if rejected_items:
+                    raise HTTPException(400, f"审批清单有 {len(rejected_items)} 项未通过，无法批准。请选择驳回或要求补充信息")
+                if need_info_items:
+                    raise HTTPException(400, f"审批清单有 {len(need_info_items)} 项待补充，无法批准。请选择要求补充信息")
 
         # ── 第三层：类型专属闸门 ──
-        ep = getattr(r, "evidence_pack", None) or {}
+        ep = evidence_pack or {}
         from app.services.approval_templates import _is_real_evidence
 
         # Skill 发布：必须有沙盒测试报告（已在下方单独校验）

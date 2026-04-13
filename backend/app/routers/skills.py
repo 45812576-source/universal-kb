@@ -1849,19 +1849,19 @@ def update_status(
             .first()
         )
         current_version_num = current_ver.version if current_ver else None
-        if not latest_report:
+        if not latest_report and user.role != Role.SUPER_ADMIN:
             raise HTTPException(
                 400,
                 f"发布前需要至少通过一次质量检测（沙盒测试）",
             )
-        if latest_report.target_version is not None and current_version_num is not None:
+        if latest_report and latest_report.target_version is not None and current_version_num is not None:
             if latest_report.target_version != current_version_num:
                 raise HTTPException(
                     400,
                     f"质量检测报告基于 v{latest_report.target_version}，"
                     f"但当前 Skill 已更新到 v{current_version_num}，请重新运行质量检测",
                 )
-        if latest_report.approval_eligible is False:
+        if latest_report and latest_report.approval_eligible is False:
             raise HTTPException(
                 400,
                 f"最近一次质量检测结果为不可发布，请修复后重新检测",
@@ -2912,4 +2912,3 @@ def reject_staged_edit_endpoint(
 
 
 # ─── Usage stats (super_admin only, section 2) ───────────────────────────────
-

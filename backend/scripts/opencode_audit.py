@@ -77,7 +77,7 @@ def audit(db, fix: bool = False) -> dict:
                 "path": ws_root_path,
             })
             if fix:
-                from app.routers.dev_studio import ensure_workspace_layout
+                from app.services.workdir_manager import ensure_workspace_layout
                 try:
                     ensure_workspace_layout(reg.workspace_root, display_name="")
                     auto_fixed.append({
@@ -163,7 +163,7 @@ def audit(db, fix: bool = False) -> dict:
                 })
                 if fix:
                     # 尝试补建 registration
-                    from app.routers.dev_studio import _workspace_root_for_user, _workspace_project_dir
+                    from app.services.workdir_manager import _workspace_root_for_user, _workspace_project_dir
                     user = db.get(User, conv.user_id)
                     if user:
                         ws_root = _workspace_root_for_user(user.id, user.display_name or "")
@@ -203,7 +203,7 @@ def audit(db, fix: bool = False) -> dict:
                 # 尝试找到对应用户并触发迁移
                 user = db.query(User).filter(User.display_name == dirname).first()
                 if user:
-                    from app.routers.dev_studio import _workspace_root_for_user
+                    from app.services.workdir_manager import _workspace_root_for_user
                     new_root = _workspace_root_for_user(user.id, user.display_name)
                     if os.path.isdir(os.path.join(studio_root, f"user_{user.id}")):
                         manual_review.append({

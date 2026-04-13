@@ -522,27 +522,39 @@ async def send_message(
     db.add(user_msg)
     db.commit()
 
-    # skill_studio 快速路径：用 system_context 直接对话，跳过 skill_engine
-    if _ws_obj and _ws_obj.workspace_type == "skill_studio" and _ws_obj.system_context:
-        _history = (
-            db.query(Message)
-            .filter(Message.conversation_id == conv_id)
-            .order_by(Message.created_at)
-            .all()
-        )
-        _llm_msgs = [{"role": "system", "content": _ws_obj.system_context}]
-        for _m in _history:
-            _llm_msgs.append({"role": "user" if _m.role == MessageRole.USER else "assistant", "content": _m.content or ""})
-        _model_cfg = llm_gateway.resolve_config(db, "conversation.main", getattr(_ws_obj, "model_config_id", None))
+    # G3: skill_studio 同步路径统一走 SkillStudioAgentProfile（消除 system_context 直聊双轨）
+    if _ws_obj and _ws_obj.workspace_type == "skill_studio":
         try:
-            _resp_text, _ = await llm_gateway.chat(_model_cfg, _llm_msgs)
+            from app.harness.profiles.skill_studio import skill_studio_profile
+            from app.harness.adapters import build_skill_studio_request
+            _studio_req = build_skill_studio_request(
+                user_id=user.id,
+                workspace_id=conv.workspace_id or 0,
+                skill_id=req.selected_skill_id or conv.skill_id or 0,
+                conversation_id=conv_id,
+                user_message=req.content,
+                stream=False,
+                metadata={"source": "conversations.send_message"},
+            )
+            _studio_resp = await skill_studio_profile.run_sync(
+                _studio_req, db, conv,
+                selected_skill_id=req.selected_skill_id,
+                editor_prompt=req.editor_prompt,
+                editor_is_dirty=req.editor_is_dirty,
+            )
+            if _studio_resp.error:
+                raise HTTPException(503, _studio_resp.error)
+            _resp_text = _studio_resp.content
+        except HTTPException:
+            raise
         except Exception as e:
+            logger.error(f"SkillStudioAgentProfile sync error: {e}")
             raise HTTPException(503, f"AI 服务暂时不可用，请稍后重试")
         _assistant_msg = Message(
             conversation_id=conv_id,
             role=MessageRole.ASSISTANT,
             content=_resp_text,
-            metadata_={},
+            metadata_={"skill_id": req.selected_skill_id, "studio_scope": "skill_studio"},
         )
         db.add(_assistant_msg)
         msg_count = db.query(Message).filter(Message.conversation_id == conv_id).count()
@@ -553,21 +565,26 @@ async def send_message(
             "id": _assistant_msg.id,
             "role": "assistant",
             "content": _resp_text,
-            "skill_id": None,
+            "skill_id": req.selected_skill_id,
             "skill_name": None,
-            "metadata": {},
+            "metadata": {"studio_scope": "skill_studio"},
         }
 
-    # Execute skill engine
+    # 同步入口保持 legacy execute 兼容；统一 runtime 继续用于流式主链。
     try:
-        result = await skill_engine.execute(db, conv, req.content, user_id=user.id, active_skill_ids=req.active_skill_ids, force_skill_id=req.force_skill_id)
+        response, guide_meta = await skill_engine.execute(
+            db,
+            conv,
+            req.content,
+            user_id=user.id,
+            active_skill_ids=req.active_skill_ids,
+            force_skill_id=req.force_skill_id,
+        )
     except ValueError as e:
         raise HTTPException(503, str(e))
     except Exception as e:
+        logger.error(f"SkillEngine sync error: {e}")
         raise HTTPException(503, f"AI 服务暂时不可用，请稍后重试")
-
-    # skill_engine always returns (content, meta_dict)
-    response, guide_meta = result
 
     # Resolve skill name
     skill_name = None
@@ -628,6 +645,33 @@ async def stream_message(
     if not conv or conv.user_id != user.id:
         raise HTTPException(404, "Conversation not found")
 
+    # G1: 标准化入口请求（旁路接线，不改变现有执行链）
+    try:
+        from app.harness.adapters import build_chat_request, build_skill_studio_request
+        from app.models.workspace import Workspace as _HarnessWsModel
+        _ws_for_harness = db.get(_HarnessWsModel, conv.workspace_id) if conv.workspace_id else None
+        if _ws_for_harness and _ws_for_harness.workspace_type == "skill_studio":
+            _h_req = build_skill_studio_request(
+                user_id=user.id,
+                workspace_id=conv.workspace_id or 0,
+                skill_id=req.selected_skill_id or conv.skill_id or 0,
+                conversation_id=conv_id,
+                user_message=req.content,
+                stream=True,
+                metadata={"source": "conversations.stream"},
+            ) if (req.selected_skill_id or conv.skill_id) else None
+        else:
+            _h_req = build_chat_request(
+                user_id=user.id,
+                workspace_id=conv.workspace_id or 0,
+                conversation_id=conv_id,
+                user_message=req.content,
+                stream=True,
+                metadata={"source": "conversations.stream"},
+            ) if conv.workspace_id else None
+    except Exception:
+        _h_req = None
+
     # 沙盒工作台 guard：在 commit user message 之前检查，避免无关消息入库
     if conv.workspace_id:
         from app.models.workspace import Workspace as WsModel
@@ -651,6 +695,8 @@ async def stream_message(
         _user_meta["studio_scope"] = "skill_studio"
     if req.editor_prompt:
         _user_meta["editor_target"] = True
+    if _h_req:
+        _user_meta["_harness_request_id"] = _h_req.request_id
     user_msg = Message(
         conversation_id=conv_id,
         role=MessageRole.USER,
@@ -750,69 +796,33 @@ async def stream_message(
                 yield _sse("done", {"message_id": pev_msg.id, "metadata": {"pev_job_id": pev_job.id}})
                 return
 
-            # --- skill_studio 路径：调用 studio_agent orchestrator ---
+            # --- G3: skill_studio 流式路径统一走 SkillStudioAgentProfile ---
             if _skip_pev and conv.workspace_id:
                 from app.models.workspace import Workspace as WsModel3
                 _ws_fast = db.get(WsModel3, conv.workspace_id)
                 if _ws_fast and _ws_fast.workspace_type == "skill_studio":
-                    from app.services.studio_agent import run_stream as _studio_run_stream
+                    from app.harness.profiles.skill_studio import skill_studio_profile
+                    from app.harness.adapters import build_skill_studio_request as _build_studio_req
                     logger.info(
-                        f"[studio_agent] conv={conv_id} skill={req.selected_skill_id} "
+                        f"[studio_profile] conv={conv_id} skill={req.selected_skill_id} "
                         f"dirty={req.editor_is_dirty}"
                     )
 
-                    # 构建历史消息（按 selected_skill_id 隔离，每个 skill 最多 30 轮 = 60 条）
-                    _STUDIO_HISTORY_ROUNDS = 30
-                    _sid = req.selected_skill_id
-                    if _sid:
-                        # 取该 skill 下最近 60 条（user 消息 metadata_.skill_id 匹配，assistant 消息紧跟其后）
-                        # 简化方案：取 conv 内所有消息，过滤出属于该 skill 的对话对
-                        _all_msgs = (
-                            db.query(Message)
-                            .filter(Message.conversation_id == conv_id)
-                            .order_by(Message.created_at)
-                            .all()
-                        )
-                        # 按 user message 的 skill_id 标记筛选对话对
-                        _skill_pairs: list[dict] = []
-                        _pending_user: dict | None = None
-                        for _m in _all_msgs:
-                            if _m.role == MessageRole.USER:
-                                _meta = _m.metadata_ or {}
-                                if _meta.get("skill_id") == _sid:
-                                    _pending_user = {"role": "user", "content": _m.content or ""}
-                                else:
-                                    _pending_user = None
-                            elif _m.role == MessageRole.ASSISTANT and _pending_user is not None:
-                                _asst_content = (_m.content or "").strip()
-                                if _asst_content:
-                                    _skill_pairs.append(_pending_user)
-                                    _skill_pairs.append({"role": "assistant", "content": _asst_content})
-                                _pending_user = None
-                        # 最多保留最近 30 轮
-                        _llm_history = _skill_pairs[-(_STUDIO_HISTORY_ROUNDS * 2):]
-                    else:
-                        # 没有选中 skill 时，取全局最近 30 轮（无 skill_id 过滤）
-                        _all_msgs = (
-                            db.query(Message)
-                            .filter(Message.conversation_id == conv_id)
-                            .order_by(Message.created_at.desc())
-                            .limit(_STUDIO_HISTORY_ROUNDS * 2)
-                            .all()
-                        )
-                        _llm_history = [
-                            {"role": "user" if _m.role == MessageRole.USER else "assistant",
-                             "content": (_m.content or "").strip() or "(empty)"}
-                            for _m in reversed(_all_msgs)
-                            if (_m.content or "").strip()
-                        ]
+                    _studio_req = _build_studio_req(
+                        user_id=current_user_id,
+                        workspace_id=conv.workspace_id or 0,
+                        skill_id=req.selected_skill_id or conv.skill_id or 0,
+                        conversation_id=conv_id,
+                        user_message=req.content,
+                        stream=True,
+                        metadata={"source": "conversations.stream"},
+                    )
 
-                    # ── Studio 结构化模式（灰度开关）──
+                    # ── Studio 结构化模式（灰度开关）：首轮 route + audit ──
                     from app.config import settings as _app_settings
                     _studio_structured = _app_settings.STUDIO_STRUCTURED_MODE == "on"
 
                     if _studio_structured:
-                        # 首轮消息触发 route（用 user_message 做 intent 判断）
                         _msg_count_check = db.query(Message).filter(
                             Message.conversation_id == conv_id
                         ).count()
@@ -829,14 +839,11 @@ async def stream_message(
                                 "workflow_mode": _route_result.workflow_mode,
                                 "initial_phase": _route_result.initial_phase,
                             })
-
-                            # 发送 assist_skills_status 事件
                             yield _sse("assist_skills_status", {
                                 "skills": _route_result.active_assist_skills,
                                 "session_mode": _route_result.session_mode,
                             })
 
-                            # ── Architect mode: 初始化状态 + 发送阶段事件 ──
                             if _route_result.workflow_mode == "architect_mode":
                                 from app.models.skill import ArchitectWorkflowState
                                 _arch_state = db.query(ArchitectWorkflowState).filter(
@@ -852,14 +859,12 @@ async def stream_message(
                                     db.add(_arch_state)
                                     db.commit()
                                     db.refresh(_arch_state)
-
                                 yield _sse("architect_phase_status", {
                                     "phase": _arch_state.workflow_phase,
                                     "mode_source": _route_result.session_mode,
                                     "ooda_round": _arch_state.ooda_round,
                                 })
 
-                            # 若 route 结果为 audit → 自动触发 audit → governance
                             if _route_result.next_action == "run_audit" and req.selected_skill_id:
                                 try:
                                     from app.services.studio_auditor import run_audit as _run_audit
@@ -870,8 +875,6 @@ async def stream_message(
                                         "recommended_path": _audit_result.recommended_path,
                                         "audit_id": getattr(_audit_result, "audit_id", None),
                                     })
-
-                                    # audit 后自动触发 governance → 发送 card + staged edit
                                     if _audit_result.verdict in ("needs_work", "poor"):
                                         try:
                                             from app.services.studio_governance import generate_governance_actions
@@ -886,98 +889,31 @@ async def stream_message(
                                         except Exception as _gov_err:
                                             logger.warning(f"[studio] auto-governance failed: {_gov_err}")
                                             yield _sse("fallback_text", {"text": f"治理建议生成失败: {_gov_err}"})
-
                                 except Exception as _audit_err:
                                     logger.warning(f"[studio] auto-audit failed: {_audit_err}")
                                     yield _sse("fallback_text", {"text": f"审计未能完成: {_audit_err}"})
 
-                    _fast_model = llm_gateway.resolve_config(db, "conversation.main", getattr(_ws_fast, "model_config_id", None))
-                    yield _sse("status", {"stage": "preparing"})
-
-                    # 查询可用工具列表，供 AI 推荐绑定
-                    from app.models.tool import ToolRegistry, ToolType
-                    _pub_tools = (
-                        db.query(ToolRegistry)
-                        .filter(ToolRegistry.status == "published")
-                        .limit(50)
-                        .all()
-                    )
-                    if _pub_tools:
-                        _tools_text = "\n".join(
-                            f"  - [{t.id}] {t.display_name or t.name}（{t.tool_type.value}）：{t.description or '无描述'}"
-                            for t in _pub_tools
-                        )
-                    else:
-                        _tools_text = "（暂无已注册工具）"
-
-                    # 查询当前 skill 的附属文件列表 + 读取文件内容注入
-                    _source_files: list[dict] = []
-                    _source_files_content: str = ""
-                    if req.selected_skill_id:
-                        from app.models.skill import Skill as SkillModel
-                        _cur_skill = db.get(SkillModel, req.selected_skill_id)
-                        if _cur_skill:
-                            _source_files = list(_cur_skill.source_files or [])
-                            if _source_files:
-                                from app.services.skill_engine import _read_source_files
-                                _source_files_content = _read_source_files(
-                                    req.selected_skill_id, _source_files
-                                )
-
-                    # 查询 memo 上下文
-                    _memo_ctx = None
-                    if req.selected_skill_id:
-                        from app.services.skill_memo_service import get_memo as _get_memo
-                        _memo_ctx = _get_memo(db, req.selected_skill_id)
-
-                    # 查询 skill 元数据（source_type 等）供路由使用
-                    _skill_metadata: dict | None = None
-                    if req.selected_skill_id:
-                        from app.models.skill import Skill as _SkillMeta
-                        _sk_meta = db.get(_SkillMeta, req.selected_skill_id)
-                        if _sk_meta:
-                            _skill_metadata = {
-                                "source_type": getattr(_sk_meta, "source_type", None),
-                                "skill_id": _sk_meta.id,
-                                "name": getattr(_sk_meta, "name", None),
-                            }
-
+                    # G3: 通过 SkillStudioAgentProfile 执行（唯一主链）
                     _final_content = ""
-                    async for _item in _stream_with_keepalive(
-                        _studio_run_stream(
-                            db=db,
-                            conv_id=conv_id,
-                            workspace_system_context=_ws_fast.system_context or "",
-                            history_messages=_llm_history,
-                            user_message=req.content,
-                            model_config=_fast_model,
-                            selected_skill_id=req.selected_skill_id,
-                            editor_prompt=req.editor_prompt,
-                            editor_is_dirty=req.editor_is_dirty,
-                            available_tools=_tools_text,
-                            source_files=_source_files,
-                            source_files_content=_source_files_content,
-                            selected_source_filename=req.selected_source_filename,
-                            memo_context=_memo_ctx,
-                            skill_metadata=_skill_metadata,
-                        ),
-                        request=request,
+                    async for _harness_evt in skill_studio_profile.run_stream(
+                        _studio_req, db, conv,
+                        selected_skill_id=req.selected_skill_id,
+                        editor_prompt=req.editor_prompt,
+                        editor_is_dirty=req.editor_is_dirty,
                     ):
-                        if isinstance(_item, str):
-                            # keepalive ping
-                            yield _item
-                            continue
-                        _evt, _data = _item
-                        if _evt == "__full_content__":
-                            _final_content = _data.get("text", "")
-                        else:
-                            yield _sse(_evt, _data)
+                        # HarnessEvent → SSE 文本
+                        yield _harness_evt.to_sse()
+                        # 捕获最终内容（从 REPLACE 或 DELTA 事件）
+                        if _harness_evt.event.value == "replace":
+                            _final_content = _harness_evt.data.get("text", _final_content)
+                        elif _harness_evt.event.value == "delta":
+                            _final_content += _harness_evt.data.get("text", "")
 
                     _fast_msg = Message(
                         conversation_id=conv_id,
                         role=MessageRole.ASSISTANT,
                         content=_final_content,
-                        metadata_={"skill_id": req.selected_skill_id} if req.selected_skill_id else {},
+                        metadata_={"skill_id": req.selected_skill_id, "studio_scope": "skill_studio"} if req.selected_skill_id else {"studio_scope": "skill_studio"},
                     )
                     db.add(_fast_msg)
                     _msg_count = db.query(Message).filter(Message.conversation_id == conv_id).count()
@@ -987,169 +923,136 @@ async def stream_message(
                     yield _sse("done", {"message_id": _fast_msg.id, "metadata": {}})
                     return
 
-            # --- Prepare phase (skill matching, knowledge, prompt) ---
-            # 用 asyncio.Queue + keepalive 循环保护 prepare 阶段：
-            # prepare 内部每完成一个子阶段就 put 一个 status，主循环取出来 yield 给前端；
-            # 超过 10s 没有进展则发送 keepalive ping，防止 nginx 等代理超时断连。
+            # --- G2: Chat 主路径通过 AgentRuntime 执行 ---
+            from app.harness.runtime import agent_runtime
+            from app.harness.adapters import build_chat_request as _build_chat_req
+
             _status_queue: asyncio.Queue = asyncio.Queue()
 
             async def _on_status(stage: str):
                 await _status_queue.put(("status", stage))
 
             yield _sse("status", {"stage": "preparing"})
-            _prep_task = asyncio.ensure_future(skill_engine.prepare(
-                db, conv, req.content,
+
+            _chat_req = _build_chat_req(
                 user_id=current_user_id,
+                workspace_id=conv.workspace_id or 0,
+                conversation_id=conv_id,
+                user_message=req.content,
+                stream=True,
+            )
+
+            # 启动 runtime.run 作为 task，同时 drain status queue
+            _runtime_events: list = []
+            _runtime_gen = agent_runtime.run(
+                _chat_req, db, conv,
                 active_skill_ids=req.active_skill_ids,
                 force_skill_id=req.force_skill_id,
                 on_status=_on_status,
-            ))
-
-            # drain queue：持续取 status 事件并 yield，直到 prepare 完成
-            while not _prep_task.done():
-                try:
-                    _evt_type, _evt_stage = await asyncio.wait_for(
-                        _status_queue.get(), timeout=10
-                    )
-                    yield _sse("status", {"stage": _evt_stage})
-                except asyncio.TimeoutError:
-                    yield _SSE_KEEPALIVE  # ": ping\n\n" — 防止代理超时
-
-            # 取出 prepare 结果（若有异常则抛出）
-            prep = _prep_task.result()
-
-            # Resolve skill name for metadata
-            skill_name = prep.skill_name
-
-            # Early return: prepare produced a non-streaming result
-            if prep.early_return is not None:
-                response_text, early_meta = prep.early_return
-                llm_usage = early_meta.pop("llm_usage", {})
-                msg_metadata = {
-                    "skill_id": req.selected_skill_id or conv.skill_id,
-                    "skill_name": skill_name,
-                    "model_id": llm_usage.get("model_id"),
-                    "input_tokens": llm_usage.get("input_tokens", 0),
-                    "output_tokens": llm_usage.get("output_tokens", 0),
-                    **early_meta,
-                }
-                if _ws_type_stream == "skill_studio":
-                    msg_metadata["studio_scope"] = "skill_studio"
-                assistant_msg = Message(
-                    conversation_id=conv_id,
-                    role=MessageRole.ASSISTANT,
-                    content=response_text,
-                    metadata_=msg_metadata,
-                )
-                db.add(assistant_msg)
-                msg_count = db.query(Message).filter(Message.conversation_id == conv_id).count()
-                if msg_count <= 2 and not _is_opencode_conv:
-                    conv.title = req.content[:60]
-                db.commit()
-
-                yield _sse("delta", {"text": response_text})
-                yield _sse("done", {
-                    "message_id": assistant_msg.id,
-                    "metadata": msg_metadata,
-                })
-                return
-
-            # --- Streaming LLM call ---
-            yield _sse("status", {"stage": "generating", "skill_name": skill_name})
-
-            full_content = ""
-            full_thinking = ""
-            block_idx = 0
-            current_block_type = None  # "text" | "thinking" | None
-            native_tool_calls: list[dict] = []
-
-            _llm_stream = llm_gateway.chat_stream_typed(
-                model_config=prep.model_config,
-                messages=prep.llm_messages,
-                tools=prep.tools_schema or None,
             )
-            async for item in _stream_with_keepalive(_llm_stream, request=request):
-                if isinstance(item, str):
-                    # keepalive ping — pass raw bytes to keep connection alive
-                    yield item
-                    continue
-                chunk_type, chunk_data = item
-                if chunk_type == "thinking":
-                    full_thinking += chunk_data
-                    if current_block_type != "thinking":
-                        if current_block_type is not None:
-                            yield _sse("content_block_stop", {"index": block_idx})
-                            block_idx += 1
-                        yield _sse("content_block_start", {"index": block_idx, "type": "thinking"})
-                        current_block_type = "thinking"
-                    yield _sse("content_block_delta", {"index": block_idx, "delta": {"text": chunk_data}})
-                elif chunk_type == "tool_call":
-                    # 原生 function calling：收集，等第一轮 LLM 结束后统一处理
-                    native_tool_calls.append(chunk_data)
-                else:  # content
-                    if current_block_type != "text":
-                        if current_block_type is not None:
-                            yield _sse("content_block_stop", {"index": block_idx})
-                            block_idx += 1
-                        yield _sse("content_block_start", {"index": block_idx, "type": "text"})
-                        current_block_type = "text"
-                    full_content += chunk_data
-                    yield _sse("content_block_delta", {"index": block_idx, "delta": {"text": chunk_data}})
-                    yield _sse("delta", {"text": chunk_data})  # backward compat
 
-            # Close last block
-            if current_block_type is not None:
-                yield _sse("content_block_stop", {"index": block_idx})
+            # 包装 runtime_gen 为 task + queue 驱动模式
+            _result_queue: asyncio.Queue = asyncio.Queue()
+            _runtime_done = False
 
-            # --- Post-processing (tool calls, structured output) ---
-            response = full_content
+            async def _drain_runtime():
+                nonlocal _runtime_done
+                try:
+                    async for item in _runtime_gen:
+                        await _result_queue.put(item)
+                except Exception as e:
+                    await _result_queue.put(("__error__", e))
+                finally:
+                    _runtime_done = True
+                    await _result_queue.put(None)  # sentinel
+
+            _drain_task = asyncio.ensure_future(_drain_runtime())
+
+            response = ""
             tool_meta: dict = {}
+            prep = None
+            skill_name = None
 
-            # Structured output
-            skill_version = prep.skill_version
-            structured_output = None
-            if skill_version and skill_version.output_schema:
-                from app.services.skill_engine import SkillEngine
-                parsed = SkillEngine._try_parse_structured_output(response)
-                if parsed is not None:
-                    structured_output = parsed
-                    from app.services import prompt_compiler
-                    response = prompt_compiler.render_structured_as_markdown(
-                        skill_version.output_schema, parsed
-                    )
-                    yield _sse("replace", {"text": response})
+            while True:
+                try:
+                    item = await asyncio.wait_for(_result_queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    # drain status events while waiting
+                    while not _status_queue.empty():
+                        _evt_type, _evt_stage = _status_queue.get_nowait()
+                        yield _sse("status", {"stage": _evt_stage})
+                    yield _SSE_KEEPALIVE
+                    continue
 
-            # Agent Loop: 原生 function calling 或文本 fallback
-            if native_tool_calls or "```tool_call" in response:
-                from app.models.skill import Skill as SkillModel
-                skill_obj = db.get(SkillModel, prep.skill_id) if prep.skill_id else None
-                yield _sse("status", {"stage": "tool_calling"})
-                # When LLM returns only tool_calls (no text), block_idx=0 and current_block_type=None.
-                # _handle_tool_calls_stream must start from 0 so it doesn't create sparse array holes.
-                _next_block_idx = block_idx + (1 if current_block_type is not None else 0)
-                async for item in skill_engine._handle_tool_calls_stream(
-                    db, skill_obj, response, prep.llm_messages, prep.model_config, current_user_id,
-                    tools_schema=prep.tools_schema or None,
-                    native_tool_calls=native_tool_calls or None,
-                    start_block_idx=_next_block_idx,
-                    thinking_content=full_thinking,
-                ):
-                    if isinstance(item, tuple):
-                        response, tool_meta = item
+                if item is None:
+                    break  # sentinel — runtime done
+
+                # Drain any pending status events
+                while not _status_queue.empty():
+                    _evt_type, _evt_stage = _status_queue.get_nowait()
+                    yield _sse("status", {"stage": _evt_stage})
+
+                if isinstance(item, tuple):
+                    key, data = item
+                    if key == "__result__":
+                        response = data["response"]
+                        tool_meta = data["tool_meta"]
+                        prep = data["prep"]
+                        skill_name = prep.skill_name if prep else None
+                    elif key == "__error__":
+                        raise data
+                elif isinstance(item, dict):
+                    evt = item.get("event", "")
+                    evt_data = item.get("data", {})
+
+                    if evt == "early_return":
+                        # early return: 直接输出结果并结束
+                        response_text = evt_data.get("response", "")
+                        early_meta = evt_data.get("metadata", {})
+                        llm_usage = early_meta.pop("llm_usage", {}) if isinstance(early_meta, dict) else {}
+                        msg_metadata = {
+                            "skill_id": req.selected_skill_id or conv.skill_id,
+                            "skill_name": None,
+                            "model_id": llm_usage.get("model_id"),
+                            "input_tokens": llm_usage.get("input_tokens", 0),
+                            "output_tokens": llm_usage.get("output_tokens", 0),
+                            **early_meta,
+                        }
+                        if _ws_type_stream == "skill_studio":
+                            msg_metadata["studio_scope"] = "skill_studio"
+                        assistant_msg = Message(
+                            conversation_id=conv_id,
+                            role=MessageRole.ASSISTANT,
+                            content=response_text,
+                            metadata_=msg_metadata,
+                        )
+                        db.add(assistant_msg)
+                        msg_count = db.query(Message).filter(Message.conversation_id == conv_id).count()
+                        if msg_count <= 2 and not _is_opencode_conv:
+                            conv.title = req.content[:60]
+                        db.commit()
+                        yield _sse("delta", {"text": response_text})
+                        yield _sse("done", {
+                            "message_id": assistant_msg.id,
+                            "metadata": msg_metadata,
+                        })
+                        # 等待 drain_task 结束
+                        await _drain_task
+                        return
+
+                    elif evt == "error":
+                        yield _sse("error", evt_data)
+                        await _drain_task
+                        return
+
                     else:
-                        yield _sse(item["event"], item["data"])
-                yield _sse("replace", {"text": response})
+                        # 透传所有 SSE 事件
+                        yield _sse(evt, evt_data)
 
-            # PPT auto-execution
-            if prep.skill_name == "pptx-generation" and "```python" in response:
-                tool_meta = skill_engine._execute_pptx_code(response)
-            if prep.skill_name == "pptx-generation" and not tool_meta and "```html" in response:
-                tool_meta = skill_engine._execute_html_ppt(response)
+            # 等待 drain_task 完成
+            await _drain_task
 
-            if structured_output is not None:
-                tool_meta["structured_output"] = structured_output
-
-            # Build metadata
+            # --- 持久化 + done ---
             msg_metadata = {
                 "skill_id": req.selected_skill_id or conv.skill_id,
                 "skill_name": skill_name,
@@ -1158,7 +1061,6 @@ async def stream_message(
             if _ws_type_stream == "skill_studio":
                 msg_metadata["studio_scope"] = "skill_studio"
 
-            # Persist assistant message
             assistant_msg = Message(
                 conversation_id=conv_id,
                 role=MessageRole.ASSISTANT,
@@ -1173,18 +1075,22 @@ async def stream_message(
 
             db.commit()
 
-            # Estimate token usage for context warning
-            total_input_chars = sum(len(m.get("content") or "") for m in prep.llm_messages)
-            estimated_input_tokens = total_input_chars // 2  # rough char-to-token ratio for CJK
+            # Token usage estimation
+            estimated_input_tokens = 0
             estimated_output_tokens = len(response) // 2
-            model_context_limit = prep.model_config.get("context_window", 32000)
+            model_context_limit = 32000
+            if prep:
+                total_input_chars = sum(len(m.get("content") or "") for m in prep.llm_messages)
+                estimated_input_tokens = total_input_chars // 2
+                model_context_limit = prep.model_config.get("context_window", 32000)
 
-            # Gap 1: 记录 Skill 执行度量
-            if prep and prep.skill_id:
+            # 记录 Skill 执行度量
+            _skill_id = prep.skill_id if prep else (conv.skill_id if conv.skill_id else None)
+            if _skill_id:
                 try:
                     skill_engine.record_execution(
                         db,
-                        skill_id=prep.skill_id,
+                        skill_id=_skill_id,
                         conversation_id=conv_id,
                         user_id=current_user_id,
                         success=_stream_success,

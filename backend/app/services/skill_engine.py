@@ -1,4 +1,13 @@
-"""Skill dispatch engine: intent matching → variable extraction → knowledge injection → LLM call."""
+"""Skill dispatch engine: intent matching → variable extraction → knowledge injection → LLM call.
+
+G2 重构后的精简 facade — 核心逻辑已迁出至：
+- skill_router.py: SkillRouter（技能匹配/切换）
+- context_assembler.py: ContextAssembler（消息历史组装、上下文压缩）
+- prompt_builder.py: PromptBuilder（system prompt 编译）
+- knowledge_injector.py: KnowledgeInjector（知识检索与注入）
+- harness/tool_loop.py: ToolLoop（统一工具调用循环）
+- harness/security.py: SecurityPipeline（统一安全管线）
+"""
 from __future__ import annotations
 
 import asyncio
@@ -18,6 +27,12 @@ from app.models.skill import Skill, SkillMode, SkillStatus
 from app.models.user import User
 from app.services.llm_gateway import llm_gateway
 from app.services import prompt_compiler
+
+# 导入抽出的模块
+from app.services.skill_router import skill_router
+from app.services.context_assembler import context_assembler
+from app.services.prompt_builder import prompt_builder
+from app.services.knowledge_injector import knowledge_injector
 
 
 def _check_model_grant(db: Session, model_config: dict, user_id: int | None) -> None:
@@ -198,236 +213,19 @@ class SkillEngine:
             })
         return result
 
-    async def _match_or_keep_skill(
-        self,
-        db: Session,
-        current_skill: "Skill",
-        user_message: str,
-        candidates: list["Skill"],
-    ) -> "Skill":
-        """一次 LLM 调用完成「是否切换 + 切换到哪个」判断。
-        返回应使用的 Skill（可能是 current_skill 本身）。
-        """
-        if not candidates:
-            return current_skill
+    # ── 已迁出方法的委托（保持旧调用兼容） ──
 
-        skill_list = "\n".join(
-            f"- {s.name}: {(s.description or '无描述')[:30]}" for s in candidates
-        )
-        prompt = (
-            f"当前技能：{current_skill.name}（{current_skill.description or '无描述'}）\n"
-            f"用户新消息：{user_message}\n\n"
-            f"可切换的其他技能：\n{skill_list}\n\n"
-            "判断规则：\n"
-            "- 只有用户明确说出切换意图（如「换一个」「用XX技能」「切换到」），才返回目标技能的 name\n"
-            "- 继续当前话题、追问、补充信息、说「好的」「继续」等，一律返回 keep\n"
-            "- 拿不准时，返回 keep\n"
-            "只返回一个词。"
-        )
-        try:
-            result, _ = await asyncio.wait_for(
-                llm_gateway.chat(
-                    model_config=llm_gateway.resolve_config(db, "skill.switch_detect"),
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.0,
-                    max_tokens=50,
-                ),
-                timeout=12.0,
-            )
-            answer = result.strip().splitlines()[0].strip().strip('"').strip("'")
-            if answer.lower() == "keep":
-                return current_skill
-            for s in candidates:
-                if s.name == answer:
-                    return s
-            return current_skill
-        except asyncio.TimeoutError:
-            logger.warning(f"Skill match_or_keep timed out after 12s, keeping current")
-            return current_skill
-        except Exception as e:
-            logger.warning(f"Skill match_or_keep failed: {e}, keeping current")
-            return current_skill
+    async def _match_or_keep_skill(self, db, current_skill, user_message, candidates):
+        """@deprecated — 委托给 skill_router。"""
+        return await skill_router.match_or_keep_skill(db, current_skill, user_message, candidates)
 
-    async def _refresh_skill_routing_prompt(self, db: Session, user_config) -> None:
-        """根据已挂载 Skill 列表生成/更新路由 prompt。支持增量更新。"""
-        from app.models.skill import Skill
+    async def _refresh_skill_routing_prompt(self, db, user_config):
+        """@deprecated — 委托给 skill_router。"""
+        return await skill_router.refresh_skill_routing_prompt(db, user_config)
 
-        mounted_ids = [
-            item["skill_id"]
-            for item in (user_config.mounted_skills or [])
-            if item.get("mounted")
-        ]
-        if not mounted_ids:
-            user_config.skill_routing_prompt = None
-            user_config.last_skill_snapshot = None
-            user_config.needs_prompt_refresh = False
-            db.flush()
-            return
-
-        skills = db.query(Skill).filter(Skill.id.in_(mounted_ids)).all()
-        new_snapshot = [{"name": s.name, "description": s.description or ""} for s in skills]
-
-        old_snapshot = user_config.last_skill_snapshot or []
-        old_names = {s["name"] for s in old_snapshot}
-        new_names = {s["name"] for s in new_snapshot}
-
-        added = [s for s in new_snapshot if s["name"] not in old_names]
-        removed = [s for s in old_snapshot if s["name"] not in new_names]
-
-        try:
-            if not old_snapshot or not user_config.skill_routing_prompt:
-                # 首次：全量生成
-                skill_list = "\n".join(
-                    f"- {s['name']}: {s['description']}" for s in new_snapshot
-                )
-                prompt = (
-                    "你是 Skill 路由专家。根据以下 Skill 列表，生成一段简洁的路由指引，"
-                    "告知 AI 助手在什么场景下应该使用哪个 Skill。\n\n"
-                    f"Skill 列表:\n{skill_list}\n\n"
-                    "输出格式:\n"
-                    "## Skill 路由指引\n"
-                    "当用户请求匹配以下场景时，优先使用对应 Skill：\n"
-                    "- [场景描述] → 使用 [skill_name]\n"
-                    "...\n\n"
-                    "如果用户请求不明确匹配以上任何 Skill，使用通用对话模式。\n\n"
-                    "直接输出路由指引内容，不要有其他解释。"
-                )
-            else:
-                # 增量更新
-                added_text = "\n".join(f"- {s['name']}: {s['description']}" for s in added) if added else "无"
-                removed_text = "\n".join(f"- {s['name']}" for s in removed) if removed else "无"
-                prompt = (
-                    "你是 Skill 路由专家。请更新以下路由指引。\n\n"
-                    f"当前路由指引:\n{user_config.skill_routing_prompt}\n\n"
-                    f"新增 Skill:\n{added_text}\n\n"
-                    f"移除 Skill:\n{removed_text}\n\n"
-                    "请输出更新后的完整路由指引，保持原有格式。"
-                    "直接输出内容，不要有其他解释。"
-                )
-
-            from app.services.llm_gateway import llm_gateway as _gw
-            config = _gw.resolve_config(db, "skill.routing_prompt")
-            result, _ = await _gw.chat(
-                config,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-            )
-            routing_prompt = result.strip() if isinstance(result, str) else str(result).strip()
-
-            if routing_prompt:
-                user_config.skill_routing_prompt = routing_prompt
-        except Exception as e:
-            logger.warning(f"Skill routing prompt generation failed: {e}")
-            # 生成失败时使用简单模板
-            lines = [
-                "## Skill 路由指引\n",
-                "当用户请求匹配以下场景时，优先使用对应 Skill：",
-            ]
-            for s in new_snapshot:
-                lines.append(f"- {s['description'] or s['name']} → 使用 {s['name']}")
-            lines.append("\n如果用户请求不明确匹配以上任何 Skill，使用通用对话模式。")
-            user_config.skill_routing_prompt = "\n".join(lines)
-
-        user_config.last_skill_snapshot = new_snapshot
-        user_config.needs_prompt_refresh = False
-        db.flush()
-
-    async def _match_skill(
-        self, db: Session, user_message: str, model_config: dict,
-        candidate_skills: list[Skill] | None = None,
-    ) -> Skill | None:
-        if candidate_skills is None:
-            skills = (
-                db.query(Skill).filter(Skill.status == SkillStatus.PUBLISHED).all()
-            )
-        else:
-            skills = candidate_skills
-
-        if not skills:
-            return None
-
-        # 只有一个候选时直接返回，无需 LLM
-        if len(skills) == 1:
-            return skills[0]
-
-        # 超过 15 个候选时，先用关键词粗筛，把候选压缩到 ≤15 个，减少 prompt 长度
-        if len(skills) > 15:
-            msg_lower = user_message.lower()
-            msg_words = [w for w in msg_lower.split() if len(w) > 1]
-            def _kw_score(s: Skill) -> int:
-                text = f"{s.name} {s.description or ''}".lower()
-                return sum(1 for w in msg_words if w in text)
-            scored = sorted(((s, _kw_score(s)) for s in skills), key=lambda x: x[1], reverse=True)
-            top = [s for s, sc in scored[:15] if sc > 0]
-            skills = top if top else [s for s, _ in scored[:15]]
-
-        # 注入执行统计信号（可靠性+使用量），辅助匹配决策
-        import datetime as _dt
-        from sqlalchemy import func as _sa_func
-        from app.models.skill import SkillExecutionLog
-        _since = _dt.datetime.utcnow() - _dt.timedelta(days=30)
-        from sqlalchemy import Integer as _SAInt
-        _stats_q = (
-            db.query(
-                SkillExecutionLog.skill_id,
-                _sa_func.count(SkillExecutionLog.id).label("cnt"),
-                _sa_func.avg(
-                    _sa_func.cast(SkillExecutionLog.success, _SAInt)
-                ).label("sr"),
-            )
-            .filter(SkillExecutionLog.created_at >= _since)
-            .group_by(SkillExecutionLog.skill_id)
-            .all()
-        )
-        _skill_stats = {r.skill_id: (r.cnt, round(float(r.sr or 0) * 100)) for r in _stats_q}
-
-        # description 截断到 30 字，避免 prompt 过长导致模型不遵循指令
-        def _fmt(s: Skill) -> str:
-            base = f"- {s.name}: {(s.description or '无描述')[:30]}"
-            st = _skill_stats.get(s.id)
-            if st:
-                base += f" [可靠性:{st[1]}%, 使用量:{st[0]}]"
-            return base
-        skill_list = "\n".join(_fmt(s) for s in skills)
-        prompt = _SKILL_MATCH_PROMPT.format(
-            skill_list=skill_list, user_message=user_message
-        )
-        import time as _time
-        try:
-            match_config = llm_gateway.resolve_config(db, "skill.match")
-        except Exception:
-            match_config = model_config
-        _t0 = _time.monotonic()
-        logger.debug(f"[_match_skill] calling {match_config.get('model_id')} with {len(skills)} skills, prompt len={len(prompt)}")
-        try:
-            result, _ = await asyncio.wait_for(
-                llm_gateway.chat(
-                    model_config=match_config,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.1,
-                    max_tokens=50,
-                ),
-                timeout=12.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f"[_match_skill] LLM timed out after 12s, returning None")
-            return None
-        logger.debug(f"[_match_skill] LLM done in {_time.monotonic()-_t0:.2f}s, raw='{result[:80]}'")
-
-        # 先取第一行，再在全文中扫描 skill name（应对模型返回解释性文字的情况）
-        first_line = result.strip().splitlines()[0].strip().strip('"').strip("'")
-        if first_line.lower() == "none":
-            return None
-        for s in skills:
-            if s.name == first_line:
-                return s
-        # fallback: 扫描全文找第一个匹配的 skill name
-        result_lower = result.lower()
-        for s in skills:
-            if s.name.lower() in result_lower:
-                return s
-        # M6: 移除 DB fallback（可绕过候选集限制），未匹配则返回 None
-        return None
+    async def _match_skill(self, db, user_message, model_config, candidate_skills=None):
+        """@deprecated — 委托给 skill_router。"""
+        return await skill_router.match_skill(db, user_message, model_config, candidate_skills=candidate_skills)
 
     async def _extract_variables(
         self,
@@ -456,218 +254,20 @@ class SkillEngine:
         except json.JSONDecodeError:
             return {}
 
-    async def _rerank_hits_with_llm(
-        self,
-        db: Session,
-        query: str,
-        hits: list[dict],
-        top_k: int = 5,
-    ) -> list[dict]:
-        """用 DeepSeek lite 从候选 chunks 中筛选出最相关的 top_k 条。"""
-        if len(hits) <= top_k:
-            return hits
-        snippets = "\n".join(
-            f"[{i}] {h.get('title', '')}：{h['text'][:150]}"
-            for i, h in enumerate(hits)
+    async def _rerank_hits_with_llm(self, db, query, hits, top_k=5):
+        """@deprecated — 委托给 knowledge_injector。"""
+        return await knowledge_injector.rerank_hits_with_llm(db, query, hits, top_k)
+
+    async def _inject_knowledge(self, query, skill=None, db=None, user_id=None, project_id=None):
+        """@deprecated — 委托给 knowledge_injector。"""
+        return await knowledge_injector.inject_knowledge(
+            query,
+            skill,
+            db=db,
+            user_id=user_id,
+            project_id=project_id,
+            rerank_fn=self._rerank_hits_with_llm,
         )
-        prompt = (
-            f"用户问题：{query}\n\n候选知识片段：\n{snippets}\n\n"
-            f"请从中选出与用户问题最相关的 {top_k} 条，返回序号（逗号分隔），只返回数字。"
-        )
-        try:
-            result, _ = await llm_gateway.chat(
-                model_config=llm_gateway.resolve_config(db, "skill.rerank"),
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=50,
-            )
-            indices = [int(x.strip()) for x in result.split(",") if x.strip().isdigit()]
-            selected = [hits[i] for i in indices if i < len(hits)]
-            return selected if selected else hits[:top_k]
-        except Exception as e:
-            logger.warning(f"Knowledge rerank failed, using top-{top_k} raw: {e}")
-            return hits[:top_k]
-
-    async def _inject_knowledge(
-        self,
-        query: str,
-        skill: Skill | None,
-        db=None,
-        user_id: int | None = None,
-        project_id: int | None = None,
-    ) -> str:
-        """Retrieve relevant knowledge chunks from Milvus and format as context.
-
-        Access control（按脱敏级别动态决定）：
-        - 自己创建 or D0 → 原文注入
-        - 已审批 + D1以下 → 原文注入
-        - 其余 → 按文档脱敏级别动态脱敏后注入
-
-        二阶段召回：粗召回 top_20 → LLM 精排 top_5
-        """
-        try:
-            from app.services.vector_service import search_knowledge
-            # 构建检索参数：如果有匹配的 Skill，用其 serving_skill_codes 对应的 taxonomy_board 做预过滤
-            search_kwargs = {"query": query, "top_k": 20}
-
-            # Skill 关联的 taxonomy_board 预过滤（减少跨领域噪音）
-            if skill and hasattr(skill, "taxonomy_board") and skill.taxonomy_board:
-                search_kwargs["taxonomy_board"] = skill.taxonomy_board
-
-            # 过滤低质量知识
-            search_kwargs["min_quality"] = 0.3
-
-            # search_knowledge 是同步阻塞调用（pymilvus），Milvus 不可用时会阻塞 ~10s
-            # 用 asyncio.wait_for + to_thread 包裹，超时立即返回空，不阻塞事件循环
-            hits = await asyncio.wait_for(
-                asyncio.to_thread(lambda: search_knowledge(**search_kwargs)),
-                timeout=3.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("Knowledge search timed out after 3s, skipping")
-            return ""
-        except Exception as e:
-            logger.warning(f"Knowledge search failed: {e}")
-            return ""
-
-        if not hits:
-            return ""
-
-        # 条件精排：高置信度或候选数少时跳过 LLM 精排
-        if len(hits) <= 5:
-            pass  # 无需精排
-        elif len(hits) >= 5 and all(h.get("score", 0) > 0.75 for h in hits[:5]):
-            hits = hits[:5]  # top5 高置信度，直接截断
-        else:
-            hits = await self._rerank_hits_with_llm(db, query, hits, top_k=5)
-
-        # 查询哪些 knowledge_id 是已审批的（全局可见）或项目关联的（项目成员全量可见）
-        approved_ids: set[int] = set()
-        if db:
-            try:
-                from app.models.knowledge import KnowledgeEntry, KnowledgeStatus
-                approved_entries = (
-                    db.query(KnowledgeEntry.id)
-                    .filter(KnowledgeEntry.status == KnowledgeStatus.APPROVED)
-                    .all()
-                )
-                approved_ids = {row[0] for row in approved_entries}
-            except Exception as e:
-                logger.warning(f"Failed to load approved knowledge ids: {e}")
-
-            # 项目知识：对项目成员全量可见（原文注入，不脱敏）
-            if project_id:
-                try:
-                    from app.models.project import ProjectKnowledgeShare
-                    project_kb_ids = {
-                        row[0] for row in
-                        db.query(ProjectKnowledgeShare.knowledge_id)
-                        .filter(ProjectKnowledgeShare.project_id == project_id)
-                        .all()
-                    }
-                    approved_ids |= project_kb_ids
-                except Exception as e:
-                    logger.warning(f"Failed to load project knowledge ids: {e}")
-
-        # 批量预查文档脱敏级别（从 KnowledgeUnderstandingProfile）
-        doc_levels: dict[int, str] = {}
-        doc_data_type_hits: dict[int, list[dict]] = {}
-        # 已发布 Skill 的已审知识引用集合
-        published_ref_ids: set[int] | None = None
-        if db:
-            try:
-                from app.models.knowledge_understanding import KnowledgeUnderstandingProfile
-                kid_set = {h["knowledge_id"] for h in hits}
-                profiles = (
-                    db.query(KnowledgeUnderstandingProfile)
-                    .filter(KnowledgeUnderstandingProfile.knowledge_id.in_(kid_set))
-                    .all()
-                )
-                for p in profiles:
-                    doc_levels[p.knowledge_id] = p.desensitization_level or "D1"
-                    doc_data_type_hits[p.knowledge_id] = p.data_type_hits or []
-            except Exception as e:
-                logger.warning(f"Failed to load doc desensitization levels: {e}")
-
-            # 批量加载 visibility_scope 和 created_by
-            kb_scope_map: dict[int, tuple[str | None, int]] = {}
-            try:
-                scope_rows = db.query(
-                    KnowledgeEntry.id, KnowledgeEntry.visibility_scope, KnowledgeEntry.created_by
-                ).filter(KnowledgeEntry.id.in_(kid_set)).all()
-                kb_scope_map = {r.id: (r.visibility_scope, r.created_by) for r in scope_rows}
-            except Exception:
-                pass
-
-            # 已发布 Skill：加载已审知识引用集合
-            if skill and hasattr(skill, 'status') and str(getattr(skill.status, 'value', skill.status)) == 'published':
-                try:
-                    from app.models.skill_knowledge_ref import SkillKnowledgeReference
-                    published_ref_ids = {
-                        r.knowledge_id for r in
-                        db.query(SkillKnowledgeReference.knowledge_id)
-                        .filter(SkillKnowledgeReference.skill_id == skill.id)
-                        .all()
-                    }
-                except Exception as e:
-                    logger.warning(f"Failed to load published skill knowledge refs: {e}")
-
-        parts = []
-        seen_ids: set[int] = set()
-        for h in hits:
-            kid = h["knowledge_id"]
-            if kid in seen_ids:
-                continue
-            seen_ids.add(kid)
-
-            # visibility_scope 检查
-            scope_info = kb_scope_map.get(kid)
-            if scope_info:
-                vs, vs_creator = scope_info
-                if vs == "project" and not project_id:
-                    continue  # 非项目上下文跳过项目级知识
-                if vs in ("owner_only", "private") and vs_creator != user_id:
-                    continue
-
-            # 已发布 Skill 运行时召回约束：不在已审集合中的 D2+ 文件跳过
-            if published_ref_ids is not None and kid not in published_ref_ids:
-                doc_level = doc_levels.get(kid, "D1")
-                if doc_level >= "D2":
-                    logger.info(f"Skill {skill.id}: 跳过未审知识 {kid}（{doc_level}）")
-                    continue
-                # D0/D1 低风险，正常处理
-
-            chunk_owner = h.get("created_by", 0)
-            is_own = user_id and chunk_owner == user_id
-            is_approved = kid in approved_ids
-            doc_level = doc_levels.get(kid, "D1")
-
-            if is_own or doc_level == "D0":
-                # 自己创建的 or 公开文档 → 原文注入
-                parts.append(f"[相关知识]\n{h['text']}")
-            elif is_approved and doc_level <= "D1":
-                # 已审批 + 低敏感 → 原文注入
-                parts.append(f"[相关知识]\n{h['text']}")
-            else:
-                # 需要脱敏：优先使用预存脱敏版（人工/系统审核过，更可靠），
-                # 其次动态 mask_text，最后 fallback 到规则脱敏
-                masked_text = h.get("desensitized_text", "").strip()
-                if not masked_text:
-                    try:
-                        from app.services.text_masker import mask_text
-                        type_hits = doc_data_type_hits.get(kid)
-                        result_text, replacements = mask_text(h["text"], level=doc_level, data_type_hits=type_hits)
-                        if replacements:
-                            masked_text = result_text
-                    except Exception:
-                        pass
-                if not masked_text:
-                    from app.services.vector_service import _desensitize_rule
-                    masked_text = _desensitize_rule(h["text"])
-                if masked_text:
-                    parts.append(f"[参考知识（已脱敏）]\n{masked_text}")
-
-        return "\n\n---\n\n".join(parts)
 
     async def _handle_data_operation(
         self,
@@ -908,11 +508,16 @@ class SkillEngine:
         if current_skill and active_skill_ids is not None and current_skill.id not in active_skill_ids:
             current_skill = None
 
+        # ── workspace 边界控制 ──
+        # 有 workspace 且有 workspace_skills 时，默认不 fallback 到全局 published skills，
+        # 防止工作台封闭边界被击穿。
+        # 无 workspace 的公共聊天保持向后兼容（allow_global_fallback=True）。
+        _allow_global_fallback = not bool(workspace and workspace_skills)
+
         if current_skill:
             switch_candidates = [s for s in (workspace_skills or []) if s.id != current_skill.id]
             if switch_candidates:
                 try:
-                    # 一次 LLM 调用完成切换判断 + 匹配
                     skill = await self._match_or_keep_skill(
                         db, current_skill, user_message, switch_candidates,
                     )
@@ -923,65 +528,25 @@ class SkillEngine:
                 skill = current_skill
         else:
             try:
-                # 合并候选列表 = workspace skills + 全局 published（去重），一次匹配
-                if workspace and workspace_skills:
-                    global_skills = (
-                        db.query(Skill).filter(Skill.status == SkillStatus.PUBLISHED).all()
-                    )
-                    seen_ids = {s.id for s in workspace_skills}
-                    merged = list(workspace_skills) + [s for s in global_skills if s.id not in seen_ids]
-                    # active_skill_ids 进一步过滤（workspace 加载时已过滤过 workspace_skills，此处处理 global_skills 混入的情况）
-                    if active_skill_ids is not None:
-                        merged = [s for s in merged if s.id in active_skill_ids]
+                _cur, candidates, need_match = skill_router.resolve_candidates(
+                    db,
+                    workspace=workspace,
+                    workspace_skills=workspace_skills,
+                    user_id=user_id,
+                    active_skill_ids=active_skill_ids,
+                    current_skill=None,
+                    allow_global_fallback=_allow_global_fallback,
+                )
+                if need_match and candidates:
                     skill = await self._match_skill(
                         db, user_message, default_config,
-                        candidate_skills=merged,
+                        candidate_skills=candidates,
                     )
+                elif need_match and not candidates and _allow_global_fallback:
+                    # 无候选且允许全局回退 → 查全局 published
+                    skill = await self._match_skill(db, user_message, default_config)
                 else:
-                    # 无 workspace：加载个人工作台配置中已挂载的 skill
-                    _user_config = None
-                    _personal_skills = []
-                    if user_id:
-                        try:
-                            from app.models.workspace import UserWorkspaceConfig
-                            _user_config = (
-                                db.query(UserWorkspaceConfig)
-                                .filter(UserWorkspaceConfig.user_id == user_id)
-                                .first()
-                            )
-                            if _user_config and _user_config.mounted_skills:
-                                mounted_ids = [
-                                    item["skill_id"]
-                                    for item in _user_config.mounted_skills
-                                    if item.get("mounted")
-                                ]
-                                if mounted_ids:
-                                    _personal_skills = [
-                                        s for s in db.query(Skill).filter(Skill.id.in_(mounted_ids)).all()
-                                        if s is not None
-                                    ]
-                        except Exception as e:
-                            logger.warning(f"UserWorkspaceConfig load failed: {e}")
-
-                    if active_skill_ids is not None:
-                        if _personal_skills:
-                            candidates = [s for s in _personal_skills if s.id in active_skill_ids]
-                        else:
-                            candidates = [
-                                db.get(Skill, sid) for sid in active_skill_ids
-                                if db.get(Skill, sid) is not None
-                            ]
-                        skill = await self._match_skill(
-                            db, user_message, default_config,
-                            candidate_skills=candidates,
-                        )
-                    elif _personal_skills:
-                        skill = await self._match_skill(
-                            db, user_message, default_config,
-                            candidate_skills=_personal_skills,
-                        )
-                    else:
-                        skill = await self._match_skill(db, user_message, default_config)
+                    skill = None
             except Exception as e:
                 logger.warning(f"Skill matching failed: {e}")
                 skill = None
@@ -1439,83 +1004,19 @@ class SkillEngine:
             tools_schema=self._build_tools_schema(available_tools) if available_tools else [],
         )
 
-    async def _compact_if_needed(
-        self,
-        db: Session,
-        llm_messages: list[dict],
-        model_config: dict,
-        threshold: float = 0.85,
-    ) -> list[dict]:
-        """If estimated token usage exceeds threshold * context_window, summarize early history."""
-        # M1: 使用 tiktoken 精确计算 token（fallback 到字符估算）
-        total_text = "".join(m.get("content") or "" for m in llm_messages)
-        try:
-            import tiktoken
-            enc = tiktoken.encoding_for_model("gpt-4")
-            estimated_tokens = len(enc.encode(total_text))
-        except Exception:
-            estimated_tokens = len(total_text) // 2
-
-        context_window = model_config.get("context_window", 32000)
-        if estimated_tokens <= context_window * threshold:
-            return llm_messages
-
-        # Split: keep system + last 6 turns, summarize the rest
-        system_msgs = [m for m in llm_messages if m["role"] == "system"]
-        non_system = [m for m in llm_messages if m["role"] != "system"]
-
-        keep_recent = 6  # rounds × 2 messages
-        early = non_system[:-keep_recent] if len(non_system) > keep_recent else []
-        recent = non_system[-keep_recent:]
-
-        if not early:
-            return llm_messages
-
-        try:
-            summary = await self._summarize_history(db, early, model_config)
-            compacted = [
-                *system_msgs,
-                {"role": "user", "content": f"[系统消息：前期对话摘要，非用户发言]\n{summary}"},
-                *recent,
-            ]
-            new_chars = sum(len(m.get("content") or "") for m in compacted)
-            logger.info(
-                f"Context compacted: {len(total_text)} → {new_chars} chars "
-                f"(~{estimated_tokens} → {new_chars // 2} tokens)"
-            )
-            return compacted
-        except Exception as e:
-            logger.warning(f"Context compaction failed, using original: {e}")
-            return llm_messages
-
-    async def _summarize_history(self, db: Session, messages: list[dict], model_config: dict) -> str:
-        """Summarize a list of messages into a concise paragraph."""
-        history_text = "\n".join(
-            f"{m['role']}: {m.get('content', '')[:500]}" for m in messages
+    async def _compact_if_needed(self, db, llm_messages, model_config, threshold=0.85):
+        """@deprecated — 委托给 context_assembler。"""
+        return await context_assembler.compact_if_needed(
+            db,
+            llm_messages,
+            model_config,
+            threshold,
+            summarize_fn=self._summarize_history,
         )
-        prompt = (
-            "请用简洁的中文（200字以内）总结以下对话的主要内容和结论。\n"
-            "要求：\n"
-            "1. 必须保留用户的原始请求/目标（第一条 user 消息的核心意图）\n"
-            "2. 保留关键信息、重要结果和已完成的步骤\n"
-            "3. 如有工具调用，保留工具名称和关键结果\n\n"
-            f"{history_text}"
-        )
-        try:
-            lite_config = llm_gateway.resolve_config(db, "skill.compress_history")
-        except Exception:
-            lite_config = model_config
-        # H2: LLM 辅助调用统一 timeout
-        result, _ = await asyncio.wait_for(
-            llm_gateway.chat(
-                model_config=lite_config,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=300,
-            ),
-            timeout=30,
-        )
-        return result.strip()
+
+    async def _summarize_history(self, db, messages, model_config):
+        """@deprecated — 委托给 context_assembler。"""
+        return await context_assembler._summarize_history(db, messages, model_config)
 
     async def execute(
         self,
@@ -1612,291 +1113,53 @@ class SkillEngine:
         tools_schema: list[dict] | None = None,
         native_tool_calls: list[dict] | None = None,
     ) -> tuple[str, dict]:
-        """Execute tool calls and continue conversation.
+        """@deprecated — 委托给 ToolLoop.run_sync。"""
+        from app.harness.tool_loop import ToolLoop, ToolLoopContext
+        ctx = ToolLoopContext(
+            db=db, llm_messages=llm_messages, model_config=model_config,
+            user_id=user_id, tools_schema=tools_schema or [],
+            initial_native_tool_calls=native_tool_calls,
+            initial_response=response, max_rounds=max_rounds,
+        )
+        loop = ToolLoop()
+        loop._execute_tools_parallel = self._execute_tools_parallel
+        return await loop.run_sync(ctx)
 
-        Returns (response_text, extra_meta) where extra_meta may contain download_url etc.
-        """
-        extra_meta: dict = {}
-        async for item in self._handle_tool_calls_stream(
-            db, skill, response, llm_messages, model_config, user_id, max_rounds,
-            tools_schema=tools_schema, native_tool_calls=native_tool_calls,
-        ):
-            if isinstance(item, tuple):
-                response, extra_meta = item
-        return response, extra_meta
+    async def _execute_tools_parallel(self, db, tool_calls, user_id):
+        """@deprecated — 委托给 ToolLoop。"""
+        from app.harness.tool_loop import ToolLoop
+        return await ToolLoop()._execute_tools_parallel(db, tool_calls, user_id)
 
-    async def _execute_tools_parallel(
-        self,
-        db: Session,
-        tool_calls: list[dict],
-        user_id: int | None,
-    ) -> list[tuple[dict, dict]]:
-        """并行执行所有工具调用，返回 [(call, result), ...]。"""
-        from app.services.tool_executor import tool_executor
-
-        async def _exec_one(call: dict) -> tuple[dict, dict]:
-            tool_name = call.get("tool") or call.get("name", "")
-            raw_args = call.get("params") or call.get("arguments", "{}")
-            if isinstance(raw_args, str):
-                try:
-                    params = json.loads(raw_args)
-                except json.JSONDecodeError:
-                    params = {}
-            else:
-                params = raw_args
-            # H1: 单次 tool 执行超时保护
-            try:
-                result = await asyncio.wait_for(
-                    tool_executor.execute_tool(db, tool_name, params, user_id),
-                    timeout=self._TOOL_EXEC_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Tool '%s' 执行超时 (%ds)", tool_name, self._TOOL_EXEC_TIMEOUT)
-                result = {"ok": False, "error": f"工具 {tool_name} 执行超时"}
-            return call, result
-
-        return list(await asyncio.gather(*[_exec_one(c) for c in tool_calls]))
-
-    _AGENT_LOOP_TIMEOUT = 300  # H1: Agent Loop 总超时 (秒)
-    _TOOL_EXEC_TIMEOUT = 60   # H1: 单次 tool 执行超时 (秒)
+    _AGENT_LOOP_TIMEOUT = 300
+    _TOOL_EXEC_TIMEOUT = 60
 
     async def _handle_tool_calls_stream(
-        self,
-        db: Session,
-        skill,
-        response: str,
-        llm_messages: list[dict],
-        model_config: dict,
-        user_id: int | None,
-        max_rounds: int = 5,
-        tools_schema: list[dict] | None = None,
-        native_tool_calls: list[dict] | None = None,
-        start_block_idx: int = 1,
-        thinking_content: str = "",
+        self, db, skill, response, llm_messages, model_config, user_id,
+        max_rounds=5, tools_schema=None, native_tool_calls=None,
+        start_block_idx=1, thinking_content="",
     ):
-        """Streaming version: yields SSE-ready dicts for tool_call events, then yields (response, meta) at end.
-
-        支持两种工具调用模式：
-        - native_tool_calls 非空：原生 function calling（模型支持时）
-        - 否则：解析 response 中的 ```tool_call``` 文本块（fallback）
-        """
-        import time as _time
-        _loop_deadline = _time.monotonic() + self._AGENT_LOOP_TIMEOUT
-
-        extra_meta: dict = {}
-        block_idx = start_block_idx  # caller tracks how many blocks were already emitted
-        consecutive_failures = 0  # 连续失败计数，用于早停
-
-        # 提取原始用户请求用于目标复述（注意力操纵，防止多轮工具调用中任务漂移）
-        original_user_request = ""
-        for m in reversed(llm_messages):
-            if m.get("role") == "user":
-                original_user_request = (m.get("content") or "")[:200]
-                break
-
-        for round_num in range(max_rounds):
-            # H1: Agent Loop 总超时检查
-            if _time.monotonic() > _loop_deadline:
-                logger.warning("Agent Loop 超时 (%ds)，强制终止", self._AGENT_LOOP_TIMEOUT)
-                break
-
-            # 解析本轮工具调用列表
-            if native_tool_calls:
-                # 原生 function calling：直接使用结构化数据（每轮都优先用，不只第0轮）
-                calls = native_tool_calls
-                use_native = True
-            else:
-                # 文本 fallback：从 response 解析 ```tool_call``` 块
-                pattern = r"```tool_call\s*(.*?)\s*```"
-                raw_matches = re.findall(pattern, response, re.DOTALL)
-                calls = []
-                for m in raw_matches:
-                    try:
-                        parsed = json.loads(m)
-                        calls.append(parsed)
-                    except json.JSONDecodeError:
-                        pass
-                use_native = False
-
-            if not calls:
-                break
-
-            yield {"event": "round_start", "data": {"round": round_num + 1, "max_rounds": max_rounds}}
-
-            # 并行触发所有工具（先发 start 事件，再并行执行）
-            call_indices: dict[int, dict] = {}  # block_idx → call
-            for call in calls:
-                tool_name = call.get("tool") or call.get("name", "")
-                raw_args = call.get("params") or call.get("arguments", {})
-                params = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                yield {"event": "content_block_start", "data": {
-                    "index": block_idx, "type": "tool_call",
-                    "tool": tool_name, "input": params,
-                }}
-                yield {"event": "tool_progress", "data": {
-                    "index": block_idx, "message": f"校验参数...",
-                    "phase": "validating",
-                }}
-                call_indices[block_idx] = call
-                block_idx += 1
-
-            # 并行执行
-            pairs = await self._execute_tools_parallel(db, calls, user_id)
-
-            # 收集结果并发送 stop 事件
-            tool_results = []
-            result_block_start = block_idx - len(calls)
-            for i, (call, result) in enumerate(pairs):
-                tool_name = call.get("tool") or call.get("name", "")
-                ok = result.get("ok", False)
-                duration_ms = result.get("duration_ms")
-
-                if ok and isinstance(result.get("result"), dict):
-                    tool_result_data = result["result"]
-                    if "download_url" in tool_result_data:
-                        extra_meta["download_url"] = tool_result_data["download_url"]
-                    if "filename" in tool_result_data:
-                        extra_meta["download_filename"] = tool_result_data["filename"]
-
-                result_str = json.dumps(result, ensure_ascii=False, indent=2)
-                yield {"event": "content_block_stop", "data": {
-                    "index": result_block_start + i, "type": "tool_call",
-                    "tool": tool_name, "result": result_str, "ok": ok,
-                    "duration_ms": duration_ms,
-                }}
-
-                if ok:
-                    tool_results.append(f"工具 `{tool_name}` 执行结果：\n```json\n{result_str}\n```")
-                else:
-                    # 构建富上下文错误，帮助 LLM 自我修正
-                    raw_args = call.get("params") or call.get("arguments", {})
-                    params_used = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                    # 获取工具的 input_schema 用于提示
-                    from app.services.tool_executor import tool_executor as _te
-                    _tool_obj = None
-                    try:
-                        from app.models.tool import ToolRegistry as _TR
-                        _tool_obj = db.query(_TR).filter(_TR.name == tool_name).first()
-                    except Exception:
-                        pass
-                    try:
-                        schema_hint = json.dumps(_tool_obj.input_schema or {}, ensure_ascii=False) if _tool_obj else "{}"
-                    except Exception:
-                        schema_hint = "{}"
-                    error_context = (
-                        f"工具 `{tool_name}` 执行失败。\n"
-                        f"错误信息：{result.get('error')}\n"
-                        f"传入参数：{json.dumps(params_used, ensure_ascii=False)}\n"
-                        f"工具期望的参数格式：{schema_hint}\n"
-                        f"请检查参数并重试，或换一种方式完成用户的需求。"
-                    )
-                    tool_results.append(error_context)
-
-            if not tool_results:
-                yield {"event": "round_end", "data": {"round": round_num + 1, "has_next": False}}
-                break
-
-            # 连续失败早停：所有工具都失败时计数+1，有任何成功则重置
-            all_failed = all(not r.get("ok", False) for _, r in pairs)
-            if all_failed:
-                consecutive_failures += 1
-            else:
-                consecutive_failures = 0
-
-            if consecutive_failures >= 2:
-                logger.warning(f"Agent loop early stop: {consecutive_failures} consecutive all-fail rounds")
-                yield {"event": "round_end", "data": {"round": round_num + 1, "has_next": False, "reason": "consecutive_failures"}}
-                break
-
-            tool_result_text = "\n\n".join(tool_results)
-
-            # 构建下一轮 messages
-            if use_native:
-                # 原生 function calling：使用规范的 tool / tool role 消息格式
-                tool_calls_msg: list[dict] = []
-                for call in calls:
-                    raw_args = call.get("params") or call.get("arguments", {})
-                    tool_calls_msg.append({
-                        "id": call.get("id", f"call_{call.get('name', '')}"),
-                        "type": "function",
-                        "function": {
-                            "name": call.get("name", ""),
-                            "arguments": raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False),
-                        },
-                    })
-                asst_msg: dict = {"role": "assistant", "content": None, "tool_calls": tool_calls_msg}
-                # thinking 模型要求 assistant 消息必须带 reasoning_content
-                if thinking_content:
-                    asst_msg["reasoning_content"] = thinking_content
-                llm_messages.append(asst_msg)
-                thinking_content = ""  # 消费后清空，避免重复附加
-                for call, result in pairs:
-                    llm_messages.append({
-                        "role": "tool",
-                        "tool_call_id": call.get("id", f"call_{call.get('name', '')}"),
-                        "content": json.dumps(result, ensure_ascii=False),
-                    })
-            else:
-                # 文本 fallback：将结果作为 user 消息追加
-                # 目标复述：多轮时追加原始用户请求，防止任务漂移
-                goal_reminder = ""
-                if round_num >= 1 and original_user_request:
-                    goal_reminder = f"\n\n[提醒] 用户的原始请求是：{original_user_request}"
-                llm_messages.append({"role": "assistant", "content": response or "(calling tools)"})
-                llm_messages.append({
-                    "role": "user",
-                    "content": f"[工具执行结果]\n\n{tool_result_text}\n\n请基于以上工具结果，给出最终回复。不需要重复展示JSON，直接告知用户结果即可。{goal_reminder}",
-                })
-
-            # 流式下一轮 LLM 响应
-            yield {"event": "content_block_start", "data": {"index": block_idx, "type": "text"}}
-            new_response = ""
-            next_native_calls: list[dict] = []
-            next_thinking_content = ""
-
-            async for chunk_type, chunk_data in llm_gateway.chat_stream_typed(
-                model_config=model_config,
-                messages=llm_messages,
-                tools=tools_schema if use_native else None,
-            ):
-                if chunk_type == "tool_call":
-                    next_native_calls.append(chunk_data)
-                elif chunk_type == "thinking":
-                    next_thinking_content += chunk_data
-                elif chunk_type == "content":
-                    new_response += chunk_data
-                    yield {"event": "content_block_delta", "data": {"index": block_idx, "delta": {"text": chunk_data}}}
-                    yield {"event": "delta", "data": {"text": chunk_data}}
-
-            yield {"event": "content_block_stop", "data": {"index": block_idx}}
-            block_idx += 1
-            response = new_response
-
-            has_next = bool(next_native_calls) or "```tool_call" in response
-            yield {"event": "round_end", "data": {"round": round_num + 1, "has_next": has_next}}
-
-            if not has_next:
-                break
-
-            # 下一轮使用原生 tool_calls（若有），并传入本轮收集的 thinking
-            native_tool_calls = next_native_calls if next_native_calls else None
-            thinking_content = next_thinking_content
-
-        response = re.sub(r"```tool_call\s*.*?\s*```", "", response, flags=re.DOTALL).strip()
-        yield (response, extra_meta)
+        """@deprecated — 委托给 ToolLoop.run。"""
+        from app.harness.tool_loop import ToolLoop, ToolLoopContext
+        ctx = ToolLoopContext(
+            db=db, llm_messages=llm_messages, model_config=model_config,
+            user_id=user_id, tools_schema=tools_schema or [],
+            initial_native_tool_calls=native_tool_calls,
+            initial_response=response, max_rounds=max_rounds,
+            start_block_idx=start_block_idx,
+            initial_thinking_content=thinking_content,
+        )
+        loop = ToolLoop()
+        loop._execute_tools_parallel = self._execute_tools_parallel
+        async for item in loop.run(ctx):
+            yield item
 
 
     # ── Structured output helpers ──────────────────────────────────
 
     @staticmethod
     def _get_latest_structured_output(messages: list[Message]) -> dict | None:
-        """Find the most recent structured_output from conversation history."""
-        for msg in reversed(messages):
-            if msg.role == MessageRole.ASSISTANT and msg.metadata_:
-                so = msg.metadata_.get("structured_output")
-                if so:
-                    return so
-        return None
+        """@deprecated — 委托给 prompt_builder。"""
+        return prompt_builder._get_latest_structured_output(messages)
 
     @staticmethod
     def _try_parse_structured_output(response: str) -> dict | None:
@@ -2113,28 +1376,8 @@ class SkillEngine:
         return content, meta
 
     def _inject_templates(self, system_prompt: str) -> str:
-        """Replace {{TEMPLATE_CLASSES}} with dynamically read CSS class reference from template files."""
-        if "{{TEMPLATE_CLASSES}}" not in system_prompt:
-            return system_prompt
-
-        from pathlib import Path
-        tmpl_dir = Path(__file__).parent.parent / "tools" / "ppt_templates"
-        parts = []
-        for tmpl_path in sorted(tmpl_dir.glob("*.html")):
-            name = tmpl_path.stem
-            html = tmpl_path.read_text(encoding="utf-8")
-            # Extract only the <style> block
-            m = re.search(r"<style>(.*?)</style>", html, re.DOTALL | re.IGNORECASE)
-            if not m:
-                continue
-            css = m.group(1)
-            # Extract class names only (e.g. .sketch-box, .flat-card)
-            class_names = re.findall(r"\.([\w-]+)\s*\{", css)
-            unique = list(dict.fromkeys(class_names))  # preserve order, dedupe
-            parts.append(f"### {name} 模板可用 class\n" + ", ".join(f".{c}" for c in unique))
-
-        injected = "\n\n".join(parts) if parts else "（模板文件未找到）"
-        return system_prompt.replace("{{TEMPLATE_CLASSES}}", injected)
+        """@deprecated — 委托给 prompt_builder。"""
+        return prompt_builder.inject_templates(system_prompt)
 
     # ── PPTX 代码执行白名单（仅允许 pptx 相关模块） ──
     _PPTX_ALLOWED_MODULES = frozenset({
