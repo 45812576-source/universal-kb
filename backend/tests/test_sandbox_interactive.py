@@ -915,3 +915,159 @@ class TestSandboxReportGovernanceActions:
         data = resp.json()
         assert len(data.get("cards", [])) >= 1
         assert len(data.get("staged_edits", [])) >= 1
+
+
+class TestPreflightDescriptionGenerator:
+    """description 缺失时，按 skill 上下文生成更具体的描述。"""
+
+    def test_generates_concise_fallback_without_context(self, db):
+        from app.services.preflight_governance import build_preflight_governance
+
+        dept = _make_dept(db)
+        user = _make_user(db, "desc_case_0", Role.SUPER_ADMIN, dept.id)
+        skill, _tool, version = _setup_skill_with_tool(db, user.id)
+        skill.description = ""
+        skill.name = "通用助理"
+        skill.knowledge_tags = []
+        skill.data_queries = []
+        skill.tools = []
+        skill.bound_tools = []
+        skill.source_files = []
+        version.system_prompt = ""
+        db.commit()
+
+        result = build_preflight_governance(
+            db,
+            skill_id=skill.id,
+            result={
+                "gates": [{
+                    "gate": "structure",
+                    "status": "failed",
+                    "items": [{"ok": False, "code": "missing_description", "issue": "description 为空"}],
+                }]
+            },
+        )
+        generated = result.staged_edits[0]["diff_ops"][0]["new"]
+        assert generated == "用于通用助理场景，根据用户输入，输出明确结论和下一步建议。"
+        assert 20 <= len(generated) <= 90
+
+    def test_generates_description_from_knowledge_and_data(self, db):
+        from app.services.preflight_governance import build_preflight_governance
+
+        dept = _make_dept(db)
+        user = _make_user(db, "desc_case_1", Role.SUPER_ADMIN, dept.id)
+        skill, _tool, _version = _setup_skill_with_tool(
+            db,
+            user.id,
+            data_queries=[{"query_name": "sales", "table_name": "sales_orders", "description": "销售订单"}],
+            knowledge_tags=["销售分析"],
+        )
+        skill.description = ""
+        skill.name = "销售分析助手"
+        skill.source_files = [{"filename": "reference.md", "category": "reference"}]
+        db.commit()
+
+        result = build_preflight_governance(
+            db,
+            skill_id=skill.id,
+            result={
+                "gates": [{
+                    "gate": "structure",
+                    "status": "failed",
+                    "items": [{"ok": False, "code": "missing_description", "issue": "description 为空"}],
+                }]
+            },
+        )
+        assert len(result.staged_edits) == 1
+        diff_ops = result.staged_edits[0]["diff_ops"]
+        generated = diff_ops[0]["new"]
+        assert "销售分析助手" in generated
+        assert "知识资料" in generated
+        assert "业务数据" in generated
+
+    def test_generates_description_from_data_query_only(self, db):
+        from app.services.preflight_governance import build_preflight_governance
+
+        dept = _make_dept(db)
+        user = _make_user(db, "desc_case_1b", Role.SUPER_ADMIN, dept.id)
+        skill, _tool, version = _setup_skill_with_tool(
+            db,
+            user.id,
+            data_queries=[{"query_name": "orders", "table_name": "orders", "description": "订单数据"}],
+        )
+        skill.description = ""
+        skill.name = "订单分析助手"
+        skill.knowledge_tags = []
+        skill.source_files = []
+        version.system_prompt = "你负责订单数据分析，并输出分析报告。"
+        db.commit()
+
+        result = build_preflight_governance(
+            db,
+            skill_id=skill.id,
+            result={
+                "gates": [{
+                    "gate": "structure",
+                    "status": "failed",
+                    "items": [{"ok": False, "code": "missing_description", "issue": "description 为空"}],
+                }]
+            },
+        )
+        generated = result.staged_edits[0]["diff_ops"][0]["new"]
+        assert "业务数据" in generated
+        assert "分析结论" in generated
+
+    def test_generates_description_from_tool_context(self, db):
+        from app.services.preflight_governance import build_preflight_governance
+
+        dept = _make_dept(db)
+        user = _make_user(db, "desc_case_2", Role.SUPER_ADMIN, dept.id)
+        skill, tool, version = _setup_skill_with_tool(
+            db,
+            user.id,
+            tool_schema={"required": ["query"], "properties": {"query": {"type": "string"}}},
+            required_inputs=[{"key": "query", "label": "查询问题", "freetext": True}],
+        )
+        skill.description = ""
+        skill.name = "工具协同助手"
+        version.system_prompt = "你是一个工具协同分析助手，需要输出结构化结果。"
+        db.commit()
+
+        result = build_preflight_governance(
+            db,
+            skill_id=skill.id,
+            result={
+                "gates": [{
+                    "gate": "structure",
+                    "status": "failed",
+                    "items": [{"ok": False, "code": "missing_description", "issue": "description 为空"}],
+                }]
+            },
+        )
+        diff_ops = result.staged_edits[0]["diff_ops"]
+        generated = diff_ops[0]["new"]
+        assert "工具协同助手" in generated
+        assert "工具能力" in generated
+        assert "结构化" in generated
+
+    def test_uses_existing_description_when_not_missing(self, db):
+        from app.services.preflight_governance import build_preflight_governance
+
+        dept = _make_dept(db)
+        user = _make_user(db, "desc_case_3", Role.SUPER_ADMIN, dept.id)
+        skill, _tool, _version = _setup_skill_with_tool(db, user.id)
+        skill.description = "现有描述"
+        db.commit()
+
+        result = build_preflight_governance(
+            db,
+            skill_id=skill.id,
+            result={
+                "gates": [{
+                    "gate": "structure",
+                    "status": "failed",
+                    "items": [{"ok": False, "code": "prompt_too_short", "issue": "prompt 过短"}],
+                }]
+            },
+        )
+        assert all(edit["target_type"] != "metadata" for edit in result.staged_edits)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session
@@ -113,8 +114,92 @@ def _create_staged_edit(
     }
 
 
+def _clean_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _latest_prompt(skill: Skill) -> str:
+    versions = list(skill.versions or [])
+    if versions:
+        first = versions[0]
+        return _clean_text(getattr(first, "system_prompt", "") or "")
+    return ""
+
+
+def _extract_scene(skill: Skill, prompt: str) -> str:
+    prompt = _clean_text(prompt)
+    if skill.name:
+        name = str(skill.name).strip()
+        if len(name) <= 24:
+            return f"用于{name}场景"
+
+    patterns = [
+        r"你是([^。；\n]{4,24})",
+        r"负责([^。；\n]{4,24})",
+        r"帮助用户([^。；\n]{4,24})",
+        r"适用于([^。；\n]{4,24})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, prompt)
+        if match:
+            phrase = _clean_text(match.group(1))
+            if phrase:
+                return f"用于{phrase}场景"
+    return "用于业务分析与辅助决策场景"
+
+
+def _extract_inputs(skill: Skill, prompt: str) -> str:
+    signals: list[str] = []
+    if skill.knowledge_tags:
+        signals.append("知识资料")
+    if skill.data_queries:
+        signals.append("业务数据")
+    bound_tools = list(getattr(skill, "bound_tools", []) or [])
+    if bound_tools or skill.tools:
+        signals.append("工具能力")
+
+    source_files = list(skill.source_files or [])
+    file_categories = {str(item.get("category", "")).strip() for item in source_files if isinstance(item, dict)}
+    if "knowledge-base" in file_categories and "知识资料" not in signals:
+        signals.append("知识资料")
+    if ("reference" in file_categories or "example" in file_categories) and "业务规则" not in signals:
+        signals.append("业务规则")
+
+    if not signals:
+        prompt_lower = prompt.lower()
+        if "知识" in prompt or "rag" in prompt_lower or "检索" in prompt:
+            signals.append("知识资料")
+        if "数据" in prompt or "表" in prompt:
+            signals.append("业务数据")
+        if "工具" in prompt or "tool" in prompt_lower:
+            signals.append("工具能力")
+
+    if not signals:
+        return "根据用户输入"
+    if len(signals) == 1:
+        return f"结合{signals[0]}"
+    if len(signals) == 2:
+        return f"结合{signals[0]}和{signals[1]}"
+    return f"结合{signals[0]}、{signals[1]}与{signals[2]}"
+
+
+def _extract_output(prompt: str) -> str:
+    prompt_lower = prompt.lower()
+    if "json" in prompt_lower or "结构化" in prompt:
+        return "输出结构化结论和下一步建议"
+    if "表格" in prompt or "markdown" in prompt_lower:
+        return "输出结构化分析结果和执行建议"
+    if "报告" in prompt or "方案" in prompt:
+        return "输出分析结论、风险提示和行动建议"
+    return "输出明确结论和下一步建议"
+
+
 def _default_description(skill: Skill) -> str:
-    return f"围绕「{skill.name}」场景，根据用户输入、知识资料与可用工具输出结构化结论和下一步建议。"
+    prompt = _latest_prompt(skill)
+    scene = _extract_scene(skill, prompt)
+    inputs = _extract_inputs(skill, prompt)
+    output = _extract_output(prompt)
+    return f"{scene}，{inputs}，{output}。"
 
 
 def _structure_prompt_patch() -> str:
