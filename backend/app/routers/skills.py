@@ -41,6 +41,15 @@ class SkillVersionCreate(BaseModel):
     output_schema: Optional[dict] = None
 
 
+class BindingActionResolveRequest(BaseModel):
+    text: str
+
+
+class BindingActionExecuteRequest(BaseModel):
+    action: str
+    target_id: int
+
+
 def _skill_summary(s: Skill) -> dict:
     latest = s.versions[0] if s.versions else None
     return {
@@ -1567,6 +1576,13 @@ def update_data_queries(
     if not is_admin and skill.created_by != user.id:
         raise HTTPException(403, "无权限")
     queries = body.get("data_queries") or []
+    next_table_names = {
+        q.get("table_name", "").strip()
+        for q in queries
+        if q.get("table_name", "").strip()
+    }
+    previous_rows = db.query(SkillDataQuery).filter(SkillDataQuery.skill_id == skill_id).all()
+    previous_table_names = {row.table_name for row in previous_rows}
     db.query(SkillDataQuery).filter(SkillDataQuery.skill_id == skill_id).delete()
     for q in queries:
         table_name = q.get("table_name", "").strip()
@@ -1579,8 +1595,72 @@ def update_data_queries(
             table_name=table_name,
             description=q.get("description") or "",
         ))
+    try:
+        from app.models.business import BusinessTable, SkillTableBinding
+
+        removed_table_names = previous_table_names - next_table_names
+        if removed_table_names:
+            removed_tables = db.query(BusinessTable).filter(BusinessTable.table_name.in_(removed_table_names)).all()
+            removed_ids = [table.id for table in removed_tables]
+            if removed_ids:
+                db.query(SkillTableBinding).filter(
+                    SkillTableBinding.skill_id == skill_id,
+                    SkillTableBinding.table_id.in_(removed_ids),
+                ).delete(synchronize_session=False)
+
+        for q in queries:
+            table_name = q.get("table_name", "").strip()
+            if not table_name:
+                continue
+            table = db.query(BusinessTable).filter(BusinessTable.table_name == table_name).first()
+            if not table:
+                continue
+            existing = db.query(SkillTableBinding).filter(
+                SkillTableBinding.skill_id == skill_id,
+                SkillTableBinding.table_id == table.id,
+            ).first()
+            if existing:
+                continue
+            db.add(SkillTableBinding(
+                skill_id=skill_id,
+                table_id=table.id,
+                view_id=None,
+                binding_type="runtime_read",
+                alias=table.display_name or table.table_name,
+                description="来自 Skill Studio 手动绑定",
+                created_by=user.id,
+            ))
+    except Exception:
+        logger.exception("failed to sync skill table execution bindings")
     db.commit()
     return {"ok": True}
+
+
+@router.post("/{skill_id}/binding-actions/resolve")
+def resolve_skill_binding_actions(
+    skill_id: int,
+    body: BindingActionResolveRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Resolve natural-language tool/table binding requests into confirmable actions."""
+    from app.services.binding_actions import resolve_binding_actions
+
+    actions = resolve_binding_actions(db, skill_id, user, body.text)
+    return {"actions": actions}
+
+
+@router.post("/{skill_id}/binding-actions/execute")
+def execute_skill_binding_action(
+    skill_id: int,
+    body: BindingActionExecuteRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Execute a confirmed Skill binding action."""
+    from app.services.binding_actions import execute_binding_action
+
+    return execute_binding_action(db, skill_id, user, body.action, body.target_id)
 
 
 @router.post("/{skill_id}/versions")

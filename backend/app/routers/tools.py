@@ -829,13 +829,18 @@ def bind_skill_tool(
     skill_id: int,
     tool_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     from app.models.skill import Skill
-    if not db.get(Skill, skill_id):
+    skill = db.get(Skill, skill_id)
+    if not skill:
         raise HTTPException(404, "Skill not found")
     if not db.get(ToolRegistry, tool_id):
         raise HTTPException(404, "Tool not found")
+    if user.role != Role.SUPER_ADMIN and skill.created_by != user.id and not (
+        user.role == Role.DEPT_ADMIN and skill.department_id == user.department_id
+    ):
+        raise HTTPException(403, "无权修改此 Skill 的工具绑定")
 
     existing = db.query(SkillTool).filter(
         SkillTool.skill_id == skill_id,
@@ -863,8 +868,17 @@ def unbind_skill_tool(
     skill_id: int,
     tool_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
+    from app.models.skill import Skill
+
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill not found")
+    if user.role != Role.SUPER_ADMIN and skill.created_by != user.id and not (
+        user.role == Role.DEPT_ADMIN and skill.department_id == user.department_id
+    ):
+        raise HTTPException(403, "无权修改此 Skill 的工具绑定")
     row = db.query(SkillTool).filter(
         SkillTool.skill_id == skill_id,
         SkillTool.tool_id == tool_id,

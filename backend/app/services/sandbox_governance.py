@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from sqlalchemy.orm import Session
 
 from app.models.sandbox import SandboxTestReport
+from app.models.sandbox import SandboxTestSession
 from app.services.preflight_governance import _create_staged_edit, _make_card
 
 
@@ -129,6 +130,7 @@ def build_sandbox_report_governance(
     part3 = report.part3_evaluation or {}
     fix_plan = part3.get("fix_plan_structured", []) or _fallback_fix_items(part3)
     issues = part3.get("issues", []) or []
+    session = db.get(SandboxTestSession, report.session_id)
 
     cards: list[dict] = []
     staged_edits: list[dict] = []
@@ -141,17 +143,41 @@ def build_sandbox_report_governance(
 
         target_kind = str(item.get("target_kind", "unknown"))
         if target_kind == "tool_binding":
+            tool_ids = [
+                int(item.get("tool_id"))
+                for item in (session.tool_review if session else []) or []
+                if item.get("confirmed") and item.get("tool_id")
+            ]
             cards.append(_make_card(
                 f"sandbox-report-tools-{skill_id}-{item.get('id')}",
                 f"补充工具治理：{str(item.get('title', '工具整改'))[:80]}",
-                "如果根因在工具绑定或工具实现，请跳转到工具页核对绑定、状态和入参。",
+                "将沙盒确认过的工具绑定回当前 Skill，并刷新整改状态。",
                 card_type="followup_prompt",
                 reason=str(item.get("suggested_changes", "工具链路存在整改项"))[:300],
-                preflight_action="navigate_tools",
+                preflight_action="bind_sandbox_tools",
                 action_payload={
-                    "target_url": "/skills",
                     "source_report_id": report.id,
                     "problem_ids": item.get("problem_ids", []),
+                    "tool_ids": sorted(set(tool_ids)),
+                },
+            ))
+        elif target_kind == "permission_config":
+            table_names = [
+                str(snap.get("table_name"))
+                for snap in (session.permission_snapshot if session else []) or []
+                if snap.get("confirmed") and snap.get("included_in_test") and snap.get("table_name")
+            ]
+            cards.append(_make_card(
+                f"sandbox-report-data-{skill_id}-{item.get('id')}",
+                f"补充数据权限绑定：{str(item.get('title', '数据整改'))[:80]}",
+                "将沙盒确认通过的数据表写入 Skill 数据查询与运行绑定，避免整改只停留在 prompt 说明。",
+                card_type="followup_prompt",
+                reason=str(item.get("suggested_changes", "数据权限/数据源配置存在整改项"))[:300],
+                preflight_action="bind_permission_tables",
+                action_payload={
+                    "source_report_id": report.id,
+                    "problem_ids": item.get("problem_ids", []),
+                    "table_names": sorted(set(table_names)),
                 },
             ))
         elif target_kind == "knowledge_reference":
@@ -167,10 +193,10 @@ def build_sandbox_report_governance(
             cards.append(_make_card(
                 f"sandbox-report-knowledge-{skill_id}-{item.get('id')}",
                 f"核对知识引用：{str(item.get('title', '知识整改'))[:80]}",
-                "如果根因在知识引用或索引，请回到知识库核对引用条目、内容和向量索引。",
+                "将沙盒证据中的知识引用写入 Skill 知识引用快照，并触发后续回归。",
                 card_type="followup_prompt",
                 reason=str(item.get("suggested_changes", "知识引用存在整改项"))[:300],
-                preflight_action="reindex_knowledge",
+                preflight_action="bind_knowledge_references",
                 action_payload={
                     "knowledge_ids": sorted(set(knowledge_ids)),
                     "source_report_id": report.id,

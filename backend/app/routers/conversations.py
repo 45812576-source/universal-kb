@@ -293,6 +293,62 @@ class ConversationCreate(BaseModel):
     project_id: Optional[int] = None
 
 
+@router.get("/{conv_id}/studio-runs/active")
+async def get_active_studio_run(
+    conv_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    conv = db.get(Conversation, conv_id)
+    if not conv or conv.user_id != user.id:
+        raise HTTPException(404, "Conversation not found")
+    from app.services.studio_runs import studio_run_registry
+
+    run = await studio_run_registry.get_active(conv_id, user.id)
+    return {"run": run.summary() if run else None}
+
+
+@router.get("/{conv_id}/studio-runs/{run_id}/events")
+async def stream_studio_run_events(
+    conv_id: int,
+    run_id: str,
+    after: int = 0,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    conv = db.get(Conversation, conv_id)
+    if not conv or conv.user_id != user.id:
+        raise HTTPException(404, "Conversation not found")
+    from app.services.studio_runs import studio_run_registry
+
+    run = await studio_run_registry.get(run_id, user.id)
+    if not run or run.conversation_id != conv_id:
+        raise HTTPException(404, "Studio run not found")
+    return StreamingResponse(
+        studio_run_registry.stream(run, after=after),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/{conv_id}/studio-runs/{run_id}/cancel")
+async def cancel_studio_run(
+    conv_id: int,
+    run_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    conv = db.get(Conversation, conv_id)
+    if not conv or conv.user_id != user.id:
+        raise HTTPException(404, "Conversation not found")
+    from app.services.studio_runs import studio_run_registry
+
+    run = await studio_run_registry.cancel(run_id, user.id)
+    if not run or run.conversation_id != conv_id:
+        raise HTTPException(404, "Studio run not found")
+    return {"run": run.summary()}
+
+
 @router.post("")
 def create_conversation(
     req: ConversationCreate = ConversationCreate(),
@@ -713,6 +769,30 @@ async def stream_message(
     # Capture user.id as a plain int before the generator closes over it —
     # the ORM User object becomes detached once the session flushes/expires.
     current_user_id = user.id
+
+    if _ws_type_stream == "skill_studio":
+        from app.services.studio_runs import studio_run_registry
+
+        run = await studio_run_registry.create(
+            conversation_id=conv_id,
+            user_id=current_user_id,
+            skill_id=req.selected_skill_id or conv.skill_id,
+            content=req.content,
+            req_payload={
+                "editor_prompt": req.editor_prompt,
+                "editor_is_dirty": req.editor_is_dirty,
+                "selected_source_filename": req.selected_source_filename,
+            },
+        )
+        return StreamingResponse(
+            studio_run_registry.stream(run, after=0),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "X-Studio-Run-Id": run.id,
+            },
+        )
 
     def _sse(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"

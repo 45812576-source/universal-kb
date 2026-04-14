@@ -2139,6 +2139,11 @@ class TargetedRerunByReportRequest(BaseModel):
     fix_plan_item_ids: Optional[List[str]] = None
 
 
+class ApplyReportActionRequest(BaseModel):
+    action: str
+    payload: dict = {}
+
+
 @router.post("/by-report/{report_id}/remediation-actions")
 async def remediation_actions_by_report(
     report_id: int,
@@ -2169,6 +2174,185 @@ async def remediation_actions_by_report(
         "cards": result.cards,
         "staged_edits": result.staged_edits,
     }
+
+
+@router.post("/by-report/{report_id}/apply-action")
+async def apply_report_action(
+    report_id: int,
+    body: ApplyReportActionRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """执行沙盒报告治理卡片的具体动作。"""
+    report = db.get(SandboxTestReport, report_id)
+    if not report:
+        raise HTTPException(404, "测试报告不存在")
+
+    session = db.get(SandboxTestSession, report.session_id)
+    if not session:
+        raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
+    if session.target_type != "skill":
+        raise HTTPException(400, "仅支持 Skill 沙盒报告")
+
+    skill = db.get(Skill, session.target_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+
+    payload = body.payload or {}
+    if body.action == "bind_sandbox_tools":
+        from app.models.tool import SkillTool
+
+        confirmed_tool_ids = {
+            int(item.get("tool_id"))
+            for item in (session.tool_review or [])
+            if item.get("confirmed") and item.get("tool_id")
+        }
+        requested_tool_ids = {
+            int(tool_id)
+            for tool_id in (payload.get("tool_ids") or [])
+            if str(tool_id).isdigit()
+        }
+        tool_ids = requested_tool_ids or confirmed_tool_ids
+        bound = 0
+        skipped = 0
+        for tool_id in tool_ids:
+            if not db.get(ToolRegistry, tool_id):
+                skipped += 1
+                continue
+            existing = db.query(SkillTool).filter(
+                SkillTool.skill_id == skill.id,
+                SkillTool.tool_id == tool_id,
+            ).first()
+            if existing:
+                skipped += 1
+                continue
+            db.add(SkillTool(skill_id=skill.id, tool_id=tool_id))
+            bound += 1
+        db.commit()
+        return {"ok": True, "action": body.action, "bound": bound, "skipped": skipped, "tool_ids": sorted(tool_ids)}
+
+    if body.action == "bind_knowledge_references":
+        from app.models.skill_knowledge_ref import SkillKnowledgeReference
+
+        knowledge_ids = {
+            int(knowledge_id)
+            for knowledge_id in (payload.get("knowledge_ids") or [])
+            if str(knowledge_id).isdigit()
+        }
+        if not knowledge_ids:
+            for slot in session.detected_slots or []:
+                knowledge_id = slot.get("knowledge_entry_id")
+                if knowledge_id:
+                    knowledge_ids.add(int(knowledge_id))
+        existing_version = (
+            db.query(SkillKnowledgeReference.publish_version)
+            .filter(SkillKnowledgeReference.skill_id == skill.id)
+            .order_by(SkillKnowledgeReference.publish_version.desc())
+            .first()
+        )
+        publish_version = (existing_version[0] + 1) if existing_version else 1
+        bound = 0
+        skipped = 0
+        for knowledge_id in knowledge_ids:
+            entry = db.get(KnowledgeEntry, knowledge_id)
+            if not entry:
+                skipped += 1
+                continue
+            db.add(SkillKnowledgeReference(
+                skill_id=skill.id,
+                knowledge_id=knowledge_id,
+                snapshot_desensitization_level=getattr(entry, "desensitization_level", None),
+                snapshot_data_type_hits=getattr(entry, "data_type_hits", []) or [],
+                snapshot_document_type=getattr(entry, "document_type", None),
+                snapshot_permission_domain=getattr(entry, "permission_domain", None),
+                snapshot_mask_rules=[],
+                mask_rule_source="sandbox_report",
+                folder_id=getattr(entry, "folder_id", None),
+                folder_path=getattr(entry, "folder_path", None),
+                manager_scope_ok=True,
+                publish_version=publish_version,
+            ))
+            bound += 1
+        db.commit()
+        return {"ok": True, "action": body.action, "bound": bound, "skipped": skipped, "knowledge_ids": sorted(knowledge_ids)}
+
+    if body.action == "bind_permission_tables":
+        from app.models.business import SkillDataQuery, SkillTableBinding
+
+        requested_table_names = {
+            str(table_name).strip()
+            for table_name in (payload.get("table_names") or [])
+            if str(table_name).strip()
+        }
+        confirmed_table_names = {
+            str(snap.get("table_name")).strip()
+            for snap in (session.permission_snapshot or [])
+            if snap.get("confirmed") and snap.get("included_in_test") and snap.get("table_name")
+        }
+        table_names = requested_table_names or confirmed_table_names
+        bound_queries = 0
+        bound_bindings = 0
+        skipped = 0
+        quick_queries = list(skill.data_queries or [])
+
+        for table_name in table_names:
+            table = db.query(BusinessTable).filter(BusinessTable.table_name == table_name).first()
+            if not table or table.publish_status != "published":
+                skipped += 1
+                continue
+
+            existing_query = db.query(SkillDataQuery).filter(
+                SkillDataQuery.skill_id == skill.id,
+                SkillDataQuery.table_name == table_name,
+            ).first()
+            if not existing_query:
+                db.add(SkillDataQuery(
+                    skill_id=skill.id,
+                    query_name=f"read_{table_name}",
+                    query_type="read",
+                    table_name=table_name,
+                    description=table.display_name or table_name,
+                ))
+                quick_queries.append({
+                    "query_name": f"read_{table_name}",
+                    "query_type": "read",
+                    "table_name": table_name,
+                    "description": table.display_name or table_name,
+                })
+                bound_queries += 1
+
+            existing_binding = db.query(SkillTableBinding).filter(
+                SkillTableBinding.skill_id == skill.id,
+                SkillTableBinding.table_id == table.id,
+            ).first()
+            if not existing_binding:
+                db.add(SkillTableBinding(
+                    skill_id=skill.id,
+                    table_id=table.id,
+                    view_id=None,
+                    binding_type="runtime_read",
+                    alias=table.display_name or table.table_name,
+                    description="来自沙盒报告权限确认",
+                    created_by=user.id,
+                ))
+                bound_bindings += 1
+
+            if existing_query and existing_binding:
+                skipped += 1
+
+        skill.data_queries = quick_queries
+        db.commit()
+        return {
+            "ok": True,
+            "action": body.action,
+            "bound_queries": bound_queries,
+            "bound_bindings": bound_bindings,
+            "skipped": skipped,
+            "table_names": sorted(table_names),
+        }
+
+    raise HTTPException(400, f"不支持的动作：{body.action}")
 
 
 @router.post("/by-report/{report_id}/targeted-rerun")
