@@ -119,7 +119,11 @@ def studio_entry(
 ):
     """统一 Studio 入口 API — 返回注册表 + conversation + runtime 状态。"""
     from app.services.studio_registry import resolve_entry
-    entry = resolve_entry(db, user, type, skill_id=skill_id)
+    try:
+        entry = resolve_entry(db, user, type, skill_id=skill_id)
+    except Exception as e:
+        logger.exception(f"studio_entry failed: user={user.id}, type={type}, skill_id={skill_id}")
+        raise HTTPException(500, f"Studio 入口初始化失败：{e.__class__.__name__}: {e}")
     return {
         "registration_id": entry.registration_id,
         "conversation_id": entry.conversation_id,

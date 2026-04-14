@@ -214,8 +214,14 @@ def resolve_entry(
 
     needs_recover = reg.runtime_status in ("stopped", "unhealthy")
 
-    # 探测 session db 状态（含一次性迁移）
-    probe = probe_session_db(reg.workspace_root)
+    # 探测 session db 状态（仅 opencode 需要）
+    if workspace_type == "opencode":
+        probe = probe_session_db(reg.workspace_root)
+    else:
+        probe = SessionDBProbe(
+            db_path=None, db_health="n/a", db_source="n/a",
+            total=0, error=None, migration_state="none",
+        )
 
     return StudioEntryResolution(
         registration_id=reg.id,

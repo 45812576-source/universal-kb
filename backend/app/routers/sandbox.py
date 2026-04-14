@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 import logging
 from typing import List, Optional
@@ -902,6 +903,42 @@ async def preflight(
             test_cases = ["请展示你的核心能力。"]
 
         model_cfg = llm_gateway.resolve_config(db, "sandbox.preflight_exec")
+
+        def _parse_score_json(text: str) -> dict:
+            """鲁棒提取 LLM 返回的评分 JSON。"""
+            # 1. 去 markdown code block 包裹
+            if "```" in text:
+                parts = text.split("```")
+                for part in parts[1::2]:  # 取奇数位（code block 内容）
+                    inner = part.strip()
+                    if inner.startswith("json"):
+                        inner = inner[4:].strip()
+                    try:
+                        return json.loads(inner)
+                    except json.JSONDecodeError:
+                        continue
+
+            # 2. 直接尝试解析整段
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                pass
+
+            # 3. regex 提取第一个包含 "score" 的 {...} 对象
+            m = re.search(r'\{[^{}]*"score"[^{}]*\}', text)
+            if m:
+                try:
+                    return json.loads(m.group())
+                except json.JSONDecodeError:
+                    pass
+
+            # 4. 最后兜底：只提取 score 数字
+            m = re.search(r'"score"\s*:\s*(\d+)', text)
+            if m:
+                return {"score": int(m.group(1)), "reason": "从非标准格式中提取到分数"}
+
+            raise ValueError(f"无法解析评分 JSON: {text[:200]}")
+
         tests = []
         total_score = 0
 
@@ -974,16 +1011,12 @@ async def preflight(
                     temperature=0.0,
                     max_tokens=1024,
                 )
-                text = score_raw.strip()
-                if "```" in text:
-                    text = text.split("```")[1]
-                    if text.startswith("json"):
-                        text = text[4:]
-                score_data = json.loads(text.strip())
+                score_data = _parse_score_json(score_raw.strip())
                 sc = int(score_data.get("score", 0))
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Preflight score parse failed: {e}, raw={score_raw[:300] if 'score_raw' in dir() else 'N/A'}")
                 sc = 50
-                score_data = {"score": 50, "reason": "评分解析失败，给默认分"}
+                score_data = {"score": 50, "reason": f"评分解析失败: {str(e)[:100]}"}
 
             test_result = {
                 "index": idx + 1,
