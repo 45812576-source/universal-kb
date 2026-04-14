@@ -133,6 +133,37 @@ async def test_adaptive_midway_degrade_success(reader):
     assert stats["degraded"] is True
 
 
+@pytest.mark.asyncio
+async def test_adaptive_invalid_filter_falls_back_to_full_scan(reader):
+    """增量过滤 InvalidFilter 时，应自动回退到不带过滤的全量拉取。"""
+    calls = []
+
+    async def mock_fetch_page(token, app_token, table_id, page_size, page_token=None, since_ts=None):
+        calls.append({"page_size": page_size, "page_token": page_token, "since_ts": since_ts})
+        if since_ts is not None:
+            raise BitableRecordError(
+                "获取记录失败: InvalidFilter (code=1254607)",
+                feishu_code=1254607,
+                feishu_msg="InvalidFilter",
+                page_token=page_token,
+                page_size=page_size,
+            )
+        return {
+            "items": [{"record_id": "r1", "fields": {"name": "ok"}}],
+            "has_more": False,
+        }
+
+    reader.fetch_records_page = mock_fetch_page
+    records, stats = await reader.fetch_records_adaptive("tok", "app", "tbl", since_ts=1713066933)
+
+    assert len(records) == 1
+    assert stats["filter_fallback"] is True
+    assert stats["degraded"] is False
+    assert stats["errors"][0]["type"] == "filter_fallback"
+    assert calls[0]["since_ts"] == 1713066933
+    assert calls[1]["since_ts"] is None
+
+
 # ── fetch_table_list ─────────────────────────────────────────────────────
 
 

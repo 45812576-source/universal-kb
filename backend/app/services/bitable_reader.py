@@ -128,6 +128,7 @@ class BitableReader:
         errors: list[dict] = []
         degraded = False
         truncated = False
+        filter_fallback = False
         fetch_page_impl = getattr(self.fetch_records_page, "__func__", self.fetch_records_page)
         use_default_fetch_page = fetch_page_impl is BitableReader.fetch_records_page
 
@@ -168,12 +169,29 @@ class BitableReader:
                         break
                     page_token = data.get("page_token")
                 except (BitableRecordError, httpx.TimeoutException) as e:
+                    feishu_msg = getattr(e, "feishu_msg", None) or str(e)
+                    if since_ts and not filter_fallback and "InvalidFilter" in feishu_msg:
+                        errors.append({
+                            "type": "filter_fallback",
+                            "error": str(e),
+                            "since_ts": since_ts,
+                        })
+                        logger.warning(
+                            f"Bitable fetch 过滤条件无效，回退为全量拉取: "
+                            f"table={table_id}, since_ts={since_ts}, error={feishu_msg}"
+                        )
+                        since_ts = None
+                        page_token = None
+                        all_records = []
+                        page_size_idx = 0
+                        filter_fallback = True
+                        continue
+
                     if page_size_idx + 1 < len(page_sizes):
                         old_size = page_sizes[page_size_idx]
                         page_size_idx += 1
                         new_size = page_sizes[page_size_idx]
                         degraded = True
-                        err_msg = getattr(e, "feishu_msg", None) or str(e)
                         errors.append({
                             "from": old_size,
                             "to": new_size,
@@ -181,7 +199,7 @@ class BitableReader:
                         })
                         logger.warning(
                             f"Bitable fetch 降级: page_size {old_size} → {new_size}, "
-                            f"error={err_msg}"
+                            f"error={feishu_msg}"
                         )
                         continue
                     else:
@@ -206,6 +224,7 @@ class BitableReader:
             "effective_page_size": page_sizes[page_size_idx],
             "pages_fetched": len(all_records) // max(page_sizes[page_size_idx], 1) + 1,
             "degraded": degraded,
+            "filter_fallback": filter_fallback,
             "truncated": truncated,
             "max_records_limit": limit,
             "errors": errors,
