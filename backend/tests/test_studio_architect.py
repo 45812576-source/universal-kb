@@ -246,6 +246,7 @@ class TestPromptBuilding:
         assert "architect_priority_matrix" in result
         assert "architect_ooda_decision" in result
         assert "architect_ready_for_draft" in result
+        assert "禁止输出 `studio_draft` / `studio_diff`" in result
 
     def test_no_architect_rules_when_no_phase(self):
         state = StudioSessionState(
@@ -299,6 +300,22 @@ class TestPromptBuilding:
         )
         assert "OODA 轮次：2" in result
         assert "phase_1_why" in result  # confirmed phases
+
+    def test_create_flow_blocks_draft_before_ready(self):
+        state = StudioSessionState(
+            session_mode="create_new_skill",
+            current_mode="draft",
+            architect_phase="phase_2_what",
+            draft_readiness_score=4,
+        )
+        result = _build_system(
+            selected_skill_id=None,
+            editor_prompt=None,
+            editor_is_dirty=False,
+            session_state=state,
+        )
+        assert "Architect 阶段未完成" in result
+        assert "禁止输出 studio_draft / studio_diff" in result
 
 
 class TestAssistSkillRules:

@@ -231,6 +231,11 @@ _GOVERNANCE_SYSTEM_ADDON = """
 _ARCHITECT_OUTPUT_RULES = """当前处于 **Skill Architect 工作流**，阶段：**{current_phase}**，OODA 轮次：{ooda_round}。
 已确认阶段：{confirmed_phases}。
 
+在进入 `ready_for_draft` 之前：
+- 禁止输出 `studio_draft` / `studio_diff`
+- 禁止口头声称“草稿已生成”或“下方有治理卡片”，除非你本轮真的输出了对应结构化块
+- 即使用户要求“直接出草稿”，也只能继续推进当前阶段，或在满足条件时先输出 `architect_ready_for_draft`
+
 你必须按当前阶段引导用户，使用以下结构化事件输出：
 
 ### architect_question — 向用户提问
@@ -726,6 +731,14 @@ def _render_session_state(state: StudioSessionState) -> str:
     elif state.current_mode == "draft":
         mode_text = mode_text.format(score=state.draft_readiness_score)
     parts.append(f"\n当前模式：**{state.current_mode}**\n{mode_text}")
+
+    if state.session_mode == "create_new_skill" and state.architect_phase and state.architect_phase != "ready_for_draft":
+        parts.append(
+            f"\n**!! Architect 阶段未完成 !!** 当前仍处于 {state.architect_phase}。"
+            "在进入 ready_for_draft 前，禁止输出 studio_draft / studio_diff，"
+            "也禁止声称草稿或治理卡片已经生成。"
+            "如果用户催促直接出草稿，你必须先说明当前阶段尚未完成，然后继续用 architect_question / architect_phase_summary / architect_structure / architect_priority_matrix / architect_ooda_decision 推进。"
+        )
 
     # ── 纠偏警告（最高优先级）──
     if state.user_corrections:
@@ -1280,6 +1293,15 @@ async def run_stream(
     session_state.architect_phase = arch_phase
     session_state.ooda_round = arch_state.ooda_round if arch_state else 0
     session_state.phase_confirmed = dict(arch_state.phase_confirmed or {}) if arch_state else {}
+
+    if session_mode == "create_new_skill" and arch_phase and arch_phase != "ready_for_draft" and not session_state.has_outputted_draft:
+        if session_state.current_mode in ("draft", "revise", "test_ready"):
+            has_refine_signal = any(
+                fact["type"] in ("correction", "scenario_shift")
+                for fact in session_state.current_reconciled_facts
+            )
+            session_state.current_mode = "refine" if has_refine_signal else "discover"
+        session_state.draft_readiness_score = min(session_state.draft_readiness_score, 2)
 
     # ── 阶段 1: routing ──
     yield ("status", {"stage": "routing"})
