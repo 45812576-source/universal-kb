@@ -1,13 +1,13 @@
 """add studio registration key dimensions
 
-Revision ID: a1b2c3d4e5f7
+Revision ID: z7a8b9c0d2a5
 Revises: z7a8b9c0d2a2
 Create Date: 2026-04-13
 """
 from alembic import op
 import sqlalchemy as sa
 
-revision = "a1b2c3d4e5f7"
+revision = "z7a8b9c0d2a5"
 down_revision = "z7a8b9c0d2a2"
 branch_labels = None
 depends_on = None
