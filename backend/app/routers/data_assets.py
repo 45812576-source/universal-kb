@@ -30,6 +30,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/data-assets", tags=["data-assets"])
 
 
+def _require_table_owner_or_admin(bt: BusinessTable, user: User):
+    """表的 owner 或管理员才可操作。未发布的表 owner 有完整权限。"""
+    if user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
+        return
+    if bt.owner_id == user.id:
+        return
+    raise HTTPException(403, "无权操作此数据表，仅表的创建者或管理员可操作")
+
+
 def _compute_default_view_fields(all_fields: list) -> tuple[list[int], str]:
     """计算默认视图的可见字段和 disclosure_ceiling。
 
@@ -541,6 +550,8 @@ def list_tables(
             "bound_skills": unique_bindings,
             "risk_warnings": _table_risk_warnings(t, fc, len(unique_bindings)),
             "is_archived": t.is_archived or False,
+            "publish_status": t.publish_status or "draft",
+            "owner_id": t.owner_id,
             "created_at": _serialize_datetime(t.created_at),
             "role_group_count": rg_counts.get(t.id, 0),
             "view_count": view_counts.get(t.id, 0),
@@ -791,6 +802,9 @@ def get_table_detail(
         "field_profile_error": bt.field_profile_error,
         "record_count": bt.record_count_cache,
         "is_archived": bt.is_archived or False,
+        "publish_status": bt.publish_status or "draft",
+        "published_at": _serialize_datetime(bt.published_at),
+        "published_by": bt.published_by,
         "owner_id": bt.owner_id,
         "department_id": bt.department_id,
         "created_at": _serialize_datetime(bt.created_at),
@@ -848,12 +862,18 @@ def move_table(
 def delete_table(
     table_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     """删除数据表及其关联的字段、行数据、视图等（级联删除）。"""
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "数据表不存在")
+    # 已发布的表只有 admin 可删，未发布的表 owner 可删
+    if bt.publish_status == "published":
+        if user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
+            raise HTTPException(403, "已发布的数据表只有管理员可以删除")
+    else:
+        _require_table_owner_or_admin(bt, user)
 
     # 删除物理表（如果存在）
     table_name = bt.table_name
@@ -867,6 +887,53 @@ def delete_table(
     db.delete(bt)
     db.commit()
     return {"ok": True, "deleted_table": table_name}
+
+
+# ─── Publish / Unpublish ──────────────────────────────────────────────────────
+
+
+@router.post("/tables/{table_id}/publish")
+def publish_table(
+    table_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """发布数据表，发布后可被 Skill 绑定。"""
+    bt = db.get(BusinessTable, table_id)
+    if not bt:
+        raise HTTPException(404, "数据表不存在")
+    _require_table_owner_or_admin(bt, user)
+    if bt.publish_status == "published":
+        return {"ok": True, "message": "数据表已处于发布状态"}
+    bt.publish_status = "published"
+    bt.published_at = datetime.datetime.utcnow()
+    bt.published_by = user.id
+    db.commit()
+    return {"ok": True, "publish_status": "published"}
+
+
+@router.post("/tables/{table_id}/unpublish")
+def unpublish_table(
+    table_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """取消发布数据表。如果有 Skill 绑定则拒绝。"""
+    bt = db.get(BusinessTable, table_id)
+    if not bt:
+        raise HTTPException(404, "数据表不存在")
+    _require_table_owner_or_admin(bt, user)
+    if bt.publish_status != "published":
+        return {"ok": True, "message": "数据表未发布"}
+    # 检查是否有 Skill 绑定
+    binding_count = db.query(SkillTableBinding).filter(SkillTableBinding.table_id == table_id).count()
+    if binding_count > 0:
+        raise HTTPException(400, f"数据表被 {binding_count} 个 Skill 绑定，请先解绑后再取消发布")
+    bt.publish_status = "draft"
+    bt.published_at = None
+    bt.published_by = None
+    db.commit()
+    return {"ok": True, "publish_status": "draft"}
 
 
 # ─── Field profile ───────────────────────────────────────────────────────────
@@ -1023,11 +1090,13 @@ class CreateBindingRequest(BaseModel):
 def create_binding(
     req: CreateBindingRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     bt = db.get(BusinessTable, req.table_id)
     if not bt:
         raise HTTPException(404, "数据表不存在")
+    if bt.publish_status != "published":
+        raise HTTPException(400, "数据表尚未发布，请先发布后再绑定 Skill")
 
     skill = db.get(Skill, req.skill_id)
     if not skill:
@@ -1367,11 +1436,12 @@ def create_role_group(
     table_id: int,
     req: RoleGroupCreate,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "数据表不存在")
+    _require_table_owner_or_admin(bt, user)
     if not req.name.strip():
         raise HTTPException(400, "角色组名称不能为空")
 
@@ -1400,11 +1470,14 @@ def patch_role_group(
     group_id: int,
     req: RoleGroupPatch,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     rg = db.get(TableRoleGroup, group_id)
     if not rg:
         raise HTTPException(404, "角色组不存在")
+    bt = db.get(BusinessTable, rg.table_id)
+    if bt:
+        _require_table_owner_or_admin(bt, user)
     if rg.is_system:
         raise HTTPException(400, "系统角色组不可编辑")
 
@@ -1428,11 +1501,14 @@ def patch_role_group(
 def delete_role_group(
     group_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     rg = db.get(TableRoleGroup, group_id)
     if not rg:
         raise HTTPException(404, "角色组不存在")
+    bt = db.get(BusinessTable, rg.table_id)
+    if bt:
+        _require_table_owner_or_admin(bt, user)
     if rg.is_system:
         raise HTTPException(400, "系统角色组不可删除")
     _write_audit_log(db, user, "delete_role_group", "table_role_groups", rg.id,
@@ -2227,11 +2303,12 @@ def create_view(
     table_id: int,
     req: ViewCreateRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "数据表不存在")
+    _require_table_owner_or_admin(bt, user)
     if not req.name.strip():
         raise HTTPException(400, "视图名称不能为空")
     if req.view_kind not in VALID_VIEW_KINDS:
@@ -2263,11 +2340,14 @@ def patch_view(
     view_id: int,
     req: ViewPatchRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     v = db.get(TableView, view_id)
     if not v:
         raise HTTPException(404, "视图不存在")
+    bt = db.get(BusinessTable, v.table_id)
+    if bt:
+        _require_table_owner_or_admin(bt, user)
     if v.is_system:
         raise HTTPException(400, "系统视图不可编辑")
 
@@ -2294,11 +2374,14 @@ def patch_view(
 def delete_view(
     view_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     v = db.get(TableView, view_id)
     if not v:
         raise HTTPException(404, "视图不存在")
+    bt = db.get(BusinessTable, v.table_id)
+    if bt:
+        _require_table_owner_or_admin(bt, user)
     if v.is_system:
         raise HTTPException(400, "系统视图不可删除")
 

@@ -325,7 +325,7 @@ class TestBindingAPI:
         admin, _ = _setup_admin(db)
         _make_model_config(db)
         skill = _make_skill(db, admin.id)
-        bt = _make_business_table(db, "bind_tbl", "绑定表", admin.id)
+        bt = _make_business_table(db, "bind_tbl", "绑定表", admin.id, publish_status="published")
         db.commit()
         token = _login(client, "da_admin")
         resp = client.post("/api/data-assets/bindings", headers=_auth(token), json={
@@ -469,6 +469,26 @@ class TestFieldProfilerUnit:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestBitableSyncSchema:
+    def test_normalize_fields_fills_empty_names(self):
+        from app.services.bitable_sync import BitableSync
+        sync = BitableSync()
+        fields = [
+            {"field_name": "文本", "type": 1},
+            {"field_name": "", "type": 1},
+            {"field_name": "", "type": 17},
+            {"field_name": "文本", "type": 3},
+        ]
+
+        normalized = sync._normalize_fields(fields)
+        col_map = sync._build_col_map(normalized)
+
+        assert [f["field_name"] for f in normalized] == ["文本", "未命名字段2", "未命名字段3", "文本_2"]
+        assert normalized[1]["_source_field_name"] == ""
+        assert normalized[2]["_source_field_name"] == ""
+        assert all(col_map[f["field_name"]] for f in normalized)
+        assert len(set(col_map.values())) == len(normalized)
+        assert "" not in col_map.values()
+
     def test_persist_schema_fields(self, db):
         admin, _ = _setup_admin(db)
         bt = _make_business_table(db, "schema_test", "Schema测试", admin.id, source_type="lark_bitable")

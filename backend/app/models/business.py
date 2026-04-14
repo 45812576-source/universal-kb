@@ -62,6 +62,10 @@ class BusinessTable(Base):
     governance_status = Column(String(20), default="ungoverned")
     governance_confidence = Column(Float, nullable=True)
     governance_note = Column(Text, nullable=True)
+    # ── 发布状态 ──
+    publish_status = Column(String(20), default="draft")  # draft | published
+    published_at = Column(DateTime, nullable=True)
+    published_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(
         DateTime,

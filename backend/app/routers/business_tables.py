@@ -1065,13 +1065,14 @@ async def upload_file_as_table(
             db.rollback()
 
     # Register in BusinessTable
-    rules = {"row_scope": "private", "column_scope": "private", "field_meta": field_meta}
+    rules = {"row_scope": "all", "column_scope": "all", "field_meta": field_meta}
     bt = BusinessTable(
         table_name=table_name,
         display_name=display_name,
         description=f"从 {filename} 导入，共 {inserted} 行",
         ddl_sql=ddl,
         validation_rules=rules,
+        source_type="imported",
         owner_id=user.id,
     )
     db.add(bt)
