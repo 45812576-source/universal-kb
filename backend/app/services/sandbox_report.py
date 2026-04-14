@@ -25,6 +25,7 @@ from app.models.sandbox import (
     CaseVerdict,
 )
 from app.models.knowledge import KnowledgeEntry, KnowledgeStatus
+from app.services.sandbox_quality_standard import QUALITY_DIMENSIONS, QUALITY_PASS_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -776,13 +777,13 @@ def _render_report_text(
     lines += [
         f"### 3.1 质量 — {'OK 通过' if q.get('passed') else 'FAIL 未通过'}",
         "",
-        f"- **评判标准**: 四维度各 0-100 分，加权综合 ≥70 为通过",
-        f"  - 覆盖度 (30%): 是否解决核心问题、覆盖用户需求的关键维度",
-        f"  - 正确性 (30%): 回答是否准确、是否存在幻觉或错误引用",
-        f"  - 约束遵守 (20%): 是否遵守行可见/字段脱敏等权限限制",
-        f"  - 可行动性 (20%): 输出是否具体到可直接用于业务决策",
+        f"- **评判标准**: 四维度各 0-100 分，加权综合 >={QUALITY_PASS_THRESHOLD} 为通过",
+        *[
+            f"  - {item['label']} ({item['weight']}%): {item['description']}"
+            for item in QUALITY_DIMENSIONS
+        ],
         "",
-        f"- **综合分: {qd.get('avg_score', 'N/A')}** (阈值 70)",
+        f"- **综合分: {qd.get('avg_score', 'N/A')}** (阈值 {QUALITY_PASS_THRESHOLD})",
         f"- 覆盖度: {qd.get('avg_coverage', 'N/A')} | 正确性: {qd.get('avg_correctness', 'N/A')} | "
         f"约束: {qd.get('avg_constraint', 'N/A')} | 可行动: {qd.get('avg_actionability', 'N/A')}",
         "",
@@ -935,7 +936,7 @@ def _render_report_text(
         "",
         f"| 维度 | 结果 |",
         f"|------|------|",
-        f"| 质量 (综合 ≥70) | {'OK' if fv.get('quality_passed') else 'FAIL'} |",
+        f"| 质量 (综合 >={QUALITY_PASS_THRESHOLD}) | {'OK' if fv.get('quality_passed') else 'FAIL'} |",
         f"| 易用性 (三项阈值) | {'OK' if fv.get('usability_passed') else 'FAIL'} |",
         f"| 幻觉限制 (关键词+行为) | {'OK' if fv.get('anti_hallucination_passed') else 'FAIL'} |",
         f"| **可提交审批** | **{'OK 是' if fv.get('approval_eligible') else 'FAIL 否'}** |",

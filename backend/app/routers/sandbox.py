@@ -22,10 +22,16 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db, SessionLocal
 from app.dependencies import get_current_user
-from app.models.user import User
 from app.models.skill import Skill, SkillVersion, SkillPreflightResult
 from app.models.tool import ToolRegistry
+from app.models.user import User
 from app.services.llm_gateway import llm_gateway
+from app.services.sandbox_quality_standard import (
+    QUALITY_DIMENSIONS,
+    QUALITY_PASS_THRESHOLD,
+    build_quality_dimension_lines,
+    build_quality_json_example,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -534,16 +540,17 @@ System Prompt 摘要（前 1500 字）：
 AI 回复：
 {response}
 
-请严格评分（0-100），评估标准：
-1. 目标覆盖度（40%）：回复是否解决了 Skill 描述中的核心问题？还是只碰到了皮毛/子问题？
-   - 如果 Skill 说"系统复盘"但只做了"查预算"，应给低分
-2. 输出完整度（30%）：回复结构是否完整？关键信息是否齐全？
-   - 如果知识库检索到了相关内容，回复是否有效利用了这些知识？
-   - 如果知识库为空或无相关结果，说明该 Skill 缺少支撑知识，应适当扣分
-3. 专业度（30%）：用词是否专业？格式是否规范？是否体现领域知识？
+请严格按照沙盒测试报告的统一标准评分（0-100）：
+{dimension_lines}
+
+补充要求：
+- 正确性要结合知识库命中情况判断；如果知识库已有明确支撑但回复未使用、误用或编造，应扣分
+- 约束遵守要检查是否越出 Skill 目标、输入边界、权限边界或约束条件；无法完全验证权限时，重点判断是否出现越权臆断
+- 可行动性要检查输出是否给出可执行结论、步骤、判断依据，而不是停留在空泛描述
+- 对每个扣分项，说明扣分维度、扣分值、原因和修复建议
 
 只输出 JSON（不要其他内容）：
-{{"score": 75, "coverage": 80, "completeness": 70, "professionalism": 75, "knowledge_used": true, "reason": "一句话说明"}}"""
+{json_example}"""
 
 
 def _hash_content(*parts: str) -> str:
@@ -738,17 +745,24 @@ async def preflight(
             items = []
             g1_pass = True
             if len(system_prompt.strip()) < 50:
-                items.append({"check": "SKILL.md 内容", "ok": False, "issue": f"System Prompt 仅 {len(system_prompt.strip())} 字，需 ≥ 50 字"})
+                items.append({
+                    "check": "SKILL.md 内容",
+                    "ok": False,
+                    "issue": f"System Prompt 仅 {len(system_prompt.strip())} 字，需 ≥ 50 字",
+                    "code": "prompt_too_short",
+                    "actual_length": len(system_prompt.strip()),
+                    "min_length": 50,
+                })
                 g1_pass = False
             else:
                 items.append({"check": "SKILL.md 内容", "ok": True})
             if not (skill.description or "").strip():
-                items.append({"check": "Skill 描述", "ok": False, "issue": "description 为空"})
+                items.append({"check": "Skill 描述", "ok": False, "issue": "description 为空", "code": "missing_description"})
                 g1_pass = False
             else:
                 items.append({"check": "Skill 描述", "ok": True})
             if len(source_files) == 0:
-                items.append({"check": "附属文件", "ok": False, "issue": "无任何附属文件"})
+                items.append({"check": "附属文件", "ok": False, "issue": "无任何附属文件", "code": "missing_source_files"})
                 g1_pass = False
             else:
                 items.append({"check": "附属文件", "ok": True, "detail": f"{len(source_files)} 个文件"})
@@ -794,7 +808,7 @@ async def preflight(
                         .first()
                     )
                     if not entry:
-                        items.append({"check": fname, "ok": False, "issue": "未入库", "action": "confirm_archive"})
+                        items.append({"check": fname, "ok": False, "issue": "未入库", "action": "confirm_archive", "code": "knowledge_not_archived"})
                         g2_pass = False
                         continue
                     # 查向量库是否有 chunk
@@ -804,7 +818,14 @@ async def preflight(
                         if hits:
                             items.append({"check": fname, "ok": True, "detail": f"已入库 (ID:{entry.id}), 有向量索引"})
                         else:
-                            items.append({"check": fname, "ok": False, "issue": "已入库但无向量索引", "knowledge_id": entry.id, "action": "reindex"})
+                            items.append({
+                                "check": fname,
+                                "ok": False,
+                                "issue": "已入库但无向量索引",
+                                "knowledge_id": entry.id,
+                                "action": "reindex",
+                                "code": "knowledge_missing_vector_index",
+                            })
                             g2_pass = False
                     except Exception:
                         items.append({"check": fname, "ok": True, "detail": f"已入库 (ID:{entry.id}), 向量检查跳过"})
@@ -841,9 +862,11 @@ async def preflight(
                 for t in bound:
                     tool_name = t.display_name or t.name
                     issues = []
+                    failures = []
                     # 检查状态
                     if t.status != "published" and not t.is_active:
                         issues.append(f"状态 {t.status}, 未激活")
+                        failures.append({"code": "tool_inactive", "tool_id": t.id, "tool_name": tool_name, "status": t.status, "is_active": t.is_active})
                     # BUILTIN 类型检查模块
                     if t.tool_type and t.tool_type.value == "BUILTIN":
                         try:
@@ -852,6 +875,7 @@ async def preflight(
                             importlib.import_module(mod_name)
                         except (ImportError, ModuleNotFoundError):
                             issues.append("模块不存在或无法导入")
+                            failures.append({"code": "tool_module_missing", "tool_id": t.id, "tool_name": tool_name, "module_name": t.name})
                     # registered_table 数据源检查
                     config = t.config or {}
                     manifest = config.get("manifest", {})
@@ -861,9 +885,15 @@ async def preflight(
                             exists = db.query(BusinessTable).filter(BusinessTable.table_name == ds.get("key", "")).first()
                             if not exists:
                                 issues.append(f"数据表 '{ds.get('key')}' 未注册")
+                                failures.append({
+                                    "code": "registered_table_missing",
+                                    "tool_id": t.id,
+                                    "tool_name": tool_name,
+                                    "table_name": ds.get("key", ""),
+                                })
 
                     if issues:
-                        items.append({"check": tool_name, "ok": False, "issue": "；".join(issues)})
+                        items.append({"check": tool_name, "ok": False, "issue": "；".join(issues), "tool_id": t.id, "failures": failures})
                         g3_pass = False
                     else:
                         items.append({"check": tool_name, "ok": True})
@@ -1003,6 +1033,8 @@ async def preflight(
                 knowledge_summary=kb_summary,
                 test_input=tc,
                 response=response[:2000],
+                dimension_lines=build_quality_dimension_lines(),
+                json_example=build_quality_json_example(),
             )
             try:
                 score_raw, _ = await llm_gateway.chat(
@@ -1030,13 +1062,38 @@ async def preflight(
             yield _sse("test_result", test_result)
 
         avg_score = round(total_score / len(tests)) if tests else 0
-        quality_passed = avg_score >= 70
+        dimension_averages = {
+            "avg_coverage": round(sum(t.get("detail", {}).get("coverage_score", 0) for t in tests) / len(tests)) if tests else 0,
+            "avg_correctness": round(sum(t.get("detail", {}).get("correctness_score", 0) for t in tests) / len(tests)) if tests else 0,
+            "avg_constraint": round(sum(t.get("detail", {}).get("constraint_score", 0) for t in tests) / len(tests)) if tests else 0,
+            "avg_actionability": round(sum(t.get("detail", {}).get("actionability_score", 0) for t in tests) / len(tests)) if tests else 0,
+        }
+        all_deductions = []
+        for test in tests:
+            all_deductions.extend(test.get("detail", {}).get("deductions", []))
+        top_deductions = sorted(all_deductions, key=lambda item: abs(item.get("points", 0)), reverse=True)[:5]
+        quality_detail = {
+            "avg_score": avg_score,
+            **dimension_averages,
+            "case_scores": [t.get("detail", {}) for t in tests],
+            "top_deductions": top_deductions,
+        }
+        quality_passed = avg_score >= QUALITY_PASS_THRESHOLD
 
-        _save_result(db, skill_id, "quality", quality_passed, "", {"tests": tests, "avg_score": avg_score}, score=avg_score)
+        _save_result(
+            db,
+            skill_id,
+            "quality",
+            quality_passed,
+            "",
+            {"tests": tests, "quality_detail": quality_detail},
+            score=avg_score,
+        )
 
         yield _sse("done", {
             "passed": quality_passed,
             "score": avg_score,
+            "quality_detail": quality_detail,
             "gates": gates,
             "tests": tests,
         })
@@ -1055,6 +1112,39 @@ class KnowledgeConfirmItem(BaseModel):
 
 class KnowledgeConfirmRequest(BaseModel):
     confirmations: List[KnowledgeConfirmItem]
+
+
+class PreflightRemediationRequest(BaseModel):
+    result: dict
+
+
+class KnowledgeReindexRequest(BaseModel):
+    knowledge_ids: List[int]
+
+
+@router.post("/preflight/{skill_id}/remediation-actions")
+async def preflight_remediation_actions(
+    skill_id: int,
+    req: PreflightRemediationRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """将 preflight 检测结果转换成 StudioChat 可消费的整改卡片。"""
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+
+    from app.models.user import Role
+    if skill.created_by != user.id and user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
+        raise HTTPException(403, "无权处理该 Skill")
+
+    from app.services.preflight_governance import build_preflight_governance
+
+    result = build_preflight_governance(db, skill_id=skill_id, result=req.result or {})
+    return {
+        "cards": result.cards,
+        "staged_edits": result.staged_edits,
+    }
 
 
 @router.post("/preflight/{skill_id}/knowledge-confirm")
@@ -1177,6 +1267,49 @@ async def knowledge_confirm(
         "created_entry_ids": created_entry_ids,
         "failed_count": len(failed),
         "failed_files": [r["filename"] for r in failed],
+    }
+
+
+@router.post("/preflight/{skill_id}/knowledge-reindex")
+async def knowledge_reindex(
+    skill_id: int,
+    req: KnowledgeReindexRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """对指定知识条目重建向量索引。"""
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+
+    from app.models.knowledge import KnowledgeEntry
+    from app.services.vector_service import delete_knowledge_vectors, index_knowledge
+
+    results = []
+    for knowledge_id in req.knowledge_ids:
+        entry = db.get(KnowledgeEntry, int(knowledge_id))
+        if not entry:
+            results.append({"knowledge_id": knowledge_id, "ok": False, "reason": "知识条目不存在"})
+            continue
+        if not (entry.content or "").strip():
+            results.append({"knowledge_id": knowledge_id, "ok": False, "reason": "知识条目内容为空"})
+            continue
+        try:
+            delete_knowledge_vectors(entry.id)
+            index_knowledge(entry.id, entry.content, user.id, db=db)
+            results.append({"knowledge_id": entry.id, "ok": True})
+        except Exception as exc:
+            results.append({"knowledge_id": entry.id, "ok": False, "reason": str(exc)})
+
+    db.query(SkillPreflightResult).filter(
+        SkillPreflightResult.skill_id == skill_id,
+        SkillPreflightResult.gate_name == "knowledge",
+    ).delete()
+    db.commit()
+
+    return {
+        "results": results,
+        "failed_count": len([item for item in results if not item.get("ok")]),
     }
 
 

@@ -214,12 +214,23 @@ def _apply_source_file_edit(skill: Skill, edit: StagedEdit) -> bool:
     source_files = skill.source_files or []
     matched = [f for f in source_files if f.get("filename") == target_key]
     if not matched:
-        return False
+        file_path = Path(f"uploads/skills/{skill.id}/{target_key}")
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        content = _apply_diff_ops("", edit.diff_ops or [])
+        file_path.write_text(content, encoding="utf-8")
+        source_files.append({
+            "filename": target_key,
+            "path": str(file_path),
+            "size": len(content.encode("utf-8")),
+            "category": "reference",
+        })
+        skill.source_files = source_files
+        return True
 
     file_path = Path(matched[0].get("path", ""))
     if not file_path.exists():
-        # 尝试 uploads/skills/{id}/{filename}
         file_path = Path(f"uploads/skills/{skill.id}/{target_key}")
+        file_path.parent.mkdir(parents=True, exist_ok=True)
 
     if file_path.exists():
         content = file_path.read_text(encoding="utf-8")
@@ -233,7 +244,16 @@ def _apply_source_file_edit(skill: Skill, edit: StagedEdit) -> bool:
         skill.source_files = source_files
         return True
 
-    return False
+    content = _apply_diff_ops("", edit.diff_ops or [])
+    file_path.write_text(content, encoding="utf-8")
+    for f in source_files:
+        if f.get("filename") == target_key:
+            f["path"] = str(file_path)
+            f["size"] = len(content.encode("utf-8"))
+            f.setdefault("category", "reference")
+    skill.source_files = source_files
+    return True
+
 
 
 def adopt_staged_edit(db: Session, edit_id: int, user_id: int) -> dict:

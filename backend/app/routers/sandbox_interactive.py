@@ -47,6 +47,11 @@ from app.models.sandbox import (
     EvidenceType,
     CaseVerdict,
 )
+from app.services.sandbox_quality_standard import (
+    QUALITY_PASS_THRESHOLD,
+    build_quality_dimension_lines,
+    build_quality_json_example,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2592,19 +2597,11 @@ async def _evaluate_session(
                 f"权限上下文：行可见={case.row_visibility}, 字段={case.field_output_semantic}\n\n"
                 f"AI 输出：\n{case.llm_response[:1500]}\n\n"
                 f"评分标准（四维度各 0-100）：\n"
-                f"1. coverage_score（目标覆盖度 30%）：是否解决核心问题\n"
-                f"2. correctness_score（正确性 30%）：回答是否准确、无幻觉\n"
-                f"3. constraint_score（约束遵守度 20%）：是否遵守权限限制\n"
-                f"4. actionability_score（可行动性 20%）：输出是否可直接用于决策\n\n"
+                f"{build_quality_dimension_lines()}\n\n"
                 f"对每个扣分项，说明扣分维度、扣分值、原因和修复建议。\n\n"
                 + baseline_section
                 + f"\n\n只输出 JSON：\n"
-                f'{{"score": 75, "coverage_score": 80, "correctness_score": 70, '
-                f'"constraint_score": 75, "actionability_score": 60, '
-                f'"deductions": [{{"dimension": "correctness", "points": -15, '
-                f'"reason": "引用了不存在的字段", "fix_suggestion": "限制输出字段白名单"'
-                f', "status": "FIXED 或 NEW"}}], '
-                f'"reason": "主问题一句话", "fix_suggestion": "整改动作一句话"}}'
+                f"{build_quality_json_example()}"
             )
             try:
                 result, _ = await llm_gateway.chat(
@@ -2650,7 +2647,7 @@ async def _evaluate_session(
         # 按扣分绝对值排序取 top 5
         top_deductions = sorted(all_deductions, key=lambda d: abs(d.get("points", 0)), reverse=True)[:5]
 
-        evaluation["quality_passed"] = avg_score >= 70
+        evaluation["quality_passed"] = avg_score >= QUALITY_PASS_THRESHOLD
         evaluation["quality_detail"] = {
             "avg_score": round(avg_score),
             "avg_coverage": round(avg_coverage),
