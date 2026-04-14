@@ -33,12 +33,14 @@ from app.services.workdir_manager import (
     _dir_size_bytes,
     _studio_root,
     _user_opencode_db_path,
+    _workspace_alias_roots,
     _workspace_project_dir,
     _workspace_root_for_user,
     _workspace_runtime_config_dir,
     _workspace_runtime_data_dir,
     _workspace_skill_studio_dir,
     ensure_workspace_layout,
+    resolve_workspace_path,
 )
 
 from app.services.runtime_process_manager import (
@@ -435,33 +437,34 @@ def dev_studio_session_repair(
     migration_state = migrate_legacy_session_db(ws_root)
     probe = probe_session_db(ws_root)
 
-    studio_root = _studio_root()
     found_legacy_dbs = []
-    if os.path.isdir(studio_root):
-        for dirname in os.listdir(studio_root):
-            if dirname == os.path.basename(ws_root):
+    seen_db_paths: set[str] = set()
+    for candidate_root in _workspace_alias_roots(ws_root, user.display_name or ""):
+        for sub in [
+            os.path.join(candidate_root, "runtime", "data", "opencode", "opencode.db"),
+            os.path.join(candidate_root, ".local", "share", "opencode", "opencode.db"),
+        ]:
+            normalized_sub = os.path.normpath(sub)
+            if normalized_sub in seen_db_paths or not os.path.exists(normalized_sub):
                 continue
-            candidate = os.path.join(studio_root, dirname)
-            if not os.path.isdir(candidate):
-                continue
-            for sub in [
-                os.path.join(candidate, "runtime", "data", "opencode", "opencode.db"),
-                os.path.join(candidate, ".local", "share", "opencode", "opencode.db"),
-            ]:
-                if os.path.exists(sub):
-                    try:
-                        con = sqlite3.connect(sub, timeout=3)
-                        count = con.execute("SELECT COUNT(*) FROM session").fetchone()[0]
-                        con.close()
-                        found_legacy_dbs.append({"path": sub, "dir": dirname, "session_count": count})
-                    except Exception:
-                        pass
+            seen_db_paths.add(normalized_sub)
+            try:
+                con = sqlite3.connect(normalized_sub, timeout=3)
+                count = con.execute("SELECT COUNT(*) FROM session").fetchone()[0]
+                con.close()
+                found_legacy_dbs.append({
+                    "path": normalized_sub,
+                    "dir": os.path.basename(candidate_root),
+                    "session_count": count,
+                })
+            except Exception:
+                pass
 
     repaired = False
     if probe.total == 0 and found_legacy_dbs:
         best = max(found_legacy_dbs, key=lambda x: x["session_count"])
-        if best["session_count"] > 0:
-            canonical = os.path.join(ws_root, "runtime", "data", "opencode", "opencode.db")
+        canonical = os.path.join(ws_root, "runtime", "data", "opencode", "opencode.db")
+        if best["session_count"] > 0 and os.path.normpath(best["path"]) != os.path.normpath(canonical):
             try:
                 os.makedirs(os.path.dirname(canonical), exist_ok=True)
                 shutil.copy2(best["path"], canonical)
@@ -594,10 +597,17 @@ def dev_studio_session_audit(
                     ).fetchone()
                     msg_count = msg_row[0] if msg_row else 0
                 total_messages += msg_count
+                normalized_directory = resolve_workspace_path(
+                    reg.workspace_root,
+                    row["directory"],
+                    prefer_existing=True,
+                    default_to_project=True,
+                    allow_external=False,
+                ) if row["directory"] else None
                 sessions.append({
                     "id": row["id"],
                     "title": row["title"],
-                    "directory": row["directory"],
+                    "directory": normalized_directory,
                     "project_id": row["project_id"],
                     "created_at": row["time_created"],
                     "updated_at": row["time_updated"],
@@ -678,10 +688,17 @@ def dev_studio_session_audit_admin(
                     ).fetchone()
                     msg_count = msg_row[0] if msg_row else 0
                 total_messages += msg_count
+                normalized_directory = resolve_workspace_path(
+                    reg.workspace_root,
+                    row["directory"],
+                    prefer_existing=True,
+                    default_to_project=True,
+                    allow_external=False,
+                ) if row["directory"] else None
                 sessions.append({
                     "id": row["id"],
                     "title": row["title"],
-                    "directory": row["directory"],
+                    "directory": normalized_directory,
                     "project_id": row["project_id"],
                     "created_at": row["time_created"],
                     "updated_at": row["time_updated"],
@@ -796,8 +813,21 @@ def dev_studio_sessions(
     sessions, total, probe = read_opencode_sessions(
         reg.workspace_root, page=page, page_size=page_size,
     )
+    items = []
+    for session in sessions:
+        item = asdict(session)
+        if item.get("directory"):
+            item["directory"] = resolve_workspace_path(
+                reg.workspace_root,
+                item["directory"],
+                prefer_existing=True,
+                default_to_project=True,
+                allow_external=False,
+            )
+        items.append(item)
+
     return {
-        "items": [asdict(s) for s in sessions],
+        "items": items,
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -837,7 +867,13 @@ async def dev_studio_session_resume(
                 row = con.execute("SELECT id, directory FROM session WHERE id = ? LIMIT 1", (session_id,)).fetchone()
                 session_belongs_to_user = row is not None
                 if row and len(row) > 1 and row[1]:
-                    session_directory = row[1]
+                    session_directory = resolve_workspace_path(
+                        workspace_root,
+                        row[1],
+                        prefer_existing=True,
+                        default_to_project=True,
+                        allow_external=False,
+                    )
             finally:
                 con.close()
         except Exception:
@@ -1018,11 +1054,6 @@ def get_latest_output(
     workdir = _workspace_root_for_user(user.id, user.display_name or "")
     db_path = _user_opencode_db_path(workdir)
     if not os.path.exists(db_path):
-        db_path = os.environ.get(
-            "OPENCODE_DB_PATH",
-            os.path.expanduser("~/.local/share/opencode/opencode.db"),
-        )
-    if not os.path.exists(db_path):
         return []
 
     try:
@@ -1056,22 +1087,40 @@ def get_latest_output(
         state = d.get("state") or {}
         inp = state.get("input") or {}
         tool = d.get("tool", "")
-        file_path = inp.get("filePath") or inp.get("file_path") or ""
+        raw_file_path = inp.get("filePath") or inp.get("file_path") or ""
+        if not raw_file_path:
+            continue
+
+        project_dir = _workspace_project_dir(workdir)
+        resolved_file_path = resolve_workspace_path(
+            workdir,
+            raw_file_path,
+            prefer_existing=True,
+            default_to_project=False,
+            allow_external=False,
+        )
+        display_file_path = resolve_workspace_path(
+            workdir,
+            raw_file_path,
+            prefer_existing=False,
+            default_to_project=False,
+            allow_external=False,
+        )
+        file_path = resolved_file_path if os.path.isfile(resolved_file_path) else display_file_path
         if not file_path or file_path in seen_paths:
             continue
         seen_paths.add(file_path)
 
-        project_dir = _workspace_project_dir(workdir)
-        exists_on_disk = os.path.isfile(file_path)
+        exists_on_disk = os.path.isfile(resolved_file_path)
 
         content = ""
         if tool == "write":
             content = inp.get("content") or ""
         elif exists_on_disk:
-            norm_path = os.path.normpath(file_path)
+            norm_path = os.path.normpath(resolved_file_path)
             if norm_path == project_dir or norm_path.startswith(project_dir + os.sep):
                 try:
-                    with open(file_path, encoding="utf-8", errors="replace") as f:
+                    with open(resolved_file_path, encoding="utf-8", errors="replace") as f:
                         content = f.read()
                 except Exception:
                     content = ""

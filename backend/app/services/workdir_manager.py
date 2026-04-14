@@ -134,6 +134,133 @@ def _workspace_runtime_config_dir(workdir: str) -> str:
     return os.path.join(workdir, "runtime", "config")
 
 
+def _workspace_alias_roots(workdir: str, display_name: str = "") -> list[str]:
+    """返回当前工作区及其可能的 legacy 根目录别名。"""
+    roots: list[str] = []
+
+    def _add(path: str) -> None:
+        normalized = os.path.normpath(path)
+        if normalized not in roots:
+            roots.append(normalized)
+
+    _add(workdir)
+
+    if display_name:
+        import re as _re
+
+        safe_name = _re.sub(r"[^\w\u4e00-\u9fff\-]", "_", display_name).strip("_")
+        if safe_name:
+            legacy_root = os.path.join(_studio_root(), safe_name)
+            _add(legacy_root)
+
+    return roots
+
+
+def _workspace_path_candidates(workdir: str, raw_path: str) -> list[str]:
+    """给定历史路径，推导当前工作区内最可能的候选路径。"""
+    if not raw_path:
+        return []
+
+    project_dir = _workspace_project_dir(workdir)
+    runtime_config_dir = _workspace_runtime_config_dir(workdir)
+    studio_root = _studio_root()
+    normalized = os.path.normpath(raw_path)
+    candidates: list[str] = []
+
+    def _add(path: str) -> None:
+        normalized_path = os.path.normpath(path)
+        if normalized_path not in candidates:
+            candidates.append(normalized_path)
+
+    if not os.path.isabs(normalized):
+        _add(os.path.join(project_dir, normalized.lstrip("/")))
+        return candidates
+
+    if normalized == workdir:
+        _add(project_dir)
+        _add(workdir)
+        return candidates
+
+    if normalized == project_dir or normalized.startswith(project_dir + os.sep):
+        _add(normalized)
+        return candidates
+
+    if normalized.startswith(workdir + os.sep):
+        rel = os.path.relpath(normalized, workdir)
+        head = rel.split(os.sep, 1)[0]
+        if head in {"runtime", "skill_studio", ".local", ".config", ".bin"}:
+            _add(normalized)
+        elif head == ".opencode":
+            _add(os.path.join(project_dir, rel))
+            suffix = rel[len(".opencode"):].lstrip("/\\")
+            if suffix:
+                _add(os.path.join(runtime_config_dir, "opencode", suffix))
+        else:
+            _add(normalized)
+            _add(os.path.join(project_dir, rel))
+        return candidates
+
+    if normalized.startswith(studio_root + os.sep):
+        rel_to_studio = os.path.relpath(normalized, studio_root)
+        parts = rel_to_studio.split(os.sep, 1)
+        if len(parts) == 1:
+            _add(project_dir)
+            _add(workdir)
+            return candidates
+
+        remainder = parts[1]
+        head = remainder.split(os.sep, 1)[0]
+        if head in {"runtime", "skill_studio", ".local", ".config", ".bin"}:
+            _add(os.path.join(workdir, remainder))
+        elif head == ".opencode":
+            _add(os.path.join(project_dir, remainder))
+            suffix = remainder[len(".opencode"):].lstrip("/\\")
+            if suffix:
+                _add(os.path.join(runtime_config_dir, "opencode", suffix))
+        else:
+            _add(os.path.join(project_dir, remainder))
+            _add(os.path.join(workdir, remainder))
+        return candidates
+
+    _add(normalized)
+    return candidates
+
+
+def resolve_workspace_path(
+    workdir: str,
+    raw_path: str,
+    *,
+    prefer_existing: bool = True,
+    default_to_project: bool = False,
+    allow_external: bool = True,
+) -> str:
+    """把历史路径映射到当前用户工作区中的稳定路径。"""
+    candidates = _workspace_path_candidates(workdir, raw_path)
+    project_dir = _workspace_project_dir(workdir)
+
+    if not allow_external:
+        candidates = [
+            path for path in candidates
+            if path == workdir
+            or path.startswith(workdir + os.sep)
+            or path == project_dir
+            or path.startswith(project_dir + os.sep)
+        ]
+
+    if prefer_existing:
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+
+    if default_to_project:
+        for path in candidates:
+            if path == project_dir or path.startswith(project_dir + os.sep):
+                return path
+        return project_dir
+
+    return candidates[0] if candidates else os.path.normpath(raw_path)
+
+
 def _user_opencode_db_path(workdir: str) -> Optional[str]:
     """返回当前用户的 opencode.db 路径，优先新布局，兼容旧布局。
     如果两个位置都不存在，返回新布局路径（供创建用）。

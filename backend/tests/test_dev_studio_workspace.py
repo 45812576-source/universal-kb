@@ -21,10 +21,12 @@ from app.services.workdir_manager import (
     _workspace_runtime_dir,
     _workspace_runtime_data_dir,
     _workspace_runtime_config_dir,
+    _workspace_alias_roots,
     _user_opencode_db_path,
     _has_old_layout_residue,
     _is_layout_complete,
     _migrate_workspace_layout,
+    resolve_workspace_path,
     ensure_workspace_layout,
     RUNTIME_IGNORE_DIRS,
 )
@@ -449,6 +451,52 @@ class TestEnsureUserInstancePaths:
 
         assert rows["s_project"] == "project_a"
         assert rows["s_empty"] == "global"
+
+
+# ─── Legacy path normalization ───────────────────────────────────────────────
+
+class TestWorkspacePathResolution:
+    def test_alias_roots_include_legacy_display_name(self, workspace):
+        roots = _workspace_alias_roots(workspace, "罗敏君")
+        assert os.path.normpath(workspace) in roots
+        assert os.path.normpath("/tmp") not in roots
+        assert any(root.endswith("罗敏君") for root in roots)
+
+    def test_resolve_legacy_root_file_into_project(self, workspace):
+        project_dir, _ = ensure_workspace_layout(workspace, "test")
+        target = os.path.join(project_dir, "analyze_docx_format.py")
+        with open(target, "w") as f:
+            f.write("print(1)")
+
+        resolved = resolve_workspace_path(
+            workspace,
+            "/Users/xia/studio_workspaces/罗敏君/analyze_docx_format.py",
+            prefer_existing=True,
+            allow_external=False,
+        )
+        assert resolved == target
+
+    def test_resolve_legacy_workspace_root_to_current_project(self, workspace):
+        project_dir, _ = ensure_workspace_layout(workspace, "test")
+        resolved = resolve_workspace_path(
+            workspace,
+            "/Users/xia/studio_workspaces/罗敏君",
+            prefer_existing=True,
+            default_to_project=True,
+            allow_external=False,
+        )
+        assert resolved == project_dir
+
+    def test_external_path_falls_back_to_project_when_disallowed(self, workspace):
+        project_dir, _ = ensure_workspace_layout(workspace, "test")
+        resolved = resolve_workspace_path(
+            workspace,
+            "/Users/xia/project/universal-kb",
+            prefer_existing=True,
+            default_to_project=True,
+            allow_external=False,
+        )
+        assert resolved == project_dir
 
 
 # ─── RUNTIME_IGNORE_DIRS consistency ──────────────────────────────────────────
