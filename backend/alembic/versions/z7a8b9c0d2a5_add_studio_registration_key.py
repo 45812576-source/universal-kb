@@ -15,6 +15,7 @@ depends_on = None
 
 def upgrade() -> None:
     with op.batch_alter_table("studio_instance_registrations") as batch:
+        batch.create_index("ix_studio_registration_user_id", ["user_id"], unique=False)
         batch.drop_constraint("uq_user_workspace_type", type_="unique")
         batch.add_column(sa.Column("workspace_id", sa.Integer(), nullable=True))
         batch.add_column(sa.Column("project_id", sa.Integer(), nullable=True))
@@ -55,3 +56,4 @@ def downgrade() -> None:
             "uq_user_workspace_type",
             ["user_id", "workspace_type"],
         )
+        batch.drop_index("ix_studio_registration_user_id")
