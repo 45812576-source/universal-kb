@@ -418,6 +418,8 @@ async def generate_report(
             "group_semantic": c.group_semantic,
             "tool_precondition": c.tool_precondition,
             "input_provenance": c.input_provenance,
+            "test_input": c.test_input or "",
+            "llm_response": c.llm_response or "",
             "test_input_preview": (c.test_input or "")[:200],
             "llm_response_preview": (c.llm_response or "")[:300],
             "verdict": c.verdict.value if c.verdict else None,
@@ -742,7 +744,7 @@ def _render_report_text(
             lines.append("")
 
         # LLM 输出片段（前端页面能看到，报告也要有）
-        llm_preview = c.get("llm_response_preview", "")
+        llm_preview = c.get("llm_response", "") or c.get("llm_response_preview", "")
         if llm_preview:
             lines += [
                 "**AI 输出片段:**",
@@ -753,7 +755,7 @@ def _render_report_text(
             ]
 
         # 测试输入片段
-        input_preview = c.get("test_input_preview", "")
+        input_preview = c.get("test_input", "") or c.get("test_input_preview", "")
         if input_preview:
             lines += [
                 "**测试输入片段:**",
@@ -907,6 +909,54 @@ def _render_report_text(
         lines += ["### Fix Plan", ""]
         for i, fix in enumerate(fix_plan, 1):
             lines.append(f"  {i}. {fix}")
+        lines.append("")
+
+    # 结构化问题清单（完整）
+    structured_issues = part3.get("issues", [])
+    if structured_issues:
+        lines += ["### 结构化问题清单（完整）", ""]
+        for issue in structured_issues:
+            lines.append(
+                f"- [{issue.get('severity', 'minor')}] "
+                f"{issue.get('issue_id', '')} | {issue.get('dimension', '')} | {issue.get('target_kind', 'unknown')}"
+            )
+            lines.append(f"  - 原因: {issue.get('reason', '')}")
+            if issue.get("impact"):
+                lines.append(f"  - 影响: {issue.get('impact', '')}")
+            if issue.get("fix_suggestion"):
+                lines.append(f"  - 修复建议: {issue.get('fix_suggestion', '')}")
+            if issue.get("target_ref"):
+                lines.append(f"  - 目标引用: {issue.get('target_ref', '')}")
+            if issue.get("source_cases"):
+                lines.append(f"  - 关联用例: {issue.get('source_cases')}")
+            if issue.get("retest_scope"):
+                lines.append(f"  - 重测范围: {issue.get('retest_scope')}")
+            for snippet in (issue.get("evidence_snippets") or [])[:3]:
+                lines.append(f"  - 证据: {snippet}")
+        lines.append("")
+
+    # 结构化整改计划（完整）
+    structured_fix_plan = part3.get("fix_plan_structured", [])
+    if structured_fix_plan:
+        lines += ["### 结构化整改计划（完整）", ""]
+        for item in structured_fix_plan:
+            lines.append(
+                f"- [{item.get('priority', 'p2')}] {item.get('id', '')} | "
+                f"{item.get('action_type', 'fix_prompt_logic')} | {item.get('target_kind', 'unknown')}"
+            )
+            lines.append(f"  - 标题: {item.get('title', '')}")
+            if item.get("problem_ids"):
+                lines.append(f"  - 关联问题: {item.get('problem_ids')}")
+            if item.get("target_ref"):
+                lines.append(f"  - 目标引用: {item.get('target_ref')}")
+            if item.get("suggested_changes"):
+                lines.append(f"  - 建议变更: {item.get('suggested_changes')}")
+            if item.get("acceptance_rule"):
+                lines.append(f"  - 验收标准: {item.get('acceptance_rule')}")
+            if item.get("retest_scope"):
+                lines.append(f"  - 重测范围: {item.get('retest_scope')}")
+            if item.get("estimated_gain"):
+                lines.append(f"  - 预期收益: {item.get('estimated_gain')}")
         lines.append("")
 
     # Supporting 结论

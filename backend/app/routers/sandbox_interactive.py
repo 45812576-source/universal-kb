@@ -1785,7 +1785,7 @@ async def _step_case_execution(
                         {"role": "system", "content": full_prompt},
                         {"role": "user", "content": test_input_text},
                     ],
-                    temperature=0.7,
+                    temperature=0.0,
                     max_tokens=1500,
                 )
                 case.llm_response = response
@@ -2137,6 +2137,38 @@ async def targeted_rerun(
 class TargetedRerunByReportRequest(BaseModel):
     issue_ids: Optional[List[str]] = None
     fix_plan_item_ids: Optional[List[str]] = None
+
+
+@router.post("/by-report/{report_id}/remediation-actions")
+async def remediation_actions_by_report(
+    report_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """将交互式沙盒报告转换成 Studio Chat 可消费的治理卡片与 staged edits。"""
+    report = db.get(SandboxTestReport, report_id)
+    if not report:
+        raise HTTPException(404, "测试报告不存在")
+
+    session = db.get(SandboxTestSession, report.session_id)
+    if not session:
+        raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
+
+    if session.target_type != "skill":
+        return {"cards": [], "staged_edits": []}
+
+    from app.services.sandbox_governance import build_sandbox_report_governance
+
+    result = build_sandbox_report_governance(
+        db,
+        skill_id=session.target_id,
+        report=report,
+    )
+    return {
+        "cards": result.cards,
+        "staged_edits": result.staged_edits,
+    }
 
 
 @router.post("/by-report/{report_id}/targeted-rerun")

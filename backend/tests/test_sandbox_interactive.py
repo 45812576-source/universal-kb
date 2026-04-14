@@ -17,7 +17,7 @@ from app.models.skill import SkillStatus, SkillVersion
 from app.models.tool import ToolType, SkillTool
 from app.models.business import BusinessTable, DataOwnership
 from app.models.knowledge import KnowledgeEntry
-from app.models.sandbox import SandboxTestSession, SessionStatus, SessionStep
+from app.models.sandbox import SandboxTestSession, SandboxTestReport, SessionStatus, SessionStep
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -825,3 +825,93 @@ class TestSandboxReportStructure:
         fix_plan = _extract_fix_plan(evaluation)
         assert isinstance(fix_plan, list)
         assert len(fix_plan) >= 1
+
+
+class TestSandboxReportGovernanceActions:
+    """沙盒报告 → Studio 治理卡片回归。"""
+
+    def test_build_remediation_actions_from_report(self, client, db):
+        dept = _make_dept(db)
+        user = _make_user(db, "sandbox_governance_user", Role.SUPER_ADMIN, dept.id)
+        _make_model_config(db)
+        skill = _make_skill(db, user.id, name="沙盒治理回归Skill", status=SkillStatus.PUBLISHED)
+
+        session = SandboxTestSession(
+            target_type="skill",
+            target_id=skill.id,
+            target_version=1,
+            target_name=skill.name,
+            tester_id=user.id,
+            status=SessionStatus.COMPLETED,
+            current_step=SessionStep.DONE,
+            detected_slots=[],
+            tool_review=[],
+            permission_snapshot=[],
+            quality_passed=False,
+            usability_passed=True,
+            anti_hallucination_passed=True,
+            approval_eligible=False,
+        )
+        db.add(session)
+        db.flush()
+
+        report = SandboxTestReport(
+            session_id=session.id,
+            target_type="skill",
+            target_id=skill.id,
+            target_version=1,
+            target_name=skill.name,
+            tester_id=user.id,
+            part1_evidence_check={},
+            part2_test_matrix={},
+            part3_evaluation={
+                "issues": [
+                    {
+                        "issue_id": "issue_1",
+                        "severity": "major",
+                        "dimension": "quality",
+                        "reason": "输出缺少明确结论",
+                        "target_kind": "skill_prompt",
+                        "target_ref": "SKILL.md",
+                        "source_cases": [0],
+                        "evidence_snippets": ["回复内容过于空泛"],
+                        "retest_scope": ["all"],
+                    }
+                ],
+                "fix_plan_structured": [
+                    {
+                        "id": "fix_1",
+                        "title": "补齐结论型输出结构",
+                        "priority": "p1",
+                        "problem_ids": ["issue_1"],
+                        "action_type": "fix_prompt_logic",
+                        "target_kind": "skill_prompt",
+                        "target_ref": "SKILL.md",
+                        "suggested_changes": "增加先结论后依据模板",
+                        "acceptance_rule": "首段必须给出结论",
+                        "retest_scope": ["all"],
+                        "estimated_gain": "提升可行动性",
+                    }
+                ],
+            },
+            quality_passed=False,
+            usability_passed=True,
+            anti_hallucination_passed=True,
+            approval_eligible=False,
+            report_hash="sandbox-gov-test-hash",
+        )
+        db.add(report)
+        db.flush()
+
+        session.report_id = report.id
+        db.commit()
+
+        token = _login(client, "sandbox_governance_user")
+        resp = client.post(
+            f"/api/sandbox/interactive/by-report/{report.id}/remediation-actions",
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert len(data.get("cards", [])) >= 1
+        assert len(data.get("staged_edits", [])) >= 1
