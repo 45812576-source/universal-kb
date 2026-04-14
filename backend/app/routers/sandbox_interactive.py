@@ -49,8 +49,11 @@ from app.models.sandbox import (
 )
 from app.services.sandbox_quality_standard import (
     QUALITY_PASS_THRESHOLD,
+    QUALITY_SCORE_TEMPERATURE,
+    QUALITY_SCORE_MAX_TOKENS,
     build_quality_dimension_lines,
     build_quality_json_example,
+    build_quality_score_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -2806,25 +2809,20 @@ async def _evaluate_session(
                     f"- 禁止对上次未提及的维度首次出现就大幅扣分（新扣分项单项 ≤ -10）"
                 )
 
-            score_prompt = (
-                f"你是 AI Skill 质量评审官。评估以下输出是否真正解决了 Skill 定义的问题。\n\n"
-                f"Skill 名称：{session.target_name}\n"
-                f"测试输入：\n{case.test_input[:500]}\n\n"
-                f"权限上下文：行可见={case.row_visibility}, 字段={case.field_output_semantic}\n\n"
-                f"AI 输出：\n{case.llm_response[:1500]}\n\n"
-                f"评分标准（四维度各 0-100）：\n"
-                f"{build_quality_dimension_lines()}\n\n"
-                f"对每个扣分项，说明扣分维度、扣分值、原因和修复建议。\n\n"
-                + baseline_section
-                + f"\n\n只输出 JSON：\n"
-                f"{build_quality_json_example()}"
+            score_prompt = build_quality_score_prompt(
+                skill_name=session.target_name or "未命名",
+                description=session.target_name or "无描述",
+                test_input=case.test_input[:500],
+                response=case.llm_response[:1500],
+                permission_context=f"行可见={case.row_visibility}, 字段={case.field_output_semantic}",
+                baseline_section=baseline_section,
             )
             try:
                 result, _ = await llm_gateway.chat(
                     model_config=llm_gateway.resolve_config(db, "sandbox.evaluate"),
                     messages=[{"role": "user", "content": score_prompt}],
-                    temperature=0.0,
-                    max_tokens=600,
+                    temperature=QUALITY_SCORE_TEMPERATURE,
+                    max_tokens=QUALITY_SCORE_MAX_TOKENS,
                 )
                 text = result.strip()
                 if "```" in text:

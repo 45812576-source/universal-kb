@@ -29,8 +29,11 @@ from app.services.llm_gateway import llm_gateway
 from app.services.sandbox_quality_standard import (
     QUALITY_DIMENSIONS,
     QUALITY_PASS_THRESHOLD,
+    QUALITY_SCORE_TEMPERATURE,
+    QUALITY_SCORE_MAX_TOKENS,
     build_quality_dimension_lines,
     build_quality_json_example,
+    build_quality_score_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -523,34 +526,6 @@ System Prompt（前 2000 字）：
 - 中文，每条 20-80 字
 - 不要编号、不要解释，一行一条"""
 
-_QUALITY_SCORE_PROMPT = """你是 AI Skill 质量评审官。
-
-该 Skill 的目标：
-{description}
-
-System Prompt 摘要（前 1500 字）：
-{system_prompt}
-
-知识库检索结果：
-{knowledge_summary}
-
-测试用例：
-{test_input}
-
-AI 回复：
-{response}
-
-请严格按照沙盒测试报告的统一标准评分（0-100）：
-{dimension_lines}
-
-补充要求：
-- 正确性要结合知识库命中情况判断；如果知识库已有明确支撑但回复未使用、误用或编造，应扣分
-- 约束遵守要检查是否越出 Skill 目标、输入边界、权限边界或约束条件；无法完全验证权限时，重点判断是否出现越权臆断
-- 可行动性要检查输出是否给出可执行结论、步骤、判断依据，而不是停留在空泛描述
-- 对每个扣分项，说明扣分维度、扣分值、原因和修复建议
-
-只输出 JSON（不要其他内容）：
-{json_example}"""
 
 
 def _hash_content(*parts: str) -> str:
@@ -608,6 +583,55 @@ def _save_result(db: Session, skill_id: int, gate_name: str, passed: bool, conte
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _persist_preflight_report(
+    db: Session,
+    *,
+    skill: "Skill",
+    skill_version: int | None,
+    gates: list[dict],
+    quality_detail: dict,
+    tests: list[dict],
+    user_id: int,
+) -> int | None:
+    """将 preflight 结果持久化为知识库条目，返回 knowledge_entry_id。"""
+    try:
+        from app.services.sandbox_report import render_preflight_report_text
+        from app.models.knowledge import KnowledgeEntry, KnowledgeStatus
+
+        report_text = render_preflight_report_text(
+            skill_name=skill.name or "未命名",
+            skill_version=skill_version,
+            gates=gates,
+            quality_detail=quality_detail,
+            tests=tests,
+        )
+
+        import datetime
+        now = datetime.datetime.utcnow()
+        title = (
+            f"{now.strftime('%Y-%m-%d %H:%M')}-"
+            f"{skill.name or 'unknown'}-v{skill_version or '?'}-Preflight报告"
+        )
+
+        ke = KnowledgeEntry(
+            title=title,
+            content=report_text,
+            category="preflight_report",
+            status=KnowledgeStatus.APPROVED,
+            created_by=user_id,
+            source_type="preflight",
+            source_file=f"preflight_{skill.id}_v{skill_version or '?'}.md",
+        )
+        db.add(ke)
+        db.commit()
+        logger.info(f"Preflight report persisted: knowledge_entry #{ke.id} for skill #{skill.id}")
+        return ke.id
+    except Exception as e:
+        logger.warning(f"Failed to persist preflight report: {e}")
+        db.rollback()
+        return None
 
 
 @router.get("/preflight/{skill_id}")
@@ -1027,21 +1051,20 @@ async def preflight(
             # AI 评分
             yield _sse("stage", {"label": f"评估测试 {idx + 1} 回复质量..."})
             kb_summary = knowledge_ctx[:500] if knowledge_ctx else "（未检索到相关知识）"
-            score_prompt = _QUALITY_SCORE_PROMPT.format(
+            score_prompt = build_quality_score_prompt(
+                skill_name=skill.name or "未命名",
                 description=skill.description or "无描述",
                 system_prompt=system_prompt[:1500],
                 knowledge_summary=kb_summary,
                 test_input=tc,
                 response=response[:2000],
-                dimension_lines=build_quality_dimension_lines(),
-                json_example=build_quality_json_example(),
             )
             try:
                 score_raw, _ = await llm_gateway.chat(
                     model_config=llm_gateway.resolve_config(db, "sandbox.preflight_score"),
                     messages=[{"role": "user", "content": score_prompt}],
-                    temperature=0.0,
-                    max_tokens=1024,
+                    temperature=QUALITY_SCORE_TEMPERATURE,
+                    max_tokens=QUALITY_SCORE_MAX_TOKENS,
                 )
                 score_data = _parse_score_json(score_raw.strip())
                 sc = int(score_data.get("score", 0))
@@ -1090,12 +1113,24 @@ async def preflight(
             score=avg_score,
         )
 
+        # 持久化 preflight 报告到知识库
+        knowledge_entry_id = _persist_preflight_report(
+            db,
+            skill=skill,
+            skill_version=latest_ver.version if latest_ver else None,
+            gates=gates,
+            quality_detail=quality_detail,
+            tests=tests,
+            user_id=user.id,
+        )
+
         yield _sse("done", {
             "passed": quality_passed,
             "score": avg_score,
             "quality_detail": quality_detail,
             "gates": gates,
             "tests": tests,
+            "knowledge_entry_id": knowledge_entry_id,
         })
 
     return StreamingResponse(generate(), media_type="text/event-stream")

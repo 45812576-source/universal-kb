@@ -993,3 +993,119 @@ def _render_report_text(
     ]
 
     return "\n".join(lines)
+
+
+def render_preflight_report_text(
+    *,
+    skill_name: str,
+    skill_version: str | int | None,
+    gates: list[dict],
+    quality_detail: dict,
+    tests: list[dict],
+) -> str:
+    """生成 preflight 专用的 Markdown 报告，章节结构与 interactive 报告对齐。"""
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    lines = [
+        f"# Preflight 报告 — {skill_name} v{skill_version or '?'}",
+        "",
+        f"- 检测时间: {now}",
+        "",
+        "---",
+        "",
+        "## 门检结果",
+        "",
+    ]
+
+    for gate in gates:
+        gate_name = gate.get("gate", gate.get("name", "unknown"))
+        passed = gate.get("passed", False)
+        icon = "OK" if passed else "FAIL"
+        lines.append(f"### [{icon}] {gate_name}")
+        lines.append("")
+
+        for item in gate.get("items", []):
+            item_passed = item.get("passed", item.get("ok", False))
+            item_icon = "OK" if item_passed else "FAIL"
+            label = item.get("label", item.get("key", ""))
+            detail = item.get("detail", item.get("reason", ""))
+            lines.append(f"- [{item_icon}] {label}")
+            if detail:
+                lines.append(f"  - {detail}")
+
+        lines.append("")
+
+    # 质量评分
+    avg_score = quality_detail.get("avg_score", 0)
+    lines += [
+        "---",
+        "",
+        "## 质量评分",
+        "",
+        f"**综合分: {avg_score}** (阈值 {QUALITY_PASS_THRESHOLD})",
+        "",
+        f"- 覆盖度: {quality_detail.get('avg_coverage', 'N/A')}",
+        f"- 正确性: {quality_detail.get('avg_correctness', 'N/A')}",
+        f"- 约束遵守: {quality_detail.get('avg_constraint', 'N/A')}",
+        f"- 可行动性: {quality_detail.get('avg_actionability', 'N/A')}",
+        "",
+    ]
+
+    # 逐用例评分
+    case_scores = quality_detail.get("case_scores", [])
+    if case_scores:
+        lines.append("| 用例 | 综合 | 覆盖 | 正确 | 约束 | 可行动 | 主问题 |")
+        lines.append("|------|------|------|------|------|--------|--------|")
+        for i, cs in enumerate(case_scores):
+            reason = (cs.get("reason") or "")[:40]
+            lines.append(
+                f"| #{i+1} "
+                f"| {cs.get('score', 'N/A')} "
+                f"| {cs.get('coverage_score', 'N/A')} "
+                f"| {cs.get('correctness_score', 'N/A')} "
+                f"| {cs.get('constraint_score', 'N/A')} "
+                f"| {cs.get('actionability_score', 'N/A')} "
+                f"| {reason} |"
+            )
+        lines.append("")
+
+    # 主要扣分项
+    top_deductions = quality_detail.get("top_deductions", [])
+    if top_deductions:
+        lines.append("**主要扣分项:**")
+        lines.append("")
+        for d in top_deductions:
+            lines.append(
+                f"- [{d.get('dimension', '')}] {d.get('points', 0)}分: {d.get('reason', '')}"
+            )
+            if d.get("fix_suggestion"):
+                lines.append(f"  → 修复建议: {d['fix_suggestion']}")
+        lines.append("")
+
+    # 测试用例及回复摘要
+    if tests:
+        lines += [
+            "---",
+            "",
+            "## 测试用例",
+            "",
+        ]
+        for t in tests:
+            idx = t.get("index", "?")
+            sc = t.get("score", "N/A")
+            lines.append(f"### 用例 #{idx} — 评分: {sc}")
+            lines.append("")
+            if t.get("test_input"):
+                lines += ["**测试输入:**", "```", t["test_input"][:500], "```", ""]
+            response = t.get("response", "")
+            if response:
+                lines += ["**AI 回复:**", "```", response[:500], "```", ""]
+            detail = t.get("detail", {})
+            if detail.get("deductions"):
+                lines.append("**扣分项:**")
+                for d in detail["deductions"]:
+                    lines.append(
+                        f"- [{d.get('dimension', '')}] {d.get('points', 0)}分: {d.get('reason', '')}"
+                    )
+                lines.append("")
+
+    return "\n".join(lines)
