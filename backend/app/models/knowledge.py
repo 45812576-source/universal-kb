@@ -76,7 +76,7 @@ class KnowledgeEntry(Base):
 
     # ── OSS 文件存储 ─────────────────────────────────────────────────────────
     oss_key = Column(String(500), nullable=True)       # OSS 对象路径
-    file_type = Column(String(50), nullable=True)      # MIME 类型 (application/pdf 等)
+    file_type = Column(String(200), nullable=True)     # MIME 类型 (含 Office 长格式如 application/vnd.openxmlformats-officedocument.spreadsheetml.sheet)
     file_ext = Column(String(20), nullable=True)       # 文件扩展名 (.pdf, .docx 等)
     file_size = Column(BigInteger, nullable=True)      # 文件大小 (bytes)
     docx_oss_key = Column(String(500), nullable=True)   # PDF 转换后的 DOCX 文件 OSS 路径
