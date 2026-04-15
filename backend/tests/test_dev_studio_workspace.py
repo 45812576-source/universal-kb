@@ -30,6 +30,7 @@ from app.services.workdir_manager import (
     ensure_workspace_layout,
     RUNTIME_IGNORE_DIRS,
 )
+from app.routers.dev_studio import _list_visible_output_files
 
 
 @pytest.fixture
@@ -451,6 +452,33 @@ class TestEnsureUserInstancePaths:
 
         assert rows["s_project"] == "project_a"
         assert rows["s_empty"] == "global"
+
+
+class TestVisibleOutputFileIndex:
+    def test_includes_project_skill_studio_and_runtime_skill_files(self, workspace):
+        project_dir, _ = ensure_workspace_layout(workspace, "test")
+
+        output_dir = os.path.join(project_dir, "output")
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "report.md"), "w") as f:
+            f.write("# report")
+
+        skill_studio_dir = os.path.join(workspace, "skill_studio", "data")
+        os.makedirs(skill_studio_dir, exist_ok=True)
+        with open(os.path.join(skill_studio_dir, "客户台账.csv"), "w") as f:
+            f.write("id,name\n1,Alice\n")
+
+        runtime_skills_dir = os.path.join(workspace, "runtime", "config", "opencode", "skills")
+        os.makedirs(runtime_skills_dir, exist_ok=True)
+        with open(os.path.join(runtime_skills_dir, "custom-skill.md"), "w") as f:
+            f.write("# custom skill")
+
+        items = _list_visible_output_files(project_dir, workspace)
+        rel_paths = {item["rel_path"] for item in items}
+
+        assert "output/report.md" in rel_paths
+        assert "skill_studio/data/客户台账.csv" in rel_paths
+        assert ".opencode/skills/custom-skill.md" in rel_paths
 
 
 # ─── Legacy path normalization ───────────────────────────────────────────────

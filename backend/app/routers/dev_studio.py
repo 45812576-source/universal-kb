@@ -168,6 +168,147 @@ def _tree(base: str, rel: str = "") -> list:
     return nodes
 
 
+def _categorize_visible_output_file(fname: str) -> str:
+    ext = os.path.splitext(fname)[1].lower()
+    return (
+        "skill" if ext == ".md" else
+        "code" if ext in (".py", ".ts", ".js", ".json", ".bat", ".command", ".sh") else
+        "data" if ext in (".csv", ".xlsx", ".xls", ".sql") else
+        "doc" if ext in (".html", ".pdf", ".docx", ".txt") else
+        "other"
+    )
+
+
+def _list_visible_output_files(project_dir: str, ws_root: str) -> list[dict]:
+    """返回管理文件/最近产物共用的可见文件列表。"""
+    import datetime as _dt
+
+    items = []
+    seen_paths: set[str] = set()
+
+    _skip_dirs = {
+        ".git", ".opencode", "node_modules", "__pycache__", ".venv", "venv",
+        ".next", "dist", "build", ".cache", ".bin", ".local", ".config",
+    }
+
+    if os.path.isdir(project_dir):
+        for dirpath, dirnames, filenames in os.walk(project_dir):
+            dirnames[:] = [d for d in dirnames if d not in _skip_dirs]
+            for fname in filenames:
+                if fname.startswith("."):
+                    continue
+                fpath = os.path.join(dirpath, fname)
+                try:
+                    stat = os.stat(fpath)
+                except OSError:
+                    continue
+                seen_paths.add(fpath)
+                items.append({
+                    "path": fpath,
+                    "rel_path": os.path.relpath(fpath, project_dir),
+                    "name": fname,
+                    "size": stat.st_size,
+                    "updated_at": _dt.datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                    "category": _categorize_visible_output_file(fname),
+                    "source": "project",
+                })
+
+    extra_dirs = [
+        (os.path.join(ws_root, "skill_studio", "data"), "skill_studio/data", None),
+        (os.path.join(ws_root, "runtime", "config", "opencode", "skills"), ".opencode/skills", "runtime_skill"),
+    ]
+    for abs_dir, rel_prefix, forced_category in extra_dirs:
+        if not os.path.isdir(abs_dir):
+            continue
+        for fname in os.listdir(abs_dir):
+            if fname.startswith("."):
+                continue
+            fpath = os.path.join(abs_dir, fname)
+            if not os.path.isfile(fpath) or fpath in seen_paths:
+                continue
+            try:
+                stat = os.stat(fpath)
+            except OSError:
+                continue
+            seen_paths.add(fpath)
+            items.append({
+                "path": fpath,
+                "rel_path": f"{rel_prefix}/{fname}",
+                "name": fname,
+                "size": stat.st_size,
+                "updated_at": _dt.datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                "category": forced_category or _categorize_visible_output_file(fname),
+                "source": rel_prefix.split("/", 1)[0],
+            })
+
+    items.sort(key=lambda x: x["updated_at"], reverse=True)
+    return items
+
+
+def _collect_tree_paths(nodes: list[dict]) -> set[str]:
+    paths: set[str] = set()
+
+    def _visit(items: list[dict]):
+        for item in items:
+            path = str(item.get("path") or "")
+            if path:
+                paths.add(path.replace("\\", "/"))
+            children = item.get("children") or []
+            if children:
+                _visit(children)
+
+    _visit(nodes)
+    return paths
+
+
+def _sort_tree_nodes(nodes: list[dict]) -> None:
+    nodes.sort(key=lambda node: (node.get("type") != "dir", str(node.get("name") or "").lower()))
+    for node in nodes:
+        children = node.get("children")
+        if isinstance(children, list) and children:
+            _sort_tree_nodes(children)
+
+
+def _inject_tree_file(nodes: list[dict], rel_path: str, *, size: int | None = None, mtime: float | None = None) -> None:
+    normalized = rel_path.replace("\\", "/").strip("/")
+    if not normalized:
+        return
+
+    parts = [part for part in normalized.split("/") if part]
+    if not parts:
+        return
+
+    cursor = nodes
+    parent_path = ""
+    for dirname in parts[:-1]:
+        node_path = f"{parent_path}/{dirname}" if parent_path else dirname
+        existing_dir = next(
+            (item for item in cursor if item.get("type") == "dir" and item.get("name") == dirname),
+            None,
+        )
+        if not existing_dir:
+            existing_dir = {"name": dirname, "path": node_path, "type": "dir", "children": []}
+            cursor.append(existing_dir)
+        children = existing_dir.setdefault("children", [])
+        if not isinstance(children, list):
+            existing_dir["children"] = []
+            children = existing_dir["children"]
+        cursor = children
+        parent_path = node_path
+
+    filename = parts[-1]
+    file_path = f"{parent_path}/{filename}" if parent_path else filename
+    if any(item.get("path") == file_path for item in cursor):
+        return
+
+    node = {"name": filename, "path": file_path, "type": "file"}
+    if size is not None:
+        node["size"] = size
+    if mtime is not None:
+        node["mtime"] = mtime
+    cursor.append(node)
+
+
 _REQUIRED_TOP_DIRS = ("inbox", "work", "export", "archive")
 _MAX_UPLOAD_FILE_BYTES = 200 * 1024 * 1024  # 单文件上限 200MB
 
@@ -1174,97 +1315,9 @@ def dev_studio_output_files(
     user: User = Depends(get_current_user),
 ):
     """枚举用户产出文件。"""
-    import datetime as _dt
-
     workdir = _user_workdir(user)
-    project_dir = workdir
-
-    _skip_dirs = {".git", ".opencode", "node_modules", "__pycache__", ".venv", "venv",
-                  ".next", "dist", "build", ".cache", ".bin", ".local", ".config"}
-
-    def _categorize(fname: str) -> str:
-        ext = os.path.splitext(fname)[1].lower()
-        return (
-            "skill" if ext == ".md" else
-            "code" if ext in (".py", ".ts", ".js", ".json", ".bat", ".command", ".sh") else
-            "data" if ext in (".csv", ".xlsx", ".xls", ".sql") else
-            "doc" if ext in (".html", ".pdf", ".docx", ".txt") else
-            "other"
-        )
-
-    items = []
-    seen_paths: set = set()
-
-    if os.path.isdir(project_dir):
-        for dirpath, dirnames, filenames in os.walk(project_dir):
-            dirnames[:] = [d for d in dirnames if d not in _skip_dirs]
-            for fname in filenames:
-                if fname.startswith("."):
-                    continue
-                fpath = os.path.join(dirpath, fname)
-                try:
-                    stat = os.stat(fpath)
-                except OSError:
-                    continue
-                seen_paths.add(fpath)
-                items.append({
-                    "path": fpath,
-                    "rel_path": os.path.relpath(fpath, project_dir),
-                    "name": fname,
-                    "size": stat.st_size,
-                    "updated_at": _dt.datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                    "category": _categorize(fname),
-                    "source": "project",
-                })
-
-    ws_root = os.path.dirname(project_dir)
-    ss_data_dir = os.path.join(ws_root, "skill_studio", "data")
-    if os.path.isdir(ss_data_dir):
-        for fname in os.listdir(ss_data_dir):
-            if fname.startswith("."):
-                continue
-            fpath = os.path.join(ss_data_dir, fname)
-            if not os.path.isfile(fpath) or fpath in seen_paths:
-                continue
-            try:
-                stat = os.stat(fpath)
-            except OSError:
-                continue
-            seen_paths.add(fpath)
-            items.append({
-                "path": fpath,
-                "rel_path": f"skill_studio/data/{fname}",
-                "name": fname,
-                "size": stat.st_size,
-                "updated_at": _dt.datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                "category": _categorize(fname),
-                "source": "skill_studio",
-            })
-
-    runtime_skills_dir = os.path.join(ws_root, "runtime", "config", "opencode", "skills")
-    if os.path.isdir(runtime_skills_dir):
-        for fname in os.listdir(runtime_skills_dir):
-            if fname.startswith(".") or not fname.lower().endswith(".md"):
-                continue
-            fpath = os.path.join(runtime_skills_dir, fname)
-            if not os.path.isfile(fpath) or fpath in seen_paths:
-                continue
-            try:
-                stat = os.stat(fpath)
-            except OSError:
-                continue
-            seen_paths.add(fpath)
-            items.append({
-                "path": fpath,
-                "rel_path": f".opencode/skills/{fname}",
-                "name": fname,
-                "size": stat.st_size,
-                "updated_at": _dt.datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                "category": "runtime_skill",
-                "source": "runtime_skill",
-            })
-
-    items.sort(key=lambda x: x["updated_at"], reverse=True)
+    ws_root = os.path.dirname(workdir)
+    items = _list_visible_output_files(workdir, ws_root)
     return {"items": items}
 
 
@@ -1648,11 +1701,8 @@ async def transfer_table(
     import csv
     import io
     import json as _json
-    import re
     from sqlalchemy import text as _text
     from app.models.business import BusinessTable
-    from app.config import settings as _cfg
-
     fmt = req.format.lower()
     if fmt not in ("csv", "json", "sql"):
         raise HTTPException(400, "format 只支持 csv / json / sql")
@@ -1711,10 +1761,14 @@ async def transfer_table(
     data_dir = os.path.join(ss_dir, "data")
     os.makedirs(data_dir, exist_ok=True)
 
+    default_stem = (bt.display_name or table_name or "").strip() or table_name
     if req.filename:
         safe_filename = os.path.basename(req.filename)
     else:
-        safe_filename = f"{table_name}.{ext}"
+        safe_filename = f"{default_stem}.{ext}"
+
+    if not safe_filename.lower().endswith(f".{ext}"):
+        safe_filename = f"{safe_filename}.{ext}"
 
     dest = os.path.join(data_dir, safe_filename)
     with open(dest, "w", encoding="utf-8", newline="" if fmt == "csv" else "\n") as f:
@@ -2056,6 +2110,17 @@ def workdir_tree(user: User = Depends(get_current_user)):
     """返回用户 workdir 的完整文件树。"""
     workdir = _user_workdir(user)
     tree = _tree(workdir)
+    ws_root = os.path.dirname(workdir)
+
+    existing_paths = _collect_tree_paths(tree)
+    for item in _list_visible_output_files(workdir, ws_root):
+        rel_path = str(item.get("rel_path") or "").replace("\\", "/").strip("/")
+        if not rel_path or rel_path in existing_paths:
+            continue
+        _inject_tree_file(tree, rel_path, size=item.get("size"))
+        existing_paths.add(rel_path)
+
+    _sort_tree_nodes(tree)
 
     existing_names = {n["name"] for n in tree if n["type"] == "dir"}
     for d in _REQUIRED_TOP_DIRS:
