@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy.orm import Session as DBSession
 
@@ -66,6 +66,8 @@ class SessionStore:
             existing.updated_at = time.time()
             return existing
         session = HarnessSession(session_key=session_key, agent_type=agent_type or session_key.agent_type)
+        if db:
+            self._recover_session_metadata(session, db)
         self._sessions[compound] = session
         if db:
             self._persist_event(db, "harness.session.created", "", session_key, {
@@ -77,6 +79,52 @@ class SessionStore:
 
     def get_session(self, session_key: HarnessSessionKey) -> Optional[HarnessSession]:
         return self._sessions.get(session_key.compound_key)
+
+    def get_studio_state(
+        self,
+        session_key: HarnessSessionKey,
+        db: Optional[DBSession] = None,
+    ) -> Optional[dict]:
+        return self.get_studio_state_snapshot(session_key, db=db).get("studio_state")
+
+    def get_studio_state_snapshot(
+        self,
+        session_key: HarnessSessionKey,
+        db: Optional[DBSession] = None,
+    ) -> dict[str, Any]:
+        session = self.get_session(session_key)
+        studio_state = session.metadata.get("studio_state") if session else None
+        if studio_state is not None:
+            return {
+                "studio_state": studio_state,
+                "recovery": {
+                    "source": "memory",
+                    "cold_start": False,
+                    "recovered_at": None,
+                },
+            }
+        if db is None:
+            return {
+                "studio_state": None,
+                "recovery": {
+                    "source": "none",
+                    "cold_start": False,
+                    "recovered_at": None,
+                },
+            }
+
+        recovered = self._load_persisted_studio_state(session_key, db)
+        if recovered["studio_state"] is not None and session is not None:
+            session.metadata["studio_state"] = recovered["studio_state"]
+            session.updated_at = time.time()
+        return {
+            "studio_state": recovered["studio_state"],
+            "recovery": {
+                "source": recovered["source"],
+                "cold_start": recovered["source"] == "persisted",
+                "recovered_at": recovered["recovered_at"],
+            },
+        }
 
     def create_run(self, run: HarnessRun, db: Optional[DBSession] = None) -> HarnessRun:
         self._runs[run.run_id] = run
@@ -111,6 +159,25 @@ class SessionStore:
 
     def get_run(self, run_id: str) -> Optional[HarnessRun]:
         return self._runs.get(run_id)
+
+    def update_run_metadata(
+        self,
+        run_id: str,
+        metadata_patch: dict[str, Any],
+        *,
+        db: Optional[DBSession] = None,
+    ) -> Optional[HarnessRun]:
+        run = self._runs.get(run_id)
+        if not run:
+            logger.warning("update_run_metadata: run %s not found", run_id)
+            return None
+        run.metadata.update(metadata_patch or {})
+        if db:
+            self._persist_event(db, "harness.run.metadata_updated", run_id, run.session_key, {
+                "run_id": run_id,
+                "metadata_patch": metadata_patch,
+            })
+        return run
 
     # ── Step ─────────────────────────────────────────────────────────────────
 
@@ -362,6 +429,58 @@ class SessionStore:
         ]
 
     # ── 持久化到 UnifiedEvent 表 ─────────────────────────────────────────
+
+    def _recover_session_metadata(self, session: HarnessSession, db: DBSession) -> None:
+        """为新建 session 从持久化事件回填关键 metadata。"""
+        session_key = session.session_key
+        if not session_key:
+            return
+        if session.agent_type != AgentType.SKILL_STUDIO:
+            return
+        recovered = self._load_persisted_studio_state(session_key, db)
+        if recovered["studio_state"] is not None:
+            session.metadata["studio_state"] = recovered["studio_state"]
+            session.updated_at = time.time()
+
+    @staticmethod
+    def _load_persisted_studio_state(
+        session_key: HarnessSessionKey,
+        db: DBSession,
+    ) -> dict[str, Any]:
+        if session_key.agent_type != AgentType.SKILL_STUDIO:
+            return {"studio_state": None, "source": "none", "recovered_at": None}
+        if session_key.target_type != "skill" or session_key.target_id is None:
+            return {"studio_state": None, "source": "none", "recovered_at": None}
+
+        events = (
+            db.query(UnifiedEvent)
+            .filter(
+                UnifiedEvent.event_type == "harness.studio.state_saved",
+                UnifiedEvent.source_type == "harness",
+                UnifiedEvent.user_id == session_key.user_id,
+                UnifiedEvent.workspace_id == session_key.workspace_id,
+            )
+            .order_by(UnifiedEvent.created_at.desc(), UnifiedEvent.id.desc())
+            .limit(20)
+            .all()
+        )
+        for event in events:
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            if payload.get("target_type") != "skill":
+                continue
+            try:
+                if int(payload.get("target_id")) != int(session_key.target_id):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            studio_state = payload.get("studio_state")
+            if isinstance(studio_state, dict):
+                return {
+                    "studio_state": studio_state,
+                    "source": "persisted",
+                    "recovered_at": event.created_at.isoformat() if event.created_at else None,
+                }
+        return {"studio_state": None, "source": "none", "recovered_at": None}
 
     @staticmethod
     def _persist_event(

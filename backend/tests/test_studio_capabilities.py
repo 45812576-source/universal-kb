@@ -1,5 +1,6 @@
 """Studio 后端能力模块测试 — rename / route / audit / governance / staged edit。"""
 import pytest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from tests.conftest import (
@@ -175,6 +176,231 @@ class TestRoute:
         assert r.route_reason == "empty_or_minimal_skill"
 
 
+class TestWorkflowOrchestrator:
+    @pytest.mark.asyncio
+    async def test_bootstrap_workflow_architect_mode(self, db, seeded):
+        """新建场景 bootstrap → 返回统一 workflow_state，并初始化 architect 状态。"""
+        from app.models.conversation import Conversation
+        from app.models.skill import ArchitectWorkflowState
+        from app.services.studio_workflow_orchestrator import bootstrap_workflow
+
+        conv = Conversation(user_id=seeded["admin"].id)
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+
+        result = await bootstrap_workflow(
+            db,
+            workflow_id="run_test_architect",
+            conversation_id=conv.id,
+            skill_id=None,
+            user_message="我想做一个新的营销分析技能",
+        )
+
+        assert result.workflow_state["session_mode"] == "create_new_skill"
+        assert result.workflow_state["workflow_mode"] == "architect_mode"
+        assert result.workflow_state["phase"] == "phase_1_why"
+        assert result.workflow_state["next_action"] == "collect_requirements"
+        assert result.workflow_state["complexity_level"] == "medium"
+        assert result.workflow_state["execution_strategy"] == "fast_then_deep"
+        assert result.workflow_state["metadata"]["latency"]["request_accepted_at"]
+        assert result.workflow_state["metadata"]["latency"]["classified_at"]
+        assert result.architect_phase_status is not None
+        assert result.route_status["workflow_mode"] == "architect_mode"
+        assert result.route_status["complexity_level"] == "medium"
+        assert "skill-architect-master" in result.assist_skills_status["skills"]
+
+        arch_state = db.query(ArchitectWorkflowState).filter(
+            ArchitectWorkflowState.conversation_id == conv.id
+        ).first()
+        assert arch_state is not None
+        assert arch_state.workflow_phase == "phase_1_why"
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_workflow_audit_promotes_to_review_cards(self, db, seeded):
+        """审计 bootstrap → 自动运行 audit/governance，并把 next_action 提升为 review_cards。"""
+        from app.models.conversation import Conversation
+        from app.services.studio_workflow_orchestrator import bootstrap_workflow
+
+        conv = Conversation(user_id=seeded["admin"].id)
+        db.add(conv)
+        skill = seeded["skill"]
+        skill.source_type = "imported"
+        db.commit()
+        db.refresh(conv)
+
+        audit_result = SimpleNamespace(
+            verdict="needs_work",
+            issues=[{"severity": "high", "category": "structure", "description": "缺少角色定义"}],
+            recommended_path="minor_edit",
+            audit_id=42,
+        )
+        governance_result = SimpleNamespace(
+            cards=[{"id": "card_1", "type": "staged_edit", "title": "补充角色定义", "content": {"summary": "补充系统角色"}}],
+            staged_edits=[{"id": "9", "target_type": "system_prompt", "summary": "添加角色定义", "diff_ops": [], "risk_level": "low", "status": "pending"}],
+        )
+
+        with patch("app.services.studio_auditor.run_audit", new=AsyncMock(return_value=audit_result)), patch(
+            "app.services.studio_governance.generate_governance_actions",
+            new=AsyncMock(return_value=governance_result),
+        ):
+            result = await bootstrap_workflow(
+                db,
+                workflow_id="run_test_audit",
+                conversation_id=conv.id,
+                skill_id=skill.id,
+                user_message="帮我审计一下这个导入 skill",
+            )
+
+        assert result.workflow_state["session_mode"] == "audit_imported_skill"
+        assert result.workflow_state["phase"] == "review"
+        assert result.workflow_state["next_action"] == "review_cards"
+        assert result.workflow_state["complexity_level"] == "high"
+        assert result.workflow_state["execution_strategy"] == "fast_then_deep"
+        assert result.route_status["next_action"] == "review_cards"
+        assert result.route_status["deep_status"] == "pending"
+        assert result.audit_summary is not None
+        assert result.audit_summary["audit_id"] == 42
+        assert len(result.cards) == 1
+        assert len(result.staged_edits) == 1
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_workflow_reuses_existing_recovery_without_rerunning_audit(self, db, seeded):
+        from app.models.conversation import Conversation
+        from app.services import skill_memo_service
+        from app.services.studio_workflow_orchestrator import bootstrap_workflow
+
+        conv = Conversation(user_id=seeded["admin"].id)
+        db.add(conv)
+        skill = seeded["skill"]
+        skill.source_type = "imported"
+        db.commit()
+        db.refresh(conv)
+
+        skill_memo_service.sync_workflow_recovery(
+            db,
+            skill.id,
+            workflow_state={
+                "workflow_id": "run_existing",
+                "conversation_id": conv.id,
+                "skill_id": skill.id,
+                "session_mode": "audit_imported_skill",
+                "workflow_mode": "none",
+                "phase": "review",
+                "next_action": "review_cards",
+                "route_reason": "imported_skill",
+                "active_assist_skills": ["mckinsey", "quality_audit"],
+            },
+            cards=[{
+                "id": "reuse_card_1",
+                "type": "staged_edit",
+                "title": "已有整改卡片",
+                "status": "pending",
+                "content": {"summary": "复用已有整改卡片"},
+            }],
+            staged_edits=[{
+                "id": "reuse_edit_1",
+                "target_type": "system_prompt",
+                "summary": "复用已有 staged edit",
+                "diff_ops": [],
+                "risk_level": "low",
+                "status": "pending",
+            }],
+            user_id=seeded["admin"].id,
+            commit=True,
+        )
+
+        with patch("app.services.studio_auditor.run_audit", new=AsyncMock(side_effect=AssertionError("should_not_rerun_audit"))):
+            result = await bootstrap_workflow(
+                db,
+                workflow_id="run_recovered",
+                conversation_id=conv.id,
+                skill_id=skill.id,
+                user_message="继续处理上一个整改项",
+                user_id=seeded["admin"].id,
+            )
+
+        assert result.workflow_state["workflow_id"] == "run_recovered"
+        assert result.workflow_state["next_action"] == "review_cards"
+        assert result.workflow_state["complexity_level"] == "medium"
+        assert result.route_status["next_action"] == "review_cards"
+        assert result.cards[0]["id"] == "reuse_card_1"
+        assert result.staged_edits[0]["id"] == "reuse_edit_1"
+
+    def test_bootstrap_preflight_remediation_builds_workflow_state(self, db, seeded):
+        """preflight remediation 也走统一 workflow_state 返回面。"""
+        from app.services.studio_workflow_orchestrator import bootstrap_preflight_remediation
+
+        result = bootstrap_preflight_remediation(
+            db,
+            workflow_id="preflight-1",
+            skill_id=seeded["skill"].id,
+            result={
+                "gates": [{
+                    "gate": "structure",
+                    "status": "failed",
+                    "items": [{"ok": False, "code": "missing_description", "issue": "description 为空"}],
+                }],
+            },
+        )
+
+        assert result.workflow_state["workflow_mode"] == "preflight_remediation"
+        assert result.workflow_state["phase"] == "remediate"
+        assert result.workflow_state["next_action"] == "review_cards"
+        assert result.workflow_state["execution_strategy"] == "deep_resume"
+        assert result.workflow_state["metadata"]["source"] == "preflight_remediation"
+        assert len(result.cards) == 1
+        assert result.cards[0]["source"] == "preflight_remediation"
+        assert len(result.staged_edits) == 1
+        assert result.staged_edits[0]["source"] == "preflight_remediation"
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_sandbox_remediation_builds_workflow_state(self, db, seeded):
+        """sandbox remediation 也走统一 workflow_state 返回面。"""
+        from app.services.studio_workflow_orchestrator import bootstrap_sandbox_remediation
+
+        governance_result = SimpleNamespace(
+            cards=[{
+                "id": "sandbox_card_1",
+                "type": "followup_prompt",
+                "title": "补充工具治理",
+                "content": {"summary": "同步工具绑定"},
+                "status": "pending",
+                "actions": [{"label": "一键处理", "type": "adopt"}],
+            }],
+            staged_edits=[{
+                "id": "11",
+                "target_type": "system_prompt",
+                "target_key": None,
+                "summary": "补充沙盒整改要求",
+                "risk_level": "medium",
+                "diff_ops": [],
+                "status": "pending",
+            }],
+        )
+
+        with patch(
+            "app.services.sandbox_governance.build_sandbox_report_governance",
+            new=AsyncMock(return_value=governance_result),
+        ):
+            result = await bootstrap_sandbox_remediation(
+                db,
+                workflow_id="sandbox-1",
+                skill_id=seeded["skill"].id,
+                report=SimpleNamespace(id=88),
+            )
+
+        assert result.workflow_state["workflow_mode"] == "sandbox_remediation"
+        assert result.workflow_state["phase"] == "remediate"
+        assert result.workflow_state["next_action"] == "review_cards"
+        assert result.workflow_state["execution_strategy"] == "deep_resume"
+        assert result.workflow_state["metadata"]["report_id"] == 88
+        assert len(result.cards) == 1
+        assert result.cards[0]["source"] == "sandbox_remediation"
+        assert len(result.staged_edits) == 1
+        assert result.staged_edits[0]["source"] == "sandbox_remediation"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 3. Audit（接口级测试，mock LLM）
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -348,6 +574,207 @@ class TestStagedEditAdoptReject:
         db.refresh(se)
         assert se.status == "rejected"
 
+
+class TestWorkflowActionEndpoint:
+    def _create_staged_edit(self, db, skill_id):
+        se = StagedEdit(
+            skill_id=skill_id,
+            target_type="system_prompt",
+            diff_ops=[{"op": "replace", "old": "你是测试助手。", "new": "你是工作流测试助手。"}],
+            summary="工作流接口采纳测试",
+            risk_level="low",
+            status="pending",
+        )
+        db.add(se)
+        db.commit()
+        db.refresh(se)
+        return se
+
+    def test_workflow_action_adopt_staged_edit(self, client, token, seeded, db):
+        se = self._create_staged_edit(db, seeded["skill"].id)
+
+        resp = client.post(
+            f"/api/skills/{seeded['skill'].id}/workflow/actions",
+            json={"action": "adopt_staged_edit", "staged_edit_id": se.id},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["action"] == "adopt_staged_edit"
+        assert data["updated_staged_edit_status"] == "adopted"
+        assert data["memo_refresh_required"] is True
+        assert data["workflow_state_patch"] == {}
+        assert data["result"]["target_type"] == "system_prompt"
+
+    def test_workflow_action_reject_staged_edit(self, client, token, seeded, db):
+        se = self._create_staged_edit(db, seeded["skill"].id)
+
+        resp = client.post(
+            f"/api/skills/{seeded['skill'].id}/workflow/actions",
+            json={"action": "reject_staged_edit", "staged_edit_id": se.id},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["action"] == "reject_staged_edit"
+        assert data["updated_staged_edit_status"] == "rejected"
+
+    def test_workflow_action_returns_recovery_workflow_state_patch(self, client, token, seeded, db):
+        from app.services import skill_memo_service
+
+        se = self._create_staged_edit(db, seeded["skill"].id)
+        skill_memo_service.sync_workflow_recovery(
+            db,
+            seeded["skill"].id,
+            workflow_state={
+                "workflow_id": "run_test_patch",
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "preflight_remediation",
+                "phase": "remediate",
+                "next_action": "review_cards",
+                "route_reason": "preflight_failed",
+            },
+            cards=[{
+                "id": "card_patch_1",
+                "title": "补齐描述",
+                "type": "staged_edit",
+                "status": "pending",
+                "content": {"summary": "补齐描述", "staged_edit_id": str(se.id)},
+                "actions": [{"label": "采纳", "type": "adopt"}],
+            }],
+            staged_edits=[{
+                "id": str(se.id),
+                "target_type": "system_prompt",
+                "summary": "工作流状态补丁测试",
+                "risk_level": "low",
+                "diff_ops": se.diff_ops,
+                "status": "pending",
+            }],
+            user_id=seeded["admin"].id,
+            commit=True,
+        )
+
+        resp = client.post(
+            f"/api/skills/{seeded['skill'].id}/workflow/actions",
+            json={"action": "reject_staged_edit", "card_id": "card_patch_1", "staged_edit_id": se.id},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["workflow_state_patch"]["workflow_mode"] == "preflight_remediation"
+        assert data["workflow_state_patch"]["next_action"] == "continue_chat"
+
+    def test_workflow_action_prepare_next_step_returns_recommendation(self, client, token, seeded, db):
+        from app.services import skill_memo_service
+
+        skill_memo_service.sync_workflow_recovery(
+            db,
+            seeded["skill"].id,
+            workflow_state={
+                "workflow_id": "run_prepare_next",
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "preflight_remediation",
+                "phase": "validate",
+                "next_action": "run_sandbox",
+                "route_reason": "preflight_passed",
+                "metadata": {
+                    "test_recommendation": {
+                        "action": "run_sandbox",
+                        "scope": "sandbox",
+                        "label": "运行沙盒测试",
+                    },
+                },
+            },
+            user_id=seeded["admin"].id,
+            commit=True,
+        )
+
+        resp = client.post(
+            f"/api/skills/{seeded['skill'].id}/workflow/actions",
+            json={"action": "prepare_next_step"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["workflow_state_patch"]["next_action"] == "run_sandbox"
+        assert data["result"]["test_recommendation"]["scope"] == "sandbox"
+
+    def test_workflow_action_followup_prompt_dispatch_updates_card(self, client, token, seeded, db, monkeypatch):
+        from app.services import skill_memo_service
+
+        skill_memo_service.sync_workflow_recovery(
+            db,
+            seeded["skill"].id,
+            workflow_state={
+                "workflow_id": "run_followup_dispatch",
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "preflight_remediation",
+                "phase": "remediate",
+                "next_action": "review_cards",
+                "route_reason": "preflight_failed",
+            },
+            cards=[{
+                "id": "card_followup_1",
+                "title": "归档知识文件",
+                "type": "followup_prompt",
+                "status": "pending",
+                "content": {
+                    "summary": "归档知识文件",
+                    "preflight_action": "confirm_archive",
+                    "action_payload": {"confirmations": [{"filename": "reference.md"}]},
+                },
+                "actions": [{"label": "执行", "type": "adopt"}],
+            }],
+            user_id=seeded["admin"].id,
+            commit=True,
+        )
+
+        called: dict[str, object] = {}
+
+        def _fake_confirm(db_session, *, skill_id, user, confirmations):
+            called["skill_id"] = skill_id
+            called["user_id"] = user.id
+            called["confirmations"] = confirmations
+            return {"ok": True, "results": [{"filename": "reference.md", "ok": True}]}
+
+        monkeypatch.setattr(
+            "app.services.studio_followup_actions.confirm_knowledge_archive",
+            _fake_confirm,
+        )
+
+        resp = client.post(
+            f"/api/skills/{seeded['skill'].id}/workflow/actions",
+            json={
+                "action": "confirm_archive",
+                "card_id": "card_followup_1",
+                "payload": {"confirmations": [{"filename": "reference.md"}]},
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["action"] == "confirm_archive"
+        assert data["updated_card_status"] == "adopted"
+        assert called["skill_id"] == seeded["skill"].id
+        assert called["user_id"] == seeded["admin"].id
+        assert called["confirmations"] == [{"filename": "reference.md"}]
+
+        memo = skill_memo_service.get_memo(db, seeded["skill"].id)
+        assert memo["workflow_recovery"]["cards"][0]["status"] == "adopted"
+
+    def test_workflow_action_missing_staged_edit_id_returns_400(self, client, token, seeded):
+        resp = client.post(
+            f"/api/skills/{seeded['skill'].id}/workflow/actions",
+            json={"action": "adopt_staged_edit"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 400
+
     def test_reject_idempotent(self, db, seeded):
         """已 rejected 再次 reject → ok + already_rejected。"""
         from app.services.studio_governance import reject_staged_edit
@@ -360,16 +787,82 @@ class TestStagedEditAdoptReject:
 
     def test_reject_then_adopt_fails(self, db, seeded):
         """rejected edit 不能再 adopt（非 pending）。"""
-        from app.services.studio_governance import adopt_staged_edit, reject_staged_edit
+        from app.services.studio_governance import reject_staged_edit
 
         se = self._create_staged_edit(db, seeded["skill"].id)
         reject_staged_edit(db, se.id, seeded["admin"].id)
 
-        # adopt 应该直接拒绝（status 既不是 pending 也不是 adopted）
-        # 当前实现：只检查 adopted 幂等，非 adopted 非 pending 会创建新版本
-        # 这里先验证行为即可
         db.refresh(se)
         assert se.status == "rejected"
+
+
+class TestStudioRunsWorkflowBootstrap:
+    @pytest.mark.asyncio
+    async def test_studio_runs_bootstrap_executes_after_first_round(self, db, seeded):
+        from app.models.conversation import Conversation, Message, MessageRole
+        from app.services.studio_runs import StudioRun, StudioRunRegistry
+
+        conv = Conversation(user_id=seeded["admin"].id, skill_id=seeded["skill"].id)
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+
+        db.add_all([
+            Message(conversation_id=conv.id, role=MessageRole.USER, content="第一轮"),
+            Message(conversation_id=conv.id, role=MessageRole.ASSISTANT, content="第一轮回复"),
+            Message(conversation_id=conv.id, role=MessageRole.USER, content="第二轮"),
+        ])
+        db.commit()
+
+        registry = StudioRunRegistry()
+        run = StudioRun(
+            id="run_multi_turn",
+            conversation_id=conv.id,
+            user_id=seeded["admin"].id,
+            skill_id=seeded["skill"].id,
+            content="继续推进",
+        )
+
+        async def _empty_stream(*args, **kwargs):
+            if False:
+                yield None
+
+        bootstrap_result = SimpleNamespace(
+            workflow_state={
+                "workflow_id": run.id,
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "none",
+                "phase": "review",
+                "next_action": "continue_chat",
+            },
+            route_status={"next_action": "continue_chat", "workflow_mode": "none"},
+            assist_skills_status={"skills": ["prompt_optimizer"], "session_mode": "optimize_existing_skill"},
+            architect_phase_status=None,
+            audit_summary=None,
+            cards=[],
+            staged_edits=[],
+        )
+
+        with patch("app.services.studio_workflow_orchestrator.bootstrap_workflow", new=AsyncMock(return_value=bootstrap_result)) as bootstrap_mock, patch(
+            "app.services.studio_runs.SessionLocal",
+            TestingSessionLocal,
+        ), patch(
+            "app.harness.adapters.build_skill_studio_request",
+            return_value={"conversation_id": conv.id, "skill_id": seeded["skill"].id},
+        ), patch(
+            "app.harness.profiles.skill_studio.skill_studio_profile.run_stream",
+            new=_empty_stream,
+        ), patch(
+            "app.config.settings.STUDIO_STRUCTURED_MODE",
+            "on",
+        ):
+            await registry._execute(run, {})
+
+        bootstrap_mock.assert_awaited_once()
+        called = bootstrap_mock.await_args.kwargs
+        assert called["conversation_id"] == conv.id
+        assert called["skill_id"] == seeded["skill"].id
+        assert run.status == "completed"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -498,6 +991,44 @@ class TestArchitectRoute:
         r = route_session(db, skill_id=seeded["skill"].id, user_message="审计一下这个技能")
         assert r.session_mode == "audit_imported_skill"
         assert r.workflow_mode == "none"
+
+
+class TestStudioLatencyPolicy:
+    def test_audit_request_is_high_and_fast_then_deep(self):
+        from app.services.studio_latency_policy import choose_execution_strategy, estimate_complexity_level
+
+        level = estimate_complexity_level(
+            session_mode="audit_imported_skill",
+            workflow_mode="none",
+            next_action="run_audit",
+            user_message="请完整审计这个导入 Skill 并给出整改方案",
+        )
+        strategy = choose_execution_strategy(
+            complexity_level=level,
+            workflow_mode="none",
+            next_action="run_audit",
+        )
+
+        assert level == "high"
+        assert strategy == "fast_then_deep"
+
+    def test_simple_patch_can_stay_fast_only(self):
+        from app.services.studio_latency_policy import choose_execution_strategy, estimate_complexity_level
+
+        level = estimate_complexity_level(
+            session_mode="optimize_existing_skill",
+            workflow_mode="none",
+            next_action="start_editing",
+            user_message="帮我小改一下措辞",
+        )
+        strategy = choose_execution_strategy(
+            complexity_level=level,
+            workflow_mode="none",
+            next_action="start_editing",
+        )
+
+        assert level == "simple"
+        assert strategy == "fast_only"
 
 
 class TestArchitectStateAPI:

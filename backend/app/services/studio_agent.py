@@ -22,8 +22,23 @@ from typing import AsyncIterator
 from sqlalchemy.orm import Session
 
 from app.services.llm_gateway import llm_gateway
+from app.services.studio_latency_policy import (
+    choose_execution_strategy,
+    estimate_complexity_level,
+    initial_lane_statuses,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _next_action_for_session_mode(session_mode: str) -> str:
+    if session_mode == "create_new_skill":
+        return "collect_requirements"
+    if session_mode == "audit_imported_skill":
+        return "run_audit"
+    if session_mode == "optimize_existing_skill":
+        return "start_editing"
+    return "continue_chat"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1303,22 +1318,56 @@ async def run_stream(
             session_state.current_mode = "refine" if has_refine_signal else "discover"
         session_state.draft_readiness_score = min(session_state.draft_readiness_score, 2)
 
+    workflow_mode = "architect_mode" if arch_phase else "none"
+    next_action = _next_action_for_session_mode(session_mode)
+    complexity_level = estimate_complexity_level(
+        session_mode=session_mode,
+        workflow_mode=workflow_mode,
+        next_action=next_action,
+        user_message=user_message,
+        has_files=bool(source_files),
+        has_memo=bool(memo_context),
+        history_count=len(history_messages),
+    )
+    execution_strategy = choose_execution_strategy(
+        complexity_level=complexity_level,
+        workflow_mode=workflow_mode,
+        next_action=next_action,
+    )
+    lane_statuses = initial_lane_statuses(execution_strategy)
+
     # ── 阶段 1: routing ──
     yield ("status", {"stage": "routing"})
+    yield ("status", {
+        "stage": "classified",
+        "complexity_level": complexity_level,
+        "execution_strategy": execution_strategy,
+        **lane_statuses,
+    })
 
     # 统一事件名：route_status（与 conversations.py 结构化模式对齐）
     yield ("route_status", {
         "session_mode": session_mode,
         "route_reason": route_reason,
         "active_assist_skills": active_assists,
-        "workflow_mode": "architect_mode" if arch_phase else "none",
+        "next_action": next_action,
+        "workflow_mode": workflow_mode,
         "initial_phase": arch_phase,
+        "complexity_level": complexity_level,
+        "execution_strategy": execution_strategy,
+        **lane_statuses,
     })
     # 向后兼容旧前端
     yield ("studio_route", {
         "session_mode": session_mode,
         "route_reason": route_reason,
         "active_assist_skills": active_assists,
+        "next_action": next_action,
+        "workflow_mode": workflow_mode,
+        "initial_phase": arch_phase,
+        "complexity_level": complexity_level,
+        "execution_strategy": execution_strategy,
+        **lane_statuses,
     })
 
     # assist_skills_status（与 conversations.py 对齐）
@@ -1552,6 +1601,23 @@ async def run_stream(
         "readiness": session_state.draft_readiness_score,
         "has_draft": session_state.has_outputted_draft,
         "total_rounds": session_state.total_user_rounds,
+        "complexity_level": complexity_level,
+        "execution_strategy": execution_strategy,
+        "fast_status": "completed",
+        "deep_status": lane_statuses["deep_status"],
+        "reconciled_facts": reconciled_display,
+        "direction_shift": {
+            "from": "unknown",
+            "to": session_state.current_scenario_shift,
+        } if session_state.current_scenario_shift else None,
+        "file_need_status": {
+            "status": session_state.file_need_status,
+            "forbidden_countdown": session_state.file_forbidden_countdown,
+        },
+        "repeat_blocked": {
+            "reason": "连续重复追问，已自动切换到 draft 模式",
+            "blocked_categories": session_state.asked_question_categories,
+        } if session_state.current_repeat_blocked else None,
     })
 
     yield ("__full_content__", {"text": clean_text or full_content})

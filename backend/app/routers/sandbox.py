@@ -1311,10 +1311,18 @@ async def preflight_remediation_actions(
     if skill.created_by != user.id and user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
         raise HTTPException(403, "无权处理该 Skill")
 
-    from app.services.preflight_governance import build_preflight_governance
+    from app.services.studio_workflow_orchestrator import bootstrap_preflight_remediation
 
-    result = build_preflight_governance(db, skill_id=skill_id, result=req.result or {})
+    result = bootstrap_preflight_remediation(
+        db,
+        workflow_id=f"preflight-{skill_id}",
+        skill_id=skill_id,
+        result=req.result or {},
+        user_id=user.id,
+        commit=True,
+    )
     return {
+        "workflow_state": result.workflow_state,
         "cards": result.cards,
         "staged_edits": result.staged_edits,
     }
@@ -1328,119 +1336,14 @@ async def knowledge_confirm(
     user: User = Depends(get_current_user),
 ):
     """确认知识库文件归档路径并入库。"""
-    skill = db.get(Skill, skill_id)
-    if not skill:
-        raise HTTPException(404, "Skill 不存在")
+    from app.services.studio_followup_actions import confirm_knowledge_archive
 
-    from app.models.knowledge import KnowledgeEntry
-    results = []
-    all_entry_ids: List[int] = []
-    created_entry_ids: List[int] = []
-
-    for item in req.confirmations:
-        # 读取文件内容
-        source_files = skill.source_files or []
-        file_info = next((f for f in source_files if f["filename"] == item.filename), None)
-        if not file_info:
-            results.append({"filename": item.filename, "ok": False, "reason": "文件不存在"})
-            continue
-
-        # 读文件内容 — 多路径搜索（workspace 迁移可能导致原路径失效）
-        import os
-        file_path = file_info.get("path", "")
-        content = ""
-        candidate_paths = [file_path] if file_path else []
-        # 如果原路径不存在，尝试 workspace 标准位置
-        if file_path and not os.path.exists(file_path):
-            fname = os.path.basename(file_path)
-            # 从 Skill 所属用户的 workspace 搜索
-            try:
-                from app.services.runtime_process_manager import _get_registry_workspace_root
-                ws_root = _get_registry_workspace_root(user.id)
-                if ws_root:
-                    for subdir in ["project/output", "project", "skill_studio/data",
-                                   "runtime/config/opencode/skills"]:
-                        alt = os.path.join(ws_root, subdir, fname)
-                        if os.path.exists(alt):
-                            candidate_paths.insert(0, alt)
-                            break
-            except Exception:
-                pass
-        for cp in candidate_paths:
-            if cp and os.path.exists(cp):
-                try:
-                    with open(cp, "r", encoding="utf-8") as f:
-                        content = f.read()
-                    if content:
-                        break
-                except Exception:
-                    pass
-
-        if not content:
-            results.append({"filename": item.filename, "ok": False, "reason": "文件内容为空或无法读取"})
-            continue
-
-        title = item.display_title or item.filename
-        category = item.target_category or "general"
-
-        # 创建/更新 knowledge_entry
-        existing = db.query(KnowledgeEntry).filter(
-            (KnowledgeEntry.title == title) | (KnowledgeEntry.source_file == item.filename)
-        ).first()
-
-        is_new = False
-        if existing:
-            existing.content = content
-            existing.category = category
-            existing.taxonomy_board = item.target_board or existing.taxonomy_board
-            entry_id = existing.id
-        else:
-            from app.models.knowledge import KnowledgeStatus
-            from app.models.user import get_system_user_id
-            entry = KnowledgeEntry(
-                title=title,
-                content=content,
-                category=category,
-                status=KnowledgeStatus.APPROVED,
-                created_by=get_system_user_id(db),
-                source_type="skill_preflight",
-                source_file=item.filename,
-                taxonomy_board=item.target_board or None,
-            )
-            db.add(entry)
-            db.flush()
-            entry_id = entry.id
-            is_new = True
-
-        db.commit()
-        all_entry_ids.append(entry_id)
-        if is_new:
-            created_entry_ids.append(entry_id)
-
-        # 触发向量入库
-        try:
-            from app.services.vector_service import index_knowledge, delete_knowledge_vectors
-            delete_knowledge_vectors(entry_id)  # 清除旧向量
-            index_knowledge(entry_id, content, user.id)
-            results.append({"filename": item.filename, "ok": True, "knowledge_id": entry_id})
-        except Exception as e:
-            results.append({"filename": item.filename, "ok": True, "knowledge_id": entry_id, "vector_warning": str(e)})
-
-    # 清除 knowledge gate 缓存，强制下次重检
-    db.query(SkillPreflightResult).filter(
-        SkillPreflightResult.skill_id == skill_id,
-        SkillPreflightResult.gate_name == "knowledge",
-    ).delete()
-    db.commit()
-
-    failed = [r for r in results if not r.get("ok")]
-    return {
-        "results": results,
-        "knowledge_entry_ids": all_entry_ids,
-        "created_entry_ids": created_entry_ids,
-        "failed_count": len(failed),
-        "failed_files": [r["filename"] for r in failed],
-    }
+    return confirm_knowledge_archive(
+        db,
+        skill_id=skill_id,
+        user=user,
+        confirmations=[item.model_dump() for item in req.confirmations],
+    )
 
 
 @router.post("/preflight/{skill_id}/knowledge-reindex")
@@ -1451,39 +1354,14 @@ async def knowledge_reindex(
     user: User = Depends(get_current_user),
 ):
     """对指定知识条目重建向量索引。"""
-    skill = db.get(Skill, skill_id)
-    if not skill:
-        raise HTTPException(404, "Skill 不存在")
+    from app.services.studio_followup_actions import reindex_skill_knowledge
 
-    from app.models.knowledge import KnowledgeEntry
-    from app.services.vector_service import delete_knowledge_vectors, index_knowledge
-
-    results = []
-    for knowledge_id in req.knowledge_ids:
-        entry = db.get(KnowledgeEntry, int(knowledge_id))
-        if not entry:
-            results.append({"knowledge_id": knowledge_id, "ok": False, "reason": "知识条目不存在"})
-            continue
-        if not (entry.content or "").strip():
-            results.append({"knowledge_id": knowledge_id, "ok": False, "reason": "知识条目内容为空"})
-            continue
-        try:
-            delete_knowledge_vectors(entry.id)
-            index_knowledge(entry.id, entry.content, user.id, db=db)
-            results.append({"knowledge_id": entry.id, "ok": True})
-        except Exception as exc:
-            results.append({"knowledge_id": entry.id, "ok": False, "reason": str(exc)})
-
-    db.query(SkillPreflightResult).filter(
-        SkillPreflightResult.skill_id == skill_id,
-        SkillPreflightResult.gate_name == "knowledge",
-    ).delete()
-    db.commit()
-
-    return {
-        "results": results,
-        "failed_count": len([item for item in results if not item.get("ok")]),
-    }
+    return reindex_skill_knowledge(
+        db,
+        skill_id=skill_id,
+        knowledge_ids=req.knowledge_ids,
+        user=user,
+    )
 
 
 # ─── Gap 7: Skill 自动回归测试 ──────────────────────────────────────────────

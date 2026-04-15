@@ -246,8 +246,505 @@ class TestNewSkillCreation:
 
         # 8. 验证最终状态
         final = skill_memo_service.get_memo(db, skill.id)
-        # 应该处于 awaiting_test 或 ready_to_submit
-        assert final["lifecycle_stage"] in ("awaiting_test", "ready_to_submit", "editing")
+        assert final["lifecycle_stage"] in ("awaiting_test", "editing")
+
+
+class TestWorkflowRecovery:
+    def test_sync_workflow_recovery_persists_cards_and_staged_edits(self, db):
+        dept = _make_dept(db, "workflow恢复部门")
+        user = _make_user(db, "workflow_recovery_user", dept_id=dept.id)
+        skill = _make_skill(db, user.id, name="恢复测试Skill")
+
+        result = skill_memo_service.sync_workflow_recovery(
+            db,
+            skill.id,
+            workflow_state={
+                "workflow_id": "run_1",
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "sandbox_remediation",
+                "phase": "remediate",
+                "next_action": "review_cards",
+                "route_reason": "sandbox_failed",
+            },
+            cards=[{
+                "id": "card_1",
+                "title": "修复问题",
+                "type": "staged_edit",
+                "status": "pending",
+                "content": {"summary": "需要修复", "staged_edit_id": "edit_1"},
+                "actions": [{"label": "采纳", "type": "adopt"}],
+            }],
+            staged_edits=[{
+                "id": "edit_1",
+                "target_type": "system_prompt",
+                "summary": "补齐约束",
+                "risk_level": "medium",
+                "diff_ops": [],
+                "status": "pending",
+            }],
+            user_id=user.id,
+            commit=True,
+        )
+
+        assert result is not None
+        assert result["workflow_recovery"]["workflow_state"]["workflow_mode"] == "sandbox_remediation"
+        assert result["workflow_recovery"]["cards"][0]["id"] == "card_1"
+        assert result["workflow_recovery"]["staged_edits"][0]["id"] == "edit_1"
+
+        fetched = skill_memo_service.get_memo(db, skill.id)
+        assert fetched is not None
+        assert fetched["lifecycle_stage"] == "fixing"
+        assert fetched["workflow_recovery"]["workflow_state"]["next_action"] == "review_cards"
+
+    def test_patch_workflow_recovery_action_updates_status_and_next_action(self, db):
+        dept = _make_dept(db, "workflow动作部门")
+        user = _make_user(db, "workflow_action_user", dept_id=dept.id)
+        skill = _make_skill(db, user.id, name="动作回写Skill")
+
+        skill_memo_service.sync_workflow_recovery(
+            db,
+            skill.id,
+            workflow_state={
+                "workflow_id": "run_2",
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "preflight_remediation",
+                "phase": "remediate",
+                "next_action": "review_cards",
+                "route_reason": "preflight_failed",
+            },
+            cards=[{
+                "id": "card_2",
+                "title": "补齐描述",
+                "type": "staged_edit",
+                "status": "pending",
+                "content": {"summary": "补齐描述", "staged_edit_id": "edit_2"},
+                "actions": [{"label": "采纳", "type": "adopt"}],
+            }],
+            staged_edits=[{
+                "id": "edit_2",
+                "target_type": "metadata",
+                "summary": "补充描述",
+                "risk_level": "low",
+                "diff_ops": [],
+                "status": "pending",
+            }],
+            user_id=user.id,
+            commit=True,
+        )
+
+        result = skill_memo_service.patch_workflow_recovery_action(
+            db,
+            skill.id,
+            card_id="card_2",
+            staged_edit_id="edit_2",
+            updated_card_status="adopted",
+            updated_staged_edit_status="adopted",
+            user_id=user.id,
+            commit=True,
+        )
+
+        assert result is not None
+        assert result["workflow_recovery"]["cards"][0]["status"] == "adopted"
+        assert result["workflow_recovery"]["staged_edits"][0]["status"] == "adopted"
+        assert result["workflow_recovery"]["workflow_state"]["next_action"] == "run_preflight"
+        assert result["workflow_recovery"]["workflow_state"]["phase"] == "validate"
+        recommendation = result["workflow_recovery"]["workflow_state"]["metadata"]["test_recommendation"]
+        assert recommendation["scope"] == "preflight"
+
+    def test_patch_workflow_recovery_prefers_targeted_rerun_when_task_exists(self, db):
+        dept = _make_dept(db, "workflow重测部门")
+        user = _make_user(db, "workflow_retest_user", dept_id=dept.id)
+        skill = _make_skill(db, user.id, name="重测Skill")
+
+        memo = skill_memo_service.init_memo(db, skill.id, "published_iteration", "目标", user.id)
+        payload = dict(memo["memo"])
+        payload["tasks"] = [{
+            "id": "task_retest_1",
+            "title": "运行局部重测",
+            "type": "run_targeted_retest",
+            "status": "todo",
+            "priority": "high",
+            "description": "仅重测受影响 case",
+            "target_files": [],
+            "acceptance_rule": {"mode": "custom", "text": "通过局部回归"},
+            "depends_on": [],
+            "problem_refs": ["issue_a", "issue_b"],
+            "source_report_id": 91,
+        }]
+        row = db.query(skill_memo_service.SkillMemo).filter(skill_memo_service.SkillMemo.skill_id == skill.id).first()
+        row.memo_payload = payload
+        db.commit()
+
+        skill_memo_service.sync_workflow_recovery(
+            db,
+            skill.id,
+            workflow_state={
+                "workflow_id": "run_3",
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "sandbox_remediation",
+                "phase": "remediate",
+                "next_action": "review_cards",
+                "route_reason": "sandbox_failed",
+            },
+            cards=[{
+                "id": "card_3",
+                "title": "修复工具使用",
+                "type": "staged_edit",
+                "status": "pending",
+                "content": {"summary": "修复工具调用", "staged_edit_id": "edit_3"},
+                "actions": [{"label": "采纳", "type": "adopt"}],
+            }],
+            staged_edits=[{
+                "id": "edit_3",
+                "target_type": "system_prompt",
+                "summary": "修复工具调用",
+                "risk_level": "medium",
+                "diff_ops": [],
+                "status": "pending",
+            }],
+            user_id=user.id,
+            commit=True,
+        )
+
+        result = skill_memo_service.patch_workflow_recovery_action(
+            db,
+            skill.id,
+            card_id="card_3",
+            staged_edit_id="edit_3",
+            updated_card_status="adopted",
+            updated_staged_edit_status="adopted",
+            user_id=user.id,
+            commit=True,
+        )
+
+        recommendation = result["workflow_recovery"]["workflow_state"]["metadata"]["test_recommendation"]
+        assert recommendation["action"] == "run_targeted_rerun"
+        assert recommendation["source_report_id"] == 91
+        assert recommendation["issue_ids"] == ["issue_a", "issue_b"]
+
+    def test_sync_workflow_recovery_links_tasks_to_cards(self, db):
+        dept = _make_dept(db, "workflow关联部门")
+        user = _make_user(db, "workflow_link_user", dept_id=dept.id)
+        skill = _make_skill(db, user.id, name="关联Skill")
+
+        memo = skill_memo_service.init_memo(db, skill.id, "published_iteration", "目标", user.id)
+        payload = dict(memo["memo"])
+        payload["tasks"] = [{
+            "id": "task_link_1",
+            "title": "修复 Prompt 逻辑",
+            "type": "fix_prompt_logic",
+            "status": "todo",
+            "priority": "high",
+            "source": "test_failure",
+            "description": "修复 issue_link_1",
+            "target_files": ["SKILL.md"],
+            "acceptance_rule": {"mode": "all_target_files_saved_nonempty"},
+            "depends_on": [],
+            "started_at": None,
+            "completed_at": None,
+            "completed_by": None,
+            "result_summary": None,
+            "problem_refs": ["issue_link_1"],
+            "target_kind": "skill_prompt",
+            "target_ref": "SKILL.md",
+            "source_report_id": 88,
+        }]
+        row = db.query(skill_memo_service.SkillMemo).filter(skill_memo_service.SkillMemo.skill_id == skill.id).first()
+        row.memo_payload = payload
+        db.commit()
+
+        result = skill_memo_service.sync_workflow_recovery(
+            db,
+            skill.id,
+            workflow_state={
+                "workflow_id": "run_link_1",
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "sandbox_remediation",
+                "phase": "remediate",
+                "next_action": "review_cards",
+                "route_reason": "sandbox_failed",
+            },
+            cards=[{
+                "id": "card_link_1",
+                "title": "修复 Prompt 逻辑",
+                "type": "staged_edit",
+                "status": "pending",
+                "content": {
+                    "summary": "修复 issue_link_1",
+                    "staged_edit_id": "edit_link_1",
+                    "problem_refs": ["issue_link_1"],
+                    "target_kind": "skill_prompt",
+                    "target_ref": "SKILL.md",
+                    "action_payload": {"source_report_id": 88},
+                },
+                "actions": [{"label": "采纳", "type": "adopt"}],
+            }],
+            staged_edits=[{
+                "id": "edit_link_1",
+                "target_type": "system_prompt",
+                "summary": "修复 issue_link_1",
+                "risk_level": "medium",
+                "diff_ops": [],
+                "status": "pending",
+            }],
+            user_id=user.id,
+            commit=True,
+        )
+
+        task = result["memo"]["tasks"][0]
+        assert task["workflow_card_ids"] == ["card_link_1"]
+        assert task["workflow_staged_edit_ids"] == ["edit_link_1"]
+        assert result["workflow_recovery"]["cards"][0]["content"]["related_task_ids"] == ["task_link_1"]
+
+    def test_patch_workflow_recovery_action_marks_linked_task_done(self, db):
+        dept = _make_dept(db, "workflow采纳联动部门")
+        user = _make_user(db, "workflow_adopt_link_user", dept_id=dept.id)
+        skill = _make_skill(db, user.id, name="采纳联动Skill")
+
+        memo = skill_memo_service.init_memo(db, skill.id, "published_iteration", "目标", user.id)
+        payload = dict(memo["memo"])
+        payload["tasks"] = [{
+            "id": "task_link_2",
+            "title": "修复 Prompt 逻辑",
+            "type": "fix_prompt_logic",
+            "status": "todo",
+            "priority": "high",
+            "source": "test_failure",
+            "description": "修复 issue_link_2",
+            "target_files": ["SKILL.md"],
+            "acceptance_rule": {"mode": "all_target_files_saved_nonempty"},
+            "depends_on": [],
+            "started_at": None,
+            "completed_at": None,
+            "completed_by": None,
+            "result_summary": None,
+            "problem_refs": ["issue_link_2"],
+            "target_kind": "skill_prompt",
+            "target_ref": "SKILL.md",
+            "source_report_id": 89,
+        }]
+        payload["persistent_notices"] = [{
+            "id": "notice_link_2",
+            "title": "待修复",
+            "status": "active",
+            "related_task_ids": ["task_link_2"],
+        }]
+        row = db.query(skill_memo_service.SkillMemo).filter(skill_memo_service.SkillMemo.skill_id == skill.id).first()
+        row.memo_payload = payload
+        db.commit()
+
+        skill_memo_service.sync_workflow_recovery(
+            db,
+            skill.id,
+            workflow_state={
+                "workflow_id": "run_link_2",
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "sandbox_remediation",
+                "phase": "remediate",
+                "next_action": "review_cards",
+                "route_reason": "sandbox_failed",
+            },
+            cards=[{
+                "id": "card_link_2",
+                "title": "修复 Prompt 逻辑",
+                "type": "staged_edit",
+                "status": "pending",
+                "content": {
+                    "summary": "修复 issue_link_2",
+                    "staged_edit_id": "edit_link_2",
+                    "problem_refs": ["issue_link_2"],
+                    "target_kind": "skill_prompt",
+                    "target_ref": "SKILL.md",
+                    "action_payload": {"source_report_id": 89},
+                },
+                "actions": [{"label": "采纳", "type": "adopt"}],
+            }],
+            staged_edits=[{
+                "id": "edit_link_2",
+                "target_type": "system_prompt",
+                "summary": "修复 issue_link_2",
+                "risk_level": "medium",
+                "diff_ops": [],
+                "status": "pending",
+            }],
+            user_id=user.id,
+            commit=True,
+        )
+
+        result = skill_memo_service.patch_workflow_recovery_action(
+            db,
+            skill.id,
+            card_id="card_link_2",
+            staged_edit_id="edit_link_2",
+            updated_card_status="adopted",
+            updated_staged_edit_status="adopted",
+            user_id=user.id,
+            commit=True,
+        )
+
+        task = next(task for task in result["memo"]["tasks"] if task["id"] == "task_link_2")
+        notice = next(notice for notice in result["memo"]["persistent_notices"] if notice["id"] == "notice_link_2")
+        assert task["status"] == "done"
+        assert task["completed_by"] == user.id
+        assert notice["status"] == "resolved"
+
+    def test_complete_from_save_updates_linked_workflow_recovery(self, db):
+        dept = _make_dept(db, "workflow任务回写部门")
+        user = _make_user(db, "workflow_task_backfill_user", dept_id=dept.id)
+        skill = _make_skill(db, user.id, name="任务回写Skill")
+
+        memo = skill_memo_service.init_memo(db, skill.id, "published_iteration", "目标", user.id)
+        payload = dict(memo["memo"])
+        payload["tasks"] = [{
+            "id": "task_link_3",
+            "title": "修复 Prompt 逻辑",
+            "type": "fix_prompt_logic",
+            "status": "todo",
+            "priority": "high",
+            "source": "test_failure",
+            "description": "修复 issue_link_3",
+            "target_files": ["SKILL.md"],
+            "acceptance_rule": {"mode": "all_target_files_saved_nonempty"},
+            "depends_on": [],
+            "started_at": None,
+            "completed_at": None,
+            "completed_by": None,
+            "result_summary": None,
+            "problem_refs": ["issue_link_3"],
+            "target_kind": "skill_prompt",
+            "target_ref": "SKILL.md",
+            "source_report_id": 90,
+        }]
+        row = db.query(skill_memo_service.SkillMemo).filter(skill_memo_service.SkillMemo.skill_id == skill.id).first()
+        row.memo_payload = payload
+        db.commit()
+
+        skill_memo_service.sync_workflow_recovery(
+            db,
+            skill.id,
+            workflow_state={
+                "workflow_id": "run_link_3",
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "sandbox_remediation",
+                "phase": "remediate",
+                "next_action": "review_cards",
+                "route_reason": "sandbox_failed",
+            },
+            cards=[{
+                "id": "card_link_3",
+                "title": "修复 Prompt 逻辑",
+                "type": "staged_edit",
+                "status": "pending",
+                "content": {
+                    "summary": "修复 issue_link_3",
+                    "staged_edit_id": "edit_link_3",
+                    "problem_refs": ["issue_link_3"],
+                    "target_kind": "skill_prompt",
+                    "target_ref": "SKILL.md",
+                    "action_payload": {"source_report_id": 90},
+                },
+                "actions": [{"label": "采纳", "type": "adopt"}],
+            }],
+            staged_edits=[{
+                "id": "edit_link_3",
+                "target_type": "system_prompt",
+                "summary": "修复 issue_link_3",
+                "risk_level": "medium",
+                "diff_ops": [],
+                "status": "pending",
+            }],
+            user_id=user.id,
+            commit=True,
+        )
+
+        result = skill_memo_service.complete_from_save(
+            db,
+            skill.id,
+            "task_link_3",
+            "SKILL.md",
+            "prompt",
+            128,
+        )
+
+        workflow_recovery = result["memo"]["workflow_recovery"]
+        assert workflow_recovery["cards"][0]["status"] == "adopted"
+        assert workflow_recovery["staged_edits"][0]["status"] == "adopted"
+        assert workflow_recovery["workflow_state"]["phase"] == "validate"
+        assert workflow_recovery["workflow_state"]["next_action"] == "run_sandbox"
+
+    def test_record_test_result_updates_workflow_recovery_after_preflight_pass(self, db):
+        dept = _make_dept(db, "workflow测试建议部门")
+        user = _make_user(db, "workflow_test_recommend_user", dept_id=dept.id)
+        skill = _make_skill(db, user.id, name="Preflight通过Skill")
+
+        skill_memo_service.sync_workflow_recovery(
+            db,
+            skill.id,
+            workflow_state={
+                "workflow_id": "run_4",
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "preflight_remediation",
+                "phase": "validate",
+                "next_action": "run_preflight",
+                "route_reason": "preflight_failed",
+            },
+            user_id=user.id,
+            commit=True,
+        )
+
+        result = skill_memo_service.record_test_result(
+            db, skill.id, "preflight", 1, "passed", "全部通过", user_id=user.id, approval_eligible=True
+        )
+
+        assert result["ok"]
+        memo = skill_memo_service.get_memo(db, skill.id)
+        assert memo["lifecycle_stage"] == "awaiting_test"
+        workflow_state = memo["workflow_recovery"]["workflow_state"]
+        assert workflow_state["next_action"] == "run_sandbox"
+        assert workflow_state["metadata"]["test_recommendation"]["scope"] == "sandbox"
+
+    def test_record_test_result_updates_workflow_recovery_after_sandbox_pass(self, db):
+        dept = _make_dept(db, "workflow验收部门")
+        user = _make_user(db, "workflow_ready_user", dept_id=dept.id)
+        skill = _make_skill(db, user.id, name="Sandbox通过Skill")
+
+        skill_memo_service.sync_workflow_recovery(
+            db,
+            skill.id,
+            workflow_state={
+                "workflow_id": "run_5",
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "sandbox_remediation",
+                "phase": "validate",
+                "next_action": "run_sandbox",
+                "route_reason": "sandbox_failed",
+            },
+            cards=[{"id": "card_done", "status": "adopted"}],
+            staged_edits=[{"id": "edit_done", "status": "adopted"}],
+            user_id=user.id,
+            commit=True,
+        )
+
+        result = skill_memo_service.record_test_result(
+            db,
+            skill.id,
+            "sandbox_interactive",
+            2,
+            "passed",
+            "沙盒通过",
+            user_id=user.id,
+            approval_eligible=True,
+            source_report_id=88,
+        )
+
+        assert result["ok"]
+        memo = skill_memo_service.get_memo(db, skill.id)
+        assert memo["lifecycle_stage"] == "ready_to_submit"
+        workflow_state = memo["workflow_recovery"]["workflow_state"]
+        assert workflow_state["phase"] == "ready"
+        assert workflow_state["next_action"] == "submit_approval"
+        assert memo["workflow_recovery"]["cards"] == []
+        assert memo["workflow_recovery"]["staged_edits"] == []
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

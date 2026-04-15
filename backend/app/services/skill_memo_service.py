@@ -113,7 +113,484 @@ def _empty_payload() -> dict:
         "post_test_diffs": [],
         "adopted_feedback": [],
         "context_rollups": [],
+        "workflow_recovery": {
+            "workflow_state": None,
+            "cards": [],
+            "staged_edits": [],
+            "updated_at": None,
+        },
     }
+
+
+def _empty_workflow_recovery() -> dict:
+    return {
+        "workflow_state": None,
+        "cards": [],
+        "staged_edits": [],
+        "updated_at": None,
+    }
+
+
+def _get_workflow_recovery(payload: dict[str, Any]) -> dict[str, Any]:
+    base = _empty_workflow_recovery()
+    raw = payload.get("workflow_recovery")
+    if not isinstance(raw, dict):
+        return base
+    if isinstance(raw.get("workflow_state"), dict):
+        base["workflow_state"] = raw.get("workflow_state")
+    if isinstance(raw.get("cards"), list):
+        base["cards"] = raw.get("cards")
+    if isinstance(raw.get("staged_edits"), list):
+        base["staged_edits"] = raw.get("staged_edits")
+    if raw.get("updated_at") is not None:
+        base["updated_at"] = raw.get("updated_at")
+    return base
+
+
+def _normalize_string_list(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    normalized: list[str] = []
+    for value in values:
+        item = str(value).strip()
+        if item and item not in normalized:
+            normalized.append(item)
+    return normalized
+
+
+def _append_unique(container: dict[str, Any], key: str, value: str) -> bool:
+    normalized_value = str(value).strip()
+    if not normalized_value:
+        return False
+    items = _normalize_string_list(container.get(key))
+    if normalized_value in items:
+        return False
+    items.append(normalized_value)
+    container[key] = items
+    return True
+
+
+def _workflow_card_content(card: dict[str, Any]) -> dict[str, Any]:
+    content = card.get("content")
+    return content if isinstance(content, dict) else {}
+
+
+def _workflow_card_action_payload(card: dict[str, Any]) -> dict[str, Any]:
+    action_payload = _workflow_card_content(card).get("action_payload")
+    return action_payload if isinstance(action_payload, dict) else {}
+
+
+def _workflow_card_problem_refs(card: dict[str, Any]) -> list[str]:
+    content = _workflow_card_content(card)
+    refs = _normalize_string_list(content.get("problem_refs"))
+    return refs or _normalize_string_list(_workflow_card_action_payload(card).get("problem_ids"))
+
+
+def _workflow_card_source_report_id(card: dict[str, Any]) -> int | None:
+    content = _workflow_card_content(card)
+    raw = content.get("source_report_id")
+    if raw is None:
+        raw = _workflow_card_action_payload(card).get("source_report_id")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _workflow_card_target_kind(card: dict[str, Any]) -> str:
+    content = _workflow_card_content(card)
+    value = content.get("target_kind")
+    if value in (None, ""):
+        value = _workflow_card_action_payload(card).get("target_kind")
+    return str(value or "").strip()
+
+
+def _workflow_card_target_ref(card: dict[str, Any]) -> str:
+    content = _workflow_card_content(card)
+    value = content.get("target_ref")
+    if value in (None, ""):
+        value = _workflow_card_action_payload(card).get("target_ref")
+    return str(value or "").strip()
+
+
+def _task_matches_workflow_card(task: dict[str, Any], card: dict[str, Any]) -> bool:
+    task_report_id = task.get("source_report_id")
+    card_report_id = _workflow_card_source_report_id(card)
+    if task_report_id is not None and card_report_id is not None:
+        try:
+            if int(task_report_id) != int(card_report_id):
+                return False
+        except (TypeError, ValueError):
+            return False
+
+    task_refs = set(_normalize_string_list(task.get("problem_refs")))
+    card_refs = set(_workflow_card_problem_refs(card))
+    if task_refs and card_refs:
+        return bool(task_refs & card_refs)
+
+    task_target_kind = str(task.get("target_kind") or "").strip()
+    card_target_kind = _workflow_card_target_kind(card)
+    if task_target_kind and card_target_kind and task_target_kind == card_target_kind:
+        task_target_ref = str(task.get("target_ref") or "").strip()
+        card_target_ref = _workflow_card_target_ref(card)
+        if task_target_ref and card_target_ref:
+            return task_target_ref == card_target_ref
+        return True
+
+    return False
+
+
+def _link_workflow_recovery_tasks(payload: dict[str, Any], recovery: dict[str, Any]) -> bool:
+    tasks = payload.get("tasks", []) if isinstance(payload.get("tasks"), list) else []
+    cards = recovery.get("cards", []) if isinstance(recovery.get("cards"), list) else []
+    staged_edits = recovery.get("staged_edits", []) if isinstance(recovery.get("staged_edits"), list) else []
+    if not tasks or not cards:
+        return False
+
+    staged_edit_lookup = {
+        str(edit.get("id")): edit
+        for edit in staged_edits
+        if isinstance(edit, dict) and edit.get("id") is not None
+    }
+
+    changed = False
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        card_id = str(card.get("id") or "").strip()
+        if not card_id:
+            continue
+        content = dict(_workflow_card_content(card))
+        staged_edit_id = str(content.get("staged_edit_id") or "").strip()
+        for task in tasks:
+            if not isinstance(task, dict) or not _task_matches_workflow_card(task, card):
+                continue
+            changed |= _append_unique(task, "workflow_card_ids", card_id)
+            changed |= _append_unique(content, "related_task_ids", str(task.get("id") or ""))
+            if staged_edit_id:
+                changed |= _append_unique(task, "workflow_staged_edit_ids", staged_edit_id)
+                edit = staged_edit_lookup.get(staged_edit_id)
+                if isinstance(edit, dict):
+                    changed |= _append_unique(edit, "related_task_ids", str(task.get("id") or ""))
+        if content != _workflow_card_content(card):
+            card["content"] = content
+            changed = True
+    return changed
+
+
+def _resolve_related_notices(payload: dict[str, Any], task_ids: list[str]) -> bool:
+    if not task_ids:
+        return False
+    task_id_set = {str(task_id).strip() for task_id in task_ids if str(task_id).strip()}
+    if not task_id_set:
+        return False
+
+    resolved = False
+    for notice in payload.get("persistent_notices", []):
+        if not isinstance(notice, dict):
+            continue
+        related_task_ids = set(_normalize_string_list(notice.get("related_task_ids")))
+        if related_task_ids and task_id_set & related_task_ids and notice.get("status") != "resolved":
+            notice["status"] = "resolved"
+            resolved = True
+    return resolved
+
+
+def _workflow_lifecycle_stage(workflow_state: dict[str, Any]) -> str:
+    workflow_mode = str(workflow_state.get("workflow_mode") or "")
+    session_mode = str(workflow_state.get("session_mode") or "")
+    phase = str(workflow_state.get("phase") or "")
+    next_action = str(workflow_state.get("next_action") or "")
+
+    if workflow_mode in {"preflight_remediation", "sandbox_remediation"} or phase == "remediate":
+        return "fixing"
+    if workflow_mode == "architect_mode" or session_mode == "create_new_skill":
+        return "planning"
+    if next_action in {"run_audit", "review_cards"} or session_mode == "audit_imported_skill":
+        return "analysis"
+    return "editing"
+
+
+def _workflow_status_summary(workflow_state: dict[str, Any]) -> str:
+    phase = str(workflow_state.get("phase") or "discover")
+    next_action = str(workflow_state.get("next_action") or "continue_chat")
+    route_reason = str(workflow_state.get("route_reason") or "").strip()
+    prefix = f"当前流程阶段：{phase}；下一步：{next_action}"
+    return f"{prefix}（{route_reason}）" if route_reason else prefix
+
+
+def _refresh_workflow_recovery_state(payload: dict[str, Any]) -> bool:
+    recovery = _get_workflow_recovery(payload)
+    workflow_state = recovery.get("workflow_state") if isinstance(recovery.get("workflow_state"), dict) else None
+    if not workflow_state:
+        return False
+
+    changed = False
+    pending_staged_edits = [
+        edit for edit in recovery["staged_edits"]
+        if isinstance(edit, dict) and str(edit.get("status") or "pending") == "pending"
+    ]
+    if not pending_staged_edits and workflow_state.get("next_action") == "review_cards":
+        adopted_edits = [
+            edit for edit in recovery["staged_edits"]
+            if isinstance(edit, dict) and str(edit.get("status") or "") == "adopted"
+        ]
+        if adopted_edits:
+            recommendation = _workflow_test_recommendation(payload, workflow_state)
+            metadata = workflow_state.get("metadata") if isinstance(workflow_state.get("metadata"), dict) else {}
+            metadata = dict(metadata)
+            metadata["test_recommendation"] = recommendation
+            workflow_state["metadata"] = metadata
+            workflow_state["phase"] = "validate"
+            workflow_state["next_action"] = recommendation["action"]
+        else:
+            workflow_state["next_action"] = "continue_chat"
+        changed = True
+
+    if changed:
+        recovery["workflow_state"] = workflow_state
+        recovery["updated_at"] = _now_iso()
+        payload["workflow_recovery"] = recovery
+    return changed
+
+
+def _sync_tasks_from_workflow_action(
+    payload: dict[str, Any],
+    *,
+    card_id: str | None,
+    staged_edit_id: str | None,
+    updated_card_status: str | None,
+    updated_staged_edit_status: str | None,
+    user_id: int | None = None,
+) -> bool:
+    recovery = _get_workflow_recovery(payload)
+    changed = _link_workflow_recovery_tasks(payload, recovery)
+    tasks = payload.get("tasks", []) if isinstance(payload.get("tasks"), list) else []
+    matched_task_ids: list[str] = []
+
+    normalized_card_id = str(card_id) if card_id is not None else None
+    normalized_staged_edit_id = str(staged_edit_id) if staged_edit_id is not None else None
+    target_status = updated_staged_edit_status or updated_card_status
+    if target_status not in {"adopted", "rejected"}:
+        if changed:
+            payload["workflow_recovery"] = recovery
+        return changed
+
+    task_status = "done" if target_status == "adopted" else "skipped"
+    task_summary = "已通过 workflow 卡片处理" if target_status == "adopted" else "已忽略对应 workflow 卡片"
+
+    for task in tasks:
+        if not isinstance(task, dict) or task.get("type") == "run_targeted_retest":
+            continue
+        linked_card_ids = set(_normalize_string_list(task.get("workflow_card_ids")))
+        linked_staged_edit_ids = set(_normalize_string_list(task.get("workflow_staged_edit_ids")))
+        if (
+            normalized_card_id and normalized_card_id in linked_card_ids
+        ) or (
+            normalized_staged_edit_id and normalized_staged_edit_id in linked_staged_edit_ids
+        ):
+            matched_task_ids.append(str(task.get("id") or ""))
+            if task.get("status") not in {"done", "skipped"}:
+                task["status"] = task_status
+                task["completed_at"] = _now_iso()
+                task["completed_by"] = user_id or "workflow_action"
+                task["result_summary"] = task_summary
+                changed = True
+
+    if _resolve_related_notices(payload, matched_task_ids):
+        changed = True
+    if matched_task_ids:
+        next_task = _pick_next_task(payload)
+        payload["current_task_id"] = next_task["id"] if next_task else None
+    if changed:
+        payload["workflow_recovery"] = recovery
+    return changed
+
+
+def _sync_workflow_recovery_from_completed_tasks(payload: dict[str, Any], completed_task_ids: list[str]) -> bool:
+    if not completed_task_ids:
+        return False
+    recovery = _get_workflow_recovery(payload)
+    changed = _link_workflow_recovery_tasks(payload, recovery)
+    completed_task_id_set = {str(task_id).strip() for task_id in completed_task_ids if str(task_id).strip()}
+    if not completed_task_id_set:
+        if changed:
+            payload["workflow_recovery"] = recovery
+        return changed
+
+    staged_edit_lookup = {
+        str(edit.get("id")): edit
+        for edit in recovery.get("staged_edits", [])
+        if isinstance(edit, dict) and edit.get("id") is not None
+    }
+
+    for card in recovery.get("cards", []):
+        if not isinstance(card, dict):
+            continue
+        content = _workflow_card_content(card)
+        related_task_ids = set(_normalize_string_list(content.get("related_task_ids")))
+        if not (completed_task_id_set & related_task_ids):
+            continue
+        if card.get("status") == "pending":
+            card["status"] = "adopted"
+            changed = True
+        staged_edit_id = str(content.get("staged_edit_id") or "").strip()
+        if staged_edit_id:
+            edit = staged_edit_lookup.get(staged_edit_id)
+            if isinstance(edit, dict) and edit.get("status") == "pending":
+                edit["status"] = "adopted"
+                changed = True
+
+    if changed:
+        recovery["updated_at"] = _now_iso()
+        payload["workflow_recovery"] = recovery
+        changed = _refresh_workflow_recovery_state(payload) or changed
+    return changed
+
+
+def _workflow_test_recommendation(
+    payload: dict[str, Any],
+    workflow_state: dict[str, Any],
+) -> dict[str, Any]:
+    tasks = payload.get("tasks", []) if isinstance(payload.get("tasks"), list) else []
+    targeted_tasks = [
+        task for task in tasks
+        if isinstance(task, dict)
+        and task.get("type") == "run_targeted_retest"
+        and task.get("status") in {"todo", "in_progress"}
+    ]
+    if targeted_tasks:
+        issue_ids: list[str] = []
+        source_report_id: int | None = None
+        for task in targeted_tasks:
+            if source_report_id is None and task.get("source_report_id") is not None:
+                try:
+                    source_report_id = int(task.get("source_report_id"))
+                except (TypeError, ValueError):
+                    source_report_id = None
+            for problem_ref in task.get("problem_refs", []) or []:
+                value = str(problem_ref).strip()
+                if value and value not in issue_ids:
+                    issue_ids.append(value)
+        return {
+            "action": "run_targeted_rerun",
+            "scope": "targeted_rerun",
+            "label": "运行局部重测",
+            "source_report_id": source_report_id,
+            "issue_ids": issue_ids,
+        }
+
+    workflow_mode = str(workflow_state.get("workflow_mode") or "")
+    route_reason = str(workflow_state.get("route_reason") or "")
+    latest_test = (payload.get("test_history") or [])[-1] if payload.get("test_history") else {}
+    latest_source = str(latest_test.get("source") or "")
+
+    if workflow_mode == "sandbox_remediation" or route_reason == "sandbox_failed" or latest_source in {"sandbox", "sandbox_interactive"}:
+        return {
+            "action": "run_sandbox",
+            "scope": "sandbox",
+            "label": "重新运行沙盒测试",
+        }
+
+    return {
+        "action": "run_preflight",
+        "scope": "preflight",
+        "label": "重新运行 Preflight",
+    }
+
+
+def _sync_workflow_recovery_after_test_result(
+    payload: dict[str, Any],
+    *,
+    source: str,
+    status: str,
+    approval_eligible: bool | None,
+    summary: str,
+    source_report_id: int | None,
+) -> None:
+    recovery = _get_workflow_recovery(payload)
+    workflow_state = recovery.get("workflow_state") if isinstance(recovery.get("workflow_state"), dict) else None
+    if not workflow_state:
+        return
+
+    metadata = workflow_state.get("metadata") if isinstance(workflow_state.get("metadata"), dict) else {}
+    metadata = dict(metadata)
+    metadata["last_test"] = {
+        "source": source,
+        "status": status,
+        "approval_eligible": approval_eligible,
+        "summary": summary,
+        "source_report_id": source_report_id,
+        "updated_at": _now_iso(),
+    }
+    metadata.pop("test_recommendation", None)
+
+    if status == "passed":
+        recovery["cards"] = []
+        recovery["staged_edits"] = []
+        if source == "preflight":
+            metadata["test_recommendation"] = {
+                "action": "run_sandbox",
+                "scope": "sandbox",
+                "label": "运行沙盒测试",
+            }
+            workflow_state["phase"] = "validate"
+            workflow_state["next_action"] = "run_sandbox"
+            workflow_state["route_reason"] = "preflight_passed"
+        else:
+            workflow_state["phase"] = "ready"
+            workflow_state["next_action"] = "submit_approval" if approval_eligible is not False else "continue_chat"
+            workflow_state["route_reason"] = "tests_passed"
+            workflow_state["status"] = "ready" if approval_eligible is not False else str(workflow_state.get("status") or "active")
+    else:
+        workflow_state["phase"] = "validate"
+        if source == "preflight":
+            workflow_state["next_action"] = "review_cards"
+            workflow_state["route_reason"] = "preflight_failed"
+        elif source in {"sandbox", "sandbox_interactive"}:
+            workflow_state["next_action"] = "review_cards" if workflow_state.get("workflow_mode") == "sandbox_remediation" else "import_remediation"
+            workflow_state["route_reason"] = "sandbox_failed"
+
+    workflow_state["metadata"] = metadata
+    recovery["workflow_state"] = workflow_state
+    recovery["updated_at"] = _now_iso()
+    payload["workflow_recovery"] = recovery
+
+
+def _ensure_workflow_memo(
+    db: Session,
+    skill_id: int,
+    workflow_state: dict[str, Any],
+    user_id: int | None = None,
+) -> SkillMemo | None:
+    memo = db.query(SkillMemo).filter(SkillMemo.skill_id == skill_id).first()
+    if memo:
+        return memo
+
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        return None
+
+    actor_id = user_id or skill.created_by
+    if not actor_id:
+        logger.warning("sync_workflow_recovery skipped: skill=%s has no actor", skill_id)
+        return None
+
+    session_mode = str(workflow_state.get("session_mode") or "")
+    scenario_type = "import_remediation" if session_mode == "audit_imported_skill" else "published_iteration"
+    memo = SkillMemo(
+        skill_id=skill_id,
+        scenario_type=scenario_type,
+        lifecycle_stage=_workflow_lifecycle_stage(workflow_state),
+        status_summary=_workflow_status_summary(workflow_state),
+        goal_summary=skill.description,
+        memo_payload=_empty_payload(),
+        created_by=actor_id,
+        updated_by=actor_id,
+    )
+    db.add(memo)
+    db.flush()
+    return memo
 
 
 def _build_skill_artifact_snapshot(db: Session, skill_id: int) -> dict | None:
@@ -241,6 +718,7 @@ def get_memo(db: Session, skill_id: int) -> dict | None:
 
     test_history = payload.get("test_history", [])
     latest_test = test_history[-1] if test_history else None
+    workflow_recovery = _get_workflow_recovery(payload)
 
     return {
         "skill_id": skill_id,
@@ -252,6 +730,7 @@ def get_memo(db: Session, skill_id: int) -> dict | None:
         "current_task": current_task,
         "next_task": next_task,
         "latest_test": latest_test,
+        "workflow_recovery": workflow_recovery,
         "memo": payload,
     }
 
@@ -809,6 +1288,8 @@ def complete_from_save(
         if notice["id"] in related_notice_ids:
             notice["status"] = "resolved"
 
+    _sync_workflow_recovery_from_completed_tasks(payload, [task_id])
+
     # 选择下一个任务
     next_task = _pick_next_task(payload)
     payload["current_task_id"] = next_task["id"] if next_task else None
@@ -880,6 +1361,13 @@ def resolve_tool_bound_tasks(db: Session, skill_id: int) -> bool:
 
     if not completed_any:
         return False
+
+    completed_task_ids = [
+        str(task["id"])
+        for task in tasks
+        if task.get("status") == "done" and task.get("completed_by") == "system"
+    ]
+    _sync_workflow_recovery_from_completed_tasks(payload, completed_task_ids)
 
     # 选择下一个任务 + 推进生命周期
     next_task = _pick_next_task(payload)
@@ -1085,7 +1573,14 @@ def record_test_result(
             t["status"] in ("todo", "in_progress") and t["type"] not in ("run_test",)
             for t in payload.get("tasks", [])
         )
-        if has_open:
+        if source == "preflight":
+            if has_open:
+                memo.lifecycle_stage = "editing"
+                memo.status_summary = "Preflight 通过，但仍有待办任务。"
+            else:
+                memo.lifecycle_stage = "awaiting_test"
+                memo.status_summary = "Preflight 通过，建议继续运行沙盒测试。"
+        elif has_open:
             memo.lifecycle_stage = "editing"
             memo.status_summary = "测试通过，但仍有待办任务。"
         else:
@@ -1097,6 +1592,15 @@ def record_test_result(
     # 更新 current_task_id
     if generated_task_ids:
         payload["current_task_id"] = generated_task_ids[0]
+
+    _sync_workflow_recovery_after_test_result(
+        payload,
+        source=source,
+        status=status,
+        approval_eligible=approval_eligible,
+        summary=summary,
+        source_report_id=source_report_id,
+    )
 
     _save_memo_payload(db, memo, payload)
     if user_id:
@@ -1312,6 +1816,123 @@ def sync_remediation_tasks(
     db.flush()
 
 
+# ── Workflow Recovery ─────────────────────────────────────────────────────────
+
+def sync_workflow_recovery(
+    db: Session,
+    skill_id: int,
+    *,
+    workflow_state: dict[str, Any],
+    cards: list[dict[str, Any]] | None = None,
+    staged_edits: list[dict[str, Any]] | None = None,
+    user_id: int | None = None,
+    commit: bool = False,
+) -> dict | None:
+    """将当前 workflow state + cards + staged edits 持久化到 memo，供刷新恢复。"""
+    memo = _ensure_workflow_memo(db, skill_id, workflow_state, user_id=user_id)
+    if not memo:
+        return None
+
+    payload = copy.deepcopy(memo.memo_payload or _empty_payload())
+    workflow_recovery = {
+        "workflow_state": workflow_state,
+        "cards": list(cards or []),
+        "staged_edits": list(staged_edits or []),
+        "updated_at": _now_iso(),
+    }
+    _link_workflow_recovery_tasks(payload, workflow_recovery)
+    payload["workflow_recovery"] = workflow_recovery
+
+    next_stage = _workflow_lifecycle_stage(workflow_state)
+    if memo.lifecycle_stage in {"analysis", "planning", "editing", "fixing"} or next_stage == "fixing":
+        memo.lifecycle_stage = next_stage
+    memo.status_summary = _workflow_status_summary(workflow_state)
+    if user_id:
+        memo.updated_by = user_id
+    elif memo.updated_by is None and memo.created_by is not None:
+        memo.updated_by = memo.created_by
+
+    _save_memo_payload(db, memo, payload)
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    return get_memo(db, skill_id)
+
+
+def patch_workflow_recovery_action(
+    db: Session,
+    skill_id: int,
+    *,
+    card_id: str | None = None,
+    staged_edit_id: str | None = None,
+    updated_card_status: str | None = None,
+    updated_staged_edit_status: str | None = None,
+    user_id: int | None = None,
+    commit: bool = False,
+) -> dict | None:
+    """回写 workflow recovery 中卡片 / staged edit 的最新状态。"""
+    memo = db.query(SkillMemo).filter(SkillMemo.skill_id == skill_id).first()
+    if not memo:
+        return None
+
+    payload = copy.deepcopy(memo.memo_payload or _empty_payload())
+    recovery = _get_workflow_recovery(payload)
+    changed = _link_workflow_recovery_tasks(payload, recovery)
+    normalized_staged_edit_id = str(staged_edit_id) if staged_edit_id is not None else None
+
+    for edit in recovery["staged_edits"]:
+        if not isinstance(edit, dict):
+            continue
+        if normalized_staged_edit_id is not None and str(edit.get("id")) == normalized_staged_edit_id:
+            if updated_staged_edit_status and edit.get("status") != updated_staged_edit_status:
+                edit["status"] = updated_staged_edit_status
+                changed = True
+
+    for card in recovery["cards"]:
+        if not isinstance(card, dict):
+            continue
+        matches_card = card_id is not None and str(card.get("id")) == str(card_id)
+        content = card.get("content") if isinstance(card.get("content"), dict) else {}
+        matches_edit = normalized_staged_edit_id is not None and str(content.get("staged_edit_id") or "") == normalized_staged_edit_id
+        if matches_card or matches_edit:
+            if updated_card_status and card.get("status") != updated_card_status:
+                card["status"] = updated_card_status
+                changed = True
+
+    if _sync_tasks_from_workflow_action(
+        payload,
+        card_id=card_id,
+        staged_edit_id=normalized_staged_edit_id,
+        updated_card_status=updated_card_status,
+        updated_staged_edit_status=updated_staged_edit_status,
+        user_id=user_id,
+    ):
+        changed = True
+
+    if _refresh_workflow_recovery_state(payload):
+        recovery = _get_workflow_recovery(payload)
+        changed = True
+    workflow_state = recovery.get("workflow_state") if isinstance(recovery.get("workflow_state"), dict) else None
+
+    if not changed:
+        return get_memo(db, skill_id)
+
+    recovery["updated_at"] = _now_iso()
+    payload["workflow_recovery"] = recovery
+    if workflow_state:
+        memo.status_summary = _workflow_status_summary(workflow_state)
+    if user_id:
+        memo.updated_by = user_id
+
+    _save_memo_payload(db, memo, payload)
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    return get_memo(db, skill_id)
+
+
 # ── 反馈采纳 ──────────────────────────────────────────────────────────────────
 
 def adopt_feedback(
@@ -1478,6 +2099,7 @@ def ingest_from_paste(
 
     # ── 5. 推进 current_task 和 lifecycle ──
     if completed_task_ids:
+        _sync_workflow_recovery_from_completed_tasks(payload, completed_task_ids)
         next_task = _pick_next_task(payload)
         payload["current_task_id"] = next_task["id"] if next_task else payload.get("current_task_id")
         _advance_lifecycle(memo, payload)

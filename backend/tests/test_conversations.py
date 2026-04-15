@@ -3,6 +3,9 @@ import pytest
 from unittest.mock import AsyncMock, patch
 from tests.conftest import _make_user, _make_dept, _login, _auth
 from app.models.user import Role
+from app.models.workspace import Workspace
+from app.models.conversation import Conversation
+from app.models.event_bus import UnifiedEvent
 
 
 # ── Create conversation ───────────────────────────────────────────────────────
@@ -98,6 +101,166 @@ def test_get_messages_nonexistent_conv(client, db):
 
     resp = client.get("/api/conversations/99999/messages", headers=_auth(token))
     assert resp.status_code == 404
+
+
+def test_get_studio_state_returns_harness_snapshot(client, db):
+    dept = _make_dept(db)
+    user = _make_user(db, "conv_studio_state", Role.EMPLOYEE, dept.id)
+    workspace = Workspace(
+        name="Skill Studio",
+        workspace_type="skill_studio",
+        created_by=user.id,
+    )
+    db.add(workspace)
+    db.flush()
+    conv = Conversation(
+        user_id=user.id,
+        title="Studio 会话",
+        workspace_id=workspace.id,
+        skill_id=123,
+    )
+    db.add(conv)
+    db.commit()
+
+    from app.harness.contracts import AgentType, HarnessSessionKey
+    from app.harness.gateway import get_session_store
+
+    store = get_session_store()
+    session_key = HarnessSessionKey(
+        user_id=user.id,
+        agent_type=AgentType.SKILL_STUDIO,
+        workspace_id=workspace.id,
+        target_type="skill",
+        target_id=123,
+    )
+    session = store.create_or_get_session(session_key)
+    session.metadata["studio_state"] = {
+        "scenario": "optimize_existing_skill",
+        "mode": "draft",
+        "goal": "补齐提示词",
+        "file_status": "forbidden",
+        "readiness": 3,
+        "has_draft": False,
+        "total_rounds": 2,
+        "reconciled_facts": [{"type": "constraint", "text": "不要改结构"}],
+        "direction_shift": {"from": "unknown", "to": "audit_imported_skill"},
+        "file_need_status": {"status": "forbidden", "forbidden_countdown": 1},
+        "repeat_blocked": {"reason": "连续重复追问，已自动切换到 draft 模式"},
+    }
+
+    token = _login(client, "conv_studio_state")
+    resp = client.get(f"/api/conversations/{conv.id}/studio-state?skill_id=123", headers=_auth(token))
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["conversation_id"] == conv.id
+    assert data["skill_id"] == 123
+    assert data["studio_state"]["goal"] == "补齐提示词"
+    assert data["studio_state"]["file_need_status"]["forbidden_countdown"] == 1
+    assert data["recovery"]["source"] == "memory"
+    assert data["recovery"]["cold_start"] is False
+    assert data["recovery"]["recovered_at"] is None
+
+
+def test_get_studio_state_recovers_from_persisted_event(client, db):
+    dept = _make_dept(db)
+    user = _make_user(db, "conv_studio_state_event", Role.EMPLOYEE, dept.id)
+    workspace = Workspace(
+        name="Skill Studio",
+        workspace_type="skill_studio",
+        created_by=user.id,
+    )
+    db.add(workspace)
+    db.flush()
+    conv = Conversation(
+        user_id=user.id,
+        title="Studio 会话",
+        workspace_id=workspace.id,
+        skill_id=456,
+    )
+    db.add(conv)
+    db.flush()
+    db.add(UnifiedEvent(
+        event_type="harness.studio.state_saved",
+        source_type="harness",
+        payload={
+            "target_type": "skill",
+            "target_id": 456,
+            "studio_state": {
+                "scenario": "audit_imported_skill",
+                "mode": "draft",
+                "goal": "事件表恢复",
+                "file_status": "user_requested",
+                "readiness": 2,
+                "has_draft": True,
+                "total_rounds": 4,
+                "reconciled_facts": [{"type": "new_fact", "text": "从事件表恢复"}],
+            },
+            "run_id": "",
+        },
+        user_id=user.id,
+        workspace_id=workspace.id,
+    ))
+    db.commit()
+
+    token = _login(client, "conv_studio_state_event")
+    resp = client.get(f"/api/conversations/{conv.id}/studio-state", headers=_auth(token))
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["skill_id"] == 456
+    assert data["studio_state"]["goal"] == "事件表恢复"
+    assert data["studio_state"]["reconciled_facts"][0]["text"] == "从事件表恢复"
+    assert data["recovery"]["source"] == "persisted"
+    assert data["recovery"]["cold_start"] is True
+    assert isinstance(data["recovery"]["recovered_at"], str)
+
+
+def test_session_store_recovers_studio_state_on_cold_start(db):
+    dept = _make_dept(db)
+    user = _make_user(db, "conv_studio_state_cold", Role.EMPLOYEE, dept.id)
+    workspace = Workspace(
+        name="Skill Studio",
+        workspace_type="skill_studio",
+        created_by=user.id,
+    )
+    db.add(workspace)
+    db.flush()
+    db.add(UnifiedEvent(
+        event_type="harness.studio.state_saved",
+        source_type="harness",
+        payload={
+            "target_type": "skill",
+            "target_id": 789,
+            "studio_state": {
+                "scenario": "optimize_existing_skill",
+                "mode": "draft",
+                "goal": "冷启动恢复",
+                "readiness": 4,
+                "reconciled_facts": [{"type": "constraint", "text": "保留原有口径"}],
+            },
+            "run_id": "",
+        },
+        user_id=user.id,
+        workspace_id=workspace.id,
+    ))
+    db.commit()
+
+    from app.harness.contracts import AgentType, HarnessSessionKey
+    from app.harness.session_store import SessionStore
+
+    store = SessionStore()
+    session_key = HarnessSessionKey(
+        user_id=user.id,
+        agent_type=AgentType.SKILL_STUDIO,
+        workspace_id=workspace.id,
+        target_type="skill",
+        target_id=789,
+    )
+    session = store.create_or_get_session(session_key, agent_type=AgentType.SKILL_STUDIO, db=db)
+
+    assert session.metadata["studio_state"]["goal"] == "冷启动恢复"
+    assert session.metadata["studio_state"]["reconciled_facts"][0]["text"] == "保留原有口径"
 
 
 # ── Send message ──────────────────────────────────────────────────────────────

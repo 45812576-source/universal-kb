@@ -3079,6 +3079,13 @@ class GovernanceActionsRequest(BaseModel):
     audit_id: Optional[int] = None
 
 
+class WorkflowActionRequest(BaseModel):
+    action: str
+    card_id: Optional[str] = None
+    staged_edit_id: Optional[int] = None
+    payload: dict = {}
+
+
 @router.post("/{skill_id}/governance-actions")
 async def governance_actions(
     skill_id: int,
@@ -3099,6 +3106,34 @@ async def governance_actions(
         "cards": result.cards,
         "staged_edits": result.staged_edits,
     }
+
+
+@router.post("/{skill_id}/workflow/actions")
+def workflow_actions(
+    skill_id: int,
+    body: WorkflowActionRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """统一的 Skill Studio workflow 卡片动作入口。"""
+    from app.services.studio_workflow_adapter import dispatch_workflow_action
+
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill 不存在")
+
+    result = dispatch_workflow_action(
+        db,
+        skill_id=skill_id,
+        action=body.action,
+        staged_edit_id=body.staged_edit_id,
+        user_id=user.id,
+        card_id=body.card_id,
+        payload=body.payload or {},
+    )
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error") or "workflow action failed")
+    return result
 
 
 @router.post("/staged-edits/{edit_id}/adopt")

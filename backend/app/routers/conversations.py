@@ -349,6 +349,41 @@ async def cancel_studio_run(
     return {"run": run.summary()}
 
 
+@router.get("/{conv_id}/studio-state")
+def get_studio_state(
+    conv_id: int,
+    skill_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    conv = db.get(Conversation, conv_id)
+    if not conv or conv.user_id != user.id:
+        raise HTTPException(404, "Conversation not found")
+
+    from app.harness.contracts import AgentType, HarnessSessionKey
+    from app.harness.gateway import get_session_store
+
+    resolved_skill_id = skill_id or conv.skill_id
+    if not resolved_skill_id:
+        return {"studio_state": None}
+
+    session_key = HarnessSessionKey(
+        user_id=user.id,
+        agent_type=AgentType.SKILL_STUDIO,
+        workspace_id=conv.workspace_id or 0,
+        target_type="skill",
+        target_id=resolved_skill_id,
+    )
+    store = get_session_store()
+    snapshot = store.get_studio_state_snapshot(session_key, db=db)
+    return {
+        "studio_state": snapshot["studio_state"],
+        "recovery": snapshot["recovery"],
+        "skill_id": resolved_skill_id,
+        "conversation_id": conv_id,
+    }
+
+
 @router.post("")
 def create_conversation(
     req: ConversationCreate = ConversationCreate(),
@@ -912,9 +947,29 @@ async def stream_message(
                         ).count()
                         if _msg_count_check <= 2:
                             from app.services.studio_router import route_session
+                            from app.services.studio_latency_policy import (
+                                choose_execution_strategy,
+                                estimate_complexity_level,
+                                initial_lane_statuses,
+                            )
                             _route_result = route_session(
                                 db, skill_id=req.selected_skill_id, user_message=req.content,
                             )
+                            _complexity_level = estimate_complexity_level(
+                                session_mode=_route_result.session_mode,
+                                workflow_mode=_route_result.workflow_mode,
+                                next_action=_route_result.next_action,
+                                user_message=req.content,
+                                has_files=False,
+                                has_memo=bool(req.selected_skill_id),
+                                history_count=_msg_count_check,
+                            )
+                            _execution_strategy = choose_execution_strategy(
+                                complexity_level=_complexity_level,
+                                workflow_mode=_route_result.workflow_mode,
+                                next_action=_route_result.next_action,
+                            )
+                            _lane_statuses = initial_lane_statuses(_execution_strategy)
                             yield _sse("route_status", {
                                 "session_mode": _route_result.session_mode,
                                 "active_assist_skills": _route_result.active_assist_skills,
@@ -922,6 +977,9 @@ async def stream_message(
                                 "next_action": _route_result.next_action,
                                 "workflow_mode": _route_result.workflow_mode,
                                 "initial_phase": _route_result.initial_phase,
+                                "complexity_level": _complexity_level,
+                                "execution_strategy": _execution_strategy,
+                                **_lane_statuses,
                             })
                             yield _sse("assist_skills_status", {
                                 "skills": _route_result.active_assist_skills,

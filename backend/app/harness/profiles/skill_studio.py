@@ -9,6 +9,7 @@ G3 核心交付：消除同步/流式双轨，统一走 SkillStudioAgentProfile�
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 from dataclasses import asdict
@@ -36,6 +37,10 @@ from app.models.conversation import Conversation, Message, MessageRole
 logger = logging.getLogger(__name__)
 
 
+def _now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # StudioSessionState 持久化
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -56,6 +61,9 @@ def _persist_studio_state(
                 "architect_phase": state_dict.get("architect_phase", ""),
                 "scenario_type": state_dict.get("scenario_type", ""),
                 "draft_readiness_score": state_dict.get("draft_readiness_score", 0),
+                "target_type": session_key.target_type,
+                "target_id": session_key.target_id,
+                "studio_state": state_dict,
             })
 
 
@@ -198,19 +206,36 @@ class SkillStudioAgentProfile:
         )
         self.store.create_run(run, db=db)
         self.store.update_run_status(run.run_id, RunStatus.RUNNING, db=db)
+        request_accepted_at = _now_iso()
+        self.store.update_run_metadata(run.run_id, {"request_accepted_at": request_accepted_at}, db=db)
 
         yield emit(
             EventName.RUN_STARTED,
-            {"run_id": run.run_id, "agent_type": "skill_studio"},
+            {"run_id": run.run_id, "agent_type": "skill_studio", "request_accepted_at": request_accepted_at},
+            run_id=run.run_id,
+            session_id=harness_session.session_id,
+        )
+        yield emit(
+            EventName.STATUS,
+            {"stage": "accepted", "request_accepted_at": request_accepted_at},
             run_id=run.run_id,
             session_id=harness_session.session_id,
         )
 
         # 2. 记录 context assembly step
+        request_step = HarnessStep(
+            run_id=run.run_id,
+            step_type=StepType.REQUEST_RECEIVED,
+            seq=0,
+            input_summary=request.input_text[:200],
+        )
+        self.store.add_step(request_step, db=db)
+        self.store.finish_step(request_step, db=db)
+
         ctx_step = HarnessStep(
             run_id=run.run_id,
             step_type=StepType.CONTEXT_ASSEMBLED,
-            seq=0,
+            seq=1,
             input_summary=f"skill_id={selected_skill_id} editor_dirty={editor_is_dirty}",
         )
         self.store.add_step(ctx_step, db=db)
@@ -238,12 +263,31 @@ class SkillStudioAgentProfile:
         skill_metadata = self._get_skill_metadata(db, selected_skill_id)
 
         self.store.finish_step(ctx_step, db=db)
+        context_ready_at = _now_iso()
+        self.store.update_run_metadata(run.run_id, {
+            "context_ready_at": context_ready_at,
+            "history_count": len(history_messages),
+            "source_file_count": len(source_files),
+            "has_memo": bool(memo_context),
+        }, db=db)
+        yield emit(
+            EventName.STATUS,
+            {
+                "stage": "context_ready",
+                "context_ready_at": context_ready_at,
+                "history_count": len(history_messages),
+                "source_file_count": len(source_files),
+                "has_memo": bool(memo_context),
+            },
+            run_id=run.run_id,
+            session_id=harness_session.session_id,
+        )
 
         # 4. 记录 model_call step
         model_step = HarnessStep(
             run_id=run.run_id,
             step_type=StepType.MODEL_CALL,
-            seq=1,
+            seq=2,
             input_summary=request.input_text[:200],
         )
         self.store.add_step(model_step, db=db)
@@ -255,6 +299,7 @@ class SkillStudioAgentProfile:
         studio_state_snapshot: dict[str, Any] = {}
 
         try:
+            first_useful_response_at = ""
             async for item in studio_run_stream(
                 db=db,
                 conv_id=conversation.id,
@@ -281,6 +326,21 @@ class SkillStudioAgentProfile:
                 if evt_name == "__full_content__":
                     full_content = evt_data.get("text", "")
                     continue
+
+                if not first_useful_response_at and evt_name in {"replace", "delta", "fallback_text"}:
+                    first_useful_response_at = _now_iso()
+                    self.store.update_run_metadata(run.run_id, {
+                        "first_useful_response_at": first_useful_response_at,
+                    }, db=db)
+                    yield emit(
+                        EventName.STATUS,
+                        {
+                            "stage": "first_useful_response",
+                            "first_useful_response_at": first_useful_response_at,
+                        },
+                        run_id=run.run_id,
+                        session_id=harness_session.session_id,
+                    )
 
                 # 捕获 studio_state_update 用于持久化
                 if evt_name == "studio_state_update":

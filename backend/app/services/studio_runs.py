@@ -18,6 +18,7 @@ from sqlalchemy import text
 
 from app.database import SessionLocal
 from app.models.conversation import Conversation, Message, MessageRole
+from app.services.studio_workflow_adapter import build_workflow_event_envelope
 
 logger = logging.getLogger(__name__)
 
@@ -135,8 +136,48 @@ class StudioRunRegistry:
     async def _append(self, run: StudioRun, event: str, data: dict) -> None:
         async with run.condition:
             run.events.append((len(run.events) + 1, event, data))
+            if event != "workflow_event":
+                envelope = self._build_workflow_event(run, event, data)
+                if envelope is not None:
+                    run.events.append((len(run.events) + 1, "workflow_event", envelope))
             run.updated_at = datetime.datetime.utcnow()
             run.condition.notify_all()
+
+    def _build_workflow_event(self, run: StudioRun, event: str, data: dict) -> dict | None:
+        if event == "workflow_state":
+            return build_workflow_event_envelope(
+                event_type="state_changed",
+                payload=data,
+                source_type="workflow",
+                phase=str(data.get("phase") or "discover"),
+                workflow_id=run.id,
+                skill_id=run.skill_id,
+                conversation_id=run.conversation_id,
+                step=event,
+            )
+        mapping = {
+            "route_status": ("route_status_changed", "router", "discover"),
+            "assist_skills_status": ("assist_skills_changed", "router", "discover"),
+            "governance_card": ("card_created", "governance", "review"),
+            "staged_edit_notice": ("staged_edit_created", "governance", "review"),
+            "audit_summary": ("audit_completed", "audit", "review"),
+            "architect_phase_status": ("phase_changed", "architect", "design"),
+            "status": ("status_changed", "workflow", "discover"),
+        }
+        target = mapping.get(event)
+        if not target:
+            return None
+        event_type, source_type, phase = target
+        return build_workflow_event_envelope(
+            event_type=event_type,
+            payload=data,
+            source_type=source_type,
+            phase=phase,
+            workflow_id=run.id,
+            skill_id=run.skill_id,
+            conversation_id=run.conversation_id,
+            step=event,
+        )
 
     async def _execute(self, run: StudioRun, req_payload: dict[str, Any]) -> None:
         db = SessionLocal()
@@ -165,69 +206,31 @@ class StudioRunRegistry:
             )
 
             if app_settings.STUDIO_STRUCTURED_MODE == "on":
-                msg_count = db.query(Message).filter(Message.conversation_id == run.conversation_id).count()
-                if msg_count <= 2:
-                    from app.services.studio_router import route_session
+                from app.services.studio_workflow_orchestrator import bootstrap_workflow
 
-                    route_result = route_session(db, skill_id=run.skill_id, user_message=run.content)
-                    await self._append(run, "route_status", {
-                        "session_mode": route_result.session_mode,
-                        "active_assist_skills": route_result.active_assist_skills,
-                        "route_reason": route_result.route_reason,
-                        "next_action": route_result.next_action,
-                        "workflow_mode": route_result.workflow_mode,
-                        "initial_phase": route_result.initial_phase,
-                    })
-                    await self._append(run, "assist_skills_status", {
-                        "skills": route_result.active_assist_skills,
-                        "session_mode": route_result.session_mode,
-                    })
-
-                    if route_result.workflow_mode == "architect_mode":
-                        from app.models.skill import ArchitectWorkflowState
-
-                        arch_state = db.query(ArchitectWorkflowState).filter(
-                            ArchitectWorkflowState.conversation_id == run.conversation_id
-                        ).first()
-                        if not arch_state:
-                            arch_state = ArchitectWorkflowState(
-                                conversation_id=run.conversation_id,
-                                skill_id=run.skill_id,
-                                workflow_mode="architect_mode",
-                                workflow_phase=route_result.initial_phase,
-                            )
-                            db.add(arch_state)
-                            db.commit()
-                            db.refresh(arch_state)
-                        await self._append(run, "architect_phase_status", {
-                            "phase": arch_state.workflow_phase,
-                            "mode_source": route_result.session_mode,
-                            "ooda_round": arch_state.ooda_round,
-                        })
-
-                    if route_result.next_action == "run_audit" and run.skill_id:
-                        try:
-                            from app.services.studio_auditor import run_audit
-                            from app.services.studio_governance import generate_governance_actions
-
-                            audit_result = await run_audit(db, run.skill_id)
-                            await self._append(run, "audit_summary", {
-                                "verdict": audit_result.verdict,
-                                "issues": audit_result.issues,
-                                "recommended_path": audit_result.recommended_path,
-                                "audit_id": getattr(audit_result, "audit_id", None),
-                            })
-                            if audit_result.verdict in ("needs_work", "poor"):
-                                gov_result = await generate_governance_actions(
-                                    db, run.skill_id, audit_id=getattr(audit_result, "audit_id", None)
-                                )
-                                for card in gov_result.cards:
-                                    await self._append(run, "governance_card", card)
-                                for staged_edit in gov_result.staged_edits:
-                                    await self._append(run, "staged_edit_notice", staged_edit)
-                        except Exception as audit_err:
-                            logger.warning("[studio_run] auto governance failed: %s", audit_err)
-                            await self._append(run, "fallback_text", {"text": f"治理建议生成失败: {audit_err}"})
+                try:
+                    bootstrap = await bootstrap_workflow(
+                        db,
+                        workflow_id=run.id,
+                        conversation_id=run.conversation_id,
+                        skill_id=run.skill_id,
+                        user_message=run.content,
+                        user_id=run.user_id,
+                    )
+                    await self._append(run, "workflow_state", bootstrap.workflow_state)
+                    await self._append(run, "route_status", bootstrap.route_status)
+                    await self._append(run, "assist_skills_status", bootstrap.assist_skills_status)
+                    if bootstrap.architect_phase_status:
+                        await self._append(run, "architect_phase_status", bootstrap.architect_phase_status)
+                    if bootstrap.audit_summary:
+                        await self._append(run, "audit_summary", bootstrap.audit_summary)
+                    for card in bootstrap.cards:
+                        await self._append(run, "governance_card", card)
+                    for staged_edit in bootstrap.staged_edits:
+                        await self._append(run, "staged_edit_notice", staged_edit)
+                except Exception as bootstrap_err:
+                    logger.warning("[studio_run] workflow bootstrap failed: %s", bootstrap_err)
+                    await self._append(run, "fallback_text", {"text": f"工作流初始化失败: {bootstrap_err}"})
 
             async for harness_evt in skill_studio_profile.run_stream(
                 studio_req,
