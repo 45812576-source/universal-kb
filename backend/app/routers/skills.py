@@ -386,6 +386,7 @@ class ImportConvertRequest(BaseModel):
 async def import_convert_skill(
     file: UploadFile = File(None),
     content: str = Form(None),
+    main_file: str = Form(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -407,29 +408,70 @@ async def import_convert_skill(
         raw = await file.read()
         source_filename = file.filename
 
-        # zip 包：解压后读取 SKILL.md 或第一个 .md 文件
+        # zip 包：解压后智能识别主 prompt 文件 vs 附属文件
         if file.filename.lower().endswith(".zip"):
             import zipfile as _zf
             import io as _io
             try:
                 with _zf.ZipFile(_io.BytesIO(raw)) as zf:
                     names = zf.namelist()
-                    # 优先找 SKILL.md（不区分路径深度）
-                    md_file = None
+                    # 收集所有有效 .md 文件及其内容
+                    md_candidates: list[tuple[str, str, int]] = []  # (name, content, score)
+                    other_asset_files: list[dict] = []
                     for n in names:
+                        if n.endswith("/") or n.startswith("__MACOSX") or n.startswith("."):
+                            continue
                         base = n.rsplit("/", 1)[-1] if "/" in n else n
-                        if base.upper() == "SKILL.MD":
-                            md_file = n
-                            break
-                    # 回退：第一个 .md 文件
-                    if not md_file:
-                        for n in names:
-                            if n.lower().endswith(".md") and not n.startswith("__MACOSX"):
-                                md_file = n
-                                break
-                    if not md_file:
+                        if base.startswith("."):
+                            continue
+                        if n.lower().endswith(".md"):
+                            try:
+                                md_content_raw = zf.read(n).decode("utf-8")
+                                sc = _score_main_md(n, md_content_raw)
+                                md_candidates.append((n, md_content_raw, sc))
+                            except (UnicodeDecodeError, KeyError):
+                                continue
+                        else:
+                            # 非 md 文件记录为附属文件
+                            try:
+                                size = zf.getinfo(n).file_size
+                            except KeyError:
+                                size = 0
+                            other_asset_files.append({
+                                "filename": base,
+                                "path": n,
+                                "size": size,
+                                "category": _infer_category(base),
+                            })
+
+                    if not md_candidates:
                         raise HTTPException(400, "zip 包中未找到 .md 文件")
-                    raw_content = zf.read(md_file).decode("utf-8")
+
+                    # 如果用户指定了主文件，优先使用
+                    if main_file:
+                        chosen = next(
+                            ((n, c, s) for n, c, s in md_candidates if n == main_file),
+                            None,
+                        )
+                        if not chosen:
+                            raise HTTPException(400, f"指定的主文件 {main_file} 不在 zip 包中")
+                        main_name, raw_content, _main_score = chosen
+                        md_candidates.remove(chosen)
+                    else:
+                        # 按分数降序选主文件
+                        md_candidates.sort(key=lambda x: x[2], reverse=True)
+                        main_name, raw_content, _main_score = md_candidates[0]
+                        md_candidates = md_candidates[1:]
+
+                    # 其余 .md 文件归为附属
+                    for name_i, content_i, _sc in md_candidates:
+                        base_i = name_i.rsplit("/", 1)[-1] if "/" in name_i else name_i
+                        other_asset_files.append({
+                            "filename": base_i,
+                            "path": name_i,
+                            "size": len(content_i.encode("utf-8")),
+                            "category": _infer_category(base_i),
+                        })
             except _zf.BadZipFile:
                 raise HTTPException(400, "无效的 zip 文件")
         else:
@@ -442,8 +484,40 @@ async def import_convert_skill(
     else:
         raise HTTPException(400, "请上传文件或提供文本内容")
 
+    # zip 包才有附属文件列表，其他方式为空
+    is_zip = file and file.filename and file.filename.lower().endswith(".zip")
+    if not is_zip:
+        other_asset_files = []
+
     if not raw_content.strip():
         raise HTTPException(400, "内容为空")
+
+    # 构建 file_tree（zip 包时返回分析结果供前端展示）
+    file_tree: list[dict] | None = None
+    if is_zip:
+        # main_name 在 zip 解析块中已赋值
+        file_tree = [{
+            "filename": main_name.rsplit("/", 1)[-1] if "/" in main_name else main_name,
+            "path": main_name,
+            "role": "main_prompt",
+            "role_label": "主 Prompt 文件",
+            "size": len(raw_content.encode("utf-8")),
+        }]
+        for af in other_asset_files:
+            file_tree.append({
+                "filename": af["filename"],
+                "path": af["path"],
+                "role": af["category"],
+                "role_label": {
+                    "knowledge-base": "知识库",
+                    "example": "示例",
+                    "reference": "参考资料",
+                    "template": "模板",
+                    "tool": "工具脚本",
+                    "other": "附属文件",
+                }.get(af["category"], "附属文件"),
+                "size": af["size"],
+            })
 
     # Step 1: 尝试本地解析（已是标准格式则跳过 AI）
     local_parsed = _parse_skill_md(raw_content)
@@ -475,6 +549,7 @@ async def import_convert_skill(
             "has_frontend_content": bool(frontend_hits) or bool(file_frontend_warning),
             "frontend_detail": "",
             "ai_converted": False,
+            "file_tree": file_tree,
         }
         if frontend_hits:
             result["frontend_detail"] = f"检测到前端相关内容：{', '.join(frontend_hits[:5])}"
@@ -537,6 +612,7 @@ async def import_convert_skill(
 
     parsed["original_content"] = raw_content
     parsed["ai_converted"] = True
+    parsed["file_tree"] = file_tree
     return parsed
 
 
@@ -714,14 +790,16 @@ async def batch_upload_skill_md(
 @router.post("/upload-zip")
 async def upload_skill_zip(
     file: UploadFile = File(...),
+    main_file: str = Form(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """上传 .zip 压缩包创建复杂 Skill（主 .md 文件 + 附属参考文件/脚本）。
 
     zip 包结构：
-    - 必须包含一个 .md 文件（优先 index.md / README.md，否则取第一个 .md）
+    - 必须包含一个 .md 文件（智能识别主 prompt 文件）
     - 其余文件作为附属文件存储到 uploads/skills/<skill_id>/ 目录
+    - 可选传 main_file 参数指定主文件路径（覆盖自动检测）
     """
     import zipfile as _zipfile
     import tempfile
@@ -745,24 +823,32 @@ async def upload_skill_zip(
         _os.unlink(tmp_path)
         raise HTTPException(400, "不是有效的 zip 文件")
 
-    # 找主 md 文件（忽略 __MACOSX 等系统目录）
-    md_files = [n for n in names if n.endswith(".md") and not n.startswith("__") and "/" not in n.lstrip("/")]
-    # 也允许一层子目录内的 md
-    if not md_files:
-        md_files = [n for n in names if n.endswith(".md") and not n.startswith("__")]
+    # 找所有 .md 文件并评分
+    md_files = [n for n in names if n.endswith(".md") and not n.startswith("__")]
     if not md_files:
         _os.unlink(tmp_path)
         raise HTTPException(400, "zip 包中未找到 .md 文件")
 
-    # 优先选 index.md / README.md
-    main_md = next(
-        (n for n in md_files if _Path(n).name.lower() in ("index.md", "readme.md", "skill.md")),
-        md_files[0],
-    )
-
     with _zipfile.ZipFile(tmp_path, "r") as zf:
+        if main_file and main_file in md_files:
+            main_md = main_file
+        else:
+            # 智能评分选主文件
+            scored = []
+            for n in md_files:
+                try:
+                    c = zf.read(n).decode("utf-8")
+                    scored.append((n, _score_main_md(n, c)))
+                except (UnicodeDecodeError, KeyError):
+                    continue
+            if not scored:
+                _os.unlink(tmp_path)
+                raise HTTPException(400, "zip 包中的 .md 文件均无法读取")
+            scored.sort(key=lambda x: x[1], reverse=True)
+            main_md = scored[0][0]
+
         md_content = zf.read(main_md).decode("utf-8")
-        # 其他文件（排除系统文件和其他 .md 可选保留）
+        # 其他文件（排除系统文件）
         other_files = [
             n for n in names
             if n != main_md
@@ -936,6 +1022,60 @@ def _infer_category(filename: str) -> str:
     if "reference" in base or base.endswith((".dot", ".xml")):
         return "reference"
     return "other"
+
+
+def _score_main_md(filename: str, content: str) -> int:
+    """给 zip 包中的 .md 文件打分，判断哪个最可能是主 prompt 文件。
+    分数越高越可能是主文件。"""
+    import re as _re
+    score = 0
+    base = filename.rsplit("/", 1)[-1].lower() if "/" in filename else filename.lower()
+
+    # 有 YAML frontmatter 且包含 name 字段 → 最强信号
+    if _re.match(r"^---\s*\n.*?name\s*:", content[:500], _re.DOTALL):
+        score += 10
+
+    # 特定文件名
+    if base in ("skill.md", "index.md", "readme.md", "prompt.md", "main.md"):
+        score += 5
+
+    # 根目录（无子文件夹嵌套）
+    stripped = filename.lstrip("/")
+    if "/" not in stripped:
+        score += 2
+
+    # prompt 特征关键词（给 AI 的指令特征）
+    prompt_signals = [
+        r"你是", r"你的[任角职]", r"# ?(角色|Role|身份|任务|Instructions|System)",
+        r"You are", r"Your (role|task|job)",
+        r"## ?(目标|Goal|Objective|输出|Output|约束|Constraint)",
+        r"\{[\w]+\}",  # 有模板变量占位符
+    ]
+    hits = sum(1 for p in prompt_signals if _re.search(p, content[:3000]))
+    if hits >= 2:
+        score += 3
+    elif hits >= 1:
+        score += 1
+
+    # 知识库/附件特征（降分）
+    kb_signals = [
+        r"^#+ ?(参考|Reference|附录|Appendix|数据|Data|案例|Case)",
+        r"-kb\.",
+        r"knowledge",
+        r"example",
+    ]
+    kb_hits = sum(1 for p in kb_signals if _re.search(p, content[:2000], _re.IGNORECASE))
+    if base != "skill.md":  # skill.md 即使内容看起来像知识库也不降分
+        score -= kb_hits
+
+    # 长度启发：prompt 通常不会太长，知识库/参考通常很长
+    length = len(content)
+    if length < 3000:
+        score += 1
+    elif length > 10000:
+        score -= 2
+
+    return score
 
 
 def _check_skill_write_access(skill: Skill, user: User):
