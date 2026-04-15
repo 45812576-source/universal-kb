@@ -56,6 +56,32 @@ class BitableSync:
             token, app_token, table_id, since_ts=since_ts,
         )
 
+    def _normalize_fields(self, fields: list[dict]) -> list[dict]:
+        """Normalize raw bitable field metadata for stable schema persistence.
+
+        Backward-compatible behavior expected by tests and older callers:
+        - blank field names are replaced with ``未命名字段{n}`` (1-based position);
+        - duplicate names receive ``_{k}`` suffixes;
+        - original source name is preserved in ``_source_field_name``.
+        """
+        normalized: list[dict] = []
+        seen_names: dict[str, int] = {}
+
+        for index, field in enumerate(fields, start=1):
+            item = dict(field)
+            source_name = (item.get("field_name") or "").strip()
+            base_name = source_name or f"未命名字段{index}"
+
+            duplicate_count = seen_names.get(base_name, 0)
+            final_name = base_name if duplicate_count == 0 else f"{base_name}_{duplicate_count + 1}"
+            seen_names[base_name] = duplicate_count + 1
+
+            item["_source_field_name"] = source_name
+            item["field_name"] = final_name
+            normalized.append(item)
+
+        return normalized
+
     def _build_col_map(self, fields: list[dict]) -> dict[str, str]:
         return {f["field_name"]: BitableReader.sanitize_col(f["field_name"]) for f in fields}
 

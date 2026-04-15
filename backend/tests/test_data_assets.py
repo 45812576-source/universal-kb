@@ -8,11 +8,14 @@
 """
 from app.utils.time_utils import utcnow
 import pytest
+from sqlalchemy import text
 from tests.conftest import _make_user, _make_dept, _make_skill, _make_model_config, _login, _auth
 from app.models.user import Role
 from app.models.business import (
     BusinessTable, DataFolder, TableField, TableSyncJob, SkillTableBinding, TableView,
+    SkillDataGrant, TablePermissionPolicy, TableRoleGroup,
 )
+from app.services.data_asset_access import is_data_asset_table, should_use_asset_safe_default
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -40,11 +43,55 @@ def _make_folder(db, name="测试文件夹", parent_id=None, workspace_scope="co
     return f
 
 
+def _create_physical_table(db, table_name: str, columns_sql: str):
+    db.execute(text(f"DROP TABLE IF EXISTS `{table_name}`"))
+    db.execute(text(f"CREATE TABLE `{table_name}` ({columns_sql})"))
+    db.commit()
+
+
 def _setup_admin(db):
     dept = _make_dept(db)
     admin = _make_user(db, "da_admin", Role.SUPER_ADMIN, dept.id)
     db.commit()
     return admin, dept
+
+
+class TestDataAssetAccessHelpers:
+    def test_legacy_folder_marker_counts_as_data_asset(self, db):
+        owner = _make_user(db, "asset_helper_owner", Role.EMPLOYEE)
+        bt = _make_business_table(
+            db,
+            "asset_helper_legacy_folder",
+            "旧目录标记表",
+            owner.id,
+        )
+        bt.validation_rules = {"folder_id": 123}
+        db.commit()
+
+        assert is_data_asset_table(bt) is True
+
+    def test_blank_unfiled_table_remains_legacy(self, db):
+        owner = _make_user(db, "asset_helper_blank_owner", Role.EMPLOYEE)
+        bt = _make_business_table(db, "asset_helper_blank", "空白旧表", owner.id)
+        db.commit()
+
+        assert is_data_asset_table(bt) is False
+
+    def test_safe_default_skips_admin_owner_and_new_policy(self, db):
+        dept = _make_dept(db, "资产 helper 部门")
+        owner = _make_user(db, "asset_helper_owner2", Role.EMPLOYEE, dept.id)
+        peer = _make_user(db, "asset_helper_peer", Role.EMPLOYEE, dept.id)
+        admin = _make_user(db, "asset_helper_admin", Role.SUPER_ADMIN, dept.id)
+        folder = DataFolder(name="helper共享目录", workspace_scope="company")
+        db.add(folder)
+        db.flush()
+        bt = _make_business_table(db, "asset_helper_safe", "安全默认表", owner.id, folder_id=folder.id)
+        db.commit()
+
+        assert should_use_asset_safe_default(peer, bt, has_new_policy=False) is True
+        assert should_use_asset_safe_default(owner, bt, has_new_policy=False) is False
+        assert should_use_asset_safe_default(admin, bt, has_new_policy=False) is False
+        assert should_use_asset_safe_default(peer, bt, has_new_policy=True) is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -242,6 +289,17 @@ class TestFolderAPI:
         assert resp.status_code == 200
         assert resp.json() == {"ok": True}
 
+    def test_employee_can_create_personal_folder(self, client, db):
+        dept = _make_dept(db, "销售")
+        employee = _make_user(db, "folder_user", Role.EMPLOYEE, dept.id)
+        db.commit()
+        token = _login(client, "folder_user")
+        resp = client.post("/api/data-assets/folders", headers=_auth(token), json={"name": "我的目录"})
+        assert resp.status_code == 200
+        folder = db.get(DataFolder, resp.json()["id"])
+        assert folder.workspace_scope == "personal"
+        assert folder.owner_id == employee.id
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # API tests — Tables
@@ -314,6 +372,239 @@ class TestTableAPI:
         assert resp.json() == {"ok": True}
         db.refresh(bt)
         assert bt.folder_id == folder.id
+
+    def test_personal_table_hidden_from_other_employee(self, client, db):
+        dept = _make_dept(db, "运营")
+        owner = _make_user(db, "owner_emp", Role.EMPLOYEE, dept.id)
+        other = _make_user(db, "other_emp", Role.EMPLOYEE, dept.id)
+        folder = DataFolder(name="owner_root", workspace_scope="personal", owner_id=owner.id)
+        db.add(folder)
+        db.flush()
+        _make_business_table(db, "tbl_private_asset", "我的私有表", owner.id, folder_id=folder.id)
+        db.commit()
+
+        owner_token = _login(client, "owner_emp")
+        other_token = _login(client, "other_emp")
+        owner_resp = client.get("/api/data-assets/tables?bucket=mine", headers=_auth(owner_token))
+        other_resp = client.get("/api/data-assets/tables", headers=_auth(other_token))
+
+        assert owner_resp.status_code == 200
+        assert owner_resp.json()["total"] == 1
+        assert other_resp.status_code == 200
+        assert other_resp.json()["total"] == 0
+
+    def test_owner_can_move_own_table_to_personal_folder(self, client, db):
+        dept = _make_dept(db, "商务")
+        owner = _make_user(db, "move_owner", Role.EMPLOYEE, dept.id)
+        personal_folder = DataFolder(name="我的数据", workspace_scope="personal", owner_id=owner.id)
+        db.add(personal_folder)
+        db.flush()
+        bt = _make_business_table(db, "tbl_move_owner", "移动测试", owner.id)
+        db.commit()
+
+        token = _login(client, "move_owner")
+        resp = client.patch(
+            f"/api/data-assets/tables/{bt.id}/move",
+            headers=_auth(token),
+            json={"folder_id": personal_folder.id},
+        )
+        assert resp.status_code == 200
+        db.refresh(bt)
+        assert bt.folder_id == personal_folder.id
+
+    def test_company_table_appears_in_shared_bucket_for_other_employee(self, client, db):
+        dept = _make_dept(db, "运营")
+        owner = _make_user(db, "shared_owner", Role.EMPLOYEE, dept.id)
+        other = _make_user(db, "shared_other", Role.EMPLOYEE, dept.id)
+        company_folder = DataFolder(name="公司数据", workspace_scope="company")
+        db.add(company_folder)
+        db.flush()
+        _make_business_table(db, "tbl_company_asset", "公司共享表", owner.id, folder_id=company_folder.id)
+        db.commit()
+
+        other_token = _login(client, "shared_other")
+        resp = client.get("/api/data-assets/tables?bucket=shared", headers=_auth(other_token))
+
+        assert resp.status_code == 200
+        assert resp.json()["total"] == 1
+        assert resp.json()["items"][0]["table_name"] == "tbl_company_asset"
+
+
+class TestDataRowsRegression:
+    def test_shared_asset_rows_do_not_fallback_to_legacy_scope(self, client, db):
+        allowed_dept = _make_dept(db, "资产允许部门")
+        owner = _make_user(db, "asset_owner_rows", Role.EMPLOYEE, allowed_dept.id)
+        peer = _make_user(db, "asset_peer_rows", Role.EMPLOYEE, allowed_dept.id)
+        company_folder = DataFolder(name="共享资产目录", workspace_scope="company")
+        db.add(company_folder)
+        db.flush()
+        _create_physical_table(db, "usr_asset_safe_rows", "id INTEGER PRIMARY KEY, name TEXT")
+        db.execute(text("INSERT INTO `usr_asset_safe_rows` (id, name) VALUES (1, 'Visible')"))
+        bt = BusinessTable(
+            table_name="usr_asset_safe_rows",
+            display_name="共享资产行表",
+            description="",
+            ddl_sql="",
+            validation_rules={
+                "row_scope": "department",
+                "row_department_ids": [allowed_dept.id],
+            },
+            workflow={},
+            owner_id=owner.id,
+            folder_id=company_folder.id,
+        )
+        db.add(bt)
+        db.commit()
+
+        peer_token = _login(client, "asset_peer_rows")
+        peer_resp = client.get("/api/data/usr_asset_safe_rows/rows", headers=_auth(peer_token))
+        assert peer_resp.status_code == 200
+        assert peer_resp.json()["total"] == 0
+        assert peer_resp.json()["rows"] == []
+
+        owner_token = _login(client, "asset_owner_rows")
+        owner_resp = client.get("/api/data/usr_asset_safe_rows/rows", headers=_auth(owner_token))
+        assert owner_resp.status_code == 200
+        assert owner_resp.json()["total"] == 1
+        assert owner_resp.json()["rows"][0]["name"] == "Visible"
+
+    def test_owner_can_read_private_rows(self, client, db):
+        dept = _make_dept(db, "客服")
+        owner = _make_user(db, "row_owner", Role.EMPLOYEE, dept.id)
+        _create_physical_table(db, "usr_private_rows", "id INTEGER PRIMARY KEY, name TEXT")
+        db.execute(text("INSERT INTO `usr_private_rows` (id, name) VALUES (1, 'Alice')"))
+        bt = BusinessTable(
+            table_name="usr_private_rows",
+            display_name="私有行表",
+            description="",
+            ddl_sql="",
+            validation_rules={"row_scope": "private"},
+            workflow={},
+            owner_id=owner.id,
+        )
+        db.add(bt)
+        db.commit()
+
+        token = _login(client, "row_owner")
+        resp = client.get("/api/data/usr_private_rows/rows", headers=_auth(token))
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 1
+        assert body["rows"][0]["name"] == "Alice"
+
+    def test_multi_select_rows_are_normalized_roundtrip(self, client, db):
+        admin, _ = _setup_admin(db)
+        _create_physical_table(db, "usr_multi_rows", "id INTEGER PRIMARY KEY, tags TEXT")
+        db.execute(text("INSERT INTO `usr_multi_rows` (id, tags) VALUES (1, '[\"A\", \"B\"]')"))
+        bt = BusinessTable(
+            table_name="usr_multi_rows",
+            display_name="多选行表",
+            description="",
+            ddl_sql="",
+            validation_rules={"row_scope": "private"},
+            workflow={},
+            owner_id=admin.id,
+        )
+        db.add(bt)
+        db.flush()
+        db.add(TableField(
+            table_id=bt.id,
+            field_name="tags",
+            physical_column_name="tags",
+            display_name="标签",
+            field_type="multi_select",
+            enum_values=["A", "B", "C"],
+        ))
+        db.commit()
+
+        token = _login(client, "da_admin")
+        list_resp = client.get("/api/data/usr_multi_rows/rows", headers=_auth(token))
+        assert list_resp.status_code == 200
+        assert list_resp.json()["rows"][0]["tags"] == ["A", "B"]
+
+        update_resp = client.put(
+            "/api/data/usr_multi_rows/rows/1",
+            headers=_auth(token),
+            json={"data": {"tags": ["C"]}},
+        )
+        assert update_resp.status_code == 200
+        stored = db.execute(text("SELECT tags FROM `usr_multi_rows` WHERE id = 1")).scalar()
+        assert stored == "[\"C\"]"
+
+    def test_shared_asset_sample_does_not_fallback_to_legacy_scope(self, client, db):
+        allowed_dept = _make_dept(db, "采样允许部门")
+        owner = _make_user(db, "asset_owner_sample", Role.EMPLOYEE, allowed_dept.id)
+        peer = _make_user(db, "asset_peer_sample", Role.EMPLOYEE, allowed_dept.id)
+        company_folder = DataFolder(name="采样共享目录v2", workspace_scope="company")
+        db.add(company_folder)
+        db.flush()
+        _create_physical_table(db, "usr_asset_safe_sample", "id INTEGER PRIMARY KEY, name TEXT")
+        db.execute(text("INSERT INTO `usr_asset_safe_sample` (id, name) VALUES (1, 'Visible')"))
+        bt = BusinessTable(
+            table_name="usr_asset_safe_sample",
+            display_name="共享资产采样表",
+            description="",
+            ddl_sql="",
+            validation_rules={
+                "row_scope": "department",
+                "row_department_ids": [allowed_dept.id],
+            },
+            workflow={},
+            owner_id=owner.id,
+            folder_id=company_folder.id,
+        )
+        db.add(bt)
+        db.commit()
+
+        peer_token = _login(client, "asset_peer_sample")
+        peer_resp = client.get("/api/data/usr_asset_safe_sample/sample", headers=_auth(peer_token))
+        assert peer_resp.status_code == 200
+        assert peer_resp.json()["total"] == 0
+        assert peer_resp.json()["rows"] == []
+
+        owner_token = _login(client, "asset_owner_sample")
+        owner_resp = client.get("/api/data/usr_asset_safe_sample/sample", headers=_auth(owner_token))
+        assert owner_resp.status_code == 200
+        assert owner_resp.json()["total"] == 1
+        assert owner_resp.json()["rows"][0]["name"] == "Visible"
+
+    def test_sample_rows_respects_legacy_department_scope(self, client, db):
+        allowed_dept = _make_dept(db, "允许部门")
+        denied_dept = _make_dept(db, "其他部门")
+        owner = _make_user(db, "sample_owner", Role.EMPLOYEE, allowed_dept.id)
+        denied_user = _make_user(db, "sample_denied", Role.EMPLOYEE, denied_dept.id)
+        company_folder = DataFolder(name="采样共享目录", workspace_scope="company")
+        db.add(company_folder)
+        db.flush()
+        _create_physical_table(db, "usr_sample_dept", "id INTEGER PRIMARY KEY, name TEXT")
+        db.execute(text("INSERT INTO `usr_sample_dept` (id, name) VALUES (1, 'Visible')"))
+        bt = BusinessTable(
+            table_name="usr_sample_dept",
+            display_name="部门采样表",
+            description="",
+            ddl_sql="",
+            validation_rules={
+                "row_scope": "department",
+                "row_department_ids": [allowed_dept.id],
+            },
+            workflow={},
+            owner_id=owner.id,
+            folder_id=company_folder.id,
+        )
+        db.add(bt)
+        db.commit()
+
+        denied_token = _login(client, "sample_denied")
+        denied_resp = client.get("/api/data/usr_sample_dept/sample", headers=_auth(denied_token))
+        assert denied_resp.status_code == 200
+        assert denied_resp.json()["total"] == 0
+        assert denied_resp.json()["rows"] == []
+
+        owner_token = _login(client, "sample_owner")
+        owner_resp = client.get("/api/data/usr_sample_dept/sample", headers=_auth(owner_token))
+        assert owner_resp.status_code == 200
+        assert owner_resp.json()["total"] == 1
+        assert owner_resp.json()["rows"][0]["name"] == "Visible"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -429,9 +720,31 @@ class TestViewImpactAPI:
         view = TableView(table_id=bt.id, name="测试视图", view_type="grid", config={}, created_by=admin.id)
         db.add(view)
         db.flush()
+        role_group = TableRoleGroup(table_id=bt.id, name="测试角色组", user_ids=[admin.id])
+        db.add(role_group)
+        db.flush()
         binding = SkillTableBinding(skill_id=skill.id, table_id=bt.id, view_id=view.id,
                                     binding_type="runtime_read", created_by=admin.id)
         db.add(binding)
+        db.add(SkillDataGrant(
+            skill_id=skill.id,
+            table_id=bt.id,
+            view_id=view.id,
+            grant_mode="runtime_read",
+            allowed_actions=["read"],
+            max_disclosure_level="L3",
+            approval_required=False,
+            audit_level="full",
+        ))
+        db.add(TablePermissionPolicy(
+            table_id=bt.id,
+            role_group_id=role_group.id,
+            view_id=view.id,
+            disclosure_level="L3",
+            row_access_mode="all",
+            field_access_mode="all",
+            tool_permission_mode="full",
+        ))
         db.commit()
         token = _login(client, "da_admin")
         resp = client.get(f"/api/data-assets/views/{view.id}/impact", headers=_auth(token))
@@ -439,6 +752,9 @@ class TestViewImpactAPI:
         data = resp.json()
         assert len(data["affected_skills"]) == 1
         assert data["can_delete"] is False
+        assert data["binding_count"] == 1
+        assert data["grant_count"] == 1
+        assert data["policy_count"] == 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

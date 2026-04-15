@@ -16,6 +16,12 @@ from app.dependencies import get_current_user
 from app.utils.sql_safe import qi
 from app.models.business import AuditLog, BusinessTable, DataOwnership, TableRoleGroup, TableField
 from app.models.user import User, Role
+from app.services.data_asset_access import (
+    require_table_manage_access,
+    require_table_view_access,
+    should_use_asset_safe_default,
+)
+from app.services.data_asset_codec import normalize_row_for_response, normalize_row_payload
 from app.services.data_visibility import data_visibility
 from app.services.policy_engine import (
     resolve_user_role_groups,
@@ -27,24 +33,129 @@ from app.services.policy_engine import (
 )
 
 
-def _check_write_permission(bt: BusinessTable, user: User):
-    """写操作行级权限校验：non-admin 只能向 row_scope=all/department(自身部门) 的表写入。"""
-    is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
-    if is_admin:
-        return
+def _check_write_permission(db: Session, bt: BusinessTable, user: User):
+    """写操作按数据资产管理权限判定。"""
+    require_table_manage_access(db, bt, user)
+
+
+def _is_admin(user: User) -> bool:
+    return user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
+
+
+def _has_new_policy(db: Session, bt: BusinessTable) -> bool:
+    return (
+        db.query(TableRoleGroup)
+        .filter(TableRoleGroup.table_id == bt.id)
+        .first()
+        is not None
+    )
+
+
+def _empty_rows_result(page: int, page_size: int) -> dict:
+    return {"total": 0, "page": page, "page_size": page_size, "columns": [], "rows": []}
+
+
+def _empty_sample_result() -> dict:
+    return {
+        "total": 0,
+        "columns": [],
+        "rows": [],
+        "sample_strategy": {"enum_fields": [], "covered": 0, "filled": 0},
+    }
+
+
+def _build_legacy_access_context(
+    db: Session,
+    bt: BusinessTable,
+    user: User,
+    is_admin: bool,
+):
+    table_name = bt.table_name
     rules = bt.validation_rules or {}
     row_scope = rules.get("row_scope", "private")
-    if row_scope == "private":
-        raise HTTPException(403, "该表为私有表，无写入权限")
-    if row_scope == "department":
+
+    if not is_admin and row_scope == "private" and bt.owner_id != user.id:
+        return None
+
+    base_sql = f"SELECT * FROM {qi(table_name, '表名')}"
+
+    if not is_admin and row_scope == "department":
         dept_ids = rules.get("row_department_ids") or []
         if dept_ids and user.department_id not in dept_ids:
-            raise HTTPException(403, "您不在该表的授权部门内，无写入权限")
+            return None
+
+    ownership = db.query(DataOwnership).filter(DataOwnership.table_name == table_name).first()
+    if ownership and not is_admin:
+        conditions = []
+        if ownership.owner_field:
+            conditions.append(f"`{ownership.owner_field}` = {user.id}")
+        if ownership.department_field and user.department_id:
+            conditions.append(f"`{ownership.department_field}` = {user.department_id}")
+        if conditions:
+            base_sql += " WHERE (" + " OR ".join(conditions) + ")"
+
+    return {
+        "base_sql": base_sql,
+        "rules": rules,
+        "ownership": ownership,
+    }
+
+
+def _apply_legacy_field_visibility(
+    rows: list[dict],
+    all_columns: list[str],
+    rules: dict,
+    ownership: DataOwnership | None,
+    user: User,
+    is_admin: bool,
+) -> tuple[list[str], list[dict]]:
+    hidden_fields: list[str] = rules.get("hidden_fields") or []
+    col_scope = rules.get("column_scope", "all")
+    visible_columns = list(all_columns)
+    visible_rows = list(rows)
+
+    if not is_admin:
+        if col_scope == "private":
+            visible_rows = [{} for _ in visible_rows]
+            visible_columns = []
+        elif col_scope == "department":
+            dept_ids = rules.get("column_department_ids") or []
+            if dept_ids and user.department_id not in dept_ids:
+                visible_rows = [{} for _ in visible_rows]
+                visible_columns = []
+
+    if hidden_fields and visible_columns:
+        visible_columns = [c for c in visible_columns if c not in hidden_fields]
+        visible_rows = [{k: v for k, v in row.items() if k not in hidden_fields} for row in visible_rows]
+
+    if ownership:
+        desensitize_config = rules.get("desensitize_fields", {})
+        visible_rows = data_visibility.apply_visibility(visible_rows, user, ownership, desensitize_config)
+
+    return visible_columns, visible_rows
+
+
+def _read_rows_for_access(
+    db: Session,
+    bt: BusinessTable,
+    user: User,
+    page: int,
+    page_size: int,
+    offset: int,
+    view_id: int | None,
+):
+    is_admin = _is_admin(user)
+    has_new_policy = _has_new_policy(db, bt)
+    if has_new_policy and not is_admin:
+        return _list_rows_new_policy(db, bt, user, page, page_size, offset, view_id)
+    if should_use_asset_safe_default(user, bt, has_new_policy=has_new_policy):
+        return _empty_rows_result(page, page_size)
+    return _list_rows_legacy(db, bt, user, page, page_size, offset, view_id, is_admin)
 
 
 def _check_row_owner(bt: BusinessTable, row_values: dict, user: User):
     """更新/删除时校验行所有权：若配置了 owner_field，非管理员只能修改自己的行。"""
-    is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
+    is_admin = _is_admin(user)
     if is_admin:
         return
     rules = bt.validation_rules or {}
@@ -76,6 +187,16 @@ def _serialize_value(v):
 
 def _serialize_row(row: dict) -> dict:
     return {k: _serialize_value(v) for k, v in row.items()}
+
+
+def _get_table_field_map(db: Session, bt: BusinessTable) -> dict[str, TableField]:
+    fields = db.query(TableField).filter(TableField.table_id == bt.id).all()
+    field_map: dict[str, TableField] = {}
+    for field in fields:
+        field_map[field.field_name] = field
+        if field.physical_column_name:
+            field_map[field.physical_column_name] = field
+    return field_map
 
 
 def _get_registered_table(db: Session, table_name: str) -> BusinessTable:
@@ -112,6 +233,7 @@ def get_table_schema(
     user: User = Depends(get_current_user),
 ):
     bt = _get_registered_table(db, table_name)
+    require_table_view_access(db, bt, user)
     columns = _get_columns(db, table_name)
     return {
         "table_name": table_name,
@@ -190,23 +312,9 @@ def list_rows(
     user: User = Depends(get_current_user),
 ):
     bt = _get_registered_table(db, table_name)
+    require_table_view_access(db, bt, user)
     offset = (page - 1) * page_size
-
-    from app.models.user import Role
-    is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
-
-    # ── 检查是否启用新权限模型（有 TableRoleGroup 记录） ──
-    has_new_policy = (
-        db.query(TableRoleGroup)
-        .filter(TableRoleGroup.table_id == bt.id)
-        .first()
-        is not None
-    )
-
-    if has_new_policy and not is_admin:
-        return _list_rows_new_policy(db, bt, user, page, page_size, offset, view_id)
-    else:
-        return _list_rows_legacy(db, bt, user, page, page_size, offset, view_id, is_admin)
+    return _read_rows_for_access(db, bt, user, page, page_size, offset, view_id)
 
 
 def _list_rows_new_policy(
@@ -255,7 +363,11 @@ def _list_rows_new_policy(
         {**sql_params, "limit": page_size, "offset": offset},
     )
     all_columns = list(rows_result.keys())
-    rows = [_serialize_row(dict(zip(all_columns, row))) for row in rows_result.fetchall()]
+    field_map = _get_table_field_map(db, bt)
+    rows = [
+        normalize_row_for_response(_serialize_row(dict(zip(all_columns, row))), field_map)
+        for row in rows_result.fetchall()
+    ]
 
     # 字段过滤
     fields = db.query(TableField).filter(TableField.table_id == bt.id).all()
@@ -288,31 +400,12 @@ def _list_rows_legacy(
     is_admin: bool,
 ):
     """旧权限逻辑（向后兼容）。"""
-    table_name = bt.table_name
-    rules = bt.validation_rules or {}
-
-    # ── Row scope: check validation_rules["row_scope"] ──
-    row_scope = rules.get("row_scope", "private")
-    if not is_admin and row_scope == "private":
-        return {"total": 0, "page": page, "page_size": page_size, "columns": [], "rows": []}
-
-    base_sql = f"SELECT * FROM {qi(table_name, '表名')}"
-
-    if not is_admin and row_scope == "department":
-        dept_ids = rules.get("row_department_ids") or []
-        if dept_ids and user.department_id not in dept_ids:
-            return {"total": 0, "page": page, "page_size": page_size, "columns": [], "rows": []}
-
-    # Legacy DataOwnership row-filter (owner/department field matching)
-    ownership = db.query(DataOwnership).filter(DataOwnership.table_name == table_name).first()
-    if ownership and not is_admin:
-        conditions = []
-        if ownership.owner_field:
-            conditions.append(f"`{ownership.owner_field}` = {user.id}")
-        if ownership.department_field and user.department_id:
-            conditions.append(f"`{ownership.department_field}` = {user.department_id}")
-        if conditions:
-            base_sql += " WHERE (" + " OR ".join(conditions) + ")"
+    context = _build_legacy_access_context(db, bt, user, is_admin)
+    if context is None:
+        return _empty_rows_result(page, page_size)
+    base_sql = context["base_sql"]
+    rules = context["rules"]
+    ownership = context["ownership"]
 
     # ── Apply view config (filters + sorts) if view_id provided ──
     if view_id:
@@ -328,30 +421,12 @@ def _list_rows_legacy(
         {"limit": page_size, "offset": offset},
     )
     all_columns = list(rows_result.keys())
-    rows = [_serialize_row(dict(zip(all_columns, row))) for row in rows_result.fetchall()]
-
-    # ── Column scope + hidden_fields ──
-    hidden_fields: list[str] = rules.get("hidden_fields") or []
-    col_scope = rules.get("column_scope", "all")
-    if not is_admin:
-        if col_scope == "private":
-            rows = [{} for _ in rows]
-            all_columns = []
-        elif col_scope == "department":
-            dept_ids = rules.get("column_department_ids") or []
-            if dept_ids and user.department_id not in dept_ids:
-                rows = [{} for _ in rows]
-                all_columns = []
-
-    # Remove hidden fields
-    if hidden_fields and all_columns:
-        all_columns = [c for c in all_columns if c not in hidden_fields]
-        rows = [{k: v for k, v in row.items() if k not in hidden_fields} for row in rows]
-
-    # Apply legacy field-level visibility (desensitize)
-    if ownership:
-        desensitize_config = rules.get("desensitize_fields", {})
-        rows = data_visibility.apply_visibility(rows, user, ownership, desensitize_config)
+    field_map = _get_table_field_map(db, bt)
+    rows = [
+        normalize_row_for_response(_serialize_row(dict(zip(all_columns, row))), field_map)
+        for row in rows_result.fetchall()
+    ]
+    all_columns, rows = _apply_legacy_field_visibility(rows, all_columns, rules, ownership, user, is_admin)
 
     return {
         "total": count_result,
@@ -398,47 +473,42 @@ def sample_rows(
     - sample_strategy: 描述采样逻辑的元数据
     """
     bt = _get_registered_table(db, table_name)
-
-    # 权限：复用 list_rows 的策略——非管理员表若有新权限模型走新策略，否则 legacy
-    from app.models.user import Role as _Role
-    is_admin = user.role in (_Role.SUPER_ADMIN, _Role.DEPT_ADMIN)
-    has_new_policy = (
-        db.query(TableRoleGroup).filter(TableRoleGroup.table_id == bt.id).first()
-        is not None
-    )
+    require_table_view_access(db, bt, user)
+    is_admin = _is_admin(user)
+    has_new_policy = _has_new_policy(db, bt)
+    if should_use_asset_safe_default(user, bt, has_new_policy=has_new_policy):
+        return _empty_sample_result()
 
     base_sql = f"SELECT * FROM {qi(table_name, '表名')}"
     sql_params: dict = {}
-    visible_cols_filter: list[str] | None = None
     masking_rules = None
     fields_for_mask: list[TableField] = []
+    legacy_rules: dict = {}
+    legacy_ownership: DataOwnership | None = None
 
     if has_new_policy and not is_admin:
         groups = resolve_user_role_groups(db, bt.id, user, skill_id=None)
         policy = resolve_effective_policy(db, bt.id, [g.id for g in groups], None)
         if policy.denied:
-            return {"total": 0, "columns": [], "rows": [], "sample_strategy": {"enum_fields": [], "covered": 0, "filled": 0}}
+            return _empty_sample_result()
         caps = check_disclosure_capability(policy.disclosure_level)
         if not caps["can_see_rows"]:
-            return {"total": 0, "columns": [], "rows": [], "sample_strategy": {"enum_fields": [], "covered": 0, "filled": 0}}
+            return _empty_sample_result()
         row_filter, row_params = build_row_filter_sql(policy, user, table_name)
         if row_filter:
             base_sql += f" WHERE ({row_filter})"
             sql_params.update(row_params)
         fields_for_mask = db.query(TableField).filter(TableField.table_id == bt.id).all()
-        if fields_for_mask and policy.field_access_mode != "all":
-            # 延后到取出列后再算 visible_cols
-            visible_cols_filter = "deferred"  # type: ignore
-            _policy_for_visible = policy
-        else:
-            _policy_for_visible = policy
+        _policy_for_visible = policy
         if policy.masking_rules and not caps["can_see_raw"]:
             masking_rules = policy.masking_rules
     else:
-        # legacy 路径：若 row_scope=private 且非 admin，直接拒绝
-        rules = bt.validation_rules or {}
-        if not is_admin and rules.get("row_scope", "private") == "private":
-            return {"total": 0, "columns": [], "rows": [], "sample_strategy": {"enum_fields": [], "covered": 0, "filled": 0}}
+        context = _build_legacy_access_context(db, bt, user, is_admin)
+        if context is None:
+            return _empty_sample_result()
+        base_sql = context["base_sql"]
+        legacy_rules = context["rules"]
+        legacy_ownership = context["ownership"]
         _policy_for_visible = None
 
     # ── 1. 总行数 ──
@@ -461,6 +531,7 @@ def sample_rows(
     sampled_row_ids: set = set()
     sampled_rows: list[dict] = []
     enum_strategy: list[dict] = []
+    field_map = _get_table_field_map(db, bt)
 
     def _add_row(row_dict: dict):
         rid = row_dict.get("id")
@@ -494,7 +565,7 @@ def sample_rows(
             row = row_q.fetchone()
             if row is None:
                 continue
-            row_dict = _serialize_row(dict(zip(all_columns, row)))
+            row_dict = normalize_row_for_response(_serialize_row(dict(zip(all_columns, row))), field_map)
             if _add_row(row_dict):
                 covered_vals.append(_serialize_value(val))
         enum_strategy.append({"field": col, "covered_values": covered_vals})
@@ -511,7 +582,7 @@ def sample_rows(
         for row in fill_q.fetchall():
             if len(sampled_rows) >= max_rows:
                 break
-            row_dict = _serialize_row(dict(zip(all_columns, row)))
+            row_dict = normalize_row_for_response(_serialize_row(dict(zip(all_columns, row))), field_map)
             _add_row(row_dict)
 
     # ── 6. 字段过滤 + 脱敏（新策略路径） ──
@@ -522,14 +593,15 @@ def sample_rows(
             all_columns = visible_cols
         if masking_rules:
             sampled_rows = apply_field_masking(sampled_rows, masking_rules, fields_for_mask)
-
-    # legacy hidden_fields 处理
-    if not has_new_policy:
-        rules = bt.validation_rules or {}
-        hidden_fields = rules.get("hidden_fields") or []
-        if hidden_fields and not is_admin:
-            all_columns = [c for c in all_columns if c not in hidden_fields]
-            sampled_rows = [{k: v for k, v in r.items() if k not in hidden_fields} for r in sampled_rows]
+    else:
+        all_columns, sampled_rows = _apply_legacy_field_visibility(
+            sampled_rows,
+            all_columns,
+            legacy_rules,
+            legacy_ownership,
+            user,
+            is_admin,
+        )
 
     return {
         "total": total,
@@ -551,7 +623,8 @@ def create_row(
     user: User = Depends(get_current_user),
 ):
     bt = _get_registered_table(db, table_name)
-    _check_write_permission(bt, user)
+    _check_write_permission(db, bt, user)
+    field_map = _get_table_field_map(db, bt)
 
     # Validate against validation_rules
     validation_rules = bt.validation_rules or {}
@@ -565,7 +638,7 @@ def create_row(
             if "enum" in rules and str(val) not in [str(e) for e in rules["enum"]]:
                 raise HTTPException(400, f"{field} 只能是 {rules['enum']}")
 
-    data = {k: v for k, v in req.data.items()}
+    data = normalize_row_payload({k: v for k, v in req.data.items()}, field_map)
     cols = ", ".join(f"`{k}`" for k in data.keys())
     placeholders = ", ".join(f":{k}" for k in data.keys())
     sql = text(f"INSERT INTO {qi(table_name, '表名')} ({cols}) VALUES ({placeholders})")
@@ -602,22 +675,19 @@ def update_row(
     user: User = Depends(get_current_user),
 ):
     bt = _get_registered_table(db, table_name)
-    _check_write_permission(bt, user)
+    _check_write_permission(db, bt, user)
+    field_map = _get_table_field_map(db, bt)
 
     # Get old values for audit
-    old_row = db.execute(
-        text(f"SELECT * FROM {qi(table_name, '表名')} WHERE id = :id"),
-        {"id": row_id},
-    ).fetchone()
-    if not old_row:
-        raise HTTPException(404, "Row not found")
-
-    old_cols = db.execute(
+    old_row_result = db.execute(
         text(f"SELECT * FROM {qi(table_name, '表名')} WHERE id = :id"),
         {"id": row_id},
     )
-    col_names = list(old_cols.keys())
-    old_values = dict(zip(col_names, old_row))
+    old_row = old_row_result.mappings().first()
+    if not old_row:
+        raise HTTPException(404, "Row not found")
+
+    old_values = dict(old_row)
     _check_row_owner(bt, old_values, user)
 
     # Validate
@@ -632,7 +702,7 @@ def update_row(
             if "enum" in rules and str(val) not in [str(e) for e in rules["enum"]]:
                 raise HTTPException(400, f"{field} 只能是 {rules['enum']}")
 
-    data = {k: v for k, v in req.data.items() if k != "id"}
+    data = normalize_row_payload({k: v for k, v in req.data.items() if k != "id"}, field_map)
     set_clause = ", ".join(f"`{k}` = :{k}" for k in data.keys())
     sql = text(f"UPDATE {qi(table_name, '表名')} SET {set_clause} WHERE id = :__id")
     data["__id"] = row_id
@@ -668,21 +738,17 @@ def delete_row(
     user: User = Depends(get_current_user),
 ):
     bt = _get_registered_table(db, table_name)
-    _check_write_permission(bt, user)
+    _check_write_permission(db, bt, user)
 
-    old_row = db.execute(
-        text(f"SELECT * FROM {qi(table_name, '表名')} WHERE id = :id"),
-        {"id": row_id},
-    ).fetchone()
-    if not old_row:
-        raise HTTPException(404, "Row not found")
-
-    old_cols = db.execute(
+    old_row_result = db.execute(
         text(f"SELECT * FROM {qi(table_name, '表名')} WHERE id = :id"),
         {"id": row_id},
     )
-    col_names = list(old_cols.keys())
-    old_values = dict(zip(col_names, old_row))
+    old_row = old_row_result.mappings().first()
+    if not old_row:
+        raise HTTPException(404, "Row not found")
+
+    old_values = dict(old_row)
     _check_row_owner(bt, old_values, user)
 
     try:
@@ -717,18 +783,8 @@ def export_rows(
 ):
     """导出表数据为 CSV / Excel / JSON 格式。复用 list_rows 的权限逻辑。"""
     bt = _get_registered_table(db, table_name)
-
-    from app.models.user import Role as _Role
-    is_admin = user.role in (_Role.SUPER_ADMIN, _Role.DEPT_ADMIN)
-    has_new_policy = (
-        db.query(TableRoleGroup).filter(TableRoleGroup.table_id == bt.id).first()
-        is not None
-    )
-
-    if has_new_policy and not is_admin:
-        result = _list_rows_new_policy(db, bt, user, 1, max_rows, 0, None)
-    else:
-        result = _list_rows_legacy(db, bt, user, 1, max_rows, 0, None, is_admin)
+    require_table_view_access(db, bt, user)
+    result = _read_rows_for_access(db, bt, user, 1, max_rows, 0, None)
 
     columns = result["columns"]
     rows = result["rows"]

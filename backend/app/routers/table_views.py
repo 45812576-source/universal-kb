@@ -5,8 +5,10 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models.business import BusinessTable, TableView
+from app.models.business import BusinessTable, TableField, TableView
 from app.models.user import User
+from app.services.data_asset_access import require_table_manage_access, require_table_view_access
+from app.services.data_asset_codec import hydrate_view_payload, serialize_view
 
 router = APIRouter(prefix="/api/business-tables", tags=["table-views"])
 
@@ -31,15 +33,9 @@ class PatchViewRequest(BaseModel):
 
 
 def _view_out(v: TableView) -> dict:
-    return {
-        "id": v.id,
-        "table_id": v.table_id,
-        "name": v.name,
-        "view_type": v.view_type,
-        "config": v.config or {},
-        "created_by": v.created_by,
-        "created_at": v.created_at.isoformat() if v.created_at else None,
-    }
+    data = serialize_view(v)
+    data["created_at"] = v.created_at.isoformat() if v.created_at else None
+    return data
 
 
 @router.get("/{table_id}/views")
@@ -51,6 +47,7 @@ def list_views(
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "Business table not found")
+    require_table_view_access(db, bt, user)
     views = db.query(TableView).filter(TableView.table_id == table_id).order_by(TableView.created_at).all()
     return [_view_out(v) for v in views]
 
@@ -65,13 +62,23 @@ def create_view(
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "Business table not found")
+    require_table_manage_access(db, bt, user)
     if not req.name.strip():
         raise HTTPException(400, "视图名称不能为空")
+    fields = db.query(TableField).filter(TableField.table_id == table_id).order_by(TableField.sort_order).all()
+    hydrated = hydrate_view_payload(req.model_dump(), fields)
     v = TableView(
         table_id=table_id,
-        name=req.name.strip(),
-        view_type=req.view_type,
-        config=req.config.model_dump(),
+        name=hydrated["name"],
+        view_type=hydrated["view_type"],
+        view_kind=hydrated["view_kind"],
+        visibility_scope=hydrated["visibility_scope"],
+        view_purpose=hydrated["view_purpose"],
+        config=hydrated["config"],
+        visible_field_ids=hydrated["visible_field_ids"],
+        filter_rule_json=hydrated["filter_rule_json"],
+        sort_rule_json=hydrated["sort_rule_json"],
+        group_rule_json=hydrated["group_rule_json"],
         created_by=user.id,
     )
     db.add(v)
@@ -91,10 +98,40 @@ def update_view(
     v = db.get(TableView, view_id)
     if not v or v.table_id != table_id:
         raise HTTPException(404, "View not found")
+    bt = db.get(BusinessTable, table_id)
+    if bt:
+        require_table_manage_access(db, bt, user)
+    fields = db.query(TableField).filter(TableField.table_id == table_id).order_by(TableField.sort_order).all()
+    current = {
+        "name": v.name,
+        "view_type": v.view_type,
+        "view_kind": v.view_kind,
+        "visibility_scope": v.visibility_scope,
+        "view_purpose": v.view_purpose,
+        "visible_field_ids": v.visible_field_ids or [],
+        "config": v.config or {},
+    }
     if req.name is not None:
-        v.name = req.name.strip()
+        current["name"] = req.name
     if req.config is not None:
-        v.config = req.config.model_dump()
+        current["config"] = req.config.model_dump()
+    hydrated = hydrate_view_payload(current, fields)
+    from sqlalchemy.orm.attributes import flag_modified
+    v.name = hydrated["name"]
+    v.view_type = hydrated["view_type"]
+    v.view_kind = hydrated["view_kind"]
+    v.visibility_scope = hydrated["visibility_scope"]
+    v.view_purpose = hydrated["view_purpose"]
+    v.visible_field_ids = hydrated["visible_field_ids"]
+    v.config = hydrated["config"]
+    v.filter_rule_json = hydrated["filter_rule_json"]
+    v.sort_rule_json = hydrated["sort_rule_json"]
+    v.group_rule_json = hydrated["group_rule_json"]
+    flag_modified(v, "visible_field_ids")
+    flag_modified(v, "config")
+    flag_modified(v, "filter_rule_json")
+    flag_modified(v, "sort_rule_json")
+    flag_modified(v, "group_rule_json")
     db.commit()
     return _view_out(v)
 
@@ -109,6 +146,9 @@ def delete_view(
     v = db.get(TableView, view_id)
     if not v or v.table_id != table_id:
         raise HTTPException(404, "View not found")
+    bt = db.get(BusinessTable, table_id)
+    if bt:
+        require_table_manage_access(db, bt, user)
     db.delete(v)
     db.commit()
     return {"ok": True}

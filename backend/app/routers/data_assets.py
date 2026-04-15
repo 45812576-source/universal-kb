@@ -23,6 +23,19 @@ from app.models.business import (
 from app.models.permission import PermissionAuditLog
 from app.models.skill import Skill
 from app.models.user import Department, Role, User
+from app.services.data_asset_access import (
+    can_manage_folder,
+    can_use_folder_as_target,
+    filter_visible_tables,
+    folder_scope,
+    require_table_manage_access,
+    require_table_view_access,
+)
+from app.services.data_asset_codec import (
+    hydrate_view_payload,
+    normalize_view_config,
+    serialize_view,
+)
 from app.utils.sql_safe import qi, check_identifier
 
 logger = logging.getLogger(__name__)
@@ -319,20 +332,29 @@ def list_folders(
 def create_folder(
     req: CreateFolderRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     if not req.name.strip():
         raise HTTPException(400, "目录名称不能为空")
+
+    requested_scope = (req.workspace_scope or "company").strip().lower()
+    if user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
+        requested_scope = "personal"
 
     if req.parent_id is not None:
         parent = db.get(DataFolder, req.parent_id)
         if not parent:
             raise HTTPException(404, "父目录不存在")
+        if not can_manage_folder(user, parent):
+            raise HTTPException(403, "无权在该目录下创建子目录")
+        requested_scope = folder_scope(parent)
 
     existing = db.query(DataFolder).filter(
         DataFolder.parent_id == req.parent_id,
         DataFolder.name == req.name.strip(),
-        DataFolder.workspace_scope == req.workspace_scope,
+        DataFolder.workspace_scope == requested_scope,
+        DataFolder.owner_id == (user.id if requested_scope == "personal" else None),
+        DataFolder.department_id == (user.department_id if requested_scope == "department" else None),
     ).first()
     if existing:
         raise HTTPException(400, "同名目录已存在")
@@ -340,8 +362,9 @@ def create_folder(
     folder = DataFolder(
         name=req.name.strip(),
         parent_id=req.parent_id,
-        workspace_scope=req.workspace_scope,
-        owner_id=user.id,
+        workspace_scope=requested_scope,
+        owner_id=user.id if requested_scope == "personal" else None,
+        department_id=user.department_id if requested_scope == "department" else None,
     )
     db.add(folder)
     db.commit()
@@ -354,11 +377,13 @@ def patch_folder(
     folder_id: int,
     req: PatchFolderRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     folder = db.get(DataFolder, folder_id)
     if not folder:
         raise HTTPException(404, "目录不存在")
+    if not can_manage_folder(user, folder):
+        raise HTTPException(403, "无权修改该目录")
 
     if req.name is not None:
         folder.name = req.name.strip()
@@ -389,11 +414,13 @@ def patch_folder(
 def delete_folder(
     folder_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     folder = db.get(DataFolder, folder_id)
     if not folder:
         raise HTTPException(404, "目录不存在")
+    if not can_manage_folder(user, folder):
+        raise HTTPException(403, "无权删除该目录")
 
     # 移出该目录下的表
     db.query(BusinessTable).filter(BusinessTable.folder_id == folder_id).update({"folder_id": None})
@@ -417,6 +444,7 @@ def list_tables(
     source_type: Optional[str] = Query(None),
     skill_id: Optional[int] = Query(None),
     sync_status: Optional[str] = Query(None),
+    bucket: Optional[str] = Query(None),
     q: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -438,23 +466,8 @@ def list_tables(
             (BusinessTable.description.like(like))
         )
 
-    # 权限过滤（复用现有逻辑）
-    is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
     tables = query.order_by(BusinessTable.created_at.desc()).all()
-
-    if not is_admin:
-        filtered = []
-        for t in tables:
-            rules = t.validation_rules or {}
-            row_scope = rules.get("row_scope", "private")
-            if row_scope == "private" and t.owner_id != user.id:
-                continue
-            if row_scope == "department":
-                dept_ids = rules.get("row_department_ids") or []
-                if dept_ids and user.department_id not in dept_ids:
-                    continue
-            filtered.append(t)
-        tables = filtered
+    tables = filter_visible_tables(db, user, tables, bucket=bucket)
 
     # skill_id 过滤
     if skill_id:
@@ -570,6 +583,7 @@ def get_table_detail(
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "数据表不存在")
+    require_table_view_access(db, bt, user)
 
     rules = bt.validation_rules or {}
 
@@ -655,26 +669,7 @@ def get_table_detail(
 
     # 视图列表
     views = db.query(TableView).filter(TableView.table_id == table_id).order_by(TableView.created_at).all()
-    views_data = [
-        {
-            "id": v.id,
-            "name": v.name,
-            "view_type": v.view_type,
-            "view_purpose": v.view_purpose,
-            "visibility_scope": v.visibility_scope or "table_inherit",
-            "is_default": v.is_default or False,
-            "is_system": v.is_system or False,
-            "config": v.config or {},
-            "created_by": v.created_by,
-            "visible_field_ids": v.visible_field_ids or [],
-            "view_kind": v.view_kind or "list",
-            "disclosure_ceiling": v.disclosure_ceiling,
-            "allowed_role_group_ids": v.allowed_role_group_ids or [],
-            "allowed_skill_ids": v.allowed_skill_ids or [],
-            "row_limit": v.row_limit,
-        }
-        for v in views
-    ]
+    views_data = [serialize_view(v) for v in views]
 
     # Skill 绑定（合并 SkillDataQuery + SkillTableBinding）
     bindings_data = []
@@ -834,17 +829,20 @@ def move_table(
     table_id: int,
     req: MoveTableRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "数据表不存在")
+    require_table_manage_access(db, bt, user)
 
     if req.folder_id is not None:
         if req.folder_id > 0:
             folder = db.get(DataFolder, req.folder_id)
             if not folder:
                 raise HTTPException(404, "目标目录不存在")
+            if not can_use_folder_as_target(user, folder):
+                raise HTTPException(403, "无权移动到该目录")
         bt.folder_id = req.folder_id if req.folder_id > 0 else None
 
     if req.sort_order is not None:
@@ -1340,34 +1338,36 @@ async def enhanced_lark_probe(
     }
 
 
-# ─── View impact check ──────────────────────────────────────────────────────
-
-
-@router.get("/views/{view_id}/impact")
-def check_view_impact(
-    view_id: int,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    """删除视图前检查影响：哪些 Skill 绑定会受影响。"""
+def _build_view_impact_payload(db: Session, view_id: int) -> dict:
     bindings = db.query(SkillTableBinding).filter(SkillTableBinding.view_id == view_id).all()
-    if not bindings:
-        return {"affected_skills": [], "can_delete": True}
+    grants = db.query(SkillDataGrant).filter(SkillDataGrant.view_id == view_id).all()
+    policy_count = db.query(TablePermissionPolicy).filter(TablePermissionPolicy.view_id == view_id).count()
 
-    affected = []
-    for b in bindings:
-        skill = db.get(Skill, b.skill_id)
-        affected.append({
-            "skill_id": b.skill_id,
-            "skill_name": skill.name if skill else f"skill_{b.skill_id}",
-            "binding_type": b.binding_type,
+    affected_skills = []
+    for binding in bindings:
+        skill = db.get(Skill, binding.skill_id)
+        affected_skills.append({
+            "skill_id": binding.skill_id,
+            "skill_name": skill.name if skill else f"skill_{binding.skill_id}",
+            "binding_type": binding.binding_type,
         })
 
-    return {
-        "affected_skills": affected,
-        "can_delete": False,
-        "message": f"该视图被 {len(affected)} 个 Skill 绑定引用，删除前请先转移绑定",
+    binding_count = len(bindings)
+    grant_count = len(grants)
+    can_delete = binding_count == 0 and grant_count == 0
+    payload = {
+        "view_id": view_id,
+        "affected_skills": affected_skills,
+        "binding_count": binding_count,
+        "grant_count": grant_count,
+        "policy_count": policy_count,
+        "can_delete": can_delete,
     }
+    if not can_delete:
+        payload["message"] = (
+            f"此视图被 {binding_count} 个 Skill 绑定和 {grant_count} 个数据授权引用，请先解除后再删除"
+        )
+    return payload
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2105,6 +2105,12 @@ def list_unfiled_tables(
         .order_by(BusinessTable.created_at.desc())
         .all()
     )
+    tables = filter_visible_tables(
+        db,
+        user,
+        tables,
+        bucket="mine" if user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN) else None,
+    )
     result = []
     for t in tables:
         fc = db.query(func.count(TableField.id)).filter(TableField.table_id == t.id).scalar() or 0
@@ -2131,14 +2137,17 @@ def classify_table(
     table_id: int,
     req: ClassifyRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "数据表不存在")
+    require_table_manage_access(db, bt, user)
     folder = db.get(DataFolder, req.folder_id)
     if not folder:
         raise HTTPException(404, "目标目录不存在")
+    if not can_use_folder_as_target(user, folder):
+        raise HTTPException(403, "无权移动到该目录")
     old_folder_id = bt.folder_id
     bt.folder_id = req.folder_id
     _write_audit_log(db, user, "classify", "business_tables", table_id,
@@ -2158,11 +2167,13 @@ class BatchClassifyRequest(BaseModel):
 def batch_classify_tables(
     req: BatchClassifyRequest,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role(Role.SUPER_ADMIN, Role.DEPT_ADMIN)),
+    user: User = Depends(get_current_user),
 ):
     folder = db.get(DataFolder, req.folder_id)
     if not folder:
         raise HTTPException(404, "目标目录不存在")
+    if not can_use_folder_as_target(user, folder):
+        raise HTTPException(403, "无权移动到该目录")
 
     # 冲突检测: 检查目标 folder 下已有的 display_name
     existing_names = {
@@ -2175,6 +2186,14 @@ def batch_classify_tables(
         bt = db.get(BusinessTable, tid)
         if not bt:
             results.append({"table_id": tid, "success": False, "error": "表不存在"})
+            continue
+        if not can_use_folder_as_target(user, folder):
+            results.append({"table_id": tid, "success": False, "error": "无权移动到该目录"})
+            continue
+        try:
+            require_table_manage_access(db, bt, user)
+        except HTTPException as exc:
+            results.append({"table_id": tid, "success": False, "error": exc.detail})
             continue
         if bt.display_name in existing_names:
             results.append({"table_id": tid, "success": False, "error": f"目标目录已有同名表: {bt.display_name}"})
@@ -2201,6 +2220,12 @@ def suggest_classifications(
         db.query(BusinessTable)
         .filter(BusinessTable.folder_id.is_(None), BusinessTable.is_archived == False)  # noqa: E712
         .all()
+    )
+    unfiled = filter_visible_tables(
+        db,
+        user,
+        unfiled,
+        bucket="mine" if user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN) else None,
     )
     folders = db.query(DataFolder).filter(DataFolder.is_archived == False).all()  # noqa: E712
 
@@ -2255,6 +2280,8 @@ class ViewCreateRequest(BaseModel):
     name: str
     view_type: str = "grid"
     view_kind: str = "list"
+    visibility_scope: str = "table_inherit"
+    view_purpose: str | None = None
     visible_field_ids: list[int] = []
     disclosure_ceiling: str | None = None
     allowed_role_group_ids: list[int] = []
@@ -2267,6 +2294,8 @@ class ViewPatchRequest(BaseModel):
     name: str | None = None
     view_type: str | None = None
     view_kind: str | None = None
+    visibility_scope: str | None = None
+    view_purpose: str | None = None
     visible_field_ids: list[int] | None = None
     disclosure_ceiling: str | None = None
     allowed_role_group_ids: list[int] | None = None
@@ -2276,26 +2305,10 @@ class ViewPatchRequest(BaseModel):
 
 
 def _serialize_view(v: TableView) -> dict:
-    return {
-        "id": v.id,
-        "table_id": v.table_id,
-        "name": v.name,
-        "view_type": v.view_type,
-        "view_purpose": v.view_purpose,
-        "visibility_scope": v.visibility_scope or "table_inherit",
-        "is_default": v.is_default or False,
-        "is_system": v.is_system or False,
-        "config": v.config or {},
-        "created_by": v.created_by,
-        "visible_field_ids": v.visible_field_ids or [],
-        "view_kind": v.view_kind or "list",
-        "disclosure_ceiling": v.disclosure_ceiling,
-        "allowed_role_group_ids": v.allowed_role_group_ids or [],
-        "allowed_skill_ids": v.allowed_skill_ids or [],
-        "row_limit": v.row_limit,
-        "created_at": _serialize_datetime(v.created_at),
-        "updated_at": _serialize_datetime(v.updated_at),
-    }
+    data = serialize_view(v)
+    data["created_at"] = _serialize_datetime(v.created_at)
+    data["updated_at"] = _serialize_datetime(v.updated_at)
+    return data
 
 
 @router.post("/tables/{table_id}/views")
@@ -2308,25 +2321,33 @@ def create_view(
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "数据表不存在")
-    _require_table_owner_or_admin(bt, user)
-    if not req.name.strip():
+    require_table_manage_access(db, bt, user)
+    payload = req.model_dump()
+    if not payload["name"].strip():
         raise HTTPException(400, "视图名称不能为空")
-    if req.view_kind not in VALID_VIEW_KINDS:
-        raise HTTPException(400, f"无效的视图类型: {req.view_kind}")
-    if req.disclosure_ceiling and req.disclosure_ceiling not in VALID_DISCLOSURE_LEVELS:
-        raise HTTPException(400, f"无效的披露上限: {req.disclosure_ceiling}")
+    if payload["view_kind"] not in VALID_VIEW_KINDS:
+        raise HTTPException(400, f"无效的视图类型: {payload['view_kind']}")
+    if payload["disclosure_ceiling"] and payload["disclosure_ceiling"] not in VALID_DISCLOSURE_LEVELS:
+        raise HTTPException(400, f"无效的披露上限: {payload['disclosure_ceiling']}")
+    fields = db.query(TableField).filter(TableField.table_id == table_id).order_by(TableField.sort_order).all()
+    hydrated = hydrate_view_payload(payload, fields)
 
     v = TableView(
         table_id=table_id,
-        name=req.name.strip(),
-        view_type=req.view_type,
-        view_kind=req.view_kind,
-        visible_field_ids=req.visible_field_ids,
-        disclosure_ceiling=req.disclosure_ceiling,
-        allowed_role_group_ids=req.allowed_role_group_ids,
-        allowed_skill_ids=req.allowed_skill_ids,
-        row_limit=req.row_limit,
-        config=req.config,
+        name=hydrated["name"],
+        view_type=hydrated["view_type"],
+        view_kind=hydrated["view_kind"],
+        visibility_scope=hydrated["visibility_scope"],
+        view_purpose=hydrated["view_purpose"],
+        visible_field_ids=hydrated["visible_field_ids"],
+        disclosure_ceiling=hydrated["disclosure_ceiling"],
+        allowed_role_group_ids=hydrated["allowed_role_group_ids"],
+        allowed_skill_ids=hydrated["allowed_skill_ids"],
+        row_limit=hydrated["row_limit"],
+        config=hydrated["config"],
+        filter_rule_json=hydrated["filter_rule_json"],
+        sort_rule_json=hydrated["sort_rule_json"],
+        group_rule_json=hydrated["group_rule_json"],
         created_by=user.id,
     )
     db.add(v)
@@ -2347,7 +2368,7 @@ def patch_view(
         raise HTTPException(404, "视图不存在")
     bt = db.get(BusinessTable, v.table_id)
     if bt:
-        _require_table_owner_or_admin(bt, user)
+        require_table_manage_access(db, bt, user)
     if v.is_system:
         raise HTTPException(400, "系统视图不可编辑")
 
@@ -2357,13 +2378,66 @@ def patch_view(
         raise HTTPException(400, f"无效的披露上限: {req.disclosure_ceiling}")
 
     from sqlalchemy.orm.attributes import flag_modified
-    for field in ("name", "view_type", "view_kind", "visible_field_ids", "disclosure_ceiling",
-                  "allowed_role_group_ids", "allowed_skill_ids", "row_limit", "config"):
+    current_payload = {
+        "name": v.name,
+        "view_type": v.view_type,
+        "view_kind": v.view_kind,
+        "visibility_scope": v.visibility_scope,
+        "view_purpose": v.view_purpose,
+        "visible_field_ids": v.visible_field_ids or [],
+        "disclosure_ceiling": v.disclosure_ceiling,
+        "allowed_role_group_ids": v.allowed_role_group_ids or [],
+        "allowed_skill_ids": v.allowed_skill_ids or [],
+        "row_limit": v.row_limit,
+        "config": normalize_view_config(v.config or {}),
+    }
+    for field in (
+        "name",
+        "view_type",
+        "view_kind",
+        "visibility_scope",
+        "view_purpose",
+        "visible_field_ids",
+        "disclosure_ceiling",
+        "allowed_role_group_ids",
+        "allowed_skill_ids",
+        "row_limit",
+        "config",
+    ):
         val = getattr(req, field)
         if val is not None:
-            setattr(v, field, val.strip() if isinstance(val, str) else val)
-            if field in ("visible_field_ids", "allowed_role_group_ids", "allowed_skill_ids", "config"):
-                flag_modified(v, field)
+            current_payload[field] = val
+    fields = db.query(TableField).filter(TableField.table_id == v.table_id).order_by(TableField.sort_order).all()
+    hydrated = hydrate_view_payload(current_payload, fields)
+    for field, value in hydrated.items():
+        if field not in {
+            "name",
+            "view_type",
+            "view_kind",
+            "visibility_scope",
+            "view_purpose",
+            "visible_field_ids",
+            "disclosure_ceiling",
+            "allowed_role_group_ids",
+            "allowed_skill_ids",
+            "row_limit",
+            "config",
+            "filter_rule_json",
+            "sort_rule_json",
+            "group_rule_json",
+        }:
+            continue
+        setattr(v, field, value)
+        if field in {
+            "visible_field_ids",
+            "allowed_role_group_ids",
+            "allowed_skill_ids",
+            "config",
+            "filter_rule_json",
+            "sort_rule_json",
+            "group_rule_json",
+        }:
+            flag_modified(v, field)
 
     db.commit()
     db.refresh(v)
@@ -2409,13 +2483,8 @@ def view_impact(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """返回删除此视图的影响：有多少 binding / grant / policy 引用。"""
+    """返回删除此视图的影响，兼容旧前端与新前端字段。"""
     v = db.get(TableView, view_id)
     if not v:
         raise HTTPException(404, "视图不存在")
-    return {
-        "view_id": view_id,
-        "binding_count": db.query(SkillTableBinding).filter(SkillTableBinding.view_id == view_id).count(),
-        "grant_count": db.query(SkillDataGrant).filter(SkillDataGrant.view_id == view_id).count(),
-        "policy_count": db.query(TablePermissionPolicy).filter(TablePermissionPolicy.view_id == view_id).count(),
-    }
+    return _build_view_impact_payload(db, view_id)

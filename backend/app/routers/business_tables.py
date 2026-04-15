@@ -13,6 +13,7 @@ from app.utils.sql_safe import qi
 from app.models.business import BusinessTable, DataOwnership, TableSyncJob, VisibilityLevel, SkillDataQuery
 from app.models.user import User, Role, Department
 from app.models.skill import Skill
+from app.services.data_asset_access import filter_visible_tables, require_table_view_access
 from app.services.llm_gateway import llm_gateway
 from app.services.lark_client import LarkConfigError, LarkAuthError
 
@@ -79,6 +80,17 @@ def _table_detail(bt: BusinessTable, columns: list[dict] = None) -> dict:
     }
 
 
+def _normalize_field_type(field_type: str) -> str:
+    mapping = {
+        "select": "single_select",
+        "single_select": "single_select",
+        "multi_select": "multi_select",
+        "checkbox": "boolean",
+        "boolean": "boolean",
+    }
+    return mapping.get(field_type, field_type)
+
+
 @router.get("")
 def list_business_tables(
     owner_id: Optional[int] = Query(None),
@@ -93,6 +105,7 @@ def list_business_tables(
             return []
         q = q.filter(BusinessTable.owner_id == owner_id)
     tables = q.order_by(BusinessTable.created_at.desc()).all()
+    tables = filter_visible_tables(db, user, tables)
     if not tables:
         return []
 
@@ -133,23 +146,8 @@ def list_business_tables(
     for tname, sname in sdq_rows:
         skill_map[tname].append(sname)
 
-    is_admin = user.role in (Role.SUPER_ADMIN, Role.DEPT_ADMIN)
-
     result = []
     for t in tables:
-        rules = t.validation_rules or {}
-        row_scope = rules.get("row_scope", "private")
-
-        if not is_admin:
-            if row_scope == "private":
-                # 仅自己能看到
-                if t.owner_id != user.id:
-                    continue
-            elif row_scope == "department":
-                dept_ids = rules.get("row_department_ids") or []
-                if dept_ids and user.department_id not in dept_ids:
-                    continue
-
         d = _table_detail(t)
         d["owner_name"] = owner_map.get(t.owner_id) if t.owner_id else None
         d["department_name"] = dept_map.get(t.department_id) if t.department_id else None
@@ -168,6 +166,7 @@ def get_business_table(
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "Business table not found")
+    require_table_view_access(db, bt, user)
 
     # Fetch columns from INFORMATION_SCHEMA
     try:
@@ -834,11 +833,13 @@ _FIELD_TYPE_MAP = {
     "text":         "TEXT",
     "number":       "DOUBLE",
     "select":       "VARCHAR(100)",
+    "single_select": "VARCHAR(100)",
     "multi_select": "TEXT",
     "date":         "DATETIME",
     "person":       "INT",
     "url":          "TEXT",
     "checkbox":     "TINYINT(1)",
+    "boolean":      "TINYINT(1)",
     "email":        "VARCHAR(255)",
     "phone":        "VARCHAR(50)",
 }
@@ -879,7 +880,8 @@ def create_blank_table(
 
     # Validate field types
     for f in req.fields:
-        if f.field_type not in _FIELD_TYPE_MAP:
+        normalized_type = _normalize_field_type(f.field_type)
+        if normalized_type not in _FIELD_TYPE_MAP:
             raise HTTPException(400, f"不支持的字段类型 '{f.field_type}'，可选：{list(_FIELD_TYPE_MAP.keys())}")
         if not re.match(r'^[a-zA-Z_\u4e00-\u9fff][a-zA-Z0-9_\u4e00-\u9fff]*$', f.name):
             raise HTTPException(400, f"字段名 '{f.name}' 格式不合法")
@@ -892,13 +894,14 @@ def create_blank_table(
     ]
     field_meta = []
     for f in req.fields:
-        mysql_type = _FIELD_TYPE_MAP[f.field_type]
+        normalized_type = _normalize_field_type(f.field_type)
+        mysql_type = _FIELD_TYPE_MAP[normalized_type]
         null_clause = "NULL" if f.nullable else "NOT NULL"
         comment_clause = f" COMMENT '{f.comment}'" if f.comment else ""
         col_defs.append(f"  `{f.name}` {mysql_type} {null_clause}{comment_clause}")
         field_meta.append({
             "name": f.name,
-            "field_type": f.field_type,
+            "field_type": normalized_type,
             "options": f.options,
             "nullable": f.nullable,
             "comment": f.comment,
@@ -1123,12 +1126,13 @@ def add_column(
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "Business table not found")
-    if req.field_type not in _FIELD_TYPE_MAP:
+    normalized_type = _normalize_field_type(req.field_type)
+    if normalized_type not in _FIELD_TYPE_MAP:
         raise HTTPException(400, f"不支持的字段类型 '{req.field_type}'")
     if not re.match(r'^[a-zA-Z_\u4e00-\u9fff][a-zA-Z0-9_\u4e00-\u9fff]*$', req.name):
         raise HTTPException(400, f"字段名 '{req.name}' 格式不合法")
 
-    mysql_type = _FIELD_TYPE_MAP[req.field_type]
+    mysql_type = _FIELD_TYPE_MAP[normalized_type]
     null_clause = "NULL" if req.nullable else "NOT NULL"
     comment_clause = f" COMMENT '{req.comment}'" if req.comment else ""
     alter_sql = f"ALTER TABLE {qi(bt.table_name, '表名')} ADD COLUMN {qi(req.name, '列名')} {mysql_type} {null_clause}{comment_clause}"
@@ -1143,7 +1147,7 @@ def add_column(
     # Update field_meta in validation_rules
     rules = dict(bt.validation_rules or {})
     meta = list(rules.get("field_meta") or [])
-    meta.append({"name": req.name, "field_type": req.field_type, "options": req.options,
+    meta.append({"name": req.name, "field_type": normalized_type, "options": req.options,
                   "nullable": req.nullable, "comment": req.comment})
     rules["field_meta"] = meta
     bt.validation_rules = rules
