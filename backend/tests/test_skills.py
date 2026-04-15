@@ -1,6 +1,7 @@
 """TC-SKILL: Skill CRUD, versioning, status, role enforcement."""
 import pytest
 from tests.conftest import _make_user, _make_dept, _make_skill, _make_model_config, _login, _auth
+from app.models.permission import ApprovalRequest
 from app.models.user import Role
 from app.models.skill import SkillStatus
 
@@ -171,6 +172,52 @@ def test_update_status(client, db):
 
     detail = client.get(f"/api/skills/{skill.id}", headers=_auth(token)).json()
     assert detail["status"] == "published"
+
+
+def test_dept_admin_publish_creates_super_pending_approval(client, db):
+    from app.models.sandbox import SandboxTestReport, SandboxTestSession
+    from app.models.skill import SkillVersion
+
+    dept = _make_dept(db)
+    admin = _make_user(db, "dept_admin_publish", Role.DEPT_ADMIN, dept.id)
+    skill = _make_skill(db, admin.id, "DeptAdminStatusSkill", status=SkillStatus.DRAFT)
+    ver = db.query(SkillVersion).filter(SkillVersion.skill_id == skill.id).first()
+    ver.system_prompt = "\n".join([f"指令行 {i+1}" for i in range(200)])
+    session = SandboxTestSession(target_type="skill", target_id=skill.id, tester_id=admin.id)
+    db.add(session)
+    db.flush()
+    report = SandboxTestReport(
+        session_id=session.id,
+        target_type="skill",
+        target_id=skill.id,
+        tester_id=admin.id,
+        approval_eligible=True,
+        report_hash="deptadminhash",
+    )
+    db.add(report)
+    db.commit()
+
+    token = _login(client, "dept_admin_publish")
+    resp = client.patch(f"/api/skills/{skill.id}/status?status=published", headers=_auth(token))
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "reviewing"
+    assert resp.json()["approval_stage"] == "super_pending"
+
+    db.refresh(skill)
+    assert skill.status == SkillStatus.REVIEWING
+    approval = (
+        db.query(ApprovalRequest)
+        .filter(
+            ApprovalRequest.target_id == skill.id,
+            ApprovalRequest.target_type == "skill",
+        )
+        .first()
+    )
+    assert approval is not None
+    assert approval.stage == "super_pending"
+
+    detail = client.get(f"/api/skills/{skill.id}", headers=_auth(token)).json()
+    assert detail["approval_stage"] == "super_pending"
 
 
 def test_update_status_invalid(client, db):

@@ -1,5 +1,6 @@
 import logging
 import re
+import threading
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, Request, UploadFile
 
@@ -69,6 +70,31 @@ def _skill_summary(s: Skill) -> dict:
         "source_files": s.source_files or [],
         "folder_key": s.folder_key,
     }
+
+
+def _get_skill_pending_stage_map(skill_ids: list[int], db: Session) -> dict[int, str | None]:
+    if not skill_ids:
+        return {}
+
+    from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus
+
+    rows = (
+        db.query(ApprovalRequest)
+        .filter(
+            ApprovalRequest.target_type == "skill",
+            ApprovalRequest.target_id.in_(skill_ids),
+            ApprovalRequest.request_type == ApprovalRequestType.SKILL_PUBLISH,
+            ApprovalRequest.status == ApprovalStatus.PENDING,
+        )
+        .order_by(ApprovalRequest.created_at.desc())
+        .all()
+    )
+
+    stage_map: dict[int, str | None] = {}
+    for row in rows:
+        if row.target_id not in stage_map:
+            stage_map[row.target_id] = getattr(row, "stage", None)
+    return stage_map
 
 
 class SaveFromMarketRequest(BaseModel):
@@ -210,6 +236,7 @@ def list_skills(
         q = q.filter(Skill.scope == "company", Skill.status == SkillStatus.PUBLISHED)
 
     skills = q.order_by(Skill.updated_at.desc()).all()
+    approval_stage_map = _get_skill_pending_stage_map([s.id for s in skills], db)
 
     # 批量查询调用次数，避免 N+1
     skill_ids = [s.id for s in skills]
@@ -229,6 +256,7 @@ def list_skills(
     for s in skills:
         summary = _skill_summary(s)
         summary["usage_count"] = usage_map.get(s.id, 0)
+        summary["approval_stage"] = approval_stage_map.get(s.id)
         result.append(summary)
     return result
 
@@ -1646,6 +1674,7 @@ def get_skill(
 
     # 可查看完整 prompt 的条件：超管 / 同部门管理员 / 自己创建的 / 外部引入
     can_view_prompt = is_super or is_own_dept or is_own or is_external
+    approval_stage = _get_skill_pending_stage_map([skill.id], db).get(skill.id)
 
     def _version_dict(v) -> dict:
         base = {
@@ -1665,6 +1694,7 @@ def get_skill(
 
     return {
         **_skill_summary(skill),
+        "approval_stage": approval_stage,
         "source_type": skill.source_type,
         "versions": [_version_dict(v) for v in skill.versions],
         "rejection_comment": _get_rejection_comment(skill.id, db),
@@ -2089,6 +2119,7 @@ def update_status(
 
     # EMPLOYEE / DEPT_ADMIN 申请发布 → 转为审核中，创建审批单等超管审批
     if status == SkillStatus.PUBLISHED.value and user.role in (Role.EMPLOYEE, Role.DEPT_ADMIN):
+        initial_stage = "super_pending" if user.role == Role.DEPT_ADMIN else "dept_pending"
         if scope is not None:
             skill.scope = scope
         if department_id is not None:
@@ -2118,13 +2149,22 @@ def update_status(
                 target_type="skill",
                 requester_id=user.id,
                 status=ApprovalStatus.PENDING,
+                stage=initial_stage,
                 evidence_pack=auto_ep if auto_ep else None,
             )
             db.add(approval)
             db.flush()
             approval_id = approval.id
+            approval_stage = approval.stage
         else:
+            if (
+                user.role == Role.DEPT_ADMIN
+                and existing_approval.requester_id == user.id
+                and existing_approval.stage == "dept_pending"
+            ):
+                existing_approval.stage = "super_pending"
             approval_id = existing_approval.id
+            approval_stage = existing_approval.stage
         # 保存知识引用快照
         _save_knowledge_reference_snapshot(skill_id, user.id, kr_result, db)
         db.commit()
@@ -2146,8 +2186,20 @@ def update_status(
             finally:
                 scan_db.close()
 
-        asyncio.create_task(_run_scan(approval_id, skill_id))
-        return {"id": skill_id, "status": SkillStatus.REVIEWING.value, "scope": skill.scope}
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_run_scan(approval_id, skill_id))
+        except RuntimeError:
+            threading.Thread(
+                target=lambda: asyncio.run(_run_scan(approval_id, skill_id)),
+                daemon=True,
+            ).start()
+        return {
+            "id": skill_id,
+            "status": SkillStatus.REVIEWING.value,
+            "scope": skill.scope,
+            "approval_stage": approval_stage,
+        }
 
     skill.status = status
     if scope is not None:
@@ -2168,7 +2220,7 @@ def update_status(
         _cascade_tool_status_on_archive(skill_id, db)
 
     db.commit()
-    return {"id": skill_id, "status": status, "scope": skill.scope}
+    return {"id": skill_id, "status": status, "scope": skill.scope, "approval_stage": None}
 
 
 # ── 知识引用安全检查 ─────────────────────────────────────────────────────────

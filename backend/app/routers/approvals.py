@@ -669,6 +669,62 @@ def create_approval(
     return _req(r, db)
 
 
+@router.post("/{request_id}/withdraw")
+def withdraw_approval(
+    request_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """申请人撤回尚未完结的审批。"""
+    r = db.get(ApprovalRequest, request_id)
+    if not r:
+        raise HTTPException(404, "审批申请不存在")
+    if r.requester_id != user.id:
+        raise HTTPException(403, "只能撤回自己发起的审批")
+    if r.status != ApprovalStatus.PENDING:
+        raise HTTPException(400, f"审批已完结（状态：{r.status}），不可撤回")
+
+    r.status = ApprovalStatus.WITHDRAWN
+    db.add(ApprovalAction(
+        request_id=request_id,
+        actor_id=user.id,
+        action=ApprovalActionType.WITHDRAW,
+        comment="申请人主动撤回",
+    ))
+
+    if r.target_type == "skill" and r.target_id:
+        from app.models.skill import Skill, SkillStatus
+        skill = db.get(Skill, r.target_id)
+        if skill and skill.status == SkillStatus.REVIEWING:
+            skill.status = SkillStatus.DRAFT
+    elif r.target_type == "tool" and r.target_id:
+        from app.models.tool import ToolRegistry
+        tool = db.get(ToolRegistry, r.target_id)
+        if tool and tool.status == "reviewing":
+            tool.status = "draft"
+            tool.is_active = False
+    elif r.target_type == "webapp" and r.target_id:
+        from app.models.web_app import WebApp
+        webapp = db.get(WebApp, r.target_id)
+        if webapp and webapp.status == "reviewing":
+            webapp.status = "draft"
+
+    db.commit()
+    db.refresh(r)
+
+    try:
+        from app.services import event_bus
+        event_bus.emit(
+            db, event_type="approval_resolved", source_type="approval", source_id=r.id,
+            payload={"request_type": str(r.request_type), "status": str(r.status), "action": "withdraw"},
+            user_id=user.id,
+        )
+    except Exception:
+        pass
+
+    return _req(r, db)
+
+
 @router.post("/{request_id}/actions")
 async def act_on_approval(
     request_id: int,

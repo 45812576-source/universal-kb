@@ -502,6 +502,23 @@ class TestPublishPermissionMatrix:
         )
         assert resp.status_code == 400
 
+    def test_publish_rejects_reviewing_skill(self, client, db):
+        """标准工作台只能挂载已发布 Skill，审核中的 Skill 应明确拒绝。"""
+        dept = _make_dept(db)
+        user = _make_user(db, "reviewing_pub", Role.DEPT_ADMIN, dept.id)
+        skill = _make_skill(db, user.id, "待终审Skill", SkillStatus.REVIEWING)
+        db.commit()
+        token = _login(client, "reviewing_pub")
+        client.get("/api/workspace-config", headers=_auth(token))
+
+        resp = client.post(
+            "/api/workspace-config/publish",
+            headers=_auth(token),
+            json={"scope": "department", "name": "不应发布"},
+        )
+        assert resp.status_code == 400
+        assert "只有已发布 Skill" in resp.json()["detail"]
+
     def test_publish_upsert_same_workspace(self, client, db):
         """同一管理员重复发布同 scope 应更新而非新建。"""
         dept = _make_dept(db)

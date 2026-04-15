@@ -131,6 +131,31 @@ def _enrich_tool(t: ToolRegistry) -> dict:
     }
 
 
+def _get_skill_pending_stage_map(skill_ids: list[int], db: Session) -> dict[int, str | None]:
+    if not skill_ids:
+        return {}
+
+    from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus
+
+    rows = (
+        db.query(ApprovalRequest)
+        .filter(
+            ApprovalRequest.target_type == "skill",
+            ApprovalRequest.target_id.in_(skill_ids),
+            ApprovalRequest.request_type == ApprovalRequestType.SKILL_PUBLISH,
+            ApprovalRequest.status == ApprovalStatus.PENDING,
+        )
+        .order_by(ApprovalRequest.created_at.desc())
+        .all()
+    )
+
+    stage_map: dict[int, str | None] = {}
+    for row in rows:
+        if row.target_id not in stage_map:
+            stage_map[row.target_id] = getattr(row, "stage", None)
+    return stage_map
+
+
 def _config_response(cfg: UserWorkspaceConfig, db: Session) -> dict:
     """返回带详情的配置。"""
     skill_ids = [item["skill_id"] for item in (cfg.mounted_skills or [])]
@@ -140,6 +165,10 @@ def _config_response(cfg: UserWorkspaceConfig, db: Session) -> dict:
     if skill_ids:
         for s in db.query(Skill).filter(Skill.id.in_(skill_ids)).all():
             skills_map[s.id] = _enrich_skill(s)
+        approval_stage_map = _get_skill_pending_stage_map(skill_ids, db)
+        for skill_id, stage in approval_stage_map.items():
+            if skill_id in skills_map:
+                skills_map[skill_id]["approval_stage"] = stage
 
     tools_map = {}
     if tool_ids:
@@ -233,6 +262,38 @@ def publish_as_workspace(
 
     if not mounted_skill_ids and not mounted_tool_ids:
         raise HTTPException(400, "没有挂载任何 Skill 或 Tool，无法发布")
+
+    if mounted_skill_ids:
+        mounted_skills = db.query(Skill).filter(Skill.id.in_(mounted_skill_ids)).all()
+        skill_map = {skill.id: skill for skill in mounted_skills}
+        missing_skill_ids = [sid for sid in mounted_skill_ids if sid not in skill_map]
+        if missing_skill_ids:
+            raise HTTPException(400, f"挂载的 Skill #{missing_skill_ids[0]} 不存在，无法发布标准工作台")
+
+        unpublished_skills = [
+            skill for skill in mounted_skills
+            if skill.status != SkillStatus.PUBLISHED
+        ]
+        if unpublished_skills:
+            stage_map = _get_skill_pending_stage_map([skill.id for skill in unpublished_skills], db)
+            skill = unpublished_skills[0]
+            stage = stage_map.get(skill.id)
+            if stage == "super_pending":
+                reason = "当前待超管终审"
+            elif stage == "dept_pending":
+                reason = "当前待部门审批"
+            elif skill.status == SkillStatus.REVIEWING:
+                reason = "当前审核中"
+            elif skill.status == SkillStatus.DRAFT:
+                reason = "当前仍是草稿"
+            elif skill.status == SkillStatus.REJECTED:
+                reason = "当前已被打回"
+            else:
+                reason = f"当前状态为 {skill.status.value}"
+            raise HTTPException(
+                400,
+                f"Skill「{skill.name}」{reason}，暂不可发布为标准工作台；只有已发布 Skill 才能挂载到标准工作台。",
+            )
 
     # 确定可见范围
     dept_id = user.department_id if req.scope == "department" else None

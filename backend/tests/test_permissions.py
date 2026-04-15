@@ -37,6 +37,8 @@ from tests.conftest import _make_dept, _make_user, _make_skill, _login, _auth
 from app.models.user import Role
 from app.models.permission import (
     ApprovalRequest,
+    ApprovalRequestType,
+    ApprovalStatus,
     DataDomain, DataScopePolicy, GlobalDataMask, HandoffSchemaCache,
     HandoffTemplate, HandoffTemplateType, MaskAction, PolicyResourceType,
     PolicyTargetType, Position, RoleMaskOverride, RoleOutputMask,
@@ -704,6 +706,50 @@ class TestApprovalFlow:
         client.post(f"/api/approvals/{rid}/actions", json={"action": "approve"}, headers=admin_headers)
         resp = client.post(f"/api/approvals/{rid}/actions", json={"action": "reject"}, headers=admin_headers)
         assert resp.status_code == 400
+
+    def test_requester_can_withdraw_pending_skill_publish(self, client, db):
+        from app.models.skill import SkillStatus
+
+        dept = _make_dept(db)
+        emp = _make_user(db, "withdraw_emp", Role.EMPLOYEE, dept.id)
+        skill = _make_skill(db, emp.id, "WithdrawSkill", status=SkillStatus.REVIEWING)
+        approval = ApprovalRequest(
+            request_type=ApprovalRequestType.SKILL_PUBLISH,
+            target_id=skill.id,
+            target_type="skill",
+            requester_id=emp.id,
+            status=ApprovalStatus.PENDING,
+            stage="super_pending",
+        )
+        db.add(approval)
+        db.commit()
+
+        token = _login(client, "withdraw_emp")
+        resp = client.post(f"/api/approvals/{approval.id}/withdraw", headers=_auth(token))
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "withdrawn"
+
+        db.refresh(skill)
+        db.refresh(approval)
+        assert skill.status == SkillStatus.DRAFT
+        assert approval.status == ApprovalStatus.WITHDRAWN
+
+    def test_non_requester_cannot_withdraw_approval(self, client, db):
+        dept = _make_dept(db)
+        requester = _make_user(db, "withdraw_owner", Role.EMPLOYEE, dept.id)
+        other = _make_user(db, "withdraw_other", Role.EMPLOYEE, dept.id)
+        approval = ApprovalRequest(
+            request_type=ApprovalRequestType.SKILL_PUBLISH,
+            requester_id=requester.id,
+            status=ApprovalStatus.PENDING,
+            stage="dept_pending",
+        )
+        db.add(approval)
+        db.commit()
+
+        token = _login(client, "withdraw_other")
+        resp = client.post(f"/api/approvals/{approval.id}/withdraw", headers=_auth(token))
+        assert resp.status_code == 403
 
 
 # ─── TC-PERM-13  Output Schema ────────────────────────────────────────────────

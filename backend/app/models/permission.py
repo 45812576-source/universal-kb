@@ -370,6 +370,7 @@ class ApprovalStatus(str, enum.Enum):
     APPROVED = "approved"
     REJECTED = "rejected"
     CONDITIONS = "conditions"
+    WITHDRAWN = "withdrawn"
 
 
 class ApprovalRequest(Base):
@@ -416,6 +417,7 @@ class ApprovalActionType(str, enum.Enum):
     REQUEST_MORE_INFO = "request_more_info"
     APPROVE_WITH_CONDITIONS = "approve_with_conditions"
     SUPPLEMENT = "supplement"
+    WITHDRAW = "withdraw"
 
 
 class ApprovalAction(Base):
