@@ -1307,7 +1307,9 @@ def sync_remediation_tasks(
         memo.updated_by = memo.created_by
 
     _save_memo_payload(db, memo, payload)
-    db.commit()
+    # 注意：不在此处 commit，由调用方（sandbox_governance）统一 commit，
+    # 保证 memo tasks + staged_edits 在同一事务中。
+    db.flush()
 
 
 # ── 反馈采纳 ──────────────────────────────────────────────────────────────────
