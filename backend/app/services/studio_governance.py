@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.models.skill import Skill, SkillAuditResult, SkillVersion, StagedEdit
 from app.services.llm_gateway import llm_gateway
+from app.services.studio_workflow_adapter import normalize_workflow_card, normalize_workflow_staged_edit
 
 logger = logging.getLogger(__name__)
 
@@ -175,9 +176,20 @@ async def generate_governance_actions(
 
     db.commit()
 
+    normalized_cards = [
+        normalize_workflow_card(card, source_type="studio_governance", phase="review")
+        for card in parsed.get("cards", [])
+        if isinstance(card, dict)
+    ]
+    normalized_staged_edits = [
+        normalize_workflow_staged_edit(edit, source_type="studio_governance")
+        for edit in staged_edit_results
+        if isinstance(edit, dict)
+    ]
+
     return GovernanceResult(
-        cards=parsed.get("cards", []),
-        staged_edits=staged_edit_results,
+        cards=normalized_cards,
+        staged_edits=normalized_staged_edits,
     )
 
 
@@ -322,6 +334,26 @@ def adopt_staged_edit(db: Session, edit_id: int, user_id: int) -> dict:
     edit.resolved_at = datetime.datetime.utcnow()
     edit.resolved_by = user_id
     db.commit()
+
+    try:
+        from app.services.skill_memo_service import record_post_test_diff
+
+        record_post_test_diff(
+            db,
+            skill.id,
+            change_type="staged_edit_adopted",
+            source="studio_governance",
+            summary=edit.summary or "已采纳自动整改 diff",
+            user_id=user_id,
+            filename=edit.target_key if edit.target_type == "source_file" else "SKILL.md" if edit.target_type == "system_prompt" else None,
+            file_type="asset" if edit.target_type == "source_file" else "prompt" if edit.target_type == "system_prompt" else "metadata",
+            version_id=(new_version.version if new_version_created else latest_version.version),  # type: ignore[possibly-undefined]
+            diff_ops=edit.diff_ops or [],
+            staged_edit_id=edit.id,
+            auto_generated=True,
+        )
+    except Exception as memo_err:
+        logger.warning("record_post_test_diff failed for staged_edit %s: %s", edit.id, memo_err)
 
     result = {"ok": True, "skill_id": skill.id, "target_type": edit.target_type}
     if new_version_created:

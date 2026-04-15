@@ -61,6 +61,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/sandbox/interactive", tags=["sandbox-interactive"])
 
 
+def _ensure_skill_test_can_start(db: Session, skill_id: int) -> None:
+    from app.services.skill_memo_service import assess_test_start
+
+    result = assess_test_start(db, skill_id)
+    if not result.get("allowed", False):
+        raise HTTPException(409, result.get("message", "未检测到新的整改 diff，禁止重复启动测试"))
+
+
 def _check_session_access(session: SandboxTestSession, user: User) -> None:
     """校验当前用户是否有权访问该测试会话。tester 本人或管理员可访问。"""
     if user.role == Role.SUPER_ADMIN:
@@ -754,6 +762,7 @@ async def start_session(
         skill = db.get(Skill, req.target_id)
         if not skill:
             raise HTTPException(404, "Skill 不存在")
+        _ensure_skill_test_can_start(db, skill.id)
         # 获取版本
         version_q = db.query(SkillVersion).filter(SkillVersion.skill_id == skill.id)
         if req.target_version:
@@ -1671,6 +1680,8 @@ def _sync_memo_from_evaluation(session: SandboxTestSession, evaluation: dict, re
         if not session.anti_hallucination_passed:
             blocking_reasons.append("anti_hallucination")
 
+    knowledge_entry = db.get(KnowledgeEntry, report.knowledge_entry_id) if report and report.knowledge_entry_id else None
+
     record_test_result(
         db=db,
         skill_id=session.target_id,
@@ -1686,6 +1697,8 @@ def _sync_memo_from_evaluation(session: SandboxTestSession, evaluation: dict, re
         source_report_id=report.id if report else None,
         approval_eligible=session.approval_eligible,
         blocking_reasons=blocking_reasons if blocking_reasons else None,
+        source_report_knowledge_id=report.knowledge_entry_id if report else None,
+        source_report_knowledge_title=knowledge_entry.title if knowledge_entry else None,
     )
 
 
@@ -2061,6 +2074,9 @@ async def targeted_rerun(
 
     if not sub_combos:
         raise HTTPException(400, "无法构建子测试矩阵")
+
+    if parent_session.target_type == "skill" and parent_session.target_id:
+        _ensure_skill_test_can_start(db, parent_session.target_id)
 
     # 创建子 session — 使用当前最新版本（用户可能已整改）
     current_ver = (

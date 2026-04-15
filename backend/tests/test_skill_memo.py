@@ -574,9 +574,58 @@ class TestDirectTestAndResults:
         user = _make_user(db, "no_memo_tester", dept_id=dept.id)
         skill = _make_skill(db, user.id, name="NoMemoTestSkill", status=SkillStatus.DRAFT)
         result = skill_memo_service.record_test_result(
-            db, skill.id, "manual", 1, "passed", "通过"
+            db, skill.id, "manual", 1, "passed", "通过", user_id=user.id
         )
-        assert not result["ok"]
+        assert result["ok"]
+        memo = skill_memo_service.get_memo(db, skill.id)
+        assert memo is not None
+        assert memo["latest_test"]["status"] == "passed"
+
+    def test_test_result_records_report_knowledge_and_fingerprint(self, db):
+        user, skill = self._setup(db)
+        result = skill_memo_service.record_test_result(
+            db,
+            skill.id,
+            "sandbox_interactive",
+            1,
+            "failed",
+            "需要整改",
+            user_id=user.id,
+            source_report_id=88,
+            source_report_knowledge_id=123,
+            source_report_knowledge_title="2026-04-15-测试员-技能-v1-沙盒测试报告",
+        )
+        assert result["ok"]
+        latest = skill_memo_service.get_memo(db, skill.id)["latest_test"]
+        assert latest["source_report_id"] == 88
+        assert latest["source_report_knowledge_id"] == 123
+        assert latest["source_report_knowledge_title"] == "2026-04-15-测试员-技能-v1-沙盒测试报告"
+        assert latest["artifact_fingerprint"]
+        assert latest["details"]["report_knowledge"]["knowledge_entry_id"] == 123
+
+    def test_assess_test_start_blocks_unchanged_and_allows_after_diff(self, db):
+        user, skill = self._setup(db)
+        skill_memo_service.record_test_result(
+            db, skill.id, "preflight", 1, "failed", "知识库未就绪", user_id=user.id
+        )
+        blocked = skill_memo_service.assess_test_start(db, skill.id)
+        assert not blocked["allowed"]
+        assert blocked["reason"] == "unchanged_since_last_test"
+
+        diff_result = skill_memo_service.record_post_test_diff(
+            db,
+            skill.id,
+            change_type="staged_edit_adopted",
+            source="studio_governance",
+            summary="已采纳自动整改 diff",
+            user_id=user.id,
+            diff_ops=[{"op": "insert", "old": "", "new": "\n补充知识库说明"}],
+            auto_generated=True,
+        )
+        assert diff_result["ok"]
+
+        allowed = skill_memo_service.assess_test_start(db, skill.id)
+        assert allowed["allowed"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1387,3 +1436,29 @@ class TestStudioAgentIntegration:
         assert len(events) == 3
         # clean text should not contain the blocks
         assert "studio_memo_status" not in clean
+
+
+class TestSandboxPreflightGuard:
+
+    def test_preflight_blocks_when_no_change_after_last_test(self, client, db):
+        dept = _make_dept(db, "preflight_guard_dept")
+        user = _make_user(db, "preflight_guard_user", dept_id=dept.id)
+        skill = _make_skill(db, user.id, name="PreflightGuardSkill", status=SkillStatus.DRAFT)
+        db.commit()
+
+        skill_memo_service.record_test_result(
+            db,
+            skill.id,
+            "preflight",
+            1,
+            "failed",
+            "上次质量检测未通过",
+            user_id=user.id,
+        )
+
+        token = _login(client, user.username)
+        resp = client.get(f"/api/sandbox/preflight/{skill.id}", headers=_auth(token))
+
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert "未检测到新的修改 diff" in detail

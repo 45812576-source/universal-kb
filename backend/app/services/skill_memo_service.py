@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import copy
 import datetime
+import hashlib
+import json
 import logging
 import re
 import uuid
@@ -108,8 +110,101 @@ def _empty_payload() -> dict:
         "current_task_id": None,
         "progress_log": [],
         "test_history": [],
+        "post_test_diffs": [],
         "adopted_feedback": [],
         "context_rollups": [],
+    }
+
+
+def _build_skill_artifact_snapshot(db: Session, skill_id: int) -> dict | None:
+    """生成当前 Skill 可测试内容的稳定指纹。"""
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        return None
+
+    latest_version = (
+        db.query(SkillVersion)
+        .filter(SkillVersion.skill_id == skill_id)
+        .order_by(SkillVersion.version.desc())
+        .first()
+    )
+
+    source_files = []
+    for item in list(skill.source_files or []):
+        if isinstance(item, dict):
+            source_files.append({
+                "filename": item.get("filename"),
+                "size": item.get("size"),
+                "category": item.get("category"),
+                "path": item.get("path"),
+            })
+
+    snapshot = {
+        "skill_id": skill_id,
+        "version": latest_version.version if latest_version else None,
+        "system_prompt_hash": hashlib.sha256(
+            ((latest_version.system_prompt if latest_version else "") or "").encode("utf-8")
+        ).hexdigest()[:16],
+        "description_hash": hashlib.sha256((skill.description or "").encode("utf-8")).hexdigest()[:16],
+        "knowledge_tags": sorted(str(tag) for tag in (skill.knowledge_tags or [])),
+        "source_files": sorted(source_files, key=lambda item: str(item.get("filename") or "")),
+        "bound_tool_ids": sorted(
+            int(tool.id) for tool in list(getattr(skill, "bound_tools", []) or []) if getattr(tool, "id", None) is not None
+        ),
+    }
+    encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, default=str)
+    snapshot["fingerprint"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+    return snapshot
+
+
+def assess_test_start(db: Session, skill_id: int) -> dict:
+    """判断当前 Skill 是否允许开始下一次测试。"""
+    memo = db.query(SkillMemo).filter(SkillMemo.skill_id == skill_id).first()
+    if not memo:
+        return {"allowed": True}
+
+    payload = memo.memo_payload or _empty_payload()
+    test_history = payload.get("test_history", [])
+    latest_test = test_history[-1] if test_history else None
+    if not latest_test:
+        return {"allowed": True}
+
+    last_fingerprint = latest_test.get("artifact_fingerprint")
+    if not last_fingerprint:
+        return {"allowed": True}
+
+    current_snapshot = _build_skill_artifact_snapshot(db, skill_id)
+    if not current_snapshot:
+        return {"allowed": True}
+
+    post_test_diffs = payload.get("post_test_diffs", [])
+    related_diffs = [
+        item for item in post_test_diffs
+        if item.get("after_test_id") == latest_test.get("id")
+    ]
+
+    if current_snapshot.get("fingerprint") != last_fingerprint or related_diffs:
+        return {
+            "allowed": True,
+            "latest_test": latest_test,
+            "current_snapshot": current_snapshot,
+            "post_test_diffs": related_diffs,
+        }
+
+    source_label = str(latest_test.get("source") or "上次测试")
+    version_label = latest_test.get("version")
+    summary = str(latest_test.get("summary") or "").strip()
+    message = f"{source_label} v{version_label or '?'} 后未检测到新的修改 diff"
+    if summary:
+        message += f"；上次结论：{summary}"
+    message += "。如果问题没有变化，则不启动下一次测试。"
+    return {
+        "allowed": False,
+        "reason": "unchanged_since_last_test",
+        "message": message,
+        "latest_test": latest_test,
+        "current_snapshot": current_snapshot,
+        "post_test_diffs": related_diffs,
     }
 
 
@@ -679,6 +774,23 @@ def complete_from_save(
     }
     payload.setdefault("progress_log", []).append(log_entry)
 
+    latest_test = (payload.get("test_history") or [])[-1] if payload.get("test_history") else None
+    if latest_test:
+        payload.setdefault("post_test_diffs", []).append({
+            "id": _new_id("diff"),
+            "after_test_id": latest_test.get("id"),
+            "change_type": "file_save",
+            "source": "editor_save",
+            "filename": filename,
+            "file_type": file_type,
+            "content_hash": content_hash,
+            "version_id": version_id,
+            "content_size": content_size,
+            "summary": f"{filename} 已保存",
+            "auto_generated": False,
+            "created_at": _now_iso(),
+        })
+
     # 写入 context_rollups
     rollup_entry = {
         "id": _new_id("rollup"),
@@ -826,13 +938,18 @@ def record_test_result(
     source_report_id: int | None = None,
     approval_eligible: bool | None = None,
     blocking_reasons: list[str] | None = None,
+    source_report_knowledge_id: int | None = None,
+    source_report_knowledge_title: str | None = None,
 ) -> dict:
     """测试流程结束后统一回写 memo。"""
     memo = db.query(SkillMemo).filter(SkillMemo.skill_id == skill_id).first()
     if not memo:
-        return {"ok": False, "error": "Memo not found"}
+        init_memo(db, skill_id, "published_iteration", None, user_id or 0)
+        memo = db.query(SkillMemo).filter(SkillMemo.skill_id == skill_id).first()
+        if not memo:
+            return {"ok": False, "error": "Memo not found"}
 
-    payload = copy.deepcopy(memo.memo_payload or {})
+    payload = copy.deepcopy(memo.memo_payload or _empty_payload())
 
     # 写入 test_history
     record_details = details or {}
@@ -840,6 +957,13 @@ def record_test_result(
         record_details["approval_eligible"] = approval_eligible
     if blocking_reasons:
         record_details["blocking_reasons"] = blocking_reasons
+    if source_report_knowledge_id is not None or source_report_knowledge_title:
+        record_details["report_knowledge"] = {
+            "knowledge_entry_id": source_report_knowledge_id,
+            "title": source_report_knowledge_title,
+        }
+
+    artifact_snapshot = _build_skill_artifact_snapshot(db, skill_id)
 
     test_record = {
         "id": _new_id("test"),
@@ -851,6 +975,10 @@ def record_test_result(
         "created_at": _now_iso(),
         "followup_task_ids": [],
         "source_report_id": source_report_id,
+        "source_report_knowledge_id": source_report_knowledge_id,
+        "source_report_knowledge_title": source_report_knowledge_title,
+        "artifact_fingerprint": artifact_snapshot.get("fingerprint") if artifact_snapshot else None,
+        "artifact_snapshot": artifact_snapshot,
     }
 
     generated_task_ids = []
@@ -981,6 +1109,54 @@ def record_test_result(
         "generated_task_ids": generated_task_ids,
         "memo": get_memo(db, skill_id),
     }
+
+
+def record_post_test_diff(
+    db: Session,
+    skill_id: int,
+    *,
+    change_type: str,
+    source: str,
+    summary: str,
+    user_id: int | None = None,
+    filename: str | None = None,
+    file_type: str | None = None,
+    version_id: int | None = None,
+    diff_ops: list[dict] | None = None,
+    staged_edit_id: int | None = None,
+    auto_generated: bool = False,
+) -> dict:
+    """将测试后的整改 diff 写入 memo，供下一轮测试前校验。"""
+    memo = db.query(SkillMemo).filter(SkillMemo.skill_id == skill_id).first()
+    if not memo:
+        return {"ok": False, "error": "Memo not found"}
+
+    payload = copy.deepcopy(memo.memo_payload or _empty_payload())
+    latest_test = (payload.get("test_history") or [])[-1] if payload.get("test_history") else None
+    if not latest_test:
+        return {"ok": True, "skipped": True, "reason": "no_test_history"}
+
+    entry = {
+        "id": _new_id("diff"),
+        "after_test_id": latest_test.get("id"),
+        "change_type": change_type,
+        "source": source,
+        "summary": summary,
+        "filename": filename,
+        "file_type": file_type,
+        "version_id": version_id,
+        "diff_ops": diff_ops or [],
+        "staged_edit_id": staged_edit_id,
+        "auto_generated": auto_generated,
+        "created_at": _now_iso(),
+    }
+    payload.setdefault("post_test_diffs", []).append(entry)
+    _save_memo_payload(db, memo, payload)
+    if user_id:
+        memo.updated_by = user_id
+    db.commit()
+
+    return {"ok": True, "entry": entry}
 
 
 def _remediation_task_target_files(task: dict[str, Any]) -> list[str]:

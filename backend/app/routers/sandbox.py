@@ -594,8 +594,8 @@ def _persist_preflight_report(
     quality_detail: dict,
     tests: list[dict],
     user_id: int,
-) -> int | None:
-    """将 preflight 结果持久化为知识库条目，返回 knowledge_entry_id。"""
+) -> dict | None:
+    """将 preflight 结果持久化为知识库条目，返回知识库引用。"""
     try:
         from app.services.sandbox_report import render_preflight_report_text
         from app.models.knowledge import KnowledgeEntry, KnowledgeStatus
@@ -627,11 +627,90 @@ def _persist_preflight_report(
         db.add(ke)
         db.commit()
         logger.info(f"Preflight report persisted: knowledge_entry #{ke.id} for skill #{skill.id}")
-        return ke.id
+        return {"knowledge_entry_id": ke.id, "knowledge_entry_title": ke.title}
     except Exception as e:
         logger.warning(f"Failed to persist preflight report: {e}")
         db.rollback()
         return None
+
+
+def _sync_preflight_memo(
+    db: Session,
+    *,
+    skill: Skill,
+    skill_version: int | None,
+    gates: list[dict],
+    quality_detail: dict,
+    tests: list[dict],
+    user_id: int,
+    passed: bool,
+    blocked_by: str | None = None,
+    report_ref: dict | None = None,
+) -> None:
+    from app.services.skill_memo_service import record_test_result
+
+    failed_items: list[str] = []
+    followups: list[dict] = []
+    for gate in gates:
+        if gate.get("status") == "failed":
+            for item in gate.get("items", []) or []:
+                label = str(item.get("check") or item.get("label") or gate.get("gate") or "未知项")
+                detail = str(item.get("issue") or item.get("detail") or "").strip()
+                failed_items.append(f"{gate.get('gate')}: {label}")
+                followups.append({
+                    "title": f"修复门检[{gate.get('gate')}] {label}"[:200],
+                    "type": "fix_after_test",
+                    "target_files": ["SKILL.md"],
+                })
+                if detail:
+                    failed_items.append(detail)
+
+    top_deductions = quality_detail.get("top_deductions", []) or []
+    for item in top_deductions:
+        reason = str(item.get("reason") or "").strip()
+        if not reason:
+            continue
+        failed_items.append(reason)
+        followups.append({
+            "title": f"修复质量问题: {reason}"[:200],
+            "type": "fix_after_test",
+            "target_files": ["SKILL.md"],
+        })
+
+    summary = f"综合分 {quality_detail.get('avg_score', 0)}"
+    if blocked_by:
+        summary = f"门检未通过：{blocked_by}"
+    if failed_items:
+        summary += f"，主问题：{'；'.join(failed_items[:3])}"
+
+    record_test_result(
+        db=db,
+        skill_id=skill.id,
+        source="preflight",
+        version=skill_version or 0,
+        status="passed" if passed else "failed",
+        summary=summary,
+        details={
+            "gates": gates,
+            "quality_detail": quality_detail,
+            "tests": tests,
+            "blocked_by": blocked_by,
+        },
+        suggested_followups=followups[:8] if not passed and followups else None,
+        user_id=user_id,
+        approval_eligible=passed,
+        blocking_reasons=[blocked_by] if blocked_by else None,
+        source_report_knowledge_id=(report_ref or {}).get("knowledge_entry_id"),
+        source_report_knowledge_title=(report_ref or {}).get("knowledge_entry_title"),
+    )
+
+
+def _ensure_preflight_can_start(db: Session, skill_id: int) -> None:
+    from app.services.skill_memo_service import assess_test_start
+
+    result = assess_test_start(db, skill_id)
+    if not result.get("allowed", False):
+        raise HTTPException(409, result.get("message", "未检测到新的整改 diff，禁止重复启动测试"))
 
 
 @router.get("/preflight/{skill_id}")
@@ -649,6 +728,7 @@ async def preflight(
     from app.models.user import Role
     if skill.created_by != user.id and user.role not in (Role.SUPER_ADMIN, Role.DEPT_ADMIN):
         raise HTTPException(403, "无权检测该 Skill")
+    _ensure_preflight_can_start(db, skill_id)
 
     latest_ver: SkillVersion | None = (
         db.query(SkillVersion)
@@ -658,6 +738,47 @@ async def preflight(
     )
     system_prompt = (latest_ver.system_prompt if latest_ver else "") or ""
     source_files = skill.source_files or []
+
+    def _finalize_preflight(
+        db: Session,
+        *,
+        gates: list[dict],
+        quality_detail: dict,
+        tests: list[dict],
+        passed: bool,
+        blocked_by: str | None = None,
+    ) -> dict:
+        report_ref = _persist_preflight_report(
+            db,
+            skill=skill,
+            skill_version=latest_ver.version if latest_ver else None,
+            gates=gates,
+            quality_detail=quality_detail,
+            tests=tests,
+            user_id=user.id,
+        )
+        _sync_preflight_memo(
+            db,
+            skill=skill,
+            skill_version=latest_ver.version if latest_ver else None,
+            gates=gates,
+            quality_detail=quality_detail,
+            tests=tests,
+            user_id=user.id,
+            passed=passed,
+            blocked_by=blocked_by,
+            report_ref=report_ref,
+        )
+        return {
+            "passed": passed,
+            "blocked_by": blocked_by,
+            "score": quality_detail.get("avg_score", 0),
+            "quality_detail": quality_detail,
+            "gates": gates,
+            "tests": tests,
+            "knowledge_entry_id": (report_ref or {}).get("knowledge_entry_id"),
+            "knowledge_entry_title": (report_ref or {}).get("knowledge_entry_title"),
+        }
 
     async def generate():
         # SSE generator 运行时 Depends(get_db) 的 session 已关闭，需要独立 session
@@ -750,7 +871,14 @@ async def preflight(
         yield _sse("gate", gate0)
         if not fe_pass:
             all_passed = False
-            yield _sse("done", {"passed": False, "blocked_by": "frontend_check", "gates": gates})
+            yield _sse("done", _finalize_preflight(
+                db,
+                gates=gates,
+                quality_detail={},
+                tests=[],
+                passed=False,
+                blocked_by="frontend_check",
+            ))
             return
 
         # ── Gate 1: 结构完整性 ──────────────────────────────────────
@@ -798,7 +926,14 @@ async def preflight(
             yield _sse("gate", gate1)
             if not g1_pass:
                 all_passed = False
-                yield _sse("done", {"passed": False, "blocked_by": "structure", "gates": gates})
+                yield _sse("done", _finalize_preflight(
+                    db,
+                    gates=gates,
+                    quality_detail={},
+                    tests=[],
+                    passed=False,
+                    blocked_by="structure",
+                ))
                 return
 
         # ── Gate 2: 知识库就绪 ──────────────────────────────────────
@@ -861,7 +996,14 @@ async def preflight(
                 yield _sse("gate", gate2)
                 if not g2_pass:
                     all_passed = False
-                    yield _sse("done", {"passed": False, "blocked_by": "knowledge", "gates": gates})
+                    yield _sse("done", _finalize_preflight(
+                        db,
+                        gates=gates,
+                        quality_detail={},
+                        tests=[],
+                        passed=False,
+                        blocked_by="knowledge",
+                    ))
                     return
 
         # ── Gate 3: 工具就绪 ──────────────────────────────────────
@@ -929,7 +1071,14 @@ async def preflight(
                 yield _sse("gate", gate3)
                 if not g3_pass:
                     all_passed = False
-                    yield _sse("done", {"passed": False, "blocked_by": "tools", "gates": gates})
+                    yield _sse("done", _finalize_preflight(
+                        db,
+                        gates=gates,
+                        quality_detail={},
+                        tests=[],
+                        passed=False,
+                        blocked_by="tools",
+                    ))
                     return
 
         # ── 阶段二：LLM 质量评分 ──────────────────────────────────
@@ -1113,25 +1262,14 @@ async def preflight(
             score=avg_score,
         )
 
-        # 持久化 preflight 报告到知识库
-        knowledge_entry_id = _persist_preflight_report(
+        yield _sse("done", _finalize_preflight(
             db,
-            skill=skill,
-            skill_version=latest_ver.version if latest_ver else None,
             gates=gates,
             quality_detail=quality_detail,
             tests=tests,
-            user_id=user.id,
-        )
-
-        yield _sse("done", {
-            "passed": quality_passed,
-            "score": avg_score,
-            "quality_detail": quality_detail,
-            "gates": gates,
-            "tests": tests,
-            "knowledge_entry_id": knowledge_entry_id,
-        })
+            passed=quality_passed,
+            blocked_by=None if quality_passed else "quality",
+        ))
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
