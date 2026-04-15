@@ -37,7 +37,17 @@ router = APIRouter(prefix="/api/admin", tags=["permission-changes"])
 
 # ─── 高风险 feature flags（与前端 constants.ts 保持一致）───────────────────────
 
-HIGH_RISK_FEATURE_FLAGS = {"dev_studio", "webapp_publish", "feishu_sync"}
+HIGH_RISK_FEATURE_FLAGS = {
+    "dev_studio",
+    "webapp_publish",
+    "feishu_sync",
+    "skill_studio_dual_lane_enabled",
+    "skill_studio_fast_lane_enabled",
+    "skill_studio_deep_lane_enabled",
+    "skill_studio_sla_degrade_enabled",
+    "skill_studio_patch_protocol_enabled",
+    "skill_studio_frontend_run_protocol_enabled",
+}
 
 _DEFAULT_FEATURE_FLAGS = {
     "dev_studio": True,
@@ -45,6 +55,12 @@ _DEFAULT_FEATURE_FLAGS = {
     "webapp_publish": True,
     "batch_upload_skill": False,
     "feishu_sync": False,
+    "skill_studio_dual_lane_enabled": True,
+    "skill_studio_fast_lane_enabled": True,
+    "skill_studio_deep_lane_enabled": True,
+    "skill_studio_sla_degrade_enabled": True,
+    "skill_studio_patch_protocol_enabled": True,
+    "skill_studio_frontend_run_protocol_enabled": True,
 }
 
 

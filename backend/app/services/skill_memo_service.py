@@ -78,6 +78,10 @@ class OptimisticLockError(Exception):
 
 def _save_memo_payload(db: Session, memo: SkillMemo, payload: dict) -> None:
     """M18: Atomically update memo_payload with optimistic version check."""
+    payload = _invalidate_context_digest_cache(
+        previous_payload=memo.memo_payload if isinstance(memo.memo_payload, dict) else {},
+        next_payload=payload,
+    )
     old_version = memo.version
     rows = (
         db.query(SkillMemo)
@@ -119,6 +123,11 @@ def _empty_payload() -> dict:
             "staged_edits": [],
             "updated_at": None,
         },
+        "context_digest_cache": {
+            "schema_version": 1,
+            "updated_at": None,
+            "entries": {},
+        },
     }
 
 
@@ -129,6 +138,54 @@ def _empty_workflow_recovery() -> dict:
         "staged_edits": [],
         "updated_at": None,
     }
+
+
+def _empty_context_digest_cache() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "updated_at": None,
+        "entries": {},
+    }
+
+
+def _normalize_context_digest_cache(payload: dict[str, Any]) -> dict[str, Any]:
+    raw = payload.get("context_digest_cache")
+    if not isinstance(raw, dict):
+        return _empty_context_digest_cache()
+    entries = raw.get("entries")
+    return {
+        "schema_version": int(raw.get("schema_version") or 1),
+        "updated_at": raw.get("updated_at"),
+        "entries": dict(entries) if isinstance(entries, dict) else {},
+    }
+
+
+def _invalidate_context_digest_cache(
+    *,
+    previous_payload: dict[str, Any] | None,
+    next_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    normalized_next = copy.deepcopy(next_payload or _empty_payload())
+    cache = _normalize_context_digest_cache(normalized_next)
+    prev = previous_payload if isinstance(previous_payload, dict) else {}
+
+    invalidated = False
+    if prev.get("tasks") != normalized_next.get("tasks"):
+        invalidated = cache["entries"].pop("memo_digest", None) is not None or invalidated
+    if prev.get("persistent_notices") != normalized_next.get("persistent_notices"):
+        invalidated = cache["entries"].pop("memo_digest", None) is not None or invalidated
+    if prev.get("test_history") != normalized_next.get("test_history"):
+        invalidated = cache["entries"].pop("memo_digest", None) is not None or invalidated
+    if prev.get("current_task_id") != normalized_next.get("current_task_id"):
+        invalidated = cache["entries"].pop("memo_digest", None) is not None or invalidated
+    if prev.get("workflow_recovery") != normalized_next.get("workflow_recovery"):
+        invalidated = cache["entries"].pop("memo_digest", None) is not None or invalidated
+        invalidated = cache["entries"].pop("recovery_digest", None) is not None or invalidated
+
+    if invalidated:
+        cache["updated_at"] = _now_iso()
+    normalized_next["context_digest_cache"] = cache
+    return normalized_next
 
 
 def _get_workflow_recovery(payload: dict[str, Any]) -> dict[str, Any]:
@@ -304,6 +361,8 @@ def _workflow_lifecycle_stage(workflow_state: dict[str, Any]) -> str:
 
     if workflow_mode in {"preflight_remediation", "sandbox_remediation"} or phase == "remediate":
         return "fixing"
+    if phase == "validate" or next_action in {"run_preflight", "run_sandbox", "run_targeted_rerun"}:
+        return "awaiting_test"
     if workflow_mode == "architect_mode" or session_mode == "create_new_skill":
         return "planning"
     if next_action in {"run_audit", "review_cards"} or session_mode == "audit_imported_skill":
@@ -364,7 +423,7 @@ def _sync_tasks_from_workflow_action(
     user_id: int | None = None,
 ) -> bool:
     recovery = _get_workflow_recovery(payload)
-    changed = _link_workflow_recovery_tasks(payload, recovery)
+    changed = False
     tasks = payload.get("tasks", []) if isinstance(payload.get("tasks"), list) else []
     matched_task_ids: list[str] = []
 
@@ -543,6 +602,8 @@ def _sync_workflow_recovery_after_test_result(
             workflow_state["route_reason"] = "tests_passed"
             workflow_state["status"] = "ready" if approval_eligible is not False else str(workflow_state.get("status") or "active")
     else:
+        recovery["cards"] = []
+        recovery["staged_edits"] = []
         workflow_state["phase"] = "validate"
         if source == "preflight":
             workflow_state["next_action"] = "review_cards"
@@ -719,6 +780,7 @@ def get_memo(db: Session, skill_id: int) -> dict | None:
     test_history = payload.get("test_history", [])
     latest_test = test_history[-1] if test_history else None
     workflow_recovery = _get_workflow_recovery(payload)
+    context_digest_cache = _normalize_context_digest_cache(payload)
 
     return {
         "skill_id": skill_id,
@@ -731,8 +793,35 @@ def get_memo(db: Session, skill_id: int) -> dict | None:
         "next_task": next_task,
         "latest_test": latest_test,
         "workflow_recovery": workflow_recovery,
+        "context_digest_cache": context_digest_cache,
         "memo": payload,
     }
+
+
+def update_context_digest_cache(
+    db: Session,
+    skill_id: int,
+    cache_payload: dict[str, Any],
+    *,
+    user_id: int | None = None,
+    commit: bool = False,
+) -> dict | None:
+    memo = db.query(SkillMemo).filter(SkillMemo.skill_id == skill_id).first()
+    if not memo:
+        return None
+
+    payload = copy.deepcopy(memo.memo_payload or _empty_payload())
+    normalized_cache = _normalize_context_digest_cache({"context_digest_cache": cache_payload})
+    payload["context_digest_cache"] = normalized_cache
+    if user_id is not None:
+        memo.updated_by = user_id
+    _save_memo_payload(db, memo, payload)
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    db.refresh(memo)
+    return get_memo(db, skill_id)
 
 
 # ── 初始化 ────────────────────────────────────────────────────────────────────

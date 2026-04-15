@@ -1,4 +1,6 @@
 """Studio 后端能力模块测试 — rename / route / audit / governance / staged edit。"""
+import asyncio
+import datetime as dt
 import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -11,6 +13,7 @@ from app.models.user import Role
 from app.models.skill import (
     Skill, SkillVersion, SkillFolderAlias, SkillAuditResult, StagedEdit, SkillStatus,
 )
+from app.models.event_bus import UnifiedEvent
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -215,6 +218,38 @@ class TestWorkflowOrchestrator:
         ).first()
         assert arch_state is not None
         assert arch_state.workflow_phase == "phase_1_why"
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_workflow_applies_user_rollout_flags(self, db, seeded):
+        """用户级 flag 可以关闭 deep/patch，并写入 workflow metadata。"""
+        from app.models.conversation import Conversation
+        from app.services.studio_workflow_orchestrator import bootstrap_workflow
+
+        admin = seeded["admin"]
+        admin.feature_flags = {
+            "skill_studio_deep_lane_enabled": False,
+            "skill_studio_patch_protocol_enabled": False,
+        }
+        conv = Conversation(user_id=admin.id)
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+
+        result = await bootstrap_workflow(
+            db,
+            workflow_id="run_rollout_flags",
+            conversation_id=conv.id,
+            skill_id=None,
+            user_message="我想做一个新的营销分析技能",
+            user_id=admin.id,
+        )
+
+        rollout = result.workflow_state["metadata"]["rollout"]
+        assert rollout["flags"]["deep_lane_enabled"] is False
+        assert rollout["flags"]["patch_protocol_enabled"] is False
+        assert result.workflow_state["execution_strategy"] == "fast_only"
+        assert result.workflow_state["deep_status"] == "not_requested"
+        assert result.route_status["execution_strategy"] == "fast_only"
 
     @pytest.mark.asyncio
     async def test_bootstrap_workflow_audit_promotes_to_review_cards(self, db, seeded):
@@ -863,6 +898,287 @@ class TestStudioRunsWorkflowBootstrap:
         assert called["conversation_id"] == conv.id
         assert called["skill_id"] == seeded["skill"].id
         assert run.status == "completed"
+        patch_events = [data for _, event, data in run.events if event == "patch_applied"]
+        assert patch_events
+        assert patch_events[0]["run_id"] == run.id
+        assert patch_events[0]["run_version"] == 1
+        assert patch_events[0]["patch_type"] == "workflow_patch"
+
+    @pytest.mark.asyncio
+    async def test_studio_runs_respects_patch_protocol_rollout_flag(self, db, seeded):
+        from app.models.conversation import Conversation, Message, MessageRole
+        from app.services.studio_runs import StudioRun, StudioRunRegistry
+
+        conv = Conversation(user_id=seeded["admin"].id, skill_id=seeded["skill"].id)
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+        db.add_all([
+            Message(conversation_id=conv.id, role=MessageRole.USER, content="第一轮"),
+            Message(conversation_id=conv.id, role=MessageRole.ASSISTANT, content="第一轮回复"),
+            Message(conversation_id=conv.id, role=MessageRole.USER, content="第二轮"),
+        ])
+        db.commit()
+
+        registry = StudioRunRegistry()
+        run = StudioRun(
+            id="run_patch_disabled",
+            conversation_id=conv.id,
+            user_id=seeded["admin"].id,
+            skill_id=seeded["skill"].id,
+            content="继续推进",
+        )
+
+        async def _empty_stream(*args, **kwargs):
+            if False:
+                yield None
+
+        bootstrap_result = SimpleNamespace(
+            workflow_state={
+                "workflow_id": run.id,
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "none",
+                "phase": "review",
+                "next_action": "continue_chat",
+                "metadata": {
+                    "rollout": {
+                        "flags": {
+                            "patch_protocol_enabled": False,
+                            "frontend_run_protocol_enabled": True,
+                        },
+                    },
+                },
+            },
+            route_status={"next_action": "continue_chat", "workflow_mode": "none"},
+            assist_skills_status={"skills": ["prompt_optimizer"], "session_mode": "optimize_existing_skill"},
+            architect_phase_status=None,
+            audit_summary=None,
+            cards=[],
+            staged_edits=[],
+        )
+
+        with patch("app.services.studio_workflow_orchestrator.bootstrap_workflow", new=AsyncMock(return_value=bootstrap_result)), patch(
+            "app.services.studio_runs.SessionLocal",
+            TestingSessionLocal,
+        ), patch(
+            "app.harness.adapters.build_skill_studio_request",
+            return_value={"conversation_id": conv.id, "skill_id": seeded["skill"].id},
+        ), patch(
+            "app.harness.profiles.skill_studio.skill_studio_profile.run_stream",
+            new=_empty_stream,
+        ), patch(
+            "app.config.settings.STUDIO_STRUCTURED_MODE",
+            "on",
+        ):
+            await registry._execute(run, {})
+
+        patch_events = [data for _, event, data in run.events if event == "patch_applied"]
+        workflow_events = [data for _, event, data in run.events if event == "workflow_event"]
+        assert patch_events == []
+        assert workflow_events
+
+    @pytest.mark.asyncio
+    async def test_studio_runs_emits_deep_summary_and_evidence_patches(self, db, seeded):
+        from app.harness.events import EventName, emit
+        from app.models.conversation import Conversation, Message, MessageRole
+        from app.services.studio_runs import StudioRun, StudioRunRegistry
+
+        conv = Conversation(user_id=seeded["admin"].id, skill_id=seeded["skill"].id)
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+        db.add_all([
+            Message(conversation_id=conv.id, role=MessageRole.USER, content="第一轮"),
+            Message(conversation_id=conv.id, role=MessageRole.ASSISTANT, content="第一轮回复"),
+            Message(conversation_id=conv.id, role=MessageRole.USER, content="第二轮"),
+        ])
+        db.commit()
+
+        registry = StudioRunRegistry()
+        run = StudioRun(
+            id="run_deep_patch",
+            conversation_id=conv.id,
+            user_id=seeded["admin"].id,
+            skill_id=seeded["skill"].id,
+            content="继续推进",
+        )
+
+        async def _stream(*args, **kwargs):
+            yield emit(EventName.STATUS, {"stage": "first_useful_response"})
+            yield emit(EventName.DELTA, {"text": "Deep Lane 完整补完"})
+            yield emit(EventName.STATUS, {"stage": "deep_started"})
+            yield emit(EventName.STATUS, {"stage": "deep_completed"})
+
+        bootstrap_result = SimpleNamespace(
+            workflow_state={
+                "workflow_id": run.id,
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "none",
+                "phase": "review",
+                "next_action": "continue_chat",
+                "execution_strategy": "fast_then_deep",
+                "deep_status": "pending",
+                "metadata": {
+                    "rollout": {
+                        "flags": {
+                            "patch_protocol_enabled": True,
+                            "frontend_run_protocol_enabled": True,
+                        },
+                    },
+                },
+            },
+            route_status={"next_action": "continue_chat", "workflow_mode": "none"},
+            assist_skills_status={"skills": ["prompt_optimizer"], "session_mode": "optimize_existing_skill"},
+            architect_phase_status=None,
+            audit_summary={"verdict": "needs_work", "quality_score": 58},
+            cards=[{"id": "card_1", "title": "治理卡片", "type": "staged_edit", "actions": []}],
+            staged_edits=[{"id": "edit_1", "target_type": "system_prompt", "summary": "补齐约束", "risk_level": "low", "diff_ops": []}],
+        )
+
+        with patch("app.services.studio_workflow_orchestrator.bootstrap_workflow", new=AsyncMock(return_value=bootstrap_result)), patch(
+            "app.services.studio_runs.SessionLocal",
+            TestingSessionLocal,
+        ), patch(
+            "app.harness.adapters.build_skill_studio_request",
+            return_value={"conversation_id": conv.id, "skill_id": seeded["skill"].id},
+        ), patch(
+            "app.harness.profiles.skill_studio.skill_studio_profile.run_stream",
+            new=_stream,
+        ), patch(
+            "app.config.settings.STUDIO_STRUCTURED_MODE",
+            "on",
+        ):
+            await registry._execute(run, {})
+
+        patch_events = [data for _, event, data in run.events if event == "patch_applied"]
+        patch_types = [event["patch_type"] for event in patch_events]
+        assert "deep_summary_patch" in patch_types
+        assert "evidence_patch" in patch_types
+        deep_summary = next(event for event in patch_events if event["patch_type"] == "deep_summary_patch")
+        evidence = next(event for event in patch_events if event["patch_type"] == "evidence_patch")
+        assert "Deep Lane 完整补完" in deep_summary["payload"]["summary"]
+        assert "已生成 1 张治理卡片" in evidence["payload"]["evidence"]
+        assert "已生成 1 个 staged edit" in evidence["payload"]["evidence"]
+
+    @pytest.mark.asyncio
+    async def test_create_supersedes_previous_active_run(self, db, seeded):
+        from app.services.studio_runs import StudioRun, StudioRunRegistry
+
+        registry = StudioRunRegistry()
+        old_run = StudioRun(
+            id="run_old",
+            conversation_id=99,
+            user_id=seeded["admin"].id,
+            skill_id=seeded["skill"].id,
+            content="旧请求",
+            run_version=1,
+            status="running",
+        )
+        registry._runs[old_run.id] = old_run
+        registry._active_by_conversation[99] = old_run.id
+        registry._version_by_conversation[99] = 1
+
+        async def _noop_execute(run, req_payload):
+            run.status = "completed"
+
+        registry._execute = _noop_execute  # type: ignore[method-assign]
+
+        new_run = await registry.create(
+            conversation_id=99,
+            user_id=seeded["admin"].id,
+            skill_id=seeded["skill"].id,
+            content="新请求",
+            req_payload={},
+        )
+
+        assert old_run.status == "superseded"
+        assert old_run.superseded_by == new_run.id
+        assert any(event == "run_superseded" for _, event, _ in old_run.events)
+        assert new_run.run_version == 2
+        assert registry._active_by_conversation[99] == new_run.id
+
+
+class TestStudioContextDigest:
+    def test_build_context_digest_bundle_returns_lightweight_digests(self):
+        from app.services.studio_context_digest import build_context_digest_bundle
+
+        bundle = build_context_digest_bundle(
+            history_messages=[
+                {"role": "user", "content": "请帮我优化这个 Skill"},
+                {"role": "assistant", "content": "先看下当前结构"},
+            ],
+            memo_context={
+                "lifecycle_stage": "fixing",
+                "current_task": {"title": "补充角色定义"},
+                "latest_test": {"summary": "缺少角色说明"},
+                "tasks": [{"id": "t1", "title": "修复角色定义", "status": "todo"}],
+                "persistent_notices": [{"id": "n1", "status": "active"}],
+                "workflow_recovery": {
+                    "workflow_state": {"phase": "review", "next_action": "review_cards"},
+                    "cards": [{"id": "c1", "status": "pending"}],
+                    "staged_edits": [{"id": "e1", "status": "pending"}],
+                    "updated_at": "2026-04-15T00:00:00+00:00",
+                },
+            },
+            source_files=[{"filename": "guide.md", "category": "reference", "size": 128}],
+            editor_prompt="你是技能优化助手",
+        )
+
+        assert bundle["conversation_digest"]["message_count"] == 2
+        assert bundle["memo_digest"]["current_task"] == "补充角色定义"
+        assert bundle["recovery_digest"]["pending_cards_count"] == 1
+        assert bundle["source_file_index_digest"]["file_count"] == 1
+        assert bundle["editor_prompt_digest"]["length"] > 0
+        assert bundle["signature"]
+
+    def test_build_context_digest_bundle_reuses_persisted_cache_entries(self):
+        from app.services.studio_context_digest import build_context_digest_bundle
+
+        first_bundle = build_context_digest_bundle(
+            history_messages=[{"role": "user", "content": "请优化"}],
+            memo_context={
+                "lifecycle_stage": "editing",
+                "current_task": {"title": "补充限制"},
+                "tasks": [{"id": "t1", "title": "补充限制", "status": "todo"}],
+                "persistent_notices": [],
+                "workflow_recovery": {
+                    "workflow_state": {"phase": "review", "next_action": "review_cards"},
+                    "cards": [],
+                    "staged_edits": [],
+                    "updated_at": "2026-04-15T00:00:00+00:00",
+                },
+                "context_digest_cache": {"schema_version": 1, "updated_at": None, "entries": {}},
+            },
+            source_files=[{"filename": "guide.md", "category": "reference", "size": 128}],
+            editor_prompt="你是技能优化助手",
+            persisted_cache={"schema_version": 1, "updated_at": None, "entries": {}},
+            include_cache_payload=True,
+        )
+        second_bundle = build_context_digest_bundle(
+            history_messages=[{"role": "user", "content": "请优化"}],
+            memo_context={
+                "lifecycle_stage": "editing",
+                "current_task": {"title": "补充限制"},
+                "tasks": [{"id": "t1", "title": "补充限制", "status": "todo"}],
+                "persistent_notices": [],
+                "workflow_recovery": {
+                    "workflow_state": {"phase": "review", "next_action": "review_cards"},
+                    "cards": [],
+                    "staged_edits": [],
+                    "updated_at": "2026-04-15T00:00:00+00:00",
+                },
+            },
+            source_files=[{"filename": "guide.md", "category": "reference", "size": 128}],
+            editor_prompt="你是技能优化助手",
+            persisted_cache=first_bundle["cache_payload"],
+            include_cache_payload=True,
+        )
+
+        assert first_bundle["cache"]["cache_changed"] is True
+        assert second_bundle["cache"]["entries"]["memo_digest"]["status"] == "hit"
+        assert second_bundle["cache"]["entries"]["recovery_digest"]["status"] == "hit"
+        assert second_bundle["cache"]["entries"]["source_file_index_digest"]["status"] == "hit"
+        assert second_bundle["cache"]["cache_changed"] is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1029,6 +1345,331 @@ class TestStudioLatencyPolicy:
 
         assert level == "simple"
         assert strategy == "fast_only"
+
+    def test_medium_request_exposes_sla_policy(self):
+        from app.services.studio_latency_policy import build_sla_policy
+
+        policy = build_sla_policy(
+            complexity_level="medium",
+            execution_strategy="fast_then_deep",
+            sla_degrade_enabled=True,
+        )
+
+        assert policy["enabled"] is True
+        assert policy["probe_after_s"] == 10
+        assert policy["degrade_after_s"] == 20
+        assert policy["deadline_after_s"] == 30
+        assert policy["force_two_stage_after_s"] is None
+
+
+class TestSkillStudioRuntimeLatency:
+    @staticmethod
+    def _build_request(*, user_id: int, skill_id: int, conversation_id: int):
+        from app.harness.contracts import AgentType, HarnessContext, HarnessRequest, HarnessSessionKey
+
+        return HarnessRequest(
+            session_key=HarnessSessionKey(
+                user_id=user_id,
+                agent_type=AgentType.SKILL_STUDIO,
+                workspace_id=1,
+                target_type="skill",
+                target_id=skill_id,
+                conversation_id=conversation_id,
+            ),
+            agent_type=AgentType.SKILL_STUDIO,
+            user_id=user_id,
+            input_text="请完整审计这个技能并给出整改方案",
+            context=HarnessContext(
+                workspace_id=1,
+                conversation_id=conversation_id,
+                skill_id=skill_id,
+                target_type="skill",
+                target_id=skill_id,
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_profile_records_runtime_latency_markers(self, db, seeded):
+        from app.harness.events import EventName
+        from app.harness.profiles.skill_studio import SkillStudioAgentProfile
+        from app.models.conversation import Conversation
+
+        conv = Conversation(user_id=seeded["admin"].id)
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+
+        request = self._build_request(
+            user_id=seeded["admin"].id,
+            skill_id=seeded["skill"].id,
+            conversation_id=conv.id,
+        )
+        profile = SkillStudioAgentProfile()
+
+        async def fake_stream(**kwargs):
+            yield ("status", {
+                "stage": "classified",
+                "complexity_level": "high",
+                "execution_strategy": "fast_then_deep",
+                "fast_status": "pending",
+                "deep_status": "pending",
+            })
+            yield ("delta", {"text": "首"})
+            yield ("delta", {"text": "答"})
+            yield ("status", {"stage": "done"})
+            yield ("__full_content__", {"text": "首答"})
+
+        with (
+            patch.object(SkillStudioAgentProfile, "_build_history", return_value=[]),
+            patch.object(SkillStudioAgentProfile, "_get_available_tools", return_value=[]),
+            patch.object(SkillStudioAgentProfile, "_get_source_files", return_value=([], "", False)),
+            patch.object(SkillStudioAgentProfile, "_get_memo", return_value=""),
+            patch.object(SkillStudioAgentProfile, "_get_skill_metadata", return_value={}),
+            patch("app.services.studio_agent.run_stream", side_effect=fake_stream),
+        ):
+            events = [event async for event in profile.run_stream(
+                request,
+                db,
+                conv,
+                selected_skill_id=seeded["skill"].id,
+            )]
+
+        run_started = next(event for event in events if event.event == EventName.RUN_STARTED)
+        run = profile.store.get_run(run_started.run_id)
+        assert run is not None
+        assert run.metadata["fast_started_at"]
+        assert run.metadata["first_token_at"]
+        assert run.metadata["first_useful_response_at"]
+        assert run.metadata["deep_started_at"]
+        assert run.metadata["deep_completed_at"]
+        assert run.metadata["run_completed_at"]
+        assert run.metadata["latency"]["first_token_at"] == run.metadata["first_token_at"]
+        stages = [event.data.get("stage") for event in events if event.event == EventName.STATUS]
+        assert "fast_started" in stages
+        assert "first_token" in stages
+        assert "first_useful_response" in stages
+        assert "deep_started" in stages
+        assert "deep_completed" in stages
+
+    @pytest.mark.asyncio
+    async def test_profile_forces_sla_first_response_and_final_replace(self, db, seeded):
+        from app.harness.events import EventName
+        from app.harness.profiles.skill_studio import SkillStudioAgentProfile
+        from app.models.conversation import Conversation
+
+        conv = Conversation(user_id=seeded["admin"].id)
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+
+        request = self._build_request(
+            user_id=seeded["admin"].id,
+            skill_id=seeded["skill"].id,
+            conversation_id=conv.id,
+        )
+        profile = SkillStudioAgentProfile()
+
+        async def slow_stream(**kwargs):
+            await asyncio.sleep(0.05)
+            yield ("delta", {"text": "真正结果"})
+            yield ("status", {"stage": "done"})
+            yield ("__full_content__", {"text": "真正结果"})
+
+        with (
+            patch.object(SkillStudioAgentProfile, "_build_history", return_value=[]),
+            patch.object(SkillStudioAgentProfile, "_get_available_tools", return_value=[]),
+            patch.object(SkillStudioAgentProfile, "_get_source_files", return_value=([], "", False)),
+            patch.object(SkillStudioAgentProfile, "_get_memo", return_value=""),
+            patch.object(SkillStudioAgentProfile, "_get_skill_metadata", return_value={}),
+            patch(
+                "app.harness.profiles.skill_studio.build_sla_policy",
+                return_value={
+                    "enabled": True,
+                    "probe_after_s": 0.005,
+                    "degrade_after_s": 0.01,
+                    "force_two_stage_after_s": None,
+                    "deadline_after_s": 0.015,
+                    "two_stage_expected": True,
+                },
+            ),
+            patch("app.services.studio_agent.run_stream", side_effect=slow_stream),
+        ):
+            events = [event async for event in profile.run_stream(
+                request,
+                db,
+                conv,
+                selected_skill_id=seeded["skill"].id,
+            )]
+
+        event_names = [event.event for event in events]
+        assert EventName.FALLBACK_TEXT in event_names
+        assert EventName.REPLACE in event_names
+
+        fallback_event = next(event for event in events if event.event == EventName.FALLBACK_TEXT)
+        replace_event = next(
+            event for event in events
+            if event.event == EventName.REPLACE and event.data.get("source") == "sla_final_replace"
+        )
+        assert "首轮" in fallback_event.data["text"]
+        assert replace_event.data["text"] == "真正结果"
+
+
+class TestStudioAdminMetrics:
+    def test_admin_metrics_dashboard_returns_rollup(self, client, token, seeded, db):
+        now = dt.datetime.utcnow()
+        run_id = "run_metrics_1"
+        db.add_all([
+            UnifiedEvent(
+                event_type="harness.run.created",
+                source_type="harness",
+                payload={"run_id": run_id, "agent_type": "skill_studio"},
+                user_id=seeded["admin"].id,
+                workspace_id=1,
+                created_at=now,
+            ),
+            UnifiedEvent(
+                event_type="harness.run.metadata_updated",
+                source_type="harness",
+                payload={
+                    "run_id": run_id,
+                    "metadata_patch": {
+                        "latency": {
+                            "request_accepted_at": "2026-04-15T00:00:00+00:00",
+                            "fast_started_at": "2026-04-15T00:00:01+00:00",
+                            "first_token_at": "2026-04-15T00:00:02+00:00",
+                            "first_useful_response_at": "2026-04-15T00:00:08+00:00",
+                            "deep_started_at": "2026-04-15T00:00:09+00:00",
+                            "deep_completed_at": "2026-04-15T00:00:18+00:00",
+                            "run_completed_at": "2026-04-15T00:00:20+00:00",
+                        },
+                        "rollout": {
+                            "eligible": True,
+                            "scope": "global_default",
+                            "reason": "global_default",
+                            "flags": {
+                                "dual_lane_enabled": True,
+                                "fast_lane_enabled": True,
+                                "deep_lane_enabled": True,
+                                "sla_degrade_enabled": True,
+                                "patch_protocol_enabled": True,
+                                "frontend_run_protocol_enabled": True,
+                            },
+                        },
+                    },
+                },
+                user_id=seeded["admin"].id,
+                workspace_id=1,
+                created_at=now + dt.timedelta(seconds=1),
+            ),
+            UnifiedEvent(
+                event_type="harness.run.status_changed",
+                source_type="harness",
+                payload={"run_id": run_id, "status": "completed", "error": None},
+                user_id=seeded["admin"].id,
+                workspace_id=1,
+                created_at=now + dt.timedelta(seconds=2),
+            ),
+        ])
+        db.commit()
+
+        resp = client.get("/api/admin/studio/metrics?days=7&limit=10", headers=_auth(token))
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["run_count"] == 1
+        assert data["status_counts"]["completed"] == 1
+        assert data["first_useful_response"]["count"] == 1
+        assert data["first_useful_response"]["p50_s"] == 8.0
+        assert data["deep_completed"]["p50_s"] == 18.0
+        assert data["first_token"]["p50_s"] == 1.0
+        assert data["records"][0]["metadata"]["rollout"]["flags"]["deep_lane_enabled"] is True
+
+    def test_admin_metrics_export_returns_csv(self, client, token, seeded, db):
+        now = dt.datetime.utcnow()
+        run_id = "run_metrics_csv"
+        db.add_all([
+            UnifiedEvent(
+                event_type="harness.run.created",
+                source_type="harness",
+                payload={"run_id": run_id, "agent_type": "skill_studio"},
+                user_id=seeded["admin"].id,
+                workspace_id=1,
+                created_at=now,
+            ),
+            UnifiedEvent(
+                event_type="harness.run.metadata_updated",
+                source_type="harness",
+                payload={
+                    "run_id": run_id,
+                    "metadata_patch": {
+                        "latency": {
+                            "request_accepted_at": "2026-04-15T00:00:00+00:00",
+                            "first_useful_response_at": "2026-04-15T00:00:05+00:00",
+                            "deep_completed_at": "2026-04-15T00:00:14+00:00",
+                            "run_completed_at": "2026-04-15T00:00:15+00:00",
+                        },
+                    },
+                },
+                user_id=seeded["admin"].id,
+                workspace_id=1,
+                created_at=now + dt.timedelta(seconds=1),
+            ),
+            UnifiedEvent(
+                event_type="harness.run.status_changed",
+                source_type="harness",
+                payload={"run_id": run_id, "status": "completed", "error": None},
+                user_id=seeded["admin"].id,
+                workspace_id=1,
+                created_at=now + dt.timedelta(seconds=2),
+            ),
+        ])
+        db.commit()
+
+        resp = client.get("/api/admin/studio/metrics/export?days=7&limit=10", headers=_auth(token))
+        assert resp.status_code == 200, resp.text
+        assert "run_id,created_at,status,user_id,workspace_id" in resp.text
+        assert "run_metrics_csv" in resp.text
+        assert "5.0" in resp.text
+
+
+class TestSkillStudioSourceFileLoading:
+    def test_source_files_are_index_only_by_default(self, db, seeded):
+        from app.harness.profiles.skill_studio import SkillStudioAgentProfile
+
+        skill = seeded["skill"]
+        skill.source_files = [{"filename": "guide.md", "category": "reference"}]
+        db.commit()
+
+        with patch(
+            "app.services.skill_engine._read_source_files",
+            side_effect=AssertionError("should_not_read_source_files"),
+        ):
+            files, content, loaded = SkillStudioAgentProfile._get_source_files(
+                db,
+                skill.id,
+                user_message="帮我优化一下这个 Skill 的表达",
+            )
+
+        assert len(files) == 1
+        assert content == ""
+        assert loaded is False
+
+    def test_source_files_load_when_user_mentions_file_content(self, db, seeded):
+        from app.harness.profiles.skill_studio import SkillStudioAgentProfile
+
+        skill = seeded["skill"]
+        skill.source_files = [{"filename": "guide.md", "category": "reference"}]
+        db.commit()
+
+        with patch("app.services.skill_engine._read_source_files", return_value="# guide"):
+            files, content, loaded = SkillStudioAgentProfile._get_source_files(
+                db,
+                skill.id,
+                user_message="请读取文件内容后帮我修复",
+            )
+
+        assert len(files) == 1
+        assert content == "# guide"
+        assert loaded is True
 
 
 class TestArchitectStateAPI:

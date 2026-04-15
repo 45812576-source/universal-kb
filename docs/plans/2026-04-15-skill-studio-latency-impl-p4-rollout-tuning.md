@@ -212,3 +212,114 @@
 ## 13. 结论
 
 如果 `P4` 完成，则 Skill Studio 的时延治理不再是一次性优化，而是进入可持续发布、可持续调优、可持续复盘的工程状态。
+
+## 14. 首波落地记录
+
+### 14.1 后端全局环境开关
+
+首波接入以下环境变量，默认保持开启，便于在上线前通过环境配置回滚：
+
+- `SKILL_STUDIO_DUAL_LANE_ENABLED`
+- `SKILL_STUDIO_FAST_LANE_ENABLED`
+- `SKILL_STUDIO_DEEP_LANE_ENABLED`
+- `SKILL_STUDIO_SLA_DEGRADE_ENABLED`
+- `SKILL_STUDIO_PATCH_PROTOCOL_ENABLED`
+- `SKILL_STUDIO_FRONTEND_RUN_PROTOCOL_ENABLED`
+
+如果 `SKILL_STUDIO_DUAL_LANE_ENABLED=false` 或 `SKILL_STUDIO_DEEP_LANE_ENABLED=false`，则后端会把当前 run 的 `execution_strategy` 收敛为 `fast_only`，并把 `deep_status` 标为 `not_requested`。
+
+如果 `SKILL_STUDIO_PATCH_PROTOCOL_ENABLED=false`，则后台 run 仍然发原始 SSE 事件，但不再追加 `patch_applied` 事件。
+
+如果 `SKILL_STUDIO_FRONTEND_RUN_PROTOCOL_ENABLED=false`，则后台 run 仍然发原始 SSE 事件，但不再追加统一 `workflow_event` envelope。
+
+### 14.2 后端 rollout 范围开关
+
+首波支持按以下维度收敛灰度范围：
+
+- `SKILL_STUDIO_ROLLOUT_INTERNAL_ONLY`
+- `SKILL_STUDIO_ROLLOUT_USER_IDS`
+- `SKILL_STUDIO_ROLLOUT_DEPARTMENT_IDS`
+- `SKILL_STUDIO_ROLLOUT_SESSION_MODES`
+
+如果未配置任何范围条件，则默认全量命中。
+
+如果配置了任一范围条件，则用户、部门、内部账号、session mode 任一命中即可进入灰度；否则本次 run 的 effective flags 会全部收敛为关闭状态，除非用户级 feature flag 明确覆盖。
+
+### 14.3 用户级 feature flags
+
+首波复用现有 `users.feature_flags`，支持以下覆盖项：
+
+- `skill_studio_dual_lane_enabled`
+- `skill_studio_fast_lane_enabled`
+- `skill_studio_deep_lane_enabled`
+- `skill_studio_sla_degrade_enabled`
+- `skill_studio_patch_protocol_enabled`
+- `skill_studio_frontend_run_protocol_enabled`
+
+这些 flag 已加入管理端默认 feature flag 列表，并作为高风险开关纳入权限变更流程。
+
+### 14.4 前端本地开关
+
+首波前端支持以下 `NEXT_PUBLIC` 环境变量：
+
+- `NEXT_PUBLIC_SKILL_STUDIO_FRONTEND_RUN_PROTOCOL_ENABLED`
+- `NEXT_PUBLIC_SKILL_STUDIO_PATCH_PROTOCOL_ENABLED`
+
+前端最终以“本地环境变量 + 后端 `workflow_state.metadata.rollout.flags`”共同判定是否启用 run-aware 展示与 patch 消费。
+
+### 14.5 Run 级可观测字段
+
+每次 `bootstrap_workflow` 会把本次 run 的命中结果写入：
+
+```text
+workflow_state.metadata.rollout
+```
+
+其中包含：
+
+- `eligible`
+- `scope`
+- `reason`
+- `user_id`
+- `department_id`
+- `session_mode`
+- `workflow_mode`
+- `flags`
+
+如果线上发生质量或时延退化，则优先按该字段回溯“本次 run 实际命中了哪些策略”。
+
+### 14.6 首波回滚顺序
+
+建议按最小影响面逐层回滚：
+
+1. 如果前端 run-aware 展示异常，则关闭 `NEXT_PUBLIC_SKILL_STUDIO_FRONTEND_RUN_PROTOCOL_ENABLED` 或用户级 `skill_studio_frontend_run_protocol_enabled`；
+2. 如果补丁回填异常，则关闭 `SKILL_STUDIO_PATCH_PROTOCOL_ENABLED` 或用户级 `skill_studio_patch_protocol_enabled`；
+3. 如果 Deep Lane 质量或成功率异常，则关闭 `SKILL_STUDIO_DEEP_LANE_ENABLED` 或用户级 `skill_studio_deep_lane_enabled`；
+4. 如果双通道整体策略异常，则关闭 `SKILL_STUDIO_DUAL_LANE_ENABLED`；
+5. 如果需要全量退回旧体验，则关闭 `STUDIO_STRUCTURED_MODE`。
+
+### 14.7 首波回归清单
+
+- 后端：`bootstrap_workflow` 默认命中 rollout metadata；
+- 后端：用户级关闭 deep lane 后，`execution_strategy=fast_only` 且 `deep_status=not_requested`；
+- 后端：关闭 patch protocol 后，后台 run 不再发 `patch_applied`；
+- 前端：后端关闭 `frontend_run_protocol_enabled` 后，不展示 run-aware 历史；
+- 前端：后端关闭 `patch_protocol_enabled` 或 frontend run protocol 后，不消费 patch。
+
+### 14.8 P4.5 首波实物补齐
+
+本轮继续把 `P4` 从“后端已有指标聚合能力”推进到“管理员可直接消费的运营面板”：
+
+- 前端管理页：`/admin/studio-metrics`
+- 后端面板接口：`GET /api/admin/studio/metrics`
+- 指标导出接口：`GET /api/admin/studio/metrics/export`
+- 脚本导出入口：`backend/scripts/export_studio_rollout_metrics.py`
+- 回归矩阵：`docs/operations/2026-04-15-skill-studio-rollout-regression-matrix.md`
+- 调优模板：`docs/operations/2026-04-15-skill-studio-tuning-record-template.md`
+
+如果要进入下一轮扩大灰度，则建议默认执行顺序为：
+
+1. 先看 `/admin/studio-metrics` 的 `first_useful_response`、`deep_completion_rate`、`run_failure_rate`；
+2. 再导出 CSV 做按 run 明细抽样；
+3. 再按回归矩阵抽样复核 `fast_only / fast_then_deep / SLA fallback / superseded`；
+4. 最后把结论回填到调优模板中，决定是否扩大灰度或回滚。

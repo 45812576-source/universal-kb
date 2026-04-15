@@ -250,6 +250,33 @@ class TestNewSkillCreation:
 
 
 class TestWorkflowRecovery:
+    def test_update_context_digest_cache_persists_payload(self, db):
+        dept = _make_dept(db, "digest缓存部门")
+        user = _make_user(db, "digest_cache_user", dept_id=dept.id)
+        skill = _make_skill(db, user.id, name="Digest缓存Skill")
+
+        skill_memo_service.init_memo(db, skill.id, "published_iteration", "目标", user.id)
+        result = skill_memo_service.update_context_digest_cache(
+            db,
+            skill.id,
+            {
+                "schema_version": 1,
+                "updated_at": "2026-04-15T00:00:00+00:00",
+                "entries": {
+                    "memo_digest": {
+                        "source_signature": "memo_sig_1",
+                        "cached_at": "2026-04-15T00:00:00+00:00",
+                        "digest": {"lifecycle_stage": "editing", "signature": "digest_sig_1"},
+                    },
+                },
+            },
+            user_id=user.id,
+            commit=True,
+        )
+
+        assert result is not None
+        assert result["context_digest_cache"]["entries"]["memo_digest"]["source_signature"] == "memo_sig_1"
+
     def test_sync_workflow_recovery_persists_cards_and_staged_edits(self, db):
         dept = _make_dept(db, "workflow恢复部门")
         user = _make_user(db, "workflow_recovery_user", dept_id=dept.id)
@@ -295,6 +322,65 @@ class TestWorkflowRecovery:
         assert fetched is not None
         assert fetched["lifecycle_stage"] == "fixing"
         assert fetched["workflow_recovery"]["workflow_state"]["next_action"] == "review_cards"
+
+    def test_sync_workflow_recovery_invalidates_digest_cache_entries(self, db):
+        dept = _make_dept(db, "workflow缓存失效部门")
+        user = _make_user(db, "workflow_cache_invalidate_user", dept_id=dept.id)
+        skill = _make_skill(db, user.id, name="缓存失效Skill")
+
+        skill_memo_service.init_memo(db, skill.id, "published_iteration", "目标", user.id)
+        skill_memo_service.update_context_digest_cache(
+            db,
+            skill.id,
+            {
+                "schema_version": 1,
+                "updated_at": "2026-04-15T00:00:00+00:00",
+                "entries": {
+                    "memo_digest": {"source_signature": "memo_sig", "cached_at": "2026-04-15T00:00:00+00:00", "digest": {"signature": "memo_digest_sig"}},
+                    "recovery_digest": {"source_signature": "recovery_sig", "cached_at": "2026-04-15T00:00:00+00:00", "digest": {"signature": "recovery_digest_sig"}},
+                    "source_file_index_digest": {"source_signature": "source_sig", "cached_at": "2026-04-15T00:00:00+00:00", "digest": {"signature": "source_digest_sig"}},
+                },
+            },
+            user_id=user.id,
+            commit=True,
+        )
+
+        skill_memo_service.sync_workflow_recovery(
+            db,
+            skill.id,
+            workflow_state={
+                "workflow_id": "run_cache_1",
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "sandbox_remediation",
+                "phase": "remediate",
+                "next_action": "review_cards",
+                "route_reason": "sandbox_failed",
+            },
+            cards=[{
+                "id": "card_cache_1",
+                "title": "修复问题",
+                "type": "staged_edit",
+                "status": "pending",
+                "content": {"summary": "需要修复", "staged_edit_id": "edit_cache_1"},
+                "actions": [{"label": "采纳", "type": "adopt"}],
+            }],
+            staged_edits=[{
+                "id": "edit_cache_1",
+                "target_type": "system_prompt",
+                "summary": "补齐约束",
+                "risk_level": "medium",
+                "diff_ops": [],
+                "status": "pending",
+            }],
+            user_id=user.id,
+            commit=True,
+        )
+
+        fetched = skill_memo_service.get_memo(db, skill.id)
+        entries = fetched["context_digest_cache"]["entries"]
+        assert "memo_digest" not in entries
+        assert "recovery_digest" not in entries
+        assert "source_file_index_digest" in entries
 
     def test_patch_workflow_recovery_action_updates_status_and_next_action(self, db):
         dept = _make_dept(db, "workflow动作部门")

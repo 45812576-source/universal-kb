@@ -9,9 +9,11 @@ G3 核心交付：消除同步/流式双轨，统一走 SkillStudioAgentProfile�
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 import logging
+import time
 from dataclasses import asdict
 from typing import Any, AsyncIterator, Optional
 
@@ -33,12 +35,95 @@ from app.harness.events import EventName, HarnessEvent, emit
 from app.harness.session_store import SessionStore
 from app.harness.gateway import get_session_store
 from app.models.conversation import Conversation, Message, MessageRole
+from app.services.studio_context_digest import build_context_digest_bundle
+from app.services.studio_latency_policy import build_sla_policy, merge_latency_metadata_fields
 
 logger = logging.getLogger(__name__)
+
+_SOURCE_CONTENT_KEYWORDS = (
+    "读取文件", "看文件", "按文件", "当前文件", "这个文件", "附属文件", "源文件",
+    "source file", "asset", "SKILL.md", "md 文件", "代码文件", "逐文件", "文件内容",
+)
+_FIRST_TOKEN_EVENTS = {"delta", "content_block_delta"}
+_FIRST_USEFUL_EVENTS = {"replace", "delta", "fallback_text"}
+_STREAM_CONTENT_EVENTS = {
+    "delta",
+    "replace",
+    "fallback_text",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+}
 
 
 def _now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def _should_load_source_file_content(user_message: str, source_files: list[dict]) -> bool:
+    if not source_files:
+        return False
+    text = (user_message or "").lower()
+    return any(keyword.lower() in text for keyword in _SOURCE_CONTENT_KEYWORDS)
+
+
+def _build_latency_metadata_patch(
+    existing_metadata: dict[str, Any] | None,
+    **updates: str | None,
+) -> dict[str, Any]:
+    patch = {key: value for key, value in updates.items() if value}
+    merged = merge_latency_metadata_fields(existing_metadata, patch)
+    latency = merged.get("latency")
+    if latency:
+        patch["latency"] = latency
+    return patch
+
+
+def _ordered_sla_checkpoints(policy: dict[str, Any] | None) -> list[tuple[str, float]]:
+    if not isinstance(policy, dict) or not policy.get("enabled"):
+        return []
+    checkpoints: list[tuple[str, float]] = []
+    for name in ("probe_after_s", "degrade_after_s", "force_two_stage_after_s", "deadline_after_s"):
+        value = policy.get(name)
+        if isinstance(value, (int, float)) and value > 0:
+            checkpoints.append((name, float(value)))
+    checkpoints.sort(key=lambda item: item[1])
+    return checkpoints
+
+
+def _build_sla_fallback_text(
+    *,
+    session_mode: str,
+    complexity_level: str,
+    execution_strategy: str,
+    user_message: str,
+    has_memo: bool,
+    source_file_count: int,
+) -> str:
+    user_summary = " ".join((user_message or "").strip().split())[:80]
+    context_bits: list[str] = []
+    if has_memo:
+        context_bits.append("已加载 memo")
+    if source_file_count:
+        context_bits.append(f"已识别 {source_file_count} 个源文件索引")
+    context_hint = f"（{'，'.join(context_bits)}）" if context_bits else ""
+
+    if session_mode == "create_new_skill":
+        focus = "我先交付首轮结构：目标用户/场景、输入输出、约束与验收标准。"
+        next_step = "深层补完会继续细化 Skill 边界与提问路径。"
+    elif session_mode == "audit_imported_skill":
+        focus = "我先交付首轮审计方向：根因清晰度、要素完备性、场景鲁棒性、失败预防。"
+        next_step = "深层补完会继续回填治理卡片和整改优先级。"
+    else:
+        focus = "我先交付首轮优化方向：优先风险、改动落点与建议顺序。"
+        next_step = "深层补完会继续展开治理建议和可采纳修改。"
+
+    return (
+        f"{focus}{context_hint}\n\n"
+        f"当前识别为 `{complexity_level}` 复杂度，执行策略是 `{execution_strategy}`。"
+        f"本轮需求摘要：{user_summary or '待根据本轮消息继续收敛'}。\n\n"
+        f"{next_step}"
+    )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -178,6 +263,19 @@ class SkillStudioAgentProfile:
     def __init__(self, store: Optional[SessionStore] = None):
         self.store = store or get_session_store()
 
+    def _update_run_latency(
+        self,
+        run_id: str,
+        *,
+        db: Optional[Session] = None,
+        **updates: str | None,
+    ) -> None:
+        run = self.store.get_run(run_id)
+        existing_metadata = run.metadata if run else {}
+        metadata_patch = _build_latency_metadata_patch(existing_metadata, **updates)
+        if metadata_patch:
+            self.store.update_run_metadata(run_id, metadata_patch, db=db)
+
     async def run_stream(
         self,
         request: HarnessRequest,
@@ -258,9 +356,77 @@ class SkillStudioAgentProfile:
         available_tools = self._get_available_tools(db)
 
         # 查询 source_files + memo
-        source_files, source_files_content = self._get_source_files(db, selected_skill_id)
+        source_files, source_files_content, source_files_content_loaded = self._get_source_files(
+            db,
+            selected_skill_id,
+            user_message=request.input_text,
+        )
         memo_context = self._get_memo(db, selected_skill_id)
         skill_metadata = self._get_skill_metadata(db, selected_skill_id)
+        context_digest = build_context_digest_bundle(
+            history_messages=history_messages,
+            memo_context=memo_context,
+            source_files=source_files,
+            editor_prompt=editor_prompt,
+            persisted_cache=(memo_context or {}).get("context_digest_cache") if isinstance(memo_context, dict) else None,
+            include_cache_payload=True,
+        )
+        if selected_skill_id and context_digest.get("cache", {}).get("cache_changed"):
+            from app.services.skill_memo_service import update_context_digest_cache
+
+            updated_memo = update_context_digest_cache(
+                db,
+                selected_skill_id,
+                context_digest.get("cache_payload") or {},
+                user_id=conversation.user_id,
+                commit=False,
+            )
+            if isinstance(updated_memo, dict):
+                memo_context = updated_memo
+
+        from app.services.studio_latency_policy import (
+            choose_execution_strategy,
+            estimate_complexity_level,
+        )
+        from app.services.studio_rollout import (
+            apply_rollout_to_execution_strategy,
+            lane_statuses_for_rollout,
+            resolve_rollout_decision,
+        )
+        from app.services.studio_router import route_session
+
+        predicted_route = route_session(db, skill_id=selected_skill_id, user_message=request.input_text)
+        rollout_decision = resolve_rollout_decision(
+            db,
+            user_id=conversation.user_id,
+            session_mode=predicted_route.session_mode,
+            workflow_mode=predicted_route.workflow_mode,
+        )
+        complexity_level = estimate_complexity_level(
+            session_mode=predicted_route.session_mode,
+            workflow_mode=predicted_route.workflow_mode,
+            next_action=predicted_route.next_action,
+            user_message=request.input_text,
+            has_files=bool(source_files),
+            has_memo=bool(memo_context),
+            history_count=len(history_messages),
+        )
+        execution_strategy = choose_execution_strategy(
+            complexity_level=complexity_level,
+            workflow_mode=predicted_route.workflow_mode,
+            next_action=predicted_route.next_action,
+        )
+        execution_strategy = apply_rollout_to_execution_strategy(
+            execution_strategy,
+            flags=rollout_decision.flags,
+        )
+        lane_statuses = lane_statuses_for_rollout(execution_strategy, flags=rollout_decision.flags)
+        sla_policy = build_sla_policy(
+            complexity_level=complexity_level,
+            execution_strategy=execution_strategy,
+            sla_degrade_enabled=rollout_decision.flags.sla_degrade_enabled,
+        )
+        initial_deep_started_at = ""
 
         self.store.finish_step(ctx_step, db=db)
         context_ready_at = _now_iso()
@@ -268,7 +434,9 @@ class SkillStudioAgentProfile:
             "context_ready_at": context_ready_at,
             "history_count": len(history_messages),
             "source_file_count": len(source_files),
+            "source_files_content_loaded": source_files_content_loaded,
             "has_memo": bool(memo_context),
+            "context_digest": context_digest,
         }, db=db)
         yield emit(
             EventName.STATUS,
@@ -277,11 +445,42 @@ class SkillStudioAgentProfile:
                 "context_ready_at": context_ready_at,
                 "history_count": len(history_messages),
                 "source_file_count": len(source_files),
+                "source_files_content_loaded": source_files_content_loaded,
                 "has_memo": bool(memo_context),
+                "context_digest": context_digest,
             },
             run_id=run.run_id,
             session_id=harness_session.session_id,
         )
+        if lane_statuses.get("fast_status") != "not_requested":
+            fast_started_at = _now_iso()
+            self._update_run_latency(run.run_id, db=db, fast_started_at=fast_started_at)
+            yield emit(
+                EventName.STATUS,
+                {
+                    "stage": "fast_started",
+                    "fast_started_at": fast_started_at,
+                    "complexity_level": complexity_level,
+                    "execution_strategy": execution_strategy,
+                },
+                run_id=run.run_id,
+                session_id=harness_session.session_id,
+            )
+        elif lane_statuses.get("deep_status") != "not_requested":
+            deep_started_at = _now_iso()
+            initial_deep_started_at = deep_started_at
+            self._update_run_latency(run.run_id, db=db, deep_started_at=deep_started_at)
+            yield emit(
+                EventName.STATUS,
+                {
+                    "stage": "deep_started",
+                    "deep_started_at": deep_started_at,
+                    "reason": "fast_lane_not_requested",
+                    "execution_strategy": execution_strategy,
+                },
+                run_id=run.run_id,
+                session_id=harness_session.session_id,
+            )
 
         # 4. 记录 model_call step
         model_step = HarnessStep(
@@ -297,56 +496,264 @@ class SkillStudioAgentProfile:
 
         full_content = ""
         studio_state_snapshot: dict[str, Any] = {}
+        stream_started_at = time.monotonic()
 
         try:
             first_useful_response_at = ""
-            async for item in studio_run_stream(
-                db=db,
-                conv_id=conversation.id,
-                workspace_system_context=workspace_system_context,
-                history_messages=history_messages,
-                user_message=request.input_text,
-                model_config=model_config,
-                selected_skill_id=selected_skill_id,
-                editor_prompt=editor_prompt,
-                editor_is_dirty=editor_is_dirty,
-                available_tools=available_tools,
-                source_files=source_files,
-                source_files_content=source_files_content,
-                memo_context=memo_context,
-                skill_metadata=skill_metadata,
-            ):
+            first_token_at = ""
+            deep_started_at = initial_deep_started_at
+            deep_completed_at = ""
+            synthetic_first_response = False
+            emitted_checkpoints: set[str] = set()
+            queue: asyncio.Queue[Any] = asyncio.Queue()
+            producer_failed: BaseException | None = None
+            producer_done = object()
+
+            async def _produce_events() -> None:
+                nonlocal producer_failed
+                try:
+                    async for item in studio_run_stream(
+                        db=db,
+                        conv_id=conversation.id,
+                        workspace_system_context=workspace_system_context,
+                        history_messages=history_messages,
+                        user_message=request.input_text,
+                        model_config=model_config,
+                        selected_skill_id=selected_skill_id,
+                        editor_prompt=editor_prompt,
+                        editor_is_dirty=editor_is_dirty,
+                        available_tools=available_tools,
+                        source_files=source_files,
+                        source_files_content=source_files_content,
+                        memo_context=memo_context,
+                        skill_metadata=skill_metadata,
+                    ):
+                        await queue.put(item)
+                except BaseException as exc:  # noqa: BLE001
+                    producer_failed = exc
+                finally:
+                    await queue.put(producer_done)
+
+            producer_task = asyncio.create_task(_produce_events())
+
+            while True:
+                elapsed = time.monotonic() - stream_started_at
+                pending_checkpoints = [
+                    (name, after_s)
+                    for name, after_s in _ordered_sla_checkpoints(sla_policy)
+                    if name not in emitted_checkpoints and not first_useful_response_at
+                ]
+                wait_timeout = None
+                if pending_checkpoints:
+                    wait_timeout = max(0.0, min(after_s - elapsed for _, after_s in pending_checkpoints))
+
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=wait_timeout)
+                except asyncio.TimeoutError:
+                    checkpoint_name, _ = pending_checkpoints[0]
+                    emitted_checkpoints.add(checkpoint_name)
+                    checkpoint_at = _now_iso()
+
+                    if checkpoint_name == "probe_after_s":
+                        self._update_run_latency(run.run_id, db=db, sla_checkpoint_at=checkpoint_at)
+                        yield emit(
+                            EventName.STATUS,
+                            {
+                                "stage": "sla_checkpoint",
+                                "sla_checkpoint_at": checkpoint_at,
+                                "checkpoint": "probe",
+                                "complexity_level": complexity_level,
+                                "execution_strategy": execution_strategy,
+                            },
+                            run_id=run.run_id,
+                            session_id=harness_session.session_id,
+                        )
+                        continue
+
+                    if checkpoint_name == "degrade_after_s":
+                        self._update_run_latency(run.run_id, db=db, sla_degraded_at=checkpoint_at)
+                        yield emit(
+                            EventName.STATUS,
+                            {
+                                "stage": "sla_degraded",
+                                "sla_degraded_at": checkpoint_at,
+                                "degrade_mode": "compact_first_response",
+                                "complexity_level": complexity_level,
+                            },
+                            run_id=run.run_id,
+                            session_id=harness_session.session_id,
+                        )
+                        continue
+
+                    if checkpoint_name == "force_two_stage_after_s":
+                        if not deep_started_at and lane_statuses.get("deep_status") != "not_requested":
+                            deep_started_at = checkpoint_at
+                            self._update_run_latency(
+                                run.run_id,
+                                db=db,
+                                deep_started_at=deep_started_at,
+                                two_stage_forced_at=checkpoint_at,
+                            )
+                        else:
+                            self._update_run_latency(run.run_id, db=db, two_stage_forced_at=checkpoint_at)
+                        yield emit(
+                            EventName.STATUS,
+                            {
+                                "stage": "two_stage_forced",
+                                "two_stage_forced_at": checkpoint_at,
+                                "deep_started_at": deep_started_at or checkpoint_at,
+                            },
+                            run_id=run.run_id,
+                            session_id=harness_session.session_id,
+                        )
+                        continue
+
+                    if checkpoint_name == "deadline_after_s":
+                        synthetic_first_response = True
+                        first_useful_response_at = checkpoint_at
+                        self._update_run_latency(
+                            run.run_id,
+                            db=db,
+                            first_useful_response_at=first_useful_response_at,
+                            sla_degraded_at=checkpoint_at,
+                        )
+                        yield emit(
+                            EventName.STATUS,
+                            {
+                                "stage": "sla_degraded",
+                                "sla_degraded_at": checkpoint_at,
+                                "degrade_mode": "forced_first_response",
+                            },
+                            run_id=run.run_id,
+                            session_id=harness_session.session_id,
+                        )
+                        yield emit(
+                            EventName.STATUS,
+                            {
+                                "stage": "first_useful_response",
+                                "first_useful_response_at": first_useful_response_at,
+                                "source": "sla_fallback",
+                            },
+                            run_id=run.run_id,
+                            session_id=harness_session.session_id,
+                        )
+                        if lane_statuses.get("deep_status") != "not_requested" and not deep_started_at:
+                            deep_started_at = checkpoint_at
+                            self._update_run_latency(run.run_id, db=db, deep_started_at=deep_started_at)
+                            yield emit(
+                                EventName.STATUS,
+                                {
+                                    "stage": "deep_started",
+                                    "deep_started_at": deep_started_at,
+                                    "reason": "sla_fallback",
+                                },
+                                run_id=run.run_id,
+                                session_id=harness_session.session_id,
+                            )
+                        yield emit(
+                            EventName.FALLBACK_TEXT,
+                            {
+                                "text": _build_sla_fallback_text(
+                                    session_mode=predicted_route.session_mode,
+                                    complexity_level=complexity_level,
+                                    execution_strategy=execution_strategy,
+                                    user_message=request.input_text,
+                                    has_memo=bool(memo_context),
+                                    source_file_count=len(source_files),
+                                ),
+                                "source": "sla_fallback",
+                            },
+                            run_id=run.run_id,
+                            session_id=harness_session.session_id,
+                        )
+                        continue
+
+                if item is producer_done:
+                    if producer_failed is not None:
+                        raise producer_failed
+                    break
+
                 if isinstance(item, str):
-                    # keepalive ping — 透传
                     continue
 
                 evt_name, evt_data = item
 
-                # 捕获 full_content
                 if evt_name == "__full_content__":
                     full_content = evt_data.get("text", "")
                     continue
 
-                if not first_useful_response_at and evt_name in {"replace", "delta", "fallback_text"}:
-                    first_useful_response_at = _now_iso()
-                    self.store.update_run_metadata(run.run_id, {
-                        "first_useful_response_at": first_useful_response_at,
-                    }, db=db)
+                if evt_name == "status" and evt_data.get("stage") == "classified":
+                    complexity_level = str(evt_data.get("complexity_level") or complexity_level)
+                    execution_strategy = str(evt_data.get("execution_strategy") or execution_strategy)
+                    lane_statuses = {
+                        "fast_status": str(evt_data.get("fast_status") or lane_statuses.get("fast_status") or "pending"),
+                        "deep_status": str(evt_data.get("deep_status") or lane_statuses.get("deep_status") or "pending"),
+                    }
+                    sla_policy = build_sla_policy(
+                        complexity_level=complexity_level,
+                        execution_strategy=execution_strategy,
+                        sla_degrade_enabled=rollout_decision.flags.sla_degrade_enabled,
+                    )
+
+                if not first_token_at and evt_name in _FIRST_TOKEN_EVENTS:
+                    first_token_at = _now_iso()
+                    self._update_run_latency(run.run_id, db=db, first_token_at=first_token_at)
                     yield emit(
                         EventName.STATUS,
                         {
-                            "stage": "first_useful_response",
-                            "first_useful_response_at": first_useful_response_at,
+                            "stage": "first_token",
+                            "first_token_at": first_token_at,
                         },
                         run_id=run.run_id,
                         session_id=harness_session.session_id,
                     )
 
-                # 捕获 studio_state_update 用于持久化
+                if not first_useful_response_at and evt_name in _FIRST_USEFUL_EVENTS:
+                    first_useful_response_at = _now_iso()
+                    self._update_run_latency(run.run_id, db=db, first_useful_response_at=first_useful_response_at)
+                    yield emit(
+                        EventName.STATUS,
+                        {
+                            "stage": "first_useful_response",
+                            "first_useful_response_at": first_useful_response_at,
+                            "source": "model_stream",
+                        },
+                        run_id=run.run_id,
+                        session_id=harness_session.session_id,
+                    )
+                    if lane_statuses.get("deep_status") != "not_requested" and not deep_started_at:
+                        deep_started_at = _now_iso()
+                        self._update_run_latency(run.run_id, db=db, deep_started_at=deep_started_at)
+                        yield emit(
+                            EventName.STATUS,
+                            {
+                                "stage": "deep_started",
+                                "deep_started_at": deep_started_at,
+                                "reason": "first_useful_response_delivered",
+                            },
+                            run_id=run.run_id,
+                            session_id=harness_session.session_id,
+                        )
+
+                if evt_name == "status" and evt_data.get("stage") == "done" and deep_started_at and not deep_completed_at:
+                    deep_completed_at = _now_iso()
+                    self._update_run_latency(run.run_id, db=db, deep_completed_at=deep_completed_at)
+                    yield emit(
+                        EventName.STATUS,
+                        {
+                            "stage": "deep_completed",
+                            "deep_completed_at": deep_completed_at,
+                        },
+                        run_id=run.run_id,
+                        session_id=harness_session.session_id,
+                    )
+
                 if evt_name == "studio_state_update":
                     studio_state_snapshot = evt_data
 
-                # 映射为 HarnessEvent
+                if synthetic_first_response and evt_name in _STREAM_CONTENT_EVENTS:
+                    continue
+
                 harness_evt = _map_studio_event(
                     evt_name, evt_data,
                     run_id=run.run_id,
@@ -354,6 +761,16 @@ class SkillStudioAgentProfile:
                 )
                 if harness_evt:
                     yield harness_evt
+
+            if synthetic_first_response and full_content:
+                yield emit(
+                    EventName.REPLACE,
+                    {"text": full_content, "source": "sla_final_replace"},
+                    run_id=run.run_id,
+                    session_id=harness_session.session_id,
+                )
+
+            await producer_task
 
         except Exception as exc:
             logger.exception("SkillStudioAgentProfile run_stream error for run %s", run.run_id)
@@ -387,9 +804,15 @@ class SkillStudioAgentProfile:
 
         # 8. 完成 run
         self.store.update_run_status(run.run_id, RunStatus.COMPLETED, db=db)
+        run_completed_at = _now_iso()
+        self._update_run_latency(run.run_id, db=db, run_completed_at=run_completed_at)
         yield emit(
             EventName.RUN_COMPLETED,
-            {"run_id": run.run_id, "full_content_length": len(full_content)},
+            {
+                "run_id": run.run_id,
+                "full_content_length": len(full_content),
+                "run_completed_at": run_completed_at,
+            },
             run_id=run.run_id,
             session_id=harness_session.session_id,
         )
@@ -496,20 +919,26 @@ class SkillStudioAgentProfile:
         return "（暂无已注册工具）"
 
     @staticmethod
-    def _get_source_files(db: Session, skill_id: Optional[int]) -> tuple[list[dict], str]:
+    def _get_source_files(
+        db: Session,
+        skill_id: Optional[int],
+        *,
+        user_message: str = "",
+    ) -> tuple[list[dict], str, bool]:
         """获取 skill 附属文件列表和内容。"""
         if not skill_id:
-            return [], ""
+            return [], "", False
         from app.models.skill import Skill
         skill = db.get(Skill, skill_id)
         if not skill:
-            return [], ""
+            return [], "", False
         source_files = list(skill.source_files or [])
         content = ""
-        if source_files:
+        should_load_content = _should_load_source_file_content(user_message, source_files)
+        if should_load_content:
             from app.services.skill_engine import _read_source_files
             content = _read_source_files(skill_id, source_files)
-        return source_files, content
+        return source_files, content, should_load_content
 
     @staticmethod
     def _get_memo(db: Session, skill_id: Optional[int]) -> Optional[dict]:

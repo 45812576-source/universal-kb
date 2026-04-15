@@ -49,6 +49,16 @@ class Settings(BaseSettings):
 
     # ── Skill Studio 结构化模式 ──────────────────────────────────────────────
     STUDIO_STRUCTURED_MODE: str = "on"  # "off" | "on"
+    SKILL_STUDIO_DUAL_LANE_ENABLED: bool = True
+    SKILL_STUDIO_FAST_LANE_ENABLED: bool = True
+    SKILL_STUDIO_DEEP_LANE_ENABLED: bool = True
+    SKILL_STUDIO_SLA_DEGRADE_ENABLED: bool = True
+    SKILL_STUDIO_PATCH_PROTOCOL_ENABLED: bool = True
+    SKILL_STUDIO_FRONTEND_RUN_PROTOCOL_ENABLED: bool = True
+    SKILL_STUDIO_ROLLOUT_INTERNAL_ONLY: bool = False
+    SKILL_STUDIO_ROLLOUT_USER_IDS: str = ""
+    SKILL_STUDIO_ROLLOUT_DEPARTMENT_IDS: str = ""
+    SKILL_STUDIO_ROLLOUT_SESSION_MODES: str = ""
 
     # 百炼 Coding Plan 三窗口额度，达到任一窗口 90% 自动切换 ARK
     BAILIAN_QUOTA_5H: int = 6000    # 每 5 小时最多请求数

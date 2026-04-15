@@ -20,6 +20,12 @@ from app.services.studio_latency_policy import (
     initial_lane_statuses,
     merge_latency_metadata,
 )
+from app.services.studio_rollout import (
+    apply_rollout_to_execution_strategy,
+    lane_statuses_for_rollout,
+    merge_rollout_metadata,
+    resolve_rollout_decision,
+)
 from app.services.studio_router import RouteResult, route_session
 from app.services.studio_workflow_adapter import normalize_workflow_card, normalize_workflow_staged_edit
 from app.services.studio_workflow_protocol import WorkflowStateData
@@ -235,6 +241,27 @@ def _recover_existing_bootstrap(
     workflow_state.setdefault("fast_status", "pending")
     workflow_state.setdefault("deep_status", "pending")
 
+    rollout_decision = resolve_rollout_decision(
+        db,
+        user_id=user_id,
+        session_mode=str(workflow_state.get("session_mode") or ""),
+        workflow_mode=str(workflow_state.get("workflow_mode") or ""),
+    )
+    execution_strategy = apply_rollout_to_execution_strategy(
+        str(workflow_state.get("execution_strategy") or "fast_then_deep"),
+        flags=rollout_decision.flags,
+    )
+    lane_statuses = lane_statuses_for_rollout(execution_strategy, flags=rollout_decision.flags)
+    workflow_state["execution_strategy"] = execution_strategy
+    if workflow_state.get("fast_status") in {None, "", "pending"} or lane_statuses["fast_status"] == "not_requested":
+        workflow_state["fast_status"] = lane_statuses["fast_status"]
+    if workflow_state.get("deep_status") in {None, "", "pending"} or lane_statuses["deep_status"] == "not_requested":
+        workflow_state["deep_status"] = lane_statuses["deep_status"]
+    workflow_state["metadata"] = merge_rollout_metadata(
+        workflow_state.get("metadata"),
+        rollout_decision,
+    )
+
     cards = list(recovery.get("cards") or [])
     staged_edits = list(recovery.get("staged_edits") or [])
 
@@ -331,12 +358,23 @@ async def bootstrap_workflow(
         return recovered
 
     route_result = route_session(db, skill_id=skill_id, user_message=user_message)
+    rollout_decision = resolve_rollout_decision(
+        db,
+        user_id=user_id,
+        session_mode=route_result.session_mode,
+        workflow_mode=route_result.workflow_mode,
+    )
     complexity_level, execution_strategy = _derive_latency_controls(
         route_result=route_result,
         user_message=user_message,
         skill_id=skill_id,
         has_memo=bool(skill_id),
     )
+    execution_strategy = apply_rollout_to_execution_strategy(
+        execution_strategy,
+        flags=rollout_decision.flags,
+    )
+    lane_statuses = lane_statuses_for_rollout(execution_strategy, flags=rollout_decision.flags)
     architect_phase_status = _ensure_architect_state(
         db,
         conversation_id=conversation_id,
@@ -383,8 +421,10 @@ async def bootstrap_workflow(
         next_action=next_action,
         complexity_level=complexity_level,
         execution_strategy=execution_strategy,
+        fast_status=lane_statuses["fast_status"],
+        deep_status=lane_statuses["deep_status"],
         metadata=merge_latency_metadata(
-            None,
+            merge_rollout_metadata(None, rollout_decision),
             accepted_at=accepted_at,
             classified_at=_now_iso(),
         ),
@@ -432,6 +472,12 @@ def bootstrap_preflight_remediation(
 ) -> WorkflowRemediationResult:
     from app.services.preflight_governance import build_preflight_governance
 
+    rollout_decision = resolve_rollout_decision(
+        db,
+        user_id=user_id,
+        session_mode="optimize_existing_skill",
+        workflow_mode="preflight_remediation",
+    )
     governance_result = build_preflight_governance(db, skill_id=skill_id, result=result)
     cards = [
         normalize_workflow_card(card, source_type="preflight_remediation", phase="remediate", workflow_id=workflow_id)
@@ -455,7 +501,7 @@ def bootstrap_preflight_remediation(
         deep_status="pending" if cards or staged_edits else "not_requested",
         route_reason="preflight_failed",
         metadata=merge_latency_metadata(
-            {"source": "preflight_remediation"},
+            merge_rollout_metadata({"source": "preflight_remediation"}, rollout_decision),
             accepted_at=_now_iso(),
             classified_at=_now_iso(),
         ),
@@ -489,6 +535,12 @@ async def bootstrap_sandbox_remediation(
 ) -> WorkflowRemediationResult:
     from app.services.sandbox_governance import build_sandbox_report_governance
 
+    rollout_decision = resolve_rollout_decision(
+        db,
+        user_id=user_id,
+        session_mode="optimize_existing_skill",
+        workflow_mode="sandbox_remediation",
+    )
     governance_result = await build_sandbox_report_governance(db, skill_id=skill_id, report=report)
     cards = []
     for card in governance_result.cards:
@@ -525,7 +577,10 @@ async def bootstrap_sandbox_remediation(
         deep_status="pending" if cards or staged_edits else "not_requested",
         route_reason="sandbox_failed",
         metadata=merge_latency_metadata(
-            {"source": "sandbox_remediation", "report_id": getattr(report, "id", None)},
+            merge_rollout_metadata(
+                {"source": "sandbox_remediation", "report_id": getattr(report, "id", None)},
+                rollout_decision,
+            ),
             accepted_at=_now_iso(),
             classified_at=_now_iso(),
         ),

@@ -25,7 +25,11 @@ from app.services.llm_gateway import llm_gateway
 from app.services.studio_latency_policy import (
     choose_execution_strategy,
     estimate_complexity_level,
-    initial_lane_statuses,
+)
+from app.services.studio_rollout import (
+    apply_rollout_to_execution_strategy,
+    lane_statuses_for_rollout,
+    resolve_rollout_decision,
 )
 
 logger = logging.getLogger(__name__)
@@ -1334,7 +1338,25 @@ async def run_stream(
         workflow_mode=workflow_mode,
         next_action=next_action,
     )
-    lane_statuses = initial_lane_statuses(execution_strategy)
+    user_id = None
+    try:
+        from app.models.conversation import Conversation
+
+        conversation = db.get(Conversation, conv_id)
+        user_id = conversation.user_id if conversation else None
+    except Exception:
+        user_id = None
+    rollout_decision = resolve_rollout_decision(
+        db,
+        user_id=user_id,
+        session_mode=session_mode,
+        workflow_mode=workflow_mode,
+    )
+    execution_strategy = apply_rollout_to_execution_strategy(
+        execution_strategy,
+        flags=rollout_decision.flags,
+    )
+    lane_statuses = lane_statuses_for_rollout(execution_strategy, flags=rollout_decision.flags)
 
     # ── 阶段 1: routing ──
     yield ("status", {"stage": "routing"})

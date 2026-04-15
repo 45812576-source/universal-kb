@@ -113,7 +113,7 @@ def confirm_knowledge_archive(
             entry_id = entry.id
             is_new = True
 
-        db.commit()
+        db.flush()
         all_entry_ids.append(entry_id)
         if is_new:
             created_entry_ids.append(entry_id)

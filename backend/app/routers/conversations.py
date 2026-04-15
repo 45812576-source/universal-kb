@@ -950,7 +950,11 @@ async def stream_message(
                             from app.services.studio_latency_policy import (
                                 choose_execution_strategy,
                                 estimate_complexity_level,
-                                initial_lane_statuses,
+                            )
+                            from app.services.studio_rollout import (
+                                apply_rollout_to_execution_strategy,
+                                lane_statuses_for_rollout,
+                                resolve_rollout_decision,
                             )
                             _route_result = route_session(
                                 db, skill_id=req.selected_skill_id, user_message=req.content,
@@ -969,7 +973,17 @@ async def stream_message(
                                 workflow_mode=_route_result.workflow_mode,
                                 next_action=_route_result.next_action,
                             )
-                            _lane_statuses = initial_lane_statuses(_execution_strategy)
+                            _rollout_decision = resolve_rollout_decision(
+                                db,
+                                user_id=current_user_id,
+                                session_mode=_route_result.session_mode,
+                                workflow_mode=_route_result.workflow_mode,
+                            )
+                            _execution_strategy = apply_rollout_to_execution_strategy(
+                                _execution_strategy,
+                                flags=_rollout_decision.flags,
+                            )
+                            _lane_statuses = lane_statuses_for_rollout(_execution_strategy, flags=_rollout_decision.flags)
                             yield _sse("route_status", {
                                 "session_mode": _route_result.session_mode,
                                 "active_assist_skills": _route_result.active_assist_skills,

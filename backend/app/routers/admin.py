@@ -1,6 +1,7 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
@@ -542,6 +543,12 @@ _DEFAULT_FEATURE_FLAGS = {
     "webapp_publish": True,
     "batch_upload_skill": False,
     "feishu_sync": False,
+    "skill_studio_dual_lane_enabled": True,
+    "skill_studio_fast_lane_enabled": True,
+    "skill_studio_deep_lane_enabled": True,
+    "skill_studio_sla_degrade_enabled": True,
+    "skill_studio_patch_protocol_enabled": True,
+    "skill_studio_frontend_run_protocol_enabled": True,
 }
 
 
@@ -564,7 +571,17 @@ def get_user_features(
 
 
 # 高风险 feature flags — 变更需走 permission_changes 工单，不允许直接写
-_HIGH_RISK_FLAGS = {"dev_studio", "webapp_publish", "feishu_sync"}
+_HIGH_RISK_FLAGS = {
+    "dev_studio",
+    "webapp_publish",
+    "feishu_sync",
+    "skill_studio_dual_lane_enabled",
+    "skill_studio_fast_lane_enabled",
+    "skill_studio_deep_lane_enabled",
+    "skill_studio_sla_degrade_enabled",
+    "skill_studio_patch_protocol_enabled",
+    "skill_studio_frontend_run_protocol_enabled",
+}
 
 
 @router.put("/users/{uid}/features")
@@ -597,3 +614,29 @@ def update_user_features(
     db.refresh(user)
     flags = {**_DEFAULT_FEATURE_FLAGS, **(user.feature_flags or {})}
     return {"ok": True, "feature_flags": flags}
+
+
+@router.get("/studio/metrics")
+def get_studio_metrics(
+    days: int = 7,
+    limit: int = 500,
+    db: Session = Depends(get_db),
+    current: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """Skill Studio rollout 监控面板数据。"""
+    from app.services.studio_rollout_dashboard import build_studio_rollout_dashboard
+
+    return build_studio_rollout_dashboard(db, since_days=days, limit=limit)
+
+
+@router.get("/studio/metrics/export", response_class=PlainTextResponse)
+def export_studio_metrics(
+    days: int = 7,
+    limit: int = 500,
+    db: Session = Depends(get_db),
+    current: User = Depends(require_role(Role.SUPER_ADMIN)),
+):
+    """导出 Skill Studio rollout 指标明细 CSV。"""
+    from app.services.studio_rollout_dashboard import export_studio_rollout_dashboard_csv
+
+    return export_studio_rollout_dashboard_csv(db, since_days=days, limit=limit)
