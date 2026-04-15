@@ -983,6 +983,157 @@ def record_test_result(
     }
 
 
+def _remediation_task_target_files(task: dict[str, Any]) -> list[str]:
+    target_kind = str(task.get("target_kind") or "").strip()
+    target_ref = str(task.get("target_ref") or "").strip()
+    if target_kind == "skill_prompt":
+        return ["SKILL.md"]
+    if target_kind == "source_file" and target_ref:
+        return [target_ref]
+    return []
+
+
+def _remediation_priority(priority: str | None) -> str:
+    if priority == "p0":
+        return "high"
+    if priority == "p1":
+        return "medium"
+    return "low"
+
+
+def _ensure_remediation_memo(
+    db: Session,
+    skill_id: int,
+    user_id: int | None = None,
+) -> SkillMemo | None:
+    memo = db.query(SkillMemo).filter(SkillMemo.skill_id == skill_id).first()
+    if memo:
+        return memo
+
+    skill = db.get(Skill, skill_id)
+    if not skill:
+        return None
+
+    actor_id = user_id or skill.created_by
+    if not actor_id:
+        logger.warning("sync_remediation_tasks skipped: skill=%s has no actor", skill_id)
+        return None
+
+    memo = SkillMemo(
+        skill_id=skill_id,
+        scenario_type="published_iteration",
+        lifecycle_stage="fixing",
+        status_summary="沙盒测试未通过，等待整改。",
+        goal_summary=skill.description,
+        memo_payload=_empty_payload(),
+        created_by=actor_id,
+        updated_by=actor_id,
+    )
+    db.add(memo)
+    db.flush()
+    return memo
+
+
+def sync_remediation_tasks(
+    db: Session,
+    skill_id: int,
+    tasks: list[dict],
+    source_report_id: int,
+    user_id: int | None = None,
+) -> None:
+    """将 remediation agent 生成的任务清单写入 memo，替代旧报告任务。"""
+    memo = _ensure_remediation_memo(db, skill_id, user_id=user_id)
+    if not memo:
+        return
+
+    payload = copy.deepcopy(memo.memo_payload or _empty_payload())
+    existing_tasks = payload.setdefault("tasks", [])
+    superseded_ids: set[str] = set()
+
+    for task in existing_tasks:
+        if (
+            task.get("source") == "test_failure"
+            and task.get("source_report_id") == source_report_id
+            and task.get("status") in ("todo", "in_progress")
+        ):
+            task["status"] = "superseded"
+            task["result_summary"] = "已由 remediation agent 生成的新整改计划替代"
+            superseded_ids.add(str(task.get("id") or ""))
+
+    generated_task_ids: list[str] = []
+    fix_task_ids: list[str] = []
+
+    for item in tasks:
+        if not isinstance(item, dict):
+            continue
+
+        task_id = _new_id("task")
+        action_type = item.get("action_type", "fix_after_test")
+        task_type = action_type if action_type in VALID_TASK_TYPES else "fix_after_test"
+        depends_on = list(fix_task_ids) if task_type == "run_targeted_retest" else []
+
+        memo_task = {
+            "id": task_id,
+            "title": str(item.get("title") or "修复测试问题")[:200],
+            "type": task_type,
+            "status": "todo",
+            "priority": _remediation_priority(item.get("priority")),
+            "source": "test_failure",
+            "description": item.get("suggested_changes") or item.get("acceptance_rule") or "",
+            "target_files": _remediation_task_target_files(item),
+            "acceptance_rule": {"mode": "custom", "text": item.get("acceptance_rule", "")},
+            "depends_on": depends_on,
+            "started_at": None,
+            "completed_at": None,
+            "completed_by": None,
+            "result_summary": None,
+            "problem_refs": item.get("problem_ids", []),
+            "target_kind": item.get("target_kind", "unknown"),
+            "target_ref": item.get("target_ref", ""),
+            "retest_scope": item.get("retest_scope", []),
+            "acceptance_rule_text": item.get("acceptance_rule", ""),
+            "source_report_id": source_report_id,
+        }
+        existing_tasks.append(memo_task)
+        generated_task_ids.append(task_id)
+        if task_type != "run_targeted_retest":
+            fix_task_ids.append(task_id)
+
+    for record in payload.get("test_history", []):
+        if record.get("source_report_id") == source_report_id:
+            record["followup_task_ids"] = generated_task_ids
+
+    payload.setdefault("persistent_notices", [])
+    payload["persistent_notices"] = [
+        notice for notice in payload["persistent_notices"]
+        if notice.get("source") != "sandbox_test"
+    ]
+    payload["persistent_notices"].append({
+        "id": _new_id("notice"),
+        "title": "沙盒测试未通过，请按 remediation agent 任务逐项修复",
+        "level": "warning",
+        "source": "sandbox_test",
+        "created_at": _now_iso(),
+        "dismissible": False,
+        "status": "active",
+        "related_task_ids": generated_task_ids,
+    })
+
+    current_task_id = payload.get("current_task_id")
+    if current_task_id in superseded_ids or not current_task_id:
+        payload["current_task_id"] = generated_task_ids[0] if generated_task_ids else None
+
+    memo.lifecycle_stage = "fixing"
+    memo.status_summary = "沙盒整改计划已同步，请按任务逐项修复。"
+    if user_id:
+        memo.updated_by = user_id
+    elif memo.updated_by is None and memo.created_by is not None:
+        memo.updated_by = memo.created_by
+
+    _save_memo_payload(db, memo, payload)
+    db.commit()
+
+
 # ── 反馈采纳 ──────────────────────────────────────────────────────────────────
 
 def adopt_feedback(

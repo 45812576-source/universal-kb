@@ -8,7 +8,9 @@ from sqlalchemy.orm import Session
 
 from app.models.sandbox import SandboxTestReport
 from app.models.sandbox import SandboxTestSession
+from app.services.sandbox_remediation_agent import generate_remediation_plan
 from app.services.preflight_governance import _create_staged_edit, _make_card
+from app.services.skill_memo_service import sync_remediation_tasks
 
 
 @dataclass
@@ -121,26 +123,48 @@ def _default_staged_edit(
     return staged, card
 
 
-def build_sandbox_report_governance(
+async def build_sandbox_report_governance(
     db: Session,
     *,
     skill_id: int,
     report: SandboxTestReport,
 ) -> SandboxGovernanceResult:
     part3 = report.part3_evaluation or {}
-    fix_plan = part3.get("fix_plan_structured", []) or _fallback_fix_items(part3)
     issues = part3.get("issues", []) or []
     session = db.get(SandboxTestSession, report.session_id)
 
     cards: list[dict] = []
     staged_edits: list[dict] = []
     issue_map = {str(item.get("issue_id")): item for item in issues if item.get("issue_id")}
+    fix_plan = part3.get("fix_plan_structured", []) or _fallback_fix_items(part3)
+    items_for_followup = fix_plan
 
-    for item in fix_plan[:8]:
-        staged, card = _default_staged_edit(db, skill_id=skill_id, item=item)
-        staged_edits.append(staged)
-        cards.append(card)
+    if part3.get("fix_plan_structured"):
+        plan = await generate_remediation_plan(db, skill_id, report)
+        sync_remediation_tasks(
+            db,
+            skill_id=skill_id,
+            tasks=plan.tasks,
+            source_report_id=report.id,
+            user_id=session.tester_id if session else None,
+        )
+        cards.extend(plan.cards)
+        staged_edits.extend(plan.staged_edits)
+        items_for_followup = plan.tasks or fix_plan
+    else:
+        sync_remediation_tasks(
+            db,
+            skill_id=skill_id,
+            tasks=fix_plan,
+            source_report_id=report.id,
+            user_id=session.tester_id if session else None,
+        )
+        for item in fix_plan[:8]:
+            staged, card = _default_staged_edit(db, skill_id=skill_id, item=item)
+            staged_edits.append(staged)
+            cards.append(card)
 
+    for item in items_for_followup[:8]:
         target_kind = str(item.get("target_kind", "unknown"))
         if target_kind == "tool_binding":
             tool_ids = [

@@ -758,6 +758,130 @@ class TestGetMemoEdgeCases:
         assert result["next_task"] is None
         assert result["latest_test"] is None
 
+
+class TestSyncRemediationTasks:
+    """agent 生成的整改任务应覆盖旧报告任务并写回 memo。"""
+
+    def test_sync_remediation_tasks_supersedes_old_report_tasks(self, db):
+        dept = _make_dept(db, "整改同步部门")
+        user = _make_user(db, "remediation_sync_user", dept_id=dept.id)
+        skill = _make_skill(db, user.id, name="整改同步Skill", status=SkillStatus.PUBLISHED)
+
+        payload = skill_memo_service._empty_payload()
+        payload["tasks"] = [{
+            "id": "task_old_fix",
+            "title": "旧整改任务",
+            "type": "fix_after_test",
+            "status": "todo",
+            "priority": "high",
+            "source": "test_failure",
+            "description": "旧描述",
+            "target_files": ["SKILL.md"],
+            "acceptance_rule": {"mode": "custom", "text": "旧规则"},
+            "depends_on": [],
+            "started_at": None,
+            "completed_at": None,
+            "completed_by": None,
+            "result_summary": None,
+            "source_report_id": 99,
+        }]
+        payload["current_task_id"] = "task_old_fix"
+        payload["test_history"] = [{
+            "id": "test_1",
+            "source": "sandbox_interactive",
+            "version": 1,
+            "status": "failed",
+            "summary": "失败",
+            "details": {},
+            "created_at": "2026-04-15T00:00:00",
+            "followup_task_ids": ["task_old_fix"],
+            "source_report_id": 99,
+        }]
+
+        memo = SkillMemo(
+            skill_id=skill.id,
+            scenario_type="published_iteration",
+            lifecycle_stage="fixing",
+            status_summary="旧整改中",
+            memo_payload=payload,
+            created_by=user.id,
+            updated_by=user.id,
+        )
+        db.add(memo)
+        db.commit()
+
+        skill_memo_service.sync_remediation_tasks(
+            db,
+            skill_id=skill.id,
+            tasks=[{
+                "title": "修复输出结构",
+                "priority": "p0",
+                "action_type": "fix_prompt_logic",
+                "target_kind": "skill_prompt",
+                "target_ref": "SKILL.md",
+                "problem_ids": ["issue_1"],
+                "suggested_changes": "增加结论段",
+                "acceptance_rule": "首段给结论",
+                "retest_scope": ["all"],
+            }],
+            source_report_id=99,
+            user_id=user.id,
+        )
+
+        refreshed = skill_memo_service.get_memo(db, skill.id)
+        assert refreshed is not None
+        tasks = refreshed["memo"]["tasks"]
+        old_task = next(task for task in tasks if task["id"] == "task_old_fix")
+        assert old_task["status"] == "superseded"
+        new_task = next(task for task in tasks if task["id"] != "task_old_fix")
+        assert new_task["title"] == "修复输出结构"
+        assert new_task["target_files"] == ["SKILL.md"]
+        assert refreshed["memo"]["current_task_id"] == new_task["id"]
+        assert refreshed["memo"]["test_history"][0]["followup_task_ids"] == [new_task["id"]]
+
+    def test_sync_remediation_tasks_creates_retest_dependency_chain(self, db):
+        dept = _make_dept(db, "整改依赖部门")
+        user = _make_user(db, "remediation_chain_user", dept_id=dept.id)
+        skill = _make_skill(db, user.id, name="整改依赖Skill", status=SkillStatus.PUBLISHED)
+
+        skill_memo_service.sync_remediation_tasks(
+            db,
+            skill_id=skill.id,
+            tasks=[
+                {
+                    "title": "补齐主 prompt 结构",
+                    "priority": "p1",
+                    "action_type": "fix_prompt_logic",
+                    "target_kind": "skill_prompt",
+                    "target_ref": "SKILL.md",
+                    "problem_ids": ["issue_1"],
+                    "suggested_changes": "补齐输出模板",
+                    "acceptance_rule": "模板完整",
+                    "retest_scope": ["all"],
+                },
+                {
+                    "title": "运行定向回归",
+                    "priority": "p1",
+                    "action_type": "run_targeted_retest",
+                    "target_kind": "unknown",
+                    "target_ref": "",
+                    "problem_ids": ["issue_1"],
+                    "suggested_changes": "只回归失败 case",
+                    "acceptance_rule": "问题消失",
+                    "retest_scope": ["case_1"],
+                },
+            ],
+            source_report_id=100,
+            user_id=user.id,
+        )
+
+        refreshed = skill_memo_service.get_memo(db, skill.id)
+        assert refreshed is not None
+        tasks = refreshed["memo"]["tasks"]
+        fix_task = next(task for task in tasks if task["type"] == "fix_prompt_logic")
+        retest_task = next(task for task in tasks if task["type"] == "run_targeted_retest")
+        assert retest_task["depends_on"] == [fix_task["id"]]
+
     def test_get_memo_stale_current_task_id(self, db):
         """current_task_id 指向已完成的任务时，自动选下一个。"""
         dept = _make_dept(db, "过期部门")

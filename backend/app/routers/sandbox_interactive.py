@@ -2168,7 +2168,7 @@ async def remediation_actions_by_report(
 
     from app.services.sandbox_governance import build_sandbox_report_governance
 
-    result = build_sandbox_report_governance(
+    result = await build_sandbox_report_governance(
         db,
         skill_id=session.target_id,
         report=report,

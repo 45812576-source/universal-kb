@@ -8,6 +8,7 @@
   - 阻断逻辑
 """
 import pytest
+from unittest.mock import AsyncMock, patch
 from tests.conftest import (
     _make_user, _make_dept, _make_skill, _make_model_config,
     _make_tool, _login, _auth,
@@ -831,6 +832,8 @@ class TestSandboxReportGovernanceActions:
     """沙盒报告 → Studio 治理卡片回归。"""
 
     def test_build_remediation_actions_from_report(self, client, db):
+        from app.services.sandbox_governance import SandboxGovernanceResult
+
         dept = _make_dept(db)
         user = _make_user(db, "sandbox_governance_user", Role.SUPER_ADMIN, dept.id)
         _make_model_config(db)
@@ -907,14 +910,125 @@ class TestSandboxReportGovernanceActions:
         db.commit()
 
         token = _login(client, "sandbox_governance_user")
-        resp = client.post(
-            f"/api/sandbox/interactive/by-report/{report.id}/remediation-actions",
-            headers=_auth(token),
-        )
+        with patch(
+            "app.services.sandbox_governance.build_sandbox_report_governance",
+            new=AsyncMock(return_value=SandboxGovernanceResult(
+                cards=[{"id": "card_1", "type": "staged_edit", "title": "修复输出结构", "content": {}, "status": "pending", "actions": []}],
+                staged_edits=[{"id": "edit_1", "target_type": "system_prompt", "target_key": None, "summary": "修复输出结构", "risk_level": "medium", "diff_ops": [{"op": "replace", "old": "A", "new": "B"}], "status": "pending"}],
+            )),
+        ):
+            resp = client.post(
+                f"/api/sandbox/interactive/by-report/{report.id}/remediation-actions",
+                headers=_auth(token),
+            )
         assert resp.status_code == 200, resp.text
         data = resp.json()
         assert len(data.get("cards", [])) >= 1
         assert len(data.get("staged_edits", [])) >= 1
+
+    @pytest.mark.asyncio
+    async def test_build_governance_syncs_agent_tasks_to_memo(self, db):
+        from app.services.sandbox_governance import build_sandbox_report_governance
+        from app.services.sandbox_remediation_agent import RemediationPlanResult
+        from app.services.skill_memo_service import get_memo
+
+        dept = _make_dept(db)
+        user = _make_user(db, "sandbox_governance_sync_user", Role.SUPER_ADMIN, dept.id)
+        _make_model_config(db)
+        skill = _make_skill(db, user.id, name="沙盒整改任务同步Skill", status=SkillStatus.PUBLISHED)
+
+        session = SandboxTestSession(
+            target_type="skill",
+            target_id=skill.id,
+            target_version=1,
+            target_name=skill.name,
+            tester_id=user.id,
+            status=SessionStatus.COMPLETED,
+            current_step=SessionStep.DONE,
+            detected_slots=[],
+            tool_review=[],
+            permission_snapshot=[],
+            quality_passed=False,
+            usability_passed=True,
+            anti_hallucination_passed=True,
+            approval_eligible=False,
+        )
+        db.add(session)
+        db.flush()
+
+        report = SandboxTestReport(
+            session_id=session.id,
+            target_type="skill",
+            target_id=skill.id,
+            target_version=1,
+            target_name=skill.name,
+            tester_id=user.id,
+            part1_evidence_check={},
+            part2_test_matrix={},
+            part3_evaluation={
+                "issues": [{"issue_id": "issue_1", "reason": "缺少结论"}],
+                "fix_plan_structured": [{"id": "fix_1", "title": "旧整改任务", "priority": "p1"}],
+            },
+            quality_passed=False,
+            usability_passed=True,
+            anti_hallucination_passed=True,
+            approval_eligible=False,
+            report_hash="sandbox-gov-sync-hash",
+        )
+        db.add(report)
+        db.flush()
+        session.report_id = report.id
+        db.commit()
+
+        plan = RemediationPlanResult(
+            tasks=[{
+                "task_id": "task_1",
+                "id": "task_1",
+                "title": "修复结论先行结构",
+                "priority": "p0",
+                "problem_ids": ["issue_1"],
+                "action_type": "fix_prompt_logic",
+                "target_kind": "skill_prompt",
+                "target_ref": "SKILL.md",
+                "suggested_changes": "把首段改成先结论后依据",
+                "acceptance_rule": "首段必须先给结论",
+                "retest_scope": ["all"],
+                "estimated_gain": "提升可执行性",
+            }],
+            staged_edits=[{
+                "id": "1001",
+                "target_type": "system_prompt",
+                "target_key": None,
+                "summary": "修复结论先行结构",
+                "risk_level": "high",
+                "diff_ops": [{"op": "replace", "old": "旧结构", "new": "新结构"}],
+                "status": "pending",
+            }],
+            cards=[{
+                "id": "card_1",
+                "type": "staged_edit",
+                "title": "修复结论先行结构",
+                "content": {"staged_edit_id": "1001"},
+                "status": "pending",
+                "actions": [],
+            }],
+        )
+
+        with patch(
+            "app.services.sandbox_governance.generate_remediation_plan",
+            new=AsyncMock(return_value=plan),
+        ):
+            result = await build_sandbox_report_governance(db, skill_id=skill.id, report=report)
+
+        assert len(result.cards) == 1
+        assert len(result.staged_edits) == 1
+        memo = get_memo(db, skill.id)
+        assert memo is not None
+        memo_tasks = memo["memo"]["tasks"]
+        synced = [task for task in memo_tasks if task.get("source_report_id") == report.id]
+        assert len(synced) == 1
+        assert synced[0]["title"] == "修复结论先行结构"
+        assert synced[0]["target_files"] == ["SKILL.md"]
 
 
 class TestPreflightDescriptionGenerator:
