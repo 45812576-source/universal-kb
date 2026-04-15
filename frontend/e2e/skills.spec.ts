@@ -38,8 +38,12 @@ test.describe("Skill 管理", () => {
   test("可以发布 Skill", async ({ authedPage: page }) => {
     await page.goto("/admin/skills/new");
     const name = `发布测试-${Date.now()}`;
+    const publishablePrompt = Array.from(
+      { length: 210 },
+      (_, index) => `第 ${index + 1} 行：这是用于 E2E 发布校验的完整 Skill 指令内容。`
+    ).join("\n");
     await page.fill('input[name="name"]', name);
-    await page.fill('textarea[name="system_prompt"]', "发布测试prompt");
+    await page.fill('textarea[name="system_prompt"]', publishablePrompt);
     await page.getByRole("button", { name: /创建 Skill/ }).click();
     await page.waitForURL(/\/admin\/skills\/\d+/, { timeout: 10000 });
 
@@ -48,8 +52,7 @@ test.describe("Skill 管理", () => {
     const skillRow = page.locator(`tr, li, [data-skill]`).filter({ hasText: name }).first();
     if (await skillRow.isVisible({ timeout: 3000 })) {
       await skillRow.getByRole("button", { name: /发布/ }).click();
-      await page.waitForTimeout(1000);
-      await expect(page.locator("text=已发布").first()).toBeVisible();
+      await expect(skillRow.getByText("已发布")).toBeVisible({ timeout: 10000 });
     }
   });
 });

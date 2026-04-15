@@ -3,8 +3,8 @@ import { test, expect } from "./fixtures";
 test.describe("对话聊天", () => {
   test("主页显示选择对话提示", async ({ authedPage: page }) => {
     await page.goto("/");
-    // Main chat index shows placeholder to select or create a conversation
-    await expect(page.getByText(/选择一个对话|新建对话/)).toBeVisible({ timeout: 5000 });
+    await expect(page.getByRole("heading", { name: /选择工作台/ })).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("自由对话")).toBeVisible();
   });
 
   test("对话列表侧边栏可见", async ({ authedPage: page }) => {

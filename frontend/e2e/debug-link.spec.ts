@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
 
 test("debug: click generate link", async ({ browser }) => {
-  const context = await browser.newContext({ baseURL: "http://localhost:5173" });
+  const context = await browser.newContext({ baseURL: "http://localhost:5174" });
   const page = await context.newPage();
 
   // Collect all JS errors

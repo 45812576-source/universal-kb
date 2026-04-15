@@ -2,7 +2,8 @@ import { test, expect } from "./fixtures";
 
 test.describe("知识库", () => {
   test("员工可以提交知识条目", async ({ authedPage: page }) => {
-    await page.goto("/knowledge/new");
+    await page.goto("/knowledge/my");
+    await page.getByRole("button", { name: /录入新知识/ }).click();
     await page.fill('input[name="title"]', `E2E知识-${Date.now()}`);
     await page.fill('textarea[name="content"]', "这是E2E测试的知识内容，足够详细。");
     // Click submit button (not the layout logout button)
@@ -23,7 +24,8 @@ test.describe("知识库", () => {
 
   test("管理员可以批准知识条目", async ({ authedPage: page }) => {
     // Submit a knowledge entry first
-    await page.goto("/knowledge/new");
+    await page.goto("/knowledge/my");
+    await page.getByRole("button", { name: /录入新知识/ }).click();
     const title = `审核测试-${Date.now()}`;
     await page.fill('input[name="title"]', title);
     await page.fill('textarea[name="content"]', "审核测试内容详细描述。");

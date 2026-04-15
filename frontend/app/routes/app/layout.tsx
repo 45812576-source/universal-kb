@@ -145,6 +145,10 @@ const ICONS = {
     pattern: ["TTTTTTT","T.....T","T.TTT.T","T.T...T","T.TTT.T","T.....T","TTTTTTT","......."],
     colors: { T: "#319795" },
   },
+  studioMetrics: {
+    pattern: ["BBBBBBB","BWWWWWB","BWBBBWB","BWBBBWB","BWBBBWB","BWWWWWB","BBBBBBB","......."],
+    colors: { B: "#2B6CB0", W: "#BEE3F8" },
+  },
   // collapse toggle arrows
   chevronDown: {
     pattern: [".......",".......",".CCCCC.","..CCC..","...C...",".......",".......","......."],
@@ -333,6 +337,9 @@ export default function AppLayout() {
             {isAdmin && (
               <NavGroup label="系统运营" storageKey="nav_group_system" collapsed={collapsed}>
                 <NavItem to="/admin/contributions" label="贡献排行" icon={ICONS.contrib} collapsed={collapsed} />
+                {isSuperAdmin && (
+                  <NavItem to="/admin/studio-metrics" label="Studio 监控" icon={ICONS.studioMetrics} collapsed={collapsed} />
+                )}
                 <NavItem to="/admin/audit" label="操作审计" icon={ICONS.audit} collapsed={collapsed} />
                 {isSuperAdmin && (
                   <NavItem to="/admin/users" label="用户管理" icon={ICONS.users} collapsed={collapsed} />

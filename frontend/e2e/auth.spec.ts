@@ -4,7 +4,7 @@ import { login, logout } from "./helpers";
 test.describe("Auth", () => {
   test("登录成功跳转到主页", async ({ page }) => {
     await login(page);
-    await expect(page).toHaveURL("/");
+    await expect(page).toHaveURL(/\/($|chat$)/);
     // 应该能看到侧边栏
     await expect(page.locator("aside").first()).toBeVisible();
   });
@@ -27,7 +27,7 @@ test.describe("Auth", () => {
   test("已登录访问 /login 跳转到主页", async ({ page }) => {
     await login(page);
     await page.goto("/login");
-    await expect(page).toHaveURL("/");
+    await expect(page).toHaveURL(/\/($|chat$)/);
   });
 
   test("登出后无法访问保护页面", async ({ page }) => {

@@ -8,8 +8,9 @@ export default defineConfig({
     screenshot: "only-on-failure",
   },
   webServer: {
-    command: "npm run dev",
+    command: "PORT=5174 npm run build && PORT=5174 npm run start",
     url: "http://localhost:5174",
     reuseExistingServer: true,
+    timeout: 120_000,
   },
 });

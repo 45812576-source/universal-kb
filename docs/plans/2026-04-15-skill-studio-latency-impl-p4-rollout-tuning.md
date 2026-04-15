@@ -316,6 +316,8 @@ workflow_state.metadata.rollout
 - 脚本导出入口：`backend/scripts/export_studio_rollout_metrics.py`
 - 回归矩阵：`docs/operations/2026-04-15-skill-studio-rollout-regression-matrix.md`
 - 调优模板：`docs/operations/2026-04-15-skill-studio-tuning-record-template.md`
+- 前端 smoke：`frontend/e2e/admin.spec.ts` 覆盖 `/admin/studio-metrics`
+- 后端接口测试：`backend/tests/test_studio_capabilities.py` 覆盖 metrics JSON 与 CSV
 
 如果要进入下一轮扩大灰度，则建议默认执行顺序为：
 
@@ -323,3 +325,19 @@ workflow_state.metadata.rollout
 2. 再导出 CSV 做按 run 明细抽样；
 3. 再按回归矩阵抽样复核 `fast_only / fast_then_deep / SLA fallback / superseded`；
 4. 最后把结论回填到调优模板中，决定是否扩大灰度或回滚。
+
+### 14.9 最终验证记录
+
+本轮收口已完成以下验证：
+
+- 前端类型检查：`npm run typecheck`
+- 前端全量 E2E：`npm run test:e2e`，`31 passed`
+- 后端 Studio 能力测试：`python -m pytest tests/test_studio_capabilities.py tests/test_skill_memo.py::TestWorkflowRecovery -q`，`90 passed`
+
+本轮同时修复了历史 E2E 与当前页面行为不一致的问题：
+
+- 登录后落点兼容 `/chat`；
+- 业务数据表生成页标题更新为“生成新数据表”；
+- 知识录入改为 `/knowledge/my` 内联表单；
+- Skill 发布用例补足发布校验所需 prompt 行数；
+- Playwright web server 改为 `build + start`，避免 dev watcher 文件句柄上限问题。

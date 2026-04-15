@@ -6,6 +6,9 @@ __pycache__/
 uploads/
 build/
 .react-router/
+frontend/test-results/
+frontend/playwright-report/
+backend/.next/
 backend/studio_workspaces/
 ._*
 .DS_Store

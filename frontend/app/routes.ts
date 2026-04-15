@@ -64,6 +64,7 @@ export default [
       route("admin/business-tables/generate", "routes/app/admin/business-tables/generate.tsx"),
       route("admin/audit", "routes/app/admin/audit.tsx"),
       route("admin/contributions", "routes/app/admin/contributions.tsx"),
+      route("admin/studio-metrics", "routes/app/admin/studio-metrics.tsx"),
       route("admin/tools", "routes/app/admin/tools/index.tsx"),
       route("admin/intel", "routes/app/admin/intel/index.tsx"),
       route("admin/workspaces", "routes/app/admin/workspaces/index.tsx"),

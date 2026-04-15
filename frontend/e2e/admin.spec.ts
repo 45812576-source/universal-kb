@@ -16,6 +16,13 @@ test.describe("管理后台", () => {
     await expect(page.getByRole("heading", { name: "贡献统计" })).toBeVisible();
   });
 
+  test("可以访问 Studio 监控页并看到导出入口", async ({ authedPage: page }) => {
+    await page.goto("/admin/studio-metrics");
+    await expect(page.getByRole("heading", { name: "Skill Studio 监控" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "导出 CSV" })).toBeVisible();
+    await expect(page.getByText("First_Useful_Response")).toBeVisible();
+  });
+
   test("可以访问情报管理页", async ({ authedPage: page }) => {
     await page.goto("/admin/intel");
     await expect(page).not.toHaveURL("/login");
