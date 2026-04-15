@@ -18,7 +18,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_db
@@ -827,6 +827,46 @@ async def start_session(
         "detected_slots": session.detected_slots,
         "tool_review": session.tool_review,
     }
+
+
+@router.get("/history")
+async def list_history(
+    target_type: str | None = None,
+    target_id: int | None = None,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """列出当前用户的历史沙盒测试记录。"""
+    normalized_limit = max(1, min(limit, 100))
+    query = (
+        db.query(SandboxTestSession)
+        .options(joinedload(SandboxTestSession.report))
+        .filter(SandboxTestSession.tester_id == user.id)
+    )
+    if target_type:
+        query = query.filter(SandboxTestSession.target_type == target_type)
+    if target_id is not None:
+        query = query.filter(SandboxTestSession.target_id == target_id)
+
+    sessions = (
+        query.order_by(SandboxTestSession.created_at.desc(), SandboxTestSession.id.desc())
+        .limit(normalized_limit)
+        .all()
+    )
+
+    return [
+        {
+            **_serialize_session(session),
+            "has_report": session.report_id is not None,
+            "report_created_at": session.report.created_at.isoformat()
+            if session.report and session.report.created_at
+            else None,
+            "report_knowledge_entry_id": session.report.knowledge_entry_id if session.report else None,
+            "report_hash": session.report.report_hash if session.report else None,
+        }
+        for session in sessions
+    ]
 
 
 @router.get("/{session_id}")

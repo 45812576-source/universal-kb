@@ -14,6 +14,91 @@ import {
   type DraftData,
 } from "~/lib/draft-api";
 
+interface SandboxHistoryItem {
+  session_id: number;
+  target_type: string;
+  target_id: number;
+  target_version: number | null;
+  target_name: string | null;
+  tester_id: number;
+  status: string;
+  current_step: string;
+  blocked_reason: string | null;
+  detected_slots: unknown[];
+  tool_review: unknown[];
+  permission_snapshot: unknown[] | null;
+  theoretical_combo_count: number | null;
+  semantic_combo_count: number | null;
+  executed_case_count: number | null;
+  quality_passed: boolean | null;
+  usability_passed: boolean | null;
+  anti_hallucination_passed: boolean | null;
+  approval_eligible: boolean | null;
+  report_id: number | null;
+  parent_session_id?: number | null;
+  created_at: string | null;
+  completed_at: string | null;
+  has_report: boolean;
+  report_created_at: string | null;
+  report_knowledge_entry_id: number | null;
+  report_hash: string | null;
+}
+
+interface SandboxReport {
+  report_id: number;
+  session_id: number;
+  target_type: string;
+  target_id: number;
+  target_version: number | null;
+  target_name: string | null;
+  part3_evaluation: Record<string, unknown>;
+  quality_passed: boolean | null;
+  usability_passed: boolean | null;
+  anti_hallucination_passed: boolean | null;
+  approval_eligible: boolean | null;
+  report_hash: string | null;
+  knowledge_entry_id: number | null;
+  created_at: string | null;
+}
+
+function formatDateTime(value: string | null | undefined): string {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString("zh-CN", {
+    hour12: false,
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function statusLabel(status: string): string {
+  switch (status) {
+    case "completed": return "已完成";
+    case "running": return "执行中";
+    case "cannot_test": return "不可测试";
+    case "ready_to_run": return "可运行";
+    case "blocked": return "已阻断";
+    case "draft": return "草稿";
+    default: return status;
+  }
+}
+
+function stepLabel(step: string): string {
+  switch (step) {
+    case "input_slot_review": return "输入确认";
+    case "tool_review": return "工具确认";
+    case "permission_review": return "权限确认";
+    case "case_generation": return "生成用例";
+    case "execution": return "执行测试";
+    case "evaluation": return "质量评估";
+    case "done": return "已结束";
+    default: return step;
+  }
+}
+
 export function shouldRevalidate() {
   // 阻止 fetcher action 完成后自动 revalidation，避免闪屏和消息被吞
   return false;
@@ -30,6 +115,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     messages,
     conversationId: Number(params.id),
     workspace: conv?.workspace ?? null,
+    workspaceType: conv?.workspace_type ?? null,
     token,
     userId: user.id,
   };
@@ -374,16 +460,172 @@ function TypingIndicator({ isFileUpload = false }: { isFileUpload?: boolean }) {
   );
 }
 
+function SandboxHistoryModal({
+  open,
+  loading,
+  detailLoading,
+  error,
+  items,
+  selectedSession,
+  report,
+  onClose,
+  onSelectSession,
+  onViewReport,
+}: {
+  open: boolean;
+  loading: boolean;
+  detailLoading: boolean;
+  error: string | null;
+  items: SandboxHistoryItem[];
+  selectedSession: SandboxHistoryItem | null;
+  report: SandboxReport | null;
+  onClose: () => void;
+  onSelectSession: (sessionId: number) => void;
+  onViewReport: (sessionId: number) => void;
+}) {
+  if (!open) return null;
+
+  return (
+    <div className="absolute inset-0 z-30 bg-[#1A202C]/35 flex justify-end">
+      <div className="w-full max-w-5xl h-full bg-[#F8FCFE] border-l-2 border-[#1A202C] flex">
+        <div className="w-[44%] border-r-2 border-[#1A202C] flex flex-col">
+          <div className="px-4 py-3 border-b-2 border-[#1A202C] bg-white flex items-center justify-between">
+            <div>
+              <div className="text-[9px] font-bold uppercase tracking-widest text-[#00CC99]">历史测试记录</div>
+              <div className="text-[9px] text-gray-400 mt-1">清空聊天后，session 与报告仍会保留</div>
+            </div>
+            <button
+              onClick={onClose}
+              className="px-3 py-1 text-[9px] font-bold uppercase tracking-widest border-2 border-[#1A202C] bg-white text-[#1A202C] hover:bg-[#F0F4F8]"
+            >
+              关闭
+            </button>
+          </div>
+          <div className="flex-1 overflow-y-auto p-3 space-y-3">
+            {loading ? (
+              <div className="text-[10px] font-bold uppercase tracking-widest text-gray-400">加载中...</div>
+            ) : error ? (
+              <div className="border-2 border-red-300 bg-red-50 px-3 py-2 text-[10px] text-red-500">{error}</div>
+            ) : items.length === 0 ? (
+              <div className="border-2 border-dashed border-[#00CC99] bg-white px-4 py-6 text-center">
+                <div className="text-[10px] font-bold uppercase tracking-widest text-[#00CC99] mb-2">暂无历史测试</div>
+                <div className="text-[10px] text-gray-500 leading-relaxed">发起沙盒测试并保存后，会在这里显示历史 session 与报告。</div>
+              </div>
+            ) : (
+              items.map((item) => {
+                const selected = item.session_id === selectedSession?.session_id;
+                return (
+                  <button
+                    key={item.session_id}
+                    onClick={() => onSelectSession(item.session_id)}
+                    className={`w-full text-left border-2 px-3 py-3 transition-colors ${
+                      selected ? "border-[#00CC99] bg-[#F0FFF9]" : "border-[#1A202C] bg-white hover:bg-[#F8FAFC]"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <div className="text-[10px] font-bold text-[#1A202C]">
+                          {item.target_name || `${item.target_type} #${item.target_id}`}
+                        </div>
+                        <div className="text-[9px] text-gray-400 mt-1">
+                          v{item.target_version ?? "?"} · {formatDateTime(item.created_at)}
+                        </div>
+                      </div>
+                      <div className={`px-2 py-0.5 text-[8px] font-bold border ${item.has_report ? "border-[#00CC99] text-[#00CC99]" : "border-gray-300 text-gray-400"}`}>
+                        {item.has_report ? "有报告" : "无报告"}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 mt-3 text-[8px] font-bold uppercase tracking-widest text-gray-500">
+                      <span>{statusLabel(item.status)}</span>
+                      <span>•</span>
+                      <span>{stepLabel(item.current_step)}</span>
+                    </div>
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </div>
+        <div className="flex-1 flex flex-col">
+          <div className="px-4 py-3 border-b-2 border-[#1A202C] bg-white">
+            <div className="text-[9px] font-bold uppercase tracking-widest text-[#1A202C]">记录详情</div>
+          </div>
+          <div className="flex-1 overflow-y-auto p-4 space-y-4">
+            {detailLoading ? (
+              <div className="text-[10px] font-bold uppercase tracking-widest text-gray-400">加载详情...</div>
+            ) : !selectedSession ? (
+              <div className="border-2 border-dashed border-gray-300 bg-white px-4 py-6 text-[10px] text-gray-500">
+                选择左侧一条历史记录后，这里会显示对应 session 与报告摘要。
+              </div>
+            ) : (
+              <>
+                <div className="border-2 border-[#1A202C] bg-white p-4 space-y-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-[10px] font-bold uppercase tracking-widest text-[#00CC99]">Session #{selectedSession.session_id}</div>
+                      <div className="text-[11px] font-bold text-[#1A202C] mt-1">
+                        {selectedSession.target_name || `${selectedSession.target_type} #${selectedSession.target_id}`}
+                      </div>
+                    </div>
+                    {selectedSession.report_id ? (
+                      <button
+                        onClick={() => onViewReport(selectedSession.session_id)}
+                        className="px-3 py-1 text-[9px] font-bold uppercase tracking-widest border-2 border-[#00CC99] bg-[#F0FFF9] text-[#00CC99] hover:bg-[#DDFBED]"
+                      >
+                        查看报告
+                      </button>
+                    ) : null}
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 text-[10px]">
+                    <div><span className="text-gray-400">状态：</span><span className="font-bold text-[#1A202C]">{statusLabel(selectedSession.status)}</span></div>
+                    <div><span className="text-gray-400">阶段：</span><span className="font-bold text-[#1A202C]">{stepLabel(selectedSession.current_step)}</span></div>
+                    <div><span className="text-gray-400">创建：</span><span className="font-bold text-[#1A202C]">{formatDateTime(selectedSession.created_at)}</span></div>
+                    <div><span className="text-gray-400">完成：</span><span className="font-bold text-[#1A202C]">{formatDateTime(selectedSession.completed_at)}</span></div>
+                    <div><span className="text-gray-400">已执行用例：</span><span className="font-bold text-[#1A202C]">{selectedSession.executed_case_count ?? "—"}</span></div>
+                    <div><span className="text-gray-400">可提审：</span><span className="font-bold text-[#1A202C]">{selectedSession.approval_eligible == null ? "—" : selectedSession.approval_eligible ? "是" : "否"}</span></div>
+                  </div>
+                </div>
+                {report ? (
+                  <div className="border-2 border-[#00CC99] bg-[#F0FFF9] p-4 space-y-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="text-[9px] font-bold uppercase tracking-widest text-[#00CC99]">报告 #{report.report_id}</div>
+                      <div className="text-[9px] text-[#00CC99]/70">{formatDateTime(report.created_at)}</div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 text-[10px]">
+                      <div><span className="text-gray-500">知识库存证：</span><span className="font-bold text-[#1A202C]">{report.knowledge_entry_id ?? "—"}</span></div>
+                      <div><span className="text-gray-500">Hash：</span><span className="font-bold text-[#1A202C]">{report.report_hash?.slice(0, 12) ?? "—"}</span></div>
+                      <div><span className="text-gray-500">质量通过：</span><span className="font-bold text-[#1A202C]">{report.quality_passed == null ? "—" : report.quality_passed ? "是" : "否"}</span></div>
+                      <div><span className="text-gray-500">反幻觉通过：</span><span className="font-bold text-[#1A202C]">{report.anti_hallucination_passed == null ? "—" : report.anti_hallucination_passed ? "是" : "否"}</span></div>
+                    </div>
+                    <pre className="text-[9px] leading-relaxed whitespace-pre-wrap break-words bg-white border border-[#BEEFD7] p-3 overflow-x-auto">
+                      {JSON.stringify(report.part3_evaluation ?? {}, null, 2)}
+                    </pre>
+                  </div>
+                ) : selectedSession.report_id ? (
+                  <div className="border border-dashed border-[#00CC99] bg-white px-4 py-3 text-[10px] text-gray-500">
+                    这条记录已生成报告，点击“查看报告”即可加载详情。
+                  </div>
+                ) : null}
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function ConversationPage() {
   const loaderData = useLoaderData<typeof loader>() as {
     messages: Message[];
     conversationId: number;
     workspace: { name: string; icon: string; color: string } | null;
+    workspaceType: string | null;
     token: string;
     userId: number;
   };
 
-  const { messages: initialMessages, workspace, token, conversationId } = loaderData;
+  const { messages: initialMessages, workspace, workspaceType, token, conversationId } = loaderData;
   const fetcher = useFetcher();
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -394,6 +636,13 @@ export default function ConversationPage() {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [isFileUploading, setIsFileUploading] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyDetailLoading, setHistoryDetailLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [sandboxHistory, setSandboxHistory] = useState<SandboxHistoryItem[]>([]);
+  const [selectedHistorySession, setSelectedHistorySession] = useState<SandboxHistoryItem | null>(null);
+  const [selectedHistoryReport, setSelectedHistoryReport] = useState<SandboxReport | null>(null);
 
   // 全局阻止浏览器把拖入的文件在新 tab 打开（capture 捕获阶段，最早拦截）
   useEffect(() => {
@@ -433,6 +682,73 @@ export default function ConversationPage() {
   }, [messages.length, isLoading]);
 
   const [classificationResult, setClassificationResult] = useState<any>(null);
+
+  useEffect(() => {
+    if (!historyOpen || workspaceType !== "sandbox") return;
+    let cancelled = false;
+    const loadHistory = async () => {
+      setHistoryLoading(true);
+      setHistoryError(null);
+      try {
+        const data = await apiFetch("/api/sandbox/interactive/history?limit=20", { token });
+        if (cancelled) return;
+        const items = data as SandboxHistoryItem[];
+        setSandboxHistory(items);
+        setSelectedHistorySession((prev) =>
+          prev && items.some((item) => item.session_id === prev.session_id) ? prev : items[0] ?? null
+        );
+      } catch (error) {
+        if (!cancelled) {
+          setHistoryError(error instanceof Error ? error.message : "加载历史记录失败");
+          setSandboxHistory([]);
+          setSelectedHistorySession(null);
+        }
+      } finally {
+        if (!cancelled) setHistoryLoading(false);
+      }
+    };
+    loadHistory();
+    return () => {
+      cancelled = true;
+    };
+  }, [historyOpen, token, workspaceType]);
+
+  const handleClearConversation = async () => {
+    if (isSubmitting || isLoading) {
+      window.alert("当前测试进行中，请先停止生成后再清空。");
+      return;
+    }
+    const confirmed = window.confirm("只清除当前聊天记录，历史测试 session、memo 和测试报告会保留。确认清空吗？");
+    if (!confirmed) return;
+    try {
+      await apiFetch(`/api/conversations/${conversationId}/messages`, {
+        method: "DELETE",
+        token,
+      });
+      window.location.reload();
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "清空失败，请重试");
+    }
+  };
+
+  const handleSelectHistorySession = (sessionId: number) => {
+    const item = sandboxHistory.find((historyItem) => historyItem.session_id === sessionId) ?? null;
+    setSelectedHistorySession(item);
+    setSelectedHistoryReport(null);
+  };
+
+  const handleViewHistoryReport = async (sessionId: number) => {
+    setHistoryDetailLoading(true);
+    setHistoryError(null);
+    try {
+      const report = await apiFetch(`/api/sandbox/interactive/${sessionId}/report`, { token });
+      setSelectedHistoryReport(report as SandboxReport);
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : "加载报告失败");
+    } finally {
+      setHistoryDetailLoading(false);
+    }
+  };
 
   const handleSubmit = async (data: { text?: string; files?: File[] }) => {
     if (!data.text?.trim() && (!data.files || data.files.length === 0)) return;
@@ -581,7 +897,19 @@ export default function ConversationPage() {
   };
 
   return (
-    <div className="flex h-full bg-[#F0F4F8]">
+    <div className="relative flex h-full bg-[#F0F4F8]">
+      <SandboxHistoryModal
+        open={historyOpen}
+        loading={historyLoading}
+        detailLoading={historyDetailLoading}
+        error={historyError}
+        items={sandboxHistory}
+        selectedSession={selectedHistorySession}
+        report={selectedHistoryReport}
+        onClose={() => setHistoryOpen(false)}
+        onSelectSession={handleSelectHistorySession}
+        onViewReport={handleViewHistoryReport}
+      />
       {/* Left: Chat area (60%) */}
       <div
         className={`w-[60%] flex flex-col border-r-2 border-[#1A202C] relative transition-colors ${isDragOver ? "bg-[#CCF2FF]/30" : ""}`}
@@ -591,29 +919,53 @@ export default function ConversationPage() {
       >
         {/* Header */}
         <div className="border-b-2 border-[#1A202C] bg-white px-4 py-2 flex-shrink-0">
-          <div className="flex items-center gap-2">
-            {workspace ? (
-              <>
-                <div
-                  className="w-6 h-6 flex items-center justify-center text-xs border-2 border-[#1A202C]"
-                  style={{ backgroundColor: workspace.color }}
-                >
-                  {workspace.icon === "chat" ? "💬" :
-                   workspace.icon === "data" ? "📊" :
-                   workspace.icon === "search" ? "🔍" :
-                   workspace.icon === "report" ? "📋" :
-                   workspace.icon === "code" ? "💻" : "⚡"}
-                </div>
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              {workspace ? (
+                <>
+                  <div
+                    className="w-6 h-6 flex items-center justify-center text-xs border-2 border-[#1A202C]"
+                    style={{ backgroundColor: workspace.color }}
+                  >
+                    {workspace.icon === "chat" ? "💬" :
+                     workspace.icon === "data" ? "📊" :
+                     workspace.icon === "search" ? "🔍" :
+                     workspace.icon === "report" ? "📋" :
+                     workspace.icon === "code" ? "💻" : "⚡"}
+                  </div>
+                  <span className="text-[10px] font-bold uppercase tracking-widest text-[#1A202C]">
+                    {workspace.name}
+                  </span>
+                </>
+              ) : (
                 <span className="text-[10px] font-bold uppercase tracking-widest text-[#1A202C]">
-                  {workspace.name}
+                  AI 助手
                 </span>
-              </>
-            ) : (
-              <span className="text-[10px] font-bold uppercase tracking-widest text-[#1A202C]">
-                AI 助手
-              </span>
+              )}
+            </div>
+            {workspaceType === "sandbox" && (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setHistoryOpen(true)}
+                  className="px-2 py-1 text-[8px] font-bold uppercase tracking-widest border-2 border-[#00CC99] bg-[#F0FFF9] text-[#00CC99] hover:bg-[#DDFBED]"
+                >
+                  历史测试记录
+                </button>
+                <button
+                  onClick={handleClearConversation}
+                  disabled={isSubmitting || isLoading || messages.length === 0}
+                  className="px-2 py-1 text-[8px] font-bold uppercase tracking-widest border-2 border-[#1A202C] bg-white text-[#1A202C] hover:bg-[#F0F4F8] disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  清空当前对话
+                </button>
+              </div>
             )}
           </div>
+          {workspaceType === "sandbox" && (
+            <div className="text-[8px] text-[#00CC99] mt-1">
+              清空只影响当前聊天，历史 session、memo 和测试报告会保留。
+            </div>
+          )}
         </div>
 
         {/* Drop overlay */}

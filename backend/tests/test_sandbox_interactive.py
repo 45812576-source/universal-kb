@@ -25,11 +25,12 @@ from app.models.sandbox import SandboxTestSession, SandboxTestReport, SessionSta
 
 def _setup_skill_with_tool(db, user_id, tool_config=None, tool_schema=None,
                            required_inputs=None, data_queries=None,
-                           knowledge_tags=None, source_files=None):
+                           knowledge_tags=None, source_files=None,
+                           skill_name="测试Skill", tool_name="sandbox_tool"):
     """创建 Skill + 绑定 Tool + SkillVersion，返回 (skill, tool, version)。"""
     from app.models.skill import Skill, SkillMode
     skill = Skill(
-        name="测试Skill",
+        name=skill_name,
         description="沙盒测试用",
         mode=SkillMode.HYBRID,
         status=SkillStatus.PUBLISHED,
@@ -43,7 +44,7 @@ def _setup_skill_with_tool(db, user_id, tool_config=None, tool_schema=None,
     db.add(skill)
     db.flush()
 
-    tool = _make_tool(db, user_id, name="sandbox_tool", tool_type=ToolType.BUILTIN)
+    tool = _make_tool(db, user_id, name=tool_name, tool_type=ToolType.BUILTIN)
     tool.config = tool_config or {}
     tool.input_schema = tool_schema or {}
     db.flush()
@@ -1185,3 +1186,91 @@ class TestPreflightDescriptionGenerator:
             },
         )
         assert all(edit["target_type"] != "metadata" for edit in result.staged_edits)
+
+
+class TestSandboxHistory:
+    def test_history_lists_latest_sessions_and_report_flags(self, client, db):
+        dept = _make_dept(db)
+        user = _make_user(db, "history_user", Role.SUPER_ADMIN, dept.id)
+        other_user = _make_user(db, "history_other", Role.SUPER_ADMIN, dept.id)
+        _make_model_config(db)
+
+        skill_a, _, _ = _setup_skill_with_tool(
+            db, user.id, skill_name="历史技能A", tool_name="history_tool_a"
+        )
+        skill_b, _, _ = _setup_skill_with_tool(
+            db, user.id, skill_name="历史技能B", tool_name="history_tool_b"
+        )
+        other_skill, _, _ = _setup_skill_with_tool(
+            db, other_user.id, skill_name="其他人的测试", tool_name="history_tool_hidden"
+        )
+        db.flush()
+
+        older = SandboxTestSession(
+            target_type="skill",
+            target_id=skill_a.id,
+            target_version=1,
+            target_name="历史技能A",
+            tester_id=user.id,
+            status=SessionStatus.COMPLETED,
+            current_step=SessionStep.DONE,
+        )
+        newer = SandboxTestSession(
+            target_type="skill",
+            target_id=skill_b.id,
+            target_version=2,
+            target_name="历史技能B",
+            tester_id=user.id,
+            status=SessionStatus.COMPLETED,
+            current_step=SessionStep.DONE,
+        )
+        hidden = SandboxTestSession(
+            target_type="skill",
+            target_id=other_skill.id,
+            target_version=3,
+            target_name="其他人的测试",
+            tester_id=other_user.id,
+            status=SessionStatus.COMPLETED,
+            current_step=SessionStep.DONE,
+        )
+        db.add_all([older, newer, hidden])
+        db.flush()
+
+        report = SandboxTestReport(
+            session_id=newer.id,
+            target_type="skill",
+            target_id=skill_b.id,
+            target_version=2,
+            target_name="历史技能B",
+            tester_id=user.id,
+            part1_evidence_check={},
+            part2_test_matrix={},
+            part3_evaluation={},
+            report_hash="hash-history",
+        )
+        db.add(report)
+        db.flush()
+        newer.report_id = report.id
+        db.commit()
+
+        token = _login(client, "history_user")
+
+        resp = client.get("/api/sandbox/interactive/history", headers=_auth(token))
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+
+        assert [item["session_id"] for item in data[:2]] == [newer.id, older.id]
+        assert all(item["tester_id"] == user.id for item in data)
+        newest = data[0]
+        assert newest["has_report"] is True
+        assert newest["report_hash"] == "hash-history"
+        assert newest["report_created_at"] is not None
+
+        resp = client.get(
+            f"/api/sandbox/interactive/history?target_type=skill&target_id={skill_a.id}",
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        filtered = resp.json()
+        assert len(filtered) == 1
+        assert filtered[0]["session_id"] == older.id
