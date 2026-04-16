@@ -17,7 +17,10 @@ from app.models.user import User
 def _check_session_access(session: SandboxTestSession, user: User) -> None:
     if user.role == "super_admin":
         return
-    if session.created_by != user.id:
+    owner_id = getattr(session, "tester_id", None)
+    if owner_id is None:
+        owner_id = getattr(session, "created_by", None)
+    if owner_id != user.id:
         raise HTTPException(403, "无权访问该测试会话")
 
 
