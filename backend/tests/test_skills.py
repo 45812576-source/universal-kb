@@ -3,7 +3,8 @@ import pytest
 from tests.conftest import _make_user, _make_dept, _make_skill, _make_model_config, _login, _auth
 from app.models.permission import ApprovalRequest
 from app.models.user import Role
-from app.models.skill import SkillStatus
+from app.models.skill import SkillStatus, SkillExecutionLog, SkillAuditResult, SkillFolderAlias, ArchitectWorkflowState, StagedEdit
+from app.models.skill_knowledge_ref import SkillKnowledgeReference
 
 
 # ── Create ────────────────────────────────────────────────────────────────────
@@ -245,6 +246,34 @@ def test_delete_skill(client, db):
 
     resp = client.get(f"/api/skills/{skill.id}", headers=_auth(token))
     assert resp.status_code == 404
+
+
+def test_delete_skill_cleans_referencing_records(client, db):
+    dept = _make_dept(db)
+    admin = _make_user(db, "admin11_refs", Role.SUPER_ADMIN, dept.id)
+    skill = _make_skill(db, admin.id, "DeleteMeWithRefs")
+    db.flush()
+    db.add(SkillExecutionLog(skill_id=skill.id, user_id=admin.id, success=False, error_type="fk"))
+    db.add(SkillAuditResult(skill_id=skill.id, quality_verdict="needs_work"))
+    db.add(SkillFolderAlias(skill_id=skill.id, old_folder_key="delete-me-with-refs-old"))
+    db.add(StagedEdit(skill_id=skill.id, target_type="system_prompt", diff_ops=[], summary="pending", risk_level="low"))
+    db.add(ArchitectWorkflowState(conversation_id=900001, skill_id=skill.id))
+    db.add(SkillKnowledgeReference(skill_id=skill.id, knowledge_id=1, publish_version=1))
+    db.commit()
+    token = _login(client, "admin11_refs")
+
+    resp = client.delete(f"/api/skills/{skill.id}", headers=_auth(token))
+    assert resp.status_code == 200
+
+    assert db.query(SkillExecutionLog).filter(SkillExecutionLog.skill_id == skill.id).count() == 0
+    assert db.query(SkillAuditResult).filter(SkillAuditResult.skill_id == skill.id).count() == 0
+    assert db.query(SkillFolderAlias).filter(SkillFolderAlias.skill_id == skill.id).count() == 0
+    assert db.query(StagedEdit).filter(StagedEdit.skill_id == skill.id).count() == 0
+    assert db.query(SkillKnowledgeReference).filter(SkillKnowledgeReference.skill_id == skill.id).count() == 0
+
+    workflow = db.query(ArchitectWorkflowState).filter(ArchitectWorkflowState.conversation_id == 900001).first()
+    assert workflow is not None
+    assert workflow.skill_id is None
 
 
 def test_delete_skill_non_superadmin_forbidden(client, db):

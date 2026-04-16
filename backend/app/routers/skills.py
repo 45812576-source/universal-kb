@@ -2571,6 +2571,12 @@ def delete_skill(
     db.execute(text("DELETE FROM skill_suggestions WHERE skill_id = :sid"), {"sid": sid})
     db.execute(text("DELETE FROM skill_memos WHERE skill_id = :sid"), {"sid": sid})
     db.execute(text("DELETE FROM skill_preflight_results WHERE skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM skill_execution_logs WHERE skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM skill_audit_results WHERE skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM staged_edits WHERE skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM skill_folder_aliases WHERE skill_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM skill_knowledge_references WHERE skill_id = :sid"), {"sid": sid})
+    db.execute(text("UPDATE architect_workflow_states SET skill_id = NULL WHERE skill_id = :sid"), {"sid": sid})
     db.execute(text("DELETE FROM skill_versions WHERE skill_id = :sid"), {"sid": sid})
     # conversations 置空 skill_id（保留对话记录）
     db.execute(text("UPDATE conversations SET skill_id = NULL WHERE skill_id = :sid"), {"sid": sid})
