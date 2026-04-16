@@ -2,6 +2,7 @@
 import base64
 import html
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 
@@ -58,7 +59,7 @@ def _call_kimi_vision(image_path: str) -> str:
 
     ext = os.path.splitext(image_path)[1].lower().lstrip(".")
     mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-                "webp": "image/webp", "bmp": "image/bmp"}
+                "webp": "image/webp", "bmp": "image/bmp", "gif": "image/gif"}
     mime = mime_map.get(ext, "image/png")
 
     client = openai.OpenAI(
@@ -96,7 +97,7 @@ def _call_ark_vision(image_path: str) -> str:
 
     ext = os.path.splitext(image_path)[1].lower().lstrip(".")
     mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-                "webp": "image/webp", "bmp": "image/bmp"}
+                "webp": "image/webp", "bmp": "image/bmp", "gif": "image/gif"}
     mime = mime_map.get(ext, "image/png")
 
     client = openai.OpenAI(api_key=api_key, base_url=base_url)
@@ -194,6 +195,21 @@ def _extract_pdf_with_vision(file_path: str) -> ExtractionResult:
         mode="pdf_fallback",
         error=("vision_ocr_failed: " + " | ".join(errors))[:500] if errors else "vision_ocr_failed",
     )
+
+
+def _strip_html_tags(raw_html: str) -> str:
+    if not raw_html:
+        return ""
+    cleaned = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw_html)
+    cleaned = re.sub(r"(?i)<br\s*/?>", "\n", cleaned)
+    cleaned = re.sub(r"(?i)</p\s*>", "\n", cleaned)
+    cleaned = re.sub(r"(?i)</div\s*>", "\n", cleaned)
+    cleaned = re.sub(r"(?s)<[^>]+>", " ", cleaned)
+    cleaned = html.unescape(cleaned)
+    cleaned = re.sub(r"\r\n?", "\n", cleaned)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def extract_text_result(file_path: str) -> ExtractionResult:
@@ -356,6 +372,10 @@ def extract_html(file_path: str) -> str:
             text = f.read()
         return md_lib.markdown(text, extensions=["tables", "fenced_code", "nl2br", "sane_lists"])
 
+    elif ext in (".html", ".htm"):
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+
     elif ext in (".pptx",):
         # PPTX: wrap each slide as a section with headings
         from pptx import Presentation
@@ -504,6 +524,10 @@ def extract_text(file_path: str) -> str:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             return f.read()
 
+    elif ext in (".html", ".htm"):
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            return _strip_html_tags(f.read())
+
     elif ext in (".xlsx", ".xls"):
         import openpyxl
         wb = openpyxl.load_workbook(file_path, data_only=True)
@@ -527,7 +551,7 @@ def extract_text(file_path: str) -> str:
                 rows.append("\t".join(row))
         return "\n".join(rows)
 
-    elif ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+    elif ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"):
         return _call_kimi_vision(file_path)
 
     elif ext in (".mp3", ".wav", ".m4a", ".ogg", ".flac"):
@@ -536,6 +560,6 @@ def extract_text(file_path: str) -> str:
     else:
         raise ValueError(
             f"Unsupported file type: {ext}. "
-            "Supported: .txt .pdf .docx .pptx .md .xlsx .xls .csv "
-            ".jpg .jpeg .png .webp .bmp .mp3 .wav .m4a .ogg .flac"
+            "Supported: .txt .pdf .docx .pptx .md .html .htm .xlsx .xls .csv "
+            ".jpg .jpeg .png .webp .bmp .gif .mp3 .wav .m4a .ogg .flac"
         )

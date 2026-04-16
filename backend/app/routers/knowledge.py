@@ -749,8 +749,9 @@ async def upload_knowledge(
             if not inner_name or inner_name.startswith("."):
                 continue
             inner_ext = os.path.splitext(inner_name)[1].lower()
-            if inner_ext not in (".txt", ".pdf", ".docx", ".pptx", ".md", ".xlsx", ".xls", ".csv",
-                                  ".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+            if inner_ext not in (".txt", ".pdf", ".docx", ".pptx", ".md", ".html", ".htm",
+                                  ".xlsx", ".xls", ".csv", ".jpg", ".jpeg", ".png", ".webp",
+                                  ".bmp", ".gif", ".mp3", ".wav", ".m4a", ".ogg", ".flac"):
                 continue
 
             # 计算文件所属的目录 folder_id

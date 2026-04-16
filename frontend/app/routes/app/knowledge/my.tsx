@@ -65,6 +65,21 @@ export async function action({ request }: Route.ActionArgs) {
         token,
       });
       return redirect(`/knowledge/my?submitted=${result.id}`);
+    } else if (mode === "lark_doc") {
+      const result = await apiFetch("/api/knowledge/import-from-lark", {
+        method: "POST",
+        body: JSON.stringify({
+          title: form.get("title") as string,
+          url: form.get("lark_url") as string,
+          category: form.get("category") as string,
+          industry_tags: tagsFromField("industry_tags"),
+          platform_tags: tagsFromField("platform_tags"),
+          topic_tags: tagsFromField("topic_tags"),
+          sync_interval: 0,
+        }),
+        token,
+      });
+      return redirect(`/knowledge/my?submitted=${result.id}`);
     } else {
       const uploadForm = new FormData();
       uploadForm.set("title", form.get("title") as string);
@@ -141,7 +156,7 @@ function FieldLabel({ children, required }: { children: React.ReactNode; require
 function CreateForm({ onCancel }: { onCancel: () => void }) {
   const actionData = useActionData<typeof action>() as any;
   const navigation = useNavigation();
-  const [mode, setMode] = useState<"text" | "file">("text");
+  const [mode, setMode] = useState<"text" | "file" | "lark_doc">("text");
   const isSubmitting = navigation.state !== "idle";
 
   return (
@@ -191,6 +206,15 @@ function CreateForm({ onCancel }: { onCancel: () => void }) {
           >
             文件上传
           </button>
+          <button
+            type="button"
+            onClick={() => setMode("lark_doc")}
+            className={`px-4 py-1.5 text-[10px] font-bold uppercase tracking-widest border-l-2 border-[#1A202C] transition-colors ${
+              mode === "lark_doc" ? "bg-[#1A202C] text-white" : "bg-white text-gray-600 hover:bg-gray-100"
+            }`}
+          >
+            飞书导入
+          </button>
         </div>
 
         <Form
@@ -229,20 +253,34 @@ function CreateForm({ onCancel }: { onCancel: () => void }) {
                 placeholder="请详细描述你的经验、方法或案例..."
               />
             </div>
-          ) : (
+          ) : mode === "file" ? (
             <div>
               <FieldLabel required>文件</FieldLabel>
               <div className="border-2 border-dashed border-[#1A202C] px-6 py-6 text-center bg-white">
                 <p className="text-[10px] font-bold uppercase text-gray-400 mb-2">
-                  支持 PDF / DOCX / PPTX / MD / TXT
+                  支持 PDF / Office / 表格 / 图片 / 音频 / HTML / ZIP
                 </p>
                 <input
                   type="file"
                   name="file"
                   required
-                  accept=".pdf,.docx,.pptx,.md,.txt"
+                  accept=".txt,.pdf,.docx,.pptx,.md,.html,.htm,.xlsx,.xls,.csv,.jpg,.jpeg,.png,.webp,.bmp,.gif,.mp3,.wav,.m4a,.ogg,.flac,.zip"
                   className="block w-full text-xs font-bold text-gray-500 file:mr-3 file:py-1.5 file:px-4 file:border-2 file:border-[#1A202C] file:bg-[#CCF2FF] file:text-xs file:font-bold file:uppercase cursor-pointer"
                 />
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div>
+                <FieldLabel required>飞书链接</FieldLabel>
+                <PixelInput
+                  name="lark_url"
+                  required
+                  placeholder="https://xxx.feishu.cn/docx/... 或 /wiki/... 或 /sheet/..."
+                />
+              </div>
+              <div className="border-2 border-[#3370ff] bg-[#f5f9ff] px-4 py-3 text-[10px] font-bold text-[#3370ff]">
+                已连接飞书账号时，可导入你有权限访问的飞书文档并生成可编辑工作台副本。
               </div>
             </div>
           )}
