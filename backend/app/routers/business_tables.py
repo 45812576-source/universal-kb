@@ -13,7 +13,7 @@ from app.utils.sql_safe import qi
 from app.models.business import BusinessTable, DataOwnership, TableSyncJob, VisibilityLevel, SkillDataQuery
 from app.models.user import User, Role, Department
 from app.models.skill import Skill
-from app.services.data_asset_access import filter_visible_tables, require_table_view_access
+from app.services.data_asset_access import filter_visible_tables, require_table_manage_access, require_table_view_access
 from app.services.llm_gateway import llm_gateway
 from app.services.lark_client import LarkConfigError, LarkAuthError
 
@@ -274,6 +274,7 @@ def get_ownership(
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "Business table not found")
+    require_table_view_access(db, bt, user)
     rule = db.query(DataOwnership).filter(DataOwnership.table_name == bt.table_name).first()
     if not rule:
         return None
@@ -1126,6 +1127,7 @@ def add_column(
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "Business table not found")
+    require_table_manage_access(db, bt, user)
     normalized_type = _normalize_field_type(req.field_type)
     if normalized_type not in _FIELD_TYPE_MAP:
         raise HTTPException(400, f"不支持的字段类型 '{req.field_type}'")
@@ -1168,6 +1170,7 @@ def rename_column(
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "Business table not found")
+    require_table_manage_access(db, bt, user)
 
     # Get current column info
     col_rows = db.execute(
@@ -1225,6 +1228,7 @@ def drop_column(
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "Business table not found")
+    require_table_manage_access(db, bt, user)
     if col_name in PROTECTED:
         raise HTTPException(400, f"列 '{col_name}' 是系统保留列，不允许删除")
 
@@ -1269,6 +1273,7 @@ def patch_business_table(
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "Business table not found")
+    require_table_manage_access(db, bt, user)
     if req.display_name is not None:
         bt.display_name = req.display_name
     if req.description is not None:
@@ -1312,6 +1317,7 @@ def set_sync_config(
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "Business table not found")
+    require_table_manage_access(db, bt, user)
     rules = dict(bt.validation_rules or {})
     if not rules.get("bitable_app_token"):
         raise HTTPException(400, "该表未关联飞书多维表格，无法配置同步")
@@ -1335,6 +1341,7 @@ async def sync_now(
     bt = db.get(BusinessTable, table_id)
     if not bt:
         raise HTTPException(404, "Business table not found")
+    require_table_manage_access(db, bt, user)
 
     from app.services.bitable_sync import bitable_sync
     try:

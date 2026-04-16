@@ -419,12 +419,20 @@ class TestTableAPI:
         company_folder = DataFolder(name="公司数据", workspace_scope="company")
         db.add(company_folder)
         db.flush()
-        _make_business_table(db, "tbl_company_asset", "公司共享表", owner.id, folder_id=company_folder.id)
+        bt = _make_business_table(db, "tbl_company_asset", "公司共享表", owner.id, folder_id=company_folder.id)
         db.commit()
 
         other_token = _login(client, "shared_other")
-        resp = client.get("/api/data-assets/tables?bucket=shared", headers=_auth(other_token))
 
+        # 未发布的表不应对非 owner 可见
+        resp = client.get("/api/data-assets/tables?bucket=shared", headers=_auth(other_token))
+        assert resp.status_code == 200
+        assert resp.json()["total"] == 0
+
+        # 发布后才可见
+        bt.publish_status = "published"
+        db.commit()
+        resp = client.get("/api/data-assets/tables?bucket=shared", headers=_auth(other_token))
         assert resp.status_code == 200
         assert resp.json()["total"] == 1
         assert resp.json()["items"][0]["table_name"] == "tbl_company_asset"
@@ -456,11 +464,10 @@ class TestDataRowsRegression:
         db.add(bt)
         db.commit()
 
+        # 未发布表：非 owner 无权访问（403）
         peer_token = _login(client, "asset_peer_rows")
         peer_resp = client.get("/api/data/usr_asset_safe_rows/rows", headers=_auth(peer_token))
-        assert peer_resp.status_code == 200
-        assert peer_resp.json()["total"] == 0
-        assert peer_resp.json()["rows"] == []
+        assert peer_resp.status_code == 403
 
         owner_token = _login(client, "asset_owner_rows")
         owner_resp = client.get("/api/data/usr_asset_safe_rows/rows", headers=_auth(owner_token))
@@ -556,17 +563,46 @@ class TestDataRowsRegression:
         db.add(bt)
         db.commit()
 
+        # 未发布表：非 owner 无权访问（403）
         peer_token = _login(client, "asset_peer_sample")
         peer_resp = client.get("/api/data/usr_asset_safe_sample/sample", headers=_auth(peer_token))
-        assert peer_resp.status_code == 200
-        assert peer_resp.json()["total"] == 0
-        assert peer_resp.json()["rows"] == []
+        assert peer_resp.status_code == 403
 
         owner_token = _login(client, "asset_owner_sample")
         owner_resp = client.get("/api/data/usr_asset_safe_sample/sample", headers=_auth(owner_token))
         assert owner_resp.status_code == 200
         assert owner_resp.json()["total"] == 1
         assert owner_resp.json()["rows"][0]["name"] == "Visible"
+
+    def test_published_asset_sample_returns_preview_rows_for_peer(self, client, db):
+        dept = _make_dept(db, "采样发布部门")
+        owner = _make_user(db, "asset_publish_owner", Role.EMPLOYEE, dept.id)
+        peer = _make_user(db, "asset_publish_peer", Role.EMPLOYEE, dept.id)
+        company_folder = DataFolder(name="已发布采样目录", workspace_scope="company")
+        db.add(company_folder)
+        db.flush()
+        _create_physical_table(db, "usr_asset_published_sample", "id INTEGER PRIMARY KEY, name TEXT")
+        db.execute(text("INSERT INTO `usr_asset_published_sample` (id, name) VALUES (1, 'Published row')"))
+        bt = BusinessTable(
+            table_name="usr_asset_published_sample",
+            display_name="已发布采样表",
+            description="",
+            ddl_sql="",
+            validation_rules={"row_scope": "private"},
+            workflow={},
+            owner_id=owner.id,
+            folder_id=company_folder.id,
+            publish_status="published",
+        )
+        db.add(bt)
+        db.commit()
+
+        peer_token = _login(client, "asset_publish_peer")
+        peer_resp = client.get("/api/data/usr_asset_published_sample/sample", headers=_auth(peer_token))
+        assert peer_resp.status_code == 200
+        body = peer_resp.json()
+        assert body["total"] == 1
+        assert body["rows"][0]["name"] == "Published row"
 
     def test_sample_rows_respects_legacy_department_scope(self, client, db):
         allowed_dept = _make_dept(db, "允许部门")
@@ -594,11 +630,10 @@ class TestDataRowsRegression:
         db.add(bt)
         db.commit()
 
+        # 未发布表：非 owner 无权访问（403）
         denied_token = _login(client, "sample_denied")
         denied_resp = client.get("/api/data/usr_sample_dept/sample", headers=_auth(denied_token))
-        assert denied_resp.status_code == 200
-        assert denied_resp.json()["total"] == 0
-        assert denied_resp.json()["rows"] == []
+        assert denied_resp.status_code == 403
 
         owner_token = _login(client, "sample_owner")
         owner_resp = client.get("/api/data/usr_sample_dept/sample", headers=_auth(owner_token))

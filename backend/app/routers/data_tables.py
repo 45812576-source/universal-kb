@@ -74,7 +74,9 @@ def _build_legacy_access_context(
     rules = bt.validation_rules or {}
     row_scope = rules.get("row_scope", "private")
 
-    if not is_admin and row_scope == "private" and bt.owner_id != user.id:
+    # 已发布的表视为公开可读（发布 = 管理员明确授权共享数据）
+    is_published = (bt.publish_status or "draft") == "published"
+    if not is_admin and row_scope == "private" and bt.owner_id != user.id and not is_published:
         return None
 
     base_sql = f"SELECT * FROM {qi(table_name, '表名')}"

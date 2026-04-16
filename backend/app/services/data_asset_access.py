@@ -62,6 +62,9 @@ def should_use_asset_safe_default(
         return False
     if table.owner_id == user.id:
         return False
+    # 已发布的表允许数据读取（发布 = 管理员明确授权共享）
+    if (table.publish_status or "draft") == "published":
+        return False
     return not has_new_policy and is_data_asset_table(table)
 
 
@@ -87,10 +90,13 @@ def can_view_table(user: User, table: BusinessTable, folder: DataFolder | None =
     scope = folder_scope(folder)
     if scope == "personal":
         return folder.owner_id == user.id
+
+    # 非 owner 在部门/公司文件夹中，只能看到已发布的表
+    is_published = (table.publish_status or "draft") == "published"
     if scope == "department":
-        return bool(user.department_id and folder.department_id == user.department_id)
+        return is_published and bool(user.department_id and folder.department_id == user.department_id)
     if scope == "company":
-        return True
+        return is_published
     return False
 
 

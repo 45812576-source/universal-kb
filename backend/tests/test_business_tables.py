@@ -7,10 +7,10 @@ Note: generate/generate-from-existing endpoints require LLM, skipped here.
 import pytest
 from tests.conftest import _make_user, _make_dept, _login, _auth
 from app.models.user import Role
-from app.models.business import BusinessTable, DataOwnership
+from app.models.business import BusinessTable, DataFolder, DataOwnership
 
 
-def _make_business_table(db, table_name="test_bt", display_name="测试业务表", owner_id=1):
+def _make_business_table(db, table_name="test_bt", display_name="测试业务表", owner_id=1, **kwargs):
     bt = BusinessTable(
         table_name=table_name,
         display_name=display_name,
@@ -19,6 +19,7 @@ def _make_business_table(db, table_name="test_bt", display_name="测试业务表
         validation_rules={},
         workflow={},
         owner_id=owner_id,
+        **kwargs,
     )
     db.add(bt)
     db.flush()
@@ -58,6 +59,22 @@ def test_list_requires_auth(client):
     assert resp.status_code in (401, 403)
 
 
+def test_list_hides_unpublished_company_table_from_non_owner(client, db):
+    dept = _make_dept(db)
+    owner = _make_user(db, "biz_owner_private", Role.EMPLOYEE, dept.id)
+    peer = _make_user(db, "biz_peer_private", Role.EMPLOYEE, dept.id)
+    folder = DataFolder(name="旧接口公司目录", workspace_scope="company")
+    db.add(folder)
+    db.flush()
+    _make_business_table(db, "legacy_hidden_company", "旧接口未发布表", owner.id, folder_id=folder.id)
+    db.commit()
+
+    token = _login(client, "biz_peer_private")
+    resp = client.get("/api/business-tables", headers=_auth(token))
+    assert resp.status_code == 200
+    assert all(t["table_name"] != "legacy_hidden_company" for t in resp.json())
+
+
 # ── Get Detail ────────────────────────────────────────────────────────────────
 
 def test_get_business_table_not_found(client, db):
@@ -82,6 +99,21 @@ def test_get_business_table_detail(client, db):
     data = resp.json()
     assert data["table_name"] == "detail_table"
     assert data["display_name"] == "详情表"
+
+
+def test_get_business_table_detail_forbids_unpublished_non_owner(client, db):
+    dept = _make_dept(db)
+    owner = _make_user(db, "biz_detail_owner", Role.EMPLOYEE, dept.id)
+    peer = _make_user(db, "biz_detail_peer", Role.EMPLOYEE, dept.id)
+    folder = DataFolder(name="旧详情公司目录", workspace_scope="company")
+    db.add(folder)
+    db.flush()
+    bt = _make_business_table(db, "legacy_detail_hidden", "旧详情未发布表", owner.id, folder_id=folder.id)
+    db.commit()
+
+    token = _login(client, "biz_detail_peer")
+    resp = client.get(f"/api/business-tables/{bt.id}", headers=_auth(token))
+    assert resp.status_code == 403
 
 
 # ── Apply (register without DDL execution) ────────────────────────────────────
@@ -192,6 +224,48 @@ def test_get_ownership_no_rule(client, db):
     resp = client.get(f"/api/business-tables/{bt.id}/ownership", headers=_auth(token))
     assert resp.status_code == 200
     assert resp.json() is None
+
+
+def test_get_ownership_forbids_unpublished_non_owner(client, db):
+    dept = _make_dept(db)
+    owner = _make_user(db, "biz_owner_rule_owner", Role.EMPLOYEE, dept.id)
+    peer = _make_user(db, "biz_owner_rule_peer", Role.EMPLOYEE, dept.id)
+    folder = DataFolder(name="旧归属公司目录", workspace_scope="company")
+    db.add(folder)
+    db.flush()
+    bt = _make_business_table(db, "legacy_rule_hidden", "旧归属未发布表", owner.id, folder_id=folder.id)
+    db.add(DataOwnership(table_name=bt.table_name, owner_field="owner_id", visibility_level="detail"))
+    db.commit()
+
+    token = _login(client, "biz_owner_rule_peer")
+    resp = client.get(f"/api/business-tables/{bt.id}/ownership", headers=_auth(token))
+    assert resp.status_code == 403
+
+
+def test_patch_business_table_forbids_non_owner(client, db):
+    dept = _make_dept(db)
+    owner = _make_user(db, "biz_patch_owner", Role.EMPLOYEE, dept.id)
+    peer = _make_user(db, "biz_patch_peer", Role.EMPLOYEE, dept.id)
+    folder = DataFolder(name="旧编辑公司目录", workspace_scope="company")
+    db.add(folder)
+    db.flush()
+    bt = _make_business_table(
+        db,
+        "legacy_patch_published",
+        "旧编辑已发布表",
+        owner.id,
+        folder_id=folder.id,
+        publish_status="published",
+    )
+    db.commit()
+
+    token = _login(client, "biz_patch_peer")
+    resp = client.patch(
+        f"/api/business-tables/{bt.id}",
+        headers=_auth(token),
+        json={"display_name": "被别人改名"},
+    )
+    assert resp.status_code == 403
 
 
 def test_set_and_get_ownership(client, db):
