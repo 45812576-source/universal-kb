@@ -9,19 +9,21 @@ LLM 允许/禁止白名单：
 from __future__ import annotations
 
 import datetime
+import asyncio
 import hashlib
 import json
 import logging
 import time
 from itertools import product
-from typing import List, Optional
+from typing import List, Optional, Awaitable, Callable
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.database import get_db
+from app.database import get_db, SessionLocal
 from app.dependencies import get_current_user
 from app.utils.sql_safe import qi
 from app.models.user import User, Role
@@ -76,6 +78,108 @@ def _check_session_access(session: SandboxTestSession, user: User) -> None:
     if session.tester_id == user.id:
         return
     raise HTTPException(403, "无权访问该测试会话")
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _build_session_snapshot_signature(payload: dict) -> str:
+    return json.dumps({
+        "status": payload.get("status"),
+        "current_step": payload.get("current_step"),
+        "report_id": payload.get("report_id"),
+        "step_statuses": payload.get("step_statuses"),
+        "semantic_combo_count": payload.get("semantic_combo_count"),
+        "executed_case_count": payload.get("executed_case_count"),
+        "approval_eligible": payload.get("approval_eligible"),
+    }, ensure_ascii=False, sort_keys=True)
+
+
+def _stream_session_operation(
+    request: Request,
+    *,
+    user_id: int,
+    operation_factory: Callable[[Session, User], Awaitable[dict]],
+    initial_session_id: int | None = None,
+    active_session_ref: dict | None = None,
+    initial_stage: dict | None = None,
+):
+    async def _execute_in_background() -> dict:
+        task_db = SessionLocal()
+        try:
+            task_user = task_db.get(User, user_id)
+            if not task_user:
+                raise HTTPException(401, "用户不存在或已失效")
+            return await operation_factory(task_db, task_user)
+        finally:
+            task_db.close()
+
+    async def generate():
+        task = asyncio.create_task(_execute_in_background())
+        poll_db = SessionLocal()
+        last_signature: str | None = None
+
+        def _current_session_id() -> int | None:
+            if active_session_ref and active_session_ref.get("session_id"):
+                return int(active_session_ref["session_id"])
+            return initial_session_id
+
+        def _snapshot() -> dict | None:
+            nonlocal last_signature
+            current_session_id = _current_session_id()
+            if not current_session_id:
+                return None
+            poll_db.expire_all()
+            current = poll_db.get(SandboxTestSession, current_session_id)
+            if not current:
+                return None
+            payload = _serialize_session(current)
+            signature = _build_session_snapshot_signature(payload)
+            if signature == last_signature:
+                return None
+            last_signature = signature
+            return payload
+
+        try:
+            if initial_stage:
+                yield _sse("stage", initial_stage)
+
+            first = _snapshot()
+            if first:
+                yield _sse("progress", {"session": first})
+
+            while not task.done():
+                if await request.is_disconnected():
+                    logger.info("sandbox stream disconnected; background task continues")
+                    return
+                await asyncio.sleep(1.0)
+                current = _snapshot()
+                if current:
+                    yield _sse("progress", {"session": current})
+                else:
+                    yield ": ping\n\n"
+
+            try:
+                result = task.result()
+            except HTTPException as exc:
+                yield _sse("error", {"status": exc.status_code, "message": str(exc.detail)})
+            except Exception as exc:
+                logger.exception("sandbox stream failed")
+                yield _sse("error", {"status": 500, "message": str(exc)})
+            else:
+                yield _sse("done", {"result": result, "session": result})
+        finally:
+            poll_db.close()
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ─── Pydantic Schemas ────────────────────────────────────────────────────────
@@ -1629,6 +1733,32 @@ async def run_tests(
     return _serialize_session(session)
 
 
+@router.post("/{session_id}/run-stream")
+async def run_tests_stream(
+    session_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """流式执行沙盒测试，持续推送 session.step_statuses 进度。"""
+    session = db.get(SandboxTestSession, session_id)
+    if not session:
+        raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
+
+    return _stream_session_operation(
+        request,
+        user_id=user.id,
+        initial_session_id=session_id,
+        initial_stage={"stage": "run", "label": "正在执行测试矩阵..."},
+        operation_factory=lambda task_db, task_user: run_tests(
+            session_id=session_id,
+            db=task_db,
+            user=task_user,
+        ),
+    )
+
+
 def _recover_evaluation_from_session(session: SandboxTestSession, db: Session) -> dict | None:
     """从已有 report 或 session 字段恢复 evaluation dict，避免重调 LLM。"""
     # 优先从 report.part3_evaluation 恢复
@@ -1859,16 +1989,13 @@ async def _step_case_execution(
     return cases
 
 
-@router.post("/{session_id}/retry-from-step")
-async def retry_from_step(
+async def _retry_from_step_impl(
     session_id: int,
-    request: Request,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    step: str,
+    db: Session,
+    user: User,
 ):
     """从失败的阶段重新执行。"""
-    body = await request.json()
-    step = body.get("step")
     valid_steps = ("case_generation", "case_execution", "evaluation", "report_generation", "memo_sync")
     if step not in valid_steps:
         raise HTTPException(400, f"无效阶段: {step}，可选: {valid_steps}")
@@ -1896,6 +2023,51 @@ async def retry_from_step(
 
     # 重新调用 run_tests（它会检测 step_statuses 中哪些已完成并跳过）
     return await run_tests(session_id, db, user)
+
+
+@router.post("/{session_id}/retry-from-step")
+async def retry_from_step(
+    session_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    body = await request.json()
+    return await _retry_from_step_impl(
+        session_id=session_id,
+        step=body.get("step"),
+        db=db,
+        user=user,
+    )
+
+
+@router.post("/{session_id}/retry-from-step-stream")
+async def retry_from_step_stream(
+    session_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    body = await request.json()
+    step = body.get("step")
+
+    session = db.get(SandboxTestSession, session_id)
+    if not session:
+        raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
+
+    return _stream_session_operation(
+        request,
+        user_id=user.id,
+        initial_session_id=session_id,
+        initial_stage={"stage": "retry", "label": f"正在从 {step} 重试..."},
+        operation_factory=lambda task_db, task_user: _retry_from_step_impl(
+            session_id=session_id,
+            step=step,
+            db=task_db,
+            user=task_user,
+        ),
+    )
 
 
 @router.post("/{session_id}/upgrade-and-rerun")
@@ -2048,12 +2220,12 @@ class TargetedRerunRequest(BaseModel):
     issue_ids: Optional[List[str]] = None
 
 
-@router.post("/{session_id}/targeted-rerun")
-async def targeted_rerun(
+async def _targeted_rerun_impl(
     session_id: int,
     body: TargetedRerunRequest,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    db: Session,
+    user: User,
+    on_child_session_created: Optional[Callable[[int], None]] = None,
 ):
     """局部回归测试：只重跑与指定 issues/fix_plan 关联的 case。"""
     parent_session = db.get(SandboxTestSession, session_id)
@@ -2145,6 +2317,44 @@ async def targeted_rerun(
     )
     db.add(child_session)
     db.flush()
+    if on_child_session_created:
+        on_child_session_created(child_session.id)
+
+    child_step_statuses: dict[str, dict] = {}
+
+    def _mark_child_step(step_name: str, status: str, **kwargs):
+        nonlocal child_step_statuses
+        base = child_step_statuses.get(step_name, {
+            "started_at": None,
+            "finished_at": None,
+            "error_code": None,
+            "error_message": None,
+            "retryable": False,
+        })
+        if status == "running":
+            base = {
+                "status": "running",
+                "started_at": _now_iso(),
+                "finished_at": None,
+                "error_code": None,
+                "error_message": None,
+                "retryable": False,
+            }
+        elif status == "completed":
+            base = {**base, "status": "completed", "finished_at": _now_iso()}
+        elif status == "failed":
+            base = {
+                **base,
+                "status": "failed",
+                "finished_at": _now_iso(),
+                "error_code": kwargs.get("error_code", "internal"),
+                "error_message": kwargs.get("error_message", "")[:500],
+                "retryable": kwargs.get("retryable", True),
+            }
+        child_step_statuses[step_name] = base
+        child_session.step_statuses = child_step_statuses
+        flag_modified(child_session, "step_statuses")
+        db.commit()
 
     # 获取 system prompt
     system_prompt = _get_system_prompt_for_session(child_session, db)
@@ -2155,31 +2365,45 @@ async def targeted_rerun(
         return _serialize_session(child_session)
 
     # 执行子矩阵
-    cases = await _step_case_execution(child_session, child_session.id, sub_combos, system_prompt, test_input_text, db)
-    child_session.executed_case_count = len(cases)
-    child_session.current_step = SessionStep.EVALUATION
-    db.commit()
+    _mark_child_step("case_execution", "running")
+    try:
+        cases = await _step_case_execution(child_session, child_session.id, sub_combos, system_prompt, test_input_text, db)
+        child_session.executed_case_count = len(cases)
+        child_session.current_step = SessionStep.EVALUATION
+        _mark_child_step("case_execution", "completed")
+    except Exception as exc:
+        _mark_child_step("case_execution", "failed", error_code="llm_error", error_message=str(exc))
+        raise
 
     # 评价
-    evaluation = await _evaluate_session(child_session, cases, db)
-    child_session.quality_passed = evaluation["quality_passed"]
-    child_session.usability_passed = evaluation["usability_passed"]
-    child_session.anti_hallucination_passed = evaluation["anti_hallucination_passed"]
-    child_session.approval_eligible = all([
-        evaluation["quality_passed"],
-        evaluation["usability_passed"],
-        evaluation["anti_hallucination_passed"],
-    ])
+    _mark_child_step("evaluation", "running")
+    try:
+        evaluation = await _evaluate_session(child_session, cases, db)
+        child_session.quality_passed = evaluation["quality_passed"]
+        child_session.usability_passed = evaluation["usability_passed"]
+        child_session.anti_hallucination_passed = evaluation["anti_hallucination_passed"]
+        child_session.approval_eligible = all([
+            evaluation["quality_passed"],
+            evaluation["usability_passed"],
+            evaluation["anti_hallucination_passed"],
+        ])
+        _mark_child_step("evaluation", "completed")
+    except Exception as exc:
+        _mark_child_step("evaluation", "failed", error_code="eval_error", error_message=str(exc))
+        raise
 
     # 生成报告
     from app.services.sandbox_report import generate_report
+    _mark_child_step("report_generation", "running")
     child_report = await generate_report(child_session, cases, evaluation, db)
     child_session.report_id = child_report.id
     child_session.current_step = SessionStep.DONE
     child_session.status = SessionStatus.COMPLETED
     child_session.completed_at = datetime.datetime.utcnow()
+    _mark_child_step("report_generation", "completed")
+    _mark_child_step("memo_sync", "running")
     _sync_memo_from_evaluation(child_session, evaluation, child_report, db)
-    db.commit()
+    _mark_child_step("memo_sync", "completed")
 
     # 返回覆盖情况
     covered_issues = list(target_issue_ids)
@@ -2192,6 +2416,51 @@ async def targeted_rerun(
         "remaining_issues": remaining_issues,
         "parent_session_id": parent_session.id,
     }
+
+
+@router.post("/{session_id}/targeted-rerun")
+async def targeted_rerun(
+    session_id: int,
+    body: TargetedRerunRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    return await _targeted_rerun_impl(
+        session_id=session_id,
+        body=body,
+        db=db,
+        user=user,
+    )
+
+
+@router.post("/{session_id}/targeted-rerun-stream")
+async def targeted_rerun_stream(
+    session_id: int,
+    body: TargetedRerunRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    session = db.get(SandboxTestSession, session_id)
+    if not session:
+        raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
+
+    active_session_ref: dict[str, int | None] = {"session_id": None}
+
+    return _stream_session_operation(
+        request,
+        user_id=user.id,
+        active_session_ref=active_session_ref,
+        initial_stage={"stage": "targeted_rerun", "label": "正在执行局部重测..."},
+        operation_factory=lambda task_db, task_user: _targeted_rerun_impl(
+            session_id=session_id,
+            body=body,
+            db=task_db,
+            user=task_user,
+            on_child_session_created=lambda child_session_id: active_session_ref.update({"session_id": child_session_id}),
+        ),
+    )
 
 
 class TargetedRerunByReportRequest(BaseModel):
@@ -2283,6 +2552,42 @@ async def targeted_rerun_by_report(
         ),
         db=db,
         user=user,
+    )
+
+
+@router.post("/by-report/{report_id}/targeted-rerun-stream")
+async def targeted_rerun_by_report_stream(
+    report_id: int,
+    body: TargetedRerunByReportRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    report = db.get(SandboxTestReport, report_id)
+    if not report:
+        raise HTTPException(404, "测试报告不存在")
+    session = db.get(SandboxTestSession, report.session_id)
+    if not session:
+        raise HTTPException(404, "测试会话不存在")
+    _check_session_access(session, user)
+
+    active_session_ref: dict[str, int | None] = {"session_id": None}
+
+    return _stream_session_operation(
+        request,
+        user_id=user.id,
+        active_session_ref=active_session_ref,
+        initial_stage={"stage": "targeted_rerun", "label": "正在基于报告执行局部重测..."},
+        operation_factory=lambda task_db, task_user: _targeted_rerun_impl(
+            session_id=report.session_id,
+            body=TargetedRerunRequest(
+                issue_ids=body.issue_ids,
+                fix_plan_item_ids=body.fix_plan_item_ids,
+            ),
+            db=task_db,
+            user=task_user,
+            on_child_session_created=lambda child_session_id: active_session_ref.update({"session_id": child_session_id}),
+        ),
     )
 
 

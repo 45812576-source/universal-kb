@@ -11,7 +11,7 @@ import pytest
 from unittest.mock import AsyncMock, patch
 from tests.conftest import (
     _make_user, _make_dept, _make_skill, _make_model_config,
-    _make_tool, _login, _auth,
+    _make_tool, _login, _auth, TestingSessionLocal,
 )
 from app.models.user import Role
 from app.models.skill import SkillStatus, SkillVersion
@@ -827,6 +827,133 @@ class TestSandboxReportStructure:
         fix_plan = _extract_fix_plan(evaluation)
         assert isinstance(fix_plan, list)
         assert len(fix_plan) >= 1
+
+
+class TestSandboxStreamEndpoints:
+    def test_run_stream_returns_done_event(self, client, db):
+        dept = _make_dept(db)
+        user = _make_user(db, "sandbox_stream_user", Role.SUPER_ADMIN, dept.id)
+        _make_model_config(db)
+
+        session = SandboxTestSession(
+            target_type="skill",
+            target_id=123,
+            target_version=1,
+            target_name="流式测试 Skill",
+            tester_id=user.id,
+            status=SessionStatus.READY_TO_RUN,
+            current_step=SessionStep.CASE_GENERATION,
+            detected_slots=[],
+            tool_review=[],
+            permission_snapshot=[],
+        )
+        db.add(session)
+        db.commit()
+        token = _login(client, "sandbox_stream_user")
+
+        async def fake_run_tests(session_id, db, user):
+            current = db.get(SandboxTestSession, session_id)
+            current.status = SessionStatus.COMPLETED
+            current.current_step = SessionStep.DONE
+            current.step_statuses = {
+                "case_generation": {
+                    "status": "completed",
+                    "started_at": None,
+                    "finished_at": None,
+                    "error_code": None,
+                    "error_message": None,
+                    "retryable": False,
+                }
+            }
+            db.commit()
+            return {
+                "session_id": current.id,
+                "status": current.status.value,
+                "current_step": current.current_step.value,
+                "step_statuses": current.step_statuses,
+                "report_id": current.report_id,
+            }
+
+        with (
+            patch("app.routers.sandbox_interactive.SessionLocal", TestingSessionLocal),
+            patch("app.routers.sandbox_interactive.run_tests", new=AsyncMock(side_effect=fake_run_tests)),
+        ):
+            resp = client.post(
+                f"/api/sandbox/interactive/{session.id}/run-stream",
+                headers=_auth(token),
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert "text/event-stream" in resp.headers.get("content-type", "")
+        assert "event: done" in resp.text
+
+    def test_retry_from_step_stream_returns_done_event(self, client, db):
+        dept = _make_dept(db)
+        user = _make_user(db, "sandbox_retry_stream_user", Role.SUPER_ADMIN, dept.id)
+        _make_model_config(db)
+
+        session = SandboxTestSession(
+            target_type="skill",
+            target_id=456,
+            target_version=1,
+            target_name="重试流式 Skill",
+            tester_id=user.id,
+            status=SessionStatus.RUNNING,
+            current_step=SessionStep.EVALUATION,
+            detected_slots=[],
+            tool_review=[],
+            permission_snapshot=[],
+            step_statuses={
+                "evaluation": {
+                    "status": "failed",
+                    "started_at": None,
+                    "finished_at": None,
+                    "error_code": "eval_error",
+                    "error_message": "boom",
+                    "retryable": True,
+                }
+            },
+        )
+        db.add(session)
+        db.commit()
+        token = _login(client, "sandbox_retry_stream_user")
+
+        async def fake_retry_impl(session_id, step, db, user):
+            current = db.get(SandboxTestSession, session_id)
+            current.status = SessionStatus.COMPLETED
+            current.current_step = SessionStep.DONE
+            current.step_statuses = {
+                step: {
+                    "status": "completed",
+                    "started_at": None,
+                    "finished_at": None,
+                    "error_code": None,
+                    "error_message": None,
+                    "retryable": False,
+                }
+            }
+            db.commit()
+            return {
+                "session_id": current.id,
+                "status": current.status.value,
+                "current_step": current.current_step.value,
+                "step_statuses": current.step_statuses,
+                "report_id": current.report_id,
+            }
+
+        with (
+            patch("app.routers.sandbox_interactive.SessionLocal", TestingSessionLocal),
+            patch("app.routers.sandbox_interactive._retry_from_step_impl", new=AsyncMock(side_effect=fake_retry_impl)),
+        ):
+            resp = client.post(
+                f"/api/sandbox/interactive/{session.id}/retry-from-step-stream",
+                headers=_auth(token),
+                json={"step": "evaluation"},
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert "text/event-stream" in resp.headers.get("content-type", "")
+        assert "event: done" in resp.text
 
 
 class TestSandboxReportGovernanceActions:
