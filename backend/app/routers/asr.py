@@ -11,8 +11,6 @@ except ImportError:
     pass
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from whisperlivekit import TranscriptionEngine, AudioProcessor
-import whisperlivekit.core
 import asyncio
 import logging
 
@@ -37,11 +35,19 @@ _ENGINE_KWARGS = dict(
 _ZH_PROMPT = "以下是普通话的句子，使用简体中文。"
 
 
+def _load_whisperlivekit():
+    from whisperlivekit import TranscriptionEngine, AudioProcessor
+    import whisperlivekit.core
+
+    return TranscriptionEngine, AudioProcessor, whisperlivekit.core
+
+
 def _load_engine():
     """同步加载模型，在线程池中调用避免阻塞 event loop。"""
+    TranscriptionEngine, _, whisperlivekit_core = _load_whisperlivekit()
     # 重置单例，确保每次创建新引擎
-    whisperlivekit.core.TranscriptionEngine._instance = None
-    whisperlivekit.core.TranscriptionEngine._initialized = False
+    whisperlivekit_core.TranscriptionEngine._instance = None
+    whisperlivekit_core.TranscriptionEngine._initialized = False
     kwargs = {**_ENGINE_KWARGS, "backend": os.environ.get("ASR_BACKEND", "faster-whisper")}
     engine = TranscriptionEngine(**kwargs)
     # 包装 transcribe，自动注入简体中文引导 prompt
@@ -118,6 +124,7 @@ async def asr_endpoint(websocket: WebSocket, token: str = None):
         return
 
     engine = await get_engine()
+    _, AudioProcessor, _ = _load_whisperlivekit()
     audio_processor = AudioProcessor(transcription_engine=engine)
     results_generator = await audio_processor.create_tasks()
 
