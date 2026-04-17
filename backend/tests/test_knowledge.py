@@ -1,6 +1,7 @@
 """TC-KNOWLEDGE: Knowledge entry CRUD, review workflow, and role visibility."""
 import pytest
 from tests.conftest import _make_user, _make_dept, _login, _auth
+from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus
 from app.models.user import Role
 
 
@@ -284,3 +285,100 @@ def test_dept_admin_can_only_review_own_dept(client, db):
         "action": "approve",
     })
     assert resp.status_code == 403
+
+
+def test_create_knowledge_does_not_auto_create_review_approval(client, db):
+    dept = _make_dept(db)
+    _make_user(db, "kemp_auto1", Role.EMPLOYEE, dept.id)
+    db.commit()
+
+    token = _login(client, "kemp_auto1")
+    resp = _create_entry(client, token, "上传后不自动提审", "内容")
+    kid = resp.json()["id"]
+
+    approval = (
+        db.query(ApprovalRequest)
+        .filter(
+            ApprovalRequest.target_id == kid,
+            ApprovalRequest.target_type == "knowledge",
+            ApprovalRequest.request_type == ApprovalRequestType.KNOWLEDGE_REVIEW,
+            ApprovalRequest.status == ApprovalStatus.PENDING,
+        )
+        .first()
+    )
+    assert approval is None
+
+
+def test_employee_can_submit_review_request_manually(client, db):
+    dept = _make_dept(db)
+    dept_admin = _make_user(db, "kdept_submit1", Role.DEPT_ADMIN, dept.id)
+    dept_admin.managed_department_id = dept.id
+    _make_user(db, "kemp_submit1", Role.EMPLOYEE, dept.id)
+    db.commit()
+
+    token = _login(client, "kemp_submit1")
+    create_resp = _create_entry(client, token, "员工手动送审", "内容")
+    kid = create_resp.json()["id"]
+
+    submit_resp = client.post(f"/api/knowledge/{kid}/submit-review", headers=_auth(token), json={})
+    assert submit_resp.status_code == 200
+    data = submit_resp.json()
+    assert data["exists"] is True
+    assert data["stage"] == "dept_pending"
+    assert data["assigned_approver_id"] == dept_admin.id
+
+
+def test_dept_admin_submit_review_routes_directly_to_super_admin(client, db):
+    dept = _make_dept(db)
+    super_admin = _make_user(db, "ksuper_submit1", Role.SUPER_ADMIN, dept.id)
+    dept_admin = _make_user(db, "kdept_submit2", Role.DEPT_ADMIN, dept.id)
+    dept_admin.managed_department_id = dept.id
+    db.commit()
+
+    token = _login(client, "kdept_submit2")
+    create_resp = _create_entry(client, token, "部门管理员手动送审", "内容")
+    kid = create_resp.json()["id"]
+
+    submit_resp = client.post(f"/api/knowledge/{kid}/submit-review", headers=_auth(token), json={})
+    assert submit_resp.status_code == 200
+    data = submit_resp.json()
+    assert data["exists"] is True
+    assert data["stage"] == "super_pending"
+    assert data["assigned_approver_id"] == super_admin.id
+
+
+def test_super_admin_can_finalize_dept_admin_submitted_review(client, db):
+    dept = _make_dept(db)
+    _make_user(db, "ksuper_submit2", Role.SUPER_ADMIN, dept.id)
+    dept_admin = _make_user(db, "kdept_submit3", Role.DEPT_ADMIN, dept.id)
+    dept_admin.managed_department_id = dept.id
+    db.commit()
+
+    dept_token = _login(client, "kdept_submit3")
+    create_resp = _create_entry(client, dept_token, "公司管理员终审", "内容")
+    kid = create_resp.json()["id"]
+    submit_resp = client.post(f"/api/knowledge/{kid}/submit-review", headers=_auth(dept_token), json={})
+    approval_id = submit_resp.json()["approval_id"]
+
+    super_token = _login(client, "ksuper_submit2")
+    approve_resp = client.post(
+        f"/api/approvals/{approval_id}/actions",
+        headers=_auth(super_token),
+        json={
+            "action": "approve",
+            "comment": "通过",
+            "checklist_result": [
+                {"status": "approved"},
+                {"status": "approved"},
+                {"status": "approved"},
+                {"status": "approved"},
+                {"status": "approved"},
+                {"status": "approved"},
+            ],
+        },
+    )
+    assert approve_resp.status_code == 200
+
+    detail = client.get(f"/api/knowledge/{kid}", headers=_auth(dept_token))
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "approved"

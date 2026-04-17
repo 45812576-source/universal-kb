@@ -669,6 +669,17 @@ def create_approval(
     return _req(r, db)
 
 
+def _find_first_super_admin(db: Session):
+    from app.models.user import User as UserModel
+
+    return (
+        db.query(UserModel)
+        .filter(UserModel.role == Role.SUPER_ADMIN, UserModel.is_active == True)
+        .order_by(UserModel.id.asc())
+        .first()
+    )
+
+
 @router.post("/{request_id}/withdraw")
 def withdraw_approval(
     request_id: int,
@@ -1016,20 +1027,31 @@ async def act_on_approval(
             # 此处仅作为后补状态同步
             r.status = ApprovalStatus.APPROVED
             from app.models.knowledge import KnowledgeEntry
-            from app.services.knowledge_service import approve_knowledge, super_approve_knowledge
+            from app.services.knowledge_service import (
+                approve_knowledge,
+                finalize_knowledge_approval,
+                super_approve_knowledge,
+            )
             entry = db.get(KnowledgeEntry, r.target_id) if r.target_id else None
             if entry and entry.status.value == "pending":
                 if stage == "super_pending" and user.role == Role.SUPER_ADMIN:
-                    try:
-                        super_approve_knowledge(db, r.target_id, user.id, req.comment or "")
-                    except ValueError:
-                        pass
+                    if entry.review_stage and entry.review_stage.value == "dept_approved_pending_super":
+                        try:
+                            super_approve_knowledge(db, r.target_id, user.id, req.comment or "")
+                        except ValueError:
+                            pass
+                    else:
+                        finalize_knowledge_approval(db, r.target_id, user.id, req.comment or "")
                 else:
-                    approve_knowledge(db, r.target_id, user.id, req.comment or "")
+                    entry = approve_knowledge(db, r.target_id, user.id, req.comment or "")
                     # L3 → 推给超管
                     if entry.review_stage and entry.review_stage.value == "dept_approved_pending_super":
                         r.status = ApprovalStatus.PENDING
                         r.stage = "super_pending"
+                        if not r.assigned_approver_id:
+                            super_admin = _find_first_super_admin(db)
+                            if super_admin:
+                                r.assigned_approver_id = super_admin.id
         elif r.request_type == ApprovalRequestType.SKILL_VERSION_CHANGE:
             # Skill 版本变更审批：通过 → 无需额外操作（版本已创建）
             r.status = ApprovalStatus.APPROVED

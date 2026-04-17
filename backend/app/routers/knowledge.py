@@ -22,6 +22,7 @@ from app.models.knowledge_share import KnowledgeShareLink
 from app.models.user import Role, User
 from app.services.knowledge_service import (
     approve_knowledge,
+    finalize_knowledge_approval,
     reject_knowledge,
     submit_knowledge,
     super_approve_knowledge,
@@ -31,6 +32,10 @@ from app.utils.time_utils import utcnow
 from app.utils.file_parser import extract_text
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
+
+
+class ReviewSubmitRequest(BaseModel):
+    reason: str | None = None
 
 
 def _raise_lark_import_http_error(error: Exception) -> None:
@@ -49,6 +54,81 @@ def _lark_import_error_payload(error: Exception) -> dict:
         "error": normalized.message,
         "error_details": normalized.to_detail()["details"],
     }
+
+
+def _get_pending_review_request(db: Session, knowledge_id: int):
+    from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus
+
+    return (
+        db.query(ApprovalRequest)
+        .filter(
+            ApprovalRequest.target_id == knowledge_id,
+            ApprovalRequest.target_type == "knowledge",
+            ApprovalRequest.request_type == ApprovalRequestType.KNOWLEDGE_REVIEW,
+            ApprovalRequest.status == ApprovalStatus.PENDING,
+        )
+        .order_by(ApprovalRequest.created_at.desc())
+        .first()
+    )
+
+
+def _serialize_review_request(approval) -> dict:
+    if not approval:
+        return {
+            "exists": False,
+            "approval_id": None,
+            "status": None,
+            "stage": None,
+            "assigned_approver_id": None,
+            "assigned_approver_name": None,
+        }
+    return {
+        "exists": True,
+        "approval_id": approval.id,
+        "status": approval.status.value if hasattr(approval.status, "value") else str(approval.status),
+        "stage": approval.stage,
+        "assigned_approver_id": approval.assigned_approver_id,
+        "assigned_approver_name": approval.assigned_approver.display_name if approval.assigned_approver else None,
+    }
+
+
+def _resolve_review_submission_route(db: Session, requester: User) -> tuple[int | None, str | None, str, str]:
+    from app.models.user import User as UserModel
+
+    if requester.role == Role.DEPT_ADMIN:
+        super_admin = (
+            db.query(UserModel)
+            .filter(UserModel.role == Role.SUPER_ADMIN, UserModel.is_active == True)
+            .order_by(UserModel.id.asc())
+            .first()
+        )
+        if not super_admin:
+            raise HTTPException(400, "未配置审批路由：无公司管理员")
+        return super_admin.id, super_admin.display_name, "super_pending", "部门管理员提交，直接路由到公司管理员"
+
+    if requester.department_id:
+        dept_admin = (
+            db.query(UserModel)
+            .filter(
+                UserModel.role == Role.DEPT_ADMIN,
+                UserModel.managed_department_id == requester.department_id,
+                UserModel.is_active == True,
+            )
+            .order_by(UserModel.id.asc())
+            .first()
+        )
+        if dept_admin:
+            return dept_admin.id, dept_admin.display_name, "dept_pending", f"路由到部门管理员 {dept_admin.display_name}"
+
+    super_admin = (
+        db.query(UserModel)
+        .filter(UserModel.role == Role.SUPER_ADMIN, UserModel.is_active == True)
+        .order_by(UserModel.id.asc())
+        .first()
+    )
+    if not super_admin:
+        raise HTTPException(400, "未配置审批路由：无公司管理员")
+    return super_admin.id, super_admin.display_name, "super_pending", f"路由到公司管理员 {super_admin.display_name}"
 
 
 def _has_table(db: Session, table_name: str) -> bool:
@@ -1393,6 +1473,81 @@ def get_knowledge(
     result["content_html"] = entry.content_html  # HTML for cloud doc editor
     result["ai_notes_html"] = entry.ai_notes_html  # AI 结构化笔记 HTML
     return result
+
+
+@router.get("/{kid}/review-request")
+def get_review_request(
+    kid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    if not _can_view_entry(entry, user):
+        raise HTTPException(403, "Access denied")
+    approval = _get_pending_review_request(db, kid)
+    payload = _serialize_review_request(approval)
+    payload["can_submit"] = (
+        entry.status == KnowledgeStatus.PENDING and entry.created_by == user.id and not payload["exists"]
+    )
+    return payload
+
+
+@router.post("/{kid}/submit-review")
+def submit_review_request(
+    kid: int,
+    req: ReviewSubmitRequest | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    entry = db.get(KnowledgeEntry, kid)
+    if not entry:
+        raise HTTPException(404, "Knowledge entry not found")
+    if entry.created_by != user.id:
+        raise HTTPException(403, "只能由文档创建者主动提交审批")
+    if entry.status != KnowledgeStatus.PENDING:
+        raise HTTPException(400, "仅待审核文档可提交审批")
+
+    existing = _get_pending_review_request(db, kid)
+    if existing:
+        payload = _serialize_review_request(existing)
+        payload["message"] = "已有待处理的审批申请"
+        return payload
+
+    from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus
+
+    try:
+        from app.services.approval_templates import get_auto_evidence
+        auto_ep = get_auto_evidence("knowledge_review", "knowledge", kid, db)
+    except Exception:
+        auto_ep = None
+
+    assigned_approver_id, assigned_approver_name, stage, routing_reason = _resolve_review_submission_route(db, user)
+    conditions = []
+    if req and req.reason:
+        conditions.append({"reason": req.reason})
+    if routing_reason:
+        conditions.append({"routing_reason": routing_reason})
+
+    approval = ApprovalRequest(
+        request_type=ApprovalRequestType.KNOWLEDGE_REVIEW,
+        target_id=kid,
+        target_type="knowledge",
+        requester_id=user.id,
+        status=ApprovalStatus.PENDING,
+        stage=stage,
+        assigned_approver_id=assigned_approver_id,
+        conditions=conditions or None,
+        evidence_pack=auto_ep if auto_ep else None,
+    )
+    db.add(approval)
+    db.commit()
+    db.refresh(approval)
+
+    payload = _serialize_review_request(approval)
+    payload["message"] = f"已提交审批，当前路由到{assigned_approver_name or ('部门管理员' if stage == 'dept_pending' else '公司管理员')}"
+    return payload
 
 
 @router.put("/{kid}/ai-notes")

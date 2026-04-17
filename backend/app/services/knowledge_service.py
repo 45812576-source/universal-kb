@@ -53,34 +53,6 @@ def submit_knowledge(db: Session, entry: KnowledgeEntry) -> KnowledgeEntry:
         # L2: 等部门管理员审核
         entry.review_stage = ReviewStage.PENDING_DEPT
 
-    # L2/L3: 自动创建 knowledge_review 审批单（统一审批流）
-    if not auto_pass:
-        try:
-            from app.models.permission import (
-                ApprovalRequest, ApprovalRequestType, ApprovalStatus,
-            )
-            # Fix 6: 自动采集证据包
-            try:
-                from app.services.approval_templates import get_auto_evidence
-                auto_ep = get_auto_evidence("knowledge_review", "knowledge", entry.id, db)
-            except Exception:
-                auto_ep = None
-            approval = ApprovalRequest(
-                request_type=ApprovalRequestType.KNOWLEDGE_REVIEW,
-                target_id=entry.id,
-                target_type="knowledge",
-                requester_id=entry.created_by,
-                status=ApprovalStatus.PENDING,
-                stage="dept_pending",
-                evidence_pack=auto_ep if auto_ep else None,
-            )
-            db.add(approval)
-        except Exception as e:
-            logger.warning(
-                "Failed to create knowledge_review approval for entry %s: %s",
-                entry.id, e,
-            )
-
     db.commit()
     return entry
 
@@ -146,6 +118,27 @@ def super_approve_knowledge(
     entry.reviewed_by = reviewer_id
     if note:
         entry.review_note = (entry.review_note or "") + f"\n[超管] {note}"
+    _do_vectorize(db, entry)
+    db.commit()
+    return entry
+
+
+def finalize_knowledge_approval(
+    db: Session, knowledge_id: int, reviewer_id: int, note: str = ""
+) -> KnowledgeEntry:
+    """最终审批通过。
+
+    用于“部门管理员主动提交 → 公司管理员直接审批”的单跳流程。
+    """
+    entry = db.get(KnowledgeEntry, knowledge_id)
+    if not entry:
+        raise ValueError(f"Knowledge {knowledge_id} not found")
+
+    entry.status = KnowledgeStatus.APPROVED
+    entry.review_stage = ReviewStage.APPROVED
+    entry.reviewed_by = reviewer_id
+    if note:
+        entry.review_note = note
     _do_vectorize(db, entry)
     db.commit()
     return entry
