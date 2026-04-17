@@ -146,6 +146,49 @@ def _safe_path(workdir: str, rel: str) -> str:
     return abs_path
 
 
+def _resolve_visible_workspace_file(project_dir: str, path: str) -> str:
+    """解析 Dev Studio UI 中可见文件路径。
+
+    UI 会展示三类路径：
+    - project/ 内的相对路径；
+    - output-files 返回的绝对路径；
+    - 注入到文件树的虚拟相对路径，如 .opencode/skills/*、skill_studio/data/*。
+    """
+    raw_path = (path or "").strip()
+    if not raw_path:
+        raise HTTPException(400, "路径不能为空")
+
+    ws_root = os.path.dirname(project_dir)
+    norm_project = os.path.normpath(project_dir)
+    norm_ws_root = os.path.normpath(ws_root)
+
+    if os.path.isabs(raw_path):
+        target = os.path.normpath(raw_path)
+        if (
+            target == norm_project
+            or target.startswith(norm_project + os.sep)
+            or target == norm_ws_root
+            or target.startswith(norm_ws_root + os.sep)
+        ):
+            return target
+        raise HTTPException(400, "路径不合法")
+
+    normalized = raw_path.replace("\\", "/").lstrip("/")
+    alias_roots = {
+        ".opencode/skills/": os.path.join(ws_root, "runtime", "config", "opencode", "skills"),
+        "skill_studio/data/": os.path.join(ws_root, "skill_studio", "data"),
+    }
+    for prefix, root in alias_roots.items():
+        if normalized.startswith(prefix):
+            target = os.path.normpath(os.path.join(root, normalized[len(prefix):]))
+            norm_root = os.path.normpath(root)
+            if target == norm_root or target.startswith(norm_root + os.sep):
+                return target
+            raise HTTPException(400, "路径不合法")
+
+    return _safe_path(project_dir, normalized)
+
+
 _TREE_SKIP = RUNTIME_IGNORE_DIRS
 
 def _tree(base: str, rel: str = "") -> list:
@@ -1451,7 +1494,7 @@ def save_skill(
         if os.path.isfile(output_path):
             abs_path = output_path
         else:
-            abs_path = _safe_path(project_dir, rel_path)
+            abs_path = _resolve_visible_workspace_file(project_dir, rel_path)
         if os.path.isfile(abs_path):
             try:
                 with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
@@ -2188,7 +2231,7 @@ def workdir_delete(req: DeleteRequest, user: User = Depends(get_current_user)):
 @router.get("/read-file")
 def read_file(path: str, user: User = Depends(get_current_user)):
     workdir = _user_workdir(user)
-    target = _safe_path(workdir, path)
+    target = _resolve_visible_workspace_file(workdir, path)
     if not os.path.exists(target) or os.path.isdir(target):
         raise HTTPException(404, "文件不存在")
     try:

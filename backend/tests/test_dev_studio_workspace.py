@@ -30,7 +30,7 @@ from app.services.workdir_manager import (
     ensure_workspace_layout,
     RUNTIME_IGNORE_DIRS,
 )
-from app.routers.dev_studio import _list_visible_output_files
+from app.routers.dev_studio import _list_visible_output_files, _resolve_visible_workspace_file
 
 
 @pytest.fixture
@@ -479,6 +479,26 @@ class TestVisibleOutputFileIndex:
         assert "output/report.md" in rel_paths
         assert "skill_studio/data/客户台账.csv" in rel_paths
         assert ".opencode/skills/custom-skill.md" in rel_paths
+
+    def test_resolves_virtual_runtime_skill_path(self, workspace):
+        project_dir, _ = ensure_workspace_layout(workspace, "test")
+        runtime_skills_dir = os.path.join(workspace, "runtime", "config", "opencode", "skills")
+        os.makedirs(runtime_skills_dir, exist_ok=True)
+        expected = os.path.join(runtime_skills_dir, "custom-skill.md")
+
+        assert _resolve_visible_workspace_file(project_dir, ".opencode/skills/custom-skill.md") == expected
+
+    def test_resolves_absolute_workspace_output_path(self, workspace):
+        project_dir, _ = ensure_workspace_layout(workspace, "test")
+        expected = os.path.join(project_dir, "output", "report.md")
+
+        assert _resolve_visible_workspace_file(project_dir, expected) == expected
+
+    def test_rejects_absolute_external_path(self, workspace):
+        project_dir, _ = ensure_workspace_layout(workspace, "test")
+
+        with pytest.raises(Exception):
+            _resolve_visible_workspace_file(project_dir, "/tmp/not-this-workspace.md")
 
 
 # ─── Legacy path normalization ───────────────────────────────────────────────
