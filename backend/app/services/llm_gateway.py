@@ -173,6 +173,43 @@ class LLMGateway:
     def supports_function_calling(self, model_config: dict) -> bool:
         return model_config.get("model_id", "") not in self._NO_FUNCTION_CALLING
 
+    def _api_protocol(self, model_config: dict) -> str:
+        """Return the wire protocol used by this model config."""
+        explicit = (
+            model_config.get("api_protocol")
+            or model_config.get("protocol")
+            or model_config.get("api_format")
+            or ""
+        ).lower()
+        if explicit in {"anthropic", "anthropic-compatible"}:
+            return "anthropic"
+        api_base = str(model_config.get("api_base", "")).lower()
+        provider = str(model_config.get("provider", "")).lower()
+        if provider == "anthropic" or "/anthropic/" in api_base or api_base.endswith("/anthropic/v1"):
+            return "anthropic"
+        return "openai"
+
+    def _anthropic_messages(self, messages: list[dict]) -> tuple[str | None, list[dict]]:
+        """Convert OpenAI-style messages into Anthropic-compatible messages."""
+        system_parts: list[str] = []
+        converted: list[dict] = []
+        for message in messages:
+            role = message.get("role") or "user"
+            content = message.get("content") or ""
+            if role == "system":
+                if isinstance(content, str):
+                    system_parts.append(content)
+                else:
+                    system_parts.append(json.dumps(content, ensure_ascii=False))
+                continue
+            if role not in {"user", "assistant"}:
+                role = "user"
+            converted.append({"role": role, "content": content})
+        if not converted:
+            converted.append({"role": "user", "content": ""})
+        system = "\n\n".join(part for part in system_parts if part.strip()) or None
+        return system, converted
+
     def _build_request(self, model_config: dict, messages: list[dict],
                        temperature: float = None, max_tokens: int = None,
                        stream: bool = False,
@@ -187,6 +224,29 @@ class LLMGateway:
         temp = temperature if temperature is not None else float(model_config.get("temperature", 0.7))
         tokens = max_tokens or model_config.get("max_tokens", 4096)
         provider = model_config.get("provider", "")
+        protocol = self._api_protocol(model_config)
+
+        if protocol == "anthropic":
+            system, anthropic_messages = self._anthropic_messages(messages)
+            headers = {
+                "x-api-key": api_key,
+                "anthropic-version": model_config.get("anthropic_version", "2023-06-01"),
+                "Content-Type": "application/json",
+            }
+            body: dict = {
+                "model": model_config["model_id"],
+                "messages": anthropic_messages,
+                "max_tokens": tokens,
+            }
+            if system:
+                body["system"] = system
+            if provider == "moonshot":
+                body["temperature"] = 1
+            else:
+                body["temperature"] = temp
+            if stream:
+                body["stream"] = True
+            return f"{api_base}/messages", headers, body
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -209,6 +269,46 @@ class LLMGateway:
             body["tool_choice"] = "auto"
 
         return f"{api_base}/chat/completions", headers, body
+
+    def _parse_response(self, model_config: dict, data: dict) -> tuple[str, dict, int]:
+        if self._api_protocol(model_config) == "anthropic":
+            content_parts: list[str] = []
+            for block in data.get("content") or []:
+                if isinstance(block, str):
+                    content_parts.append(block)
+                elif isinstance(block, dict) and block.get("type") in {"text", "thinking"}:
+                    content_parts.append(block.get("text") or block.get("thinking") or "")
+            content = "".join(content_parts) or data.get("completion", "")
+            raw_usage = data.get("usage") or {}
+            usage = {
+                "input_tokens": raw_usage.get("input_tokens") or 0,
+                "output_tokens": raw_usage.get("output_tokens") or 0,
+                "model_id": model_config.get("model_id", ""),
+            }
+            return content, usage, 0
+
+        msg = data["choices"][0]["message"]
+        content = msg.get("content") or msg.get("reasoning_content") or ""
+
+        # 处理 native function calling 响应：将 tool_calls 转为文本 fallback 格式
+        native_tool_calls = msg.get("tool_calls") or []
+        if native_tool_calls:
+            import json as _json
+            for tc in native_tool_calls:
+                fn = tc.get("function", {})
+                try:
+                    args = _json.loads(fn.get("arguments", "{}"))
+                except Exception:
+                    args = {}
+                content += f"\n```tool_call\n{_json.dumps({'id': tc.get('id', ''), 'name': fn.get('name', ''), 'arguments': args}, ensure_ascii=False)}\n```"
+
+        raw_usage = data.get("usage") or {}
+        usage = {
+            "input_tokens": raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens") or 0,
+            "output_tokens": raw_usage.get("completion_tokens") or raw_usage.get("output_tokens") or 0,
+            "model_id": model_config.get("model_id", ""),
+        }
+        return content, usage, len(native_tool_calls)
 
     async def chat(self, model_config: dict, messages: list[dict],
                    temperature: float = None, max_tokens: int = None,
@@ -265,32 +365,12 @@ class LLMGateway:
             raise
         cb.record_success()
         data = resp.json()
-        msg = data["choices"][0]["message"]
-        content = msg.get("content") or msg.get("reasoning_content") or ""
-
-        # 处理 native function calling 响应：将 tool_calls 转为文本 fallback 格式
-        native_tool_calls = msg.get("tool_calls") or []
-        if native_tool_calls:
-            import json as _json
-            for tc in native_tool_calls:
-                fn = tc.get("function", {})
-                try:
-                    args = _json.loads(fn.get("arguments", "{}"))
-                except Exception:
-                    args = {}
-                content += f"\n```tool_call\n{_json.dumps({'id': tc.get('id', ''), 'name': fn.get('name', ''), 'arguments': args}, ensure_ascii=False)}\n```"
-
-        raw_usage = data.get("usage") or {}
-        usage = {
-            "input_tokens": raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens") or 0,
-            "output_tokens": raw_usage.get("completion_tokens") or raw_usage.get("output_tokens") or 0,
-            "model_id": model_config.get("model_id", ""),
-        }
+        content, usage, tool_call_count = self._parse_response(model_config, data)
         # L2: 结构化 LLM 审计日志（含 token 用量）
         logger.info(
             "llm_audit model=%s elapsed=%.1fs in_tokens=%d out_tokens=%d tool_calls=%d",
             model_config.get("model_id", "?"), elapsed,
-            usage["input_tokens"], usage["output_tokens"], len(native_tool_calls),
+            usage["input_tokens"], usage["output_tokens"], tool_call_count,
         )
         return content, usage
 
@@ -325,8 +405,9 @@ class LLMGateway:
         url, headers, body = self._build_request(
             model_config, messages, temperature, max_tokens, stream=True, tools=tools
         )
+        protocol = self._api_protocol(model_config)
         # 若模型不支持 function calling，tools 已被 _build_request 忽略
-        use_native_tools = bool(tools and self.supports_function_calling(model_config))
+        use_native_tools = bool(protocol == "openai" and tools and self.supports_function_calling(model_config))
 
         # Streaming 连接级重试：仅在连接阶段重试，一旦开始接收 chunk 则不重试
         last_exc: Exception | None = None
@@ -355,6 +436,21 @@ class LLMGateway:
                             continue
                         try:
                             chunk = json.loads(line[6:])
+                            if protocol == "anthropic":
+                                event_type = chunk.get("type")
+                                if event_type == "content_block_start":
+                                    block = chunk.get("content_block") or {}
+                                    if block.get("type") == "text" and block.get("text"):
+                                        yield ("content", block["text"])
+                                elif event_type == "content_block_delta":
+                                    delta = chunk.get("delta") or {}
+                                    delta_type = delta.get("type")
+                                    if delta_type == "text_delta" and delta.get("text"):
+                                        yield ("content", delta["text"])
+                                    elif delta_type == "thinking_delta" and delta.get("thinking"):
+                                        yield ("thinking", delta["thinking"])
+                                continue
+
                             choice = chunk["choices"][0]
                             delta = choice.get("delta", {})
                             finish_reason = choice.get("finish_reason")
@@ -449,6 +545,7 @@ class LLMGateway:
         return {
             "provider": "bailian",
             "model_id": "kimi-k2.5",
+            "api_protocol": "anthropic-compatible",
             "api_base": "https://coding.dashscope.aliyuncs.com/apps/anthropic/v1",
             "api_key_env": "BAILIAN_API_KEY",
             "api_key": bailian_key,

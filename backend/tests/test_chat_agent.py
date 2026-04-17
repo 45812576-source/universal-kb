@@ -213,6 +213,65 @@ class TestNativeFunctionCalling:
         assert "tools" in body
         assert body["tool_choice"] == "auto"
 
+    def test_anthropic_protocol_uses_messages_endpoint(self):
+        gw = self._make_gw()
+        cfg = {
+            "provider": "bailian",
+            "api_protocol": "anthropic-compatible",
+            "api_base": "https://coding.dashscope.aliyuncs.com/apps/anthropic/v1",
+            "api_key": "k",
+            "model_id": "kimi-k2.5",
+            "max_tokens": 100,
+            "temperature": "0.0",
+        }
+
+        url, headers, body = gw._build_request(
+            cfg,
+            [
+                {"role": "system", "content": "你是评分器"},
+                {"role": "user", "content": "请评分"},
+            ],
+            max_tokens=50,
+        )
+
+        assert url == "https://coding.dashscope.aliyuncs.com/apps/anthropic/v1/messages"
+        assert headers["x-api-key"] == "k"
+        assert headers["anthropic-version"] == "2023-06-01"
+        assert body["model"] == "kimi-k2.5"
+        assert body["system"] == "你是评分器"
+        assert body["messages"] == [{"role": "user", "content": "请评分"}]
+        assert body["max_tokens"] == 50
+
+    @pytest.mark.asyncio
+    async def test_anthropic_chat_response_parsed(self):
+        gw = self._make_gw()
+        cfg = {
+            "provider": "bailian",
+            "api_protocol": "anthropic-compatible",
+            "api_base": "https://coding.dashscope.aliyuncs.com/apps/anthropic/v1",
+            "api_key": "k",
+            "model_id": "kimi-k2.5",
+            "max_tokens": 100,
+            "temperature": "0.0",
+        }
+
+        class FakeResp:
+            status_code = 200
+            def raise_for_status(self): pass
+            def json(self):
+                return {
+                    "content": [{"type": "text", "text": "{\"score\": 88}"}],
+                    "usage": {"input_tokens": 12, "output_tokens": 6},
+                }
+
+        with patch.object(gw._client, "post", new=AsyncMock(return_value=FakeResp())) as mock_post:
+            content, usage = await gw.chat(cfg, [{"role": "user", "content": "评分"}])
+
+        assert content == "{\"score\": 88}"
+        assert usage["input_tokens"] == 12
+        assert usage["output_tokens"] == 6
+        assert mock_post.call_args.args[0].endswith("/messages")
+
     def test_supports_function_calling_returns_false_for_known_model(self):
         gw = self._make_gw()
         assert gw.supports_function_calling({"model_id": "moonshot-v1-8k-thinking"}) is False
