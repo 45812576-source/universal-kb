@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     LARK_VERIFICATION_TOKEN: str = ""
     LARK_ENCRYPT_KEY: str = ""
     LARK_OAUTH_REDIRECT_URI: str = ""  # 飞书 OAuth 回调地址，如 https://xxx/api/lark/oauth/callback
+    LARK_IMPORT_AUTH_MODE: str = "app_only"  # app_only | user_fallback
+    LARK_OAUTH_ENABLED: bool = False
 
     # LLM API Keys (forwarded to opencode web process)
     KIMI_API_KEY: str = ""

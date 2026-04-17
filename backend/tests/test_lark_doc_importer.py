@@ -10,6 +10,7 @@ from app.services.lark_doc_importer import (
     _EXPORT_EXT_MAP,
     _normalize_type,
 )
+from app.services.lark_errors import LarkAppDocumentPermissionError
 
 
 @pytest.fixture
@@ -279,6 +280,31 @@ class TestStrategyDispatch:
         assert called.get("wiki") is True
         assert called.get("export") is True
         assert result == "entry_wiki"
+
+    @pytest.mark.asyncio
+    async def test_permission_error_does_not_fallback_to_user_token_by_default(self, importer, monkeypatch):
+        """默认 app_only 模式下，组织应用无权限时不再提示连接个人飞书账号。"""
+        from app.services.lark_client import LarkPermissionError
+
+        called = {"user_token": False}
+
+        async def mock_export(self, *args, **kwargs):
+            raise LarkPermissionError("文档权限不足")
+
+        async def mock_user_token(self, db, user):
+            called["user_token"] = True
+            return "user-token"
+
+        monkeypatch.setattr(LarkDocImporter, "_strategy_export", mock_export)
+        monkeypatch.setattr(LarkDocImporter, "_get_user_token_or_raise", mock_user_token)
+
+        with pytest.raises(LarkAppDocumentPermissionError) as exc:
+            await importer.import_doc(
+                db=None, user=None, url="https://abc.feishu.cn/docx/Token123"
+            )
+
+        assert called["user_token"] is False
+        assert exc.value.code == "LARK_APP_NO_DOCUMENT_ACCESS"
 
 
 # ── sheets → sheet, base → bitable 端到端验证 ───────────────────────────

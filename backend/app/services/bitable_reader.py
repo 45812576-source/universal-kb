@@ -45,21 +45,28 @@ class BitableReader:
         return await lark_client.get_tenant_access_token()
 
     async def get_token_with_fallback(self, db: Session, user) -> tuple[str, str]:
-        """先 tenant → 遇权限错误 fallback user token。
+        """先 tenant → 仅在显式开启时 fallback user token。
         返回 (token, token_type: "tenant"|"user")
         """
+        from app.config import settings
+
         try:
             token = await self.get_token()
             return token, "tenant"
         except Exception:
             pass
 
+        mode = (getattr(settings, "LARK_IMPORT_AUTH_MODE", "app_only") or "app_only").lower()
+        oauth_enabled = bool(getattr(settings, "LARK_OAUTH_ENABLED", False))
+        if not (oauth_enabled and mode in {"user_fallback", "user", "oauth_fallback"}):
+            raise PermissionError("Le Desk 飞书应用暂时无法获取 tenant token，请联系管理员检查应用配置")
+
         from app.services.lark_doc_importer import get_valid_user_token
         user_token = await get_valid_user_token(db, user)
         if user_token:
             return user_token, "user"
 
-        raise PermissionError("请先连接飞书账号")
+        raise PermissionError("个人飞书授权不可用，请将该多维表授权给 Le Desk 飞书应用")
 
     async def fetch_table_list(self, token: str, app_token: str) -> list[dict]:
         """获取多维表格下的数据表列表。返回 [{"table_id": "tblXXX", "name": "表名"}, ...]"""
@@ -384,7 +391,7 @@ def _permission_error_message(code: int, msg: str) -> str:
     if code == 99991671:
         return "请在飞书多维表格中添加本系统的应用"
     if code == 99991668:
-        return "请先连接飞书账号"
+        return "Le Desk 飞书应用无权访问该多维表，请在多维表中添加本系统的应用并授予读取权限"
     if code == 99991672:
         return "请联系管理员为应用开通 bitable:app:readonly 权限"
     return f"飞书权限错误: {msg} (code={code})"

@@ -28,7 +28,9 @@ def knowledge_health(
             "upload_dir_exists": os.path.isdir(upload_dir),
             "upload_dir_writable": os.access(upload_dir, os.W_OK) if os.path.isdir(upload_dir) else False,
             "lark_configured": bool(
-                os.getenv("LARK_APP_ID") and os.getenv("LARK_APP_SECRET")
+                settings.LARK_APP_ID and settings.LARK_APP_SECRET
             ),
+            "lark_import_auth_mode": settings.LARK_IMPORT_AUTH_MODE,
+            "lark_oauth_enabled": settings.LARK_OAUTH_ENABLED,
         },
     }

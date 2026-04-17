@@ -2,13 +2,21 @@
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
-from app.services.bitable_reader import BitableReader, BitableRecordError
+from app.services.bitable_reader import BitableReader, BitableRecordError, _permission_error_message
 from app.services.lark_doc_importer import LarkDocImporter
 
 
 @pytest.fixture
 def reader():
     return BitableReader()
+
+
+def test_permission_error_message_uses_app_authorization_guidance():
+    """多维表权限错误不再引导用户连接个人飞书账号。"""
+    msg = _permission_error_message(99991668, "permission denied")
+
+    assert "连接飞书账号" not in msg
+    assert "Le Desk 飞书应用" in msg
 
 
 # ── fetch_records_adaptive: 降级成功 ─────────────────────────────────────

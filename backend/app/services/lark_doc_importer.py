@@ -99,6 +99,15 @@ def _normalize_type(url_type: str) -> str:
     return _URL_PATH_TO_API_TYPE.get(url_type, url_type)
 
 
+def _allow_user_token_fallback() -> bool:
+    """是否允许从组织应用 token 回退到用户 OAuth token。默认关闭。"""
+    from app.config import settings
+
+    mode = (getattr(settings, "LARK_IMPORT_AUTH_MODE", "app_only") or "app_only").lower()
+    oauth_enabled = bool(getattr(settings, "LARK_OAUTH_ENABLED", False))
+    return oauth_enabled and mode in {"user_fallback", "user", "oauth_fallback"}
+
+
 async def get_valid_user_token(db: Session, user) -> str | None:
     """获取用户的有效 lark user_access_token，过期则自动刷新。
 
@@ -188,12 +197,15 @@ class LarkDocImporter:
     ) -> KnowledgeEntry:
         """完整导入一个飞书文档到知识库。根据类型自动分发到三种策略。
 
-        权限 fallback：默认用 tenant_access_token，遇权限错误自动切换 user_access_token 重试。
+        默认用 tenant_access_token（组织统一飞书应用）。仅在显式开启 user_fallback 时，
+        才会遇权限错误后切换 user_access_token 重试。
         on_phase: 可选回调，用于报告当前阶段（如 "parse_url", "resolve_wiki", "exporting" 等）。
         """
         from app.services.lark_client import lark_client, LarkPermissionError
+        from app.services.lark_errors import LarkAppDocumentPermissionError
 
         _report = on_phase or (lambda _: None)
+        allow_user_fallback = _allow_user_token_fallback()
 
         # 1. 解析链接
         _report("parse_url")
@@ -208,8 +220,9 @@ class LarkDocImporter:
             _report("resolve_wiki")
             try:
                 node = await lark_client.get_wiki_node(token)
-            except (PermissionError, LarkPermissionError):
-                # tenant token 权限不足，尝试 user token
+            except (PermissionError, LarkPermissionError) as e:
+                if not allow_user_fallback:
+                    raise LarkAppDocumentPermissionError(str(e)) from e
                 effective_token = await self._get_user_token_or_raise(db, user)
                 node = await lark_client.get_wiki_node(token, access_token=effective_token)
             token = node["obj_token"]
@@ -223,10 +236,11 @@ class LarkDocImporter:
                 folder_id, category, effective_token,
                 extra_params=extra_params, on_phase=_report,
             )
-        except (PermissionError, LarkPermissionError):
+        except (PermissionError, LarkPermissionError) as e:
             if effective_token:
                 raise  # 已经用了 user token 还失败，直接抛
-            # 用 user token 重试
+            if not allow_user_fallback:
+                raise LarkAppDocumentPermissionError(str(e)) from e
             effective_token = await self._get_user_token_or_raise(db, user)
             return await self._dispatch_strategy(
                 db, user, url, token, api_type, title, wiki_title,
@@ -239,8 +253,7 @@ class LarkDocImporter:
         token = await get_valid_user_token(db, user)
         if not token:
             raise PermissionError(
-                "该文档需要用户授权才能访问。请先在「我的知识」页面点击「连接飞书账号」完成授权，"
-                "然后重新导入。"
+                "当前环境未启用个人飞书授权 fallback。请优先将该文档授权给 Le Desk 飞书应用。"
             )
         return token
 

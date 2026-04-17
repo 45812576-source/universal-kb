@@ -33,6 +33,24 @@ from app.utils.file_parser import extract_text
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
 
 
+def _raise_lark_import_http_error(error: Exception) -> None:
+    from app.services.lark_errors import normalize_lark_import_error
+
+    normalized = normalize_lark_import_error(error)
+    raise HTTPException(status_code=normalized.status_code, detail=normalized.to_detail())
+
+
+def _lark_import_error_payload(error: Exception) -> dict:
+    from app.services.lark_errors import normalize_lark_import_error
+
+    normalized = normalize_lark_import_error(error)
+    return {
+        "error_code": normalized.code,
+        "error": normalized.message,
+        "error_details": normalized.to_detail()["details"],
+    }
+
+
 def _has_table(db: Session, table_name: str) -> bool:
     try:
         return inspect(db.bind).has_table(table_name)
@@ -2186,11 +2204,14 @@ async def _run_lark_import(job_id: int, url: str, title: str | None, folder_id: 
         import logging
         logging.getLogger(__name__).error(f"Lark import job {job_id} failed: {e}")
         try:
+            error_payload = _lark_import_error_payload(e)
             job = db.query(KnowledgeJob).filter(KnowledgeJob.id == job_id).first()
             if job:
                 job.status = "failed"
                 job.phase = "failed"
-                job.error_message = str(e)
+                job.error_type = error_payload["error_code"]
+                job.error_message = error_payload["error"]
+                job.payload = error_payload
                 job.finished_at = datetime.datetime.utcnow()
                 db.commit()
         except Exception:
@@ -2250,6 +2271,9 @@ def get_lark_import_job(
         "status": job.status,
         "phase": job.phase,
         "error": job.error_message,
+        "error_type": job.error_type,
+        "error_code": job.error_type,
+        "error_details": (job.payload or {}).get("error_details") if isinstance(job.payload, dict) else None,
         "result": job.payload,
     }
 
@@ -2262,7 +2286,6 @@ async def import_from_lark(
 ):
     """从飞书文档链接导入为知识库云文档。"""
     from app.services.lark_doc_importer import lark_doc_importer
-    from app.services.lark_client import LarkConfigError, LarkAuthError
 
     try:
         entry = await lark_doc_importer.import_doc(
@@ -2274,16 +2297,8 @@ async def import_from_lark(
             category=req.category,
             sync_interval=req.sync_interval,
         )
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    except LarkConfigError as e:
-        raise HTTPException(501, f"飞书集成未配置: {e}")
-    except LarkAuthError as e:
-        raise HTTPException(502, f"飞书认证失败: {e}")
-    except PermissionError as e:
-        raise HTTPException(403, str(e))
-    except RuntimeError as e:
-        raise HTTPException(502, f"飞书 API 调用失败: {e}")
+    except Exception as e:
+        _raise_lark_import_http_error(e)
 
     return {
         "id": entry.id,
@@ -2334,10 +2349,11 @@ async def batch_import_from_lark(
                 "external_edit_mode": entry.external_edit_mode,
             })
         except Exception as e:
+            error_payload = _lark_import_error_payload(e)
             results.append({
                 "url": url,
                 "ok": False,
-                "error": str(e),
+                **error_payload,
             })
 
     return {"total": len(req.urls), "results": results}
