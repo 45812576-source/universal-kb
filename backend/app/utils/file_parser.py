@@ -4,7 +4,9 @@ import html
 import os
 import re
 import tempfile
+import zipfile
 from dataclasses import dataclass
+from xml.etree import ElementTree as ET
 
 
 def convert_pdf_to_docx(pdf_path: str, timeout: int = 120) -> str:
@@ -137,6 +139,110 @@ class ExtractionResult:
     text: str
     mode: str
     error: str | None = None
+
+
+_XLSX_NS = {
+    "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "rel": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+}
+_XLSX_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+def _xlsx_col_to_index(cell_ref: str) -> int:
+    letters = "".join(ch for ch in cell_ref if ch.isalpha())
+    if not letters:
+        return 0
+    index = 0
+    for ch in letters.upper():
+        index = index * 26 + (ord(ch) - 64)
+    return max(index - 1, 0)
+
+
+def _xlsx_shared_strings(zf: zipfile.ZipFile) -> list[str]:
+    if "xl/sharedStrings.xml" not in zf.namelist():
+        return []
+    root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+    values: list[str] = []
+    for item in root.findall("main:si", _XLSX_NS):
+        texts = [node.text or "" for node in item.findall('.//main:t', _XLSX_NS)]
+        values.append("".join(texts))
+    return values
+
+
+def _xlsx_cell_value(cell: ET.Element, shared_strings: list[str]) -> str:
+    cell_type = cell.attrib.get("t")
+    if cell_type == "inlineStr":
+        texts = [node.text or "" for node in cell.findall('.//main:t', _XLSX_NS)]
+        return "".join(texts)
+
+    value_node = cell.find("main:v", _XLSX_NS)
+    if value_node is None or value_node.text is None:
+        return ""
+
+    raw_value = value_node.text
+    if cell_type == "s":
+        try:
+            shared_idx = int(raw_value)
+        except (TypeError, ValueError):
+            return raw_value
+        if 0 <= shared_idx < len(shared_strings):
+            return shared_strings[shared_idx]
+        return raw_value
+    if cell_type == "b":
+        return "TRUE" if raw_value == "1" else "FALSE"
+    return raw_value
+
+
+def _extract_xlsx_rows_fallback(file_path: str) -> list[tuple[str, list[list[str]]]]:
+    import posixpath
+
+    with zipfile.ZipFile(file_path) as zf:
+        shared_strings = _xlsx_shared_strings(zf)
+        workbook_root = ET.fromstring(zf.read("xl/workbook.xml"))
+        rels_root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+        rel_map = {
+            rel.attrib.get("Id"): rel.attrib.get("Target", "")
+            for rel in rels_root.findall(f'{{{_XLSX_REL_NS}}}Relationship')
+        }
+
+        sheets: list[tuple[str, list[list[str]]]] = []
+        for sheet in workbook_root.findall("main:sheets/main:sheet", _XLSX_NS):
+            sheet_name = sheet.attrib.get("name") or "Sheet"
+            rel_id = sheet.attrib.get(f'{{{_XLSX_NS["rel"]}}}id')
+            target = rel_map.get(rel_id)
+            if not target:
+                continue
+            sheet_path = posixpath.normpath(posixpath.join("xl", target))
+            sheet_root = ET.fromstring(zf.read(sheet_path))
+
+            rows: list[list[str]] = []
+            for row in sheet_root.findall("main:sheetData/main:row", _XLSX_NS):
+                values: list[str] = []
+                last_index = -1
+                for cell in row.findall("main:c", _XLSX_NS):
+                    ref = cell.attrib.get("r", "")
+                    cell_index = _xlsx_col_to_index(ref) if ref else last_index + 1
+                    while len(values) < cell_index:
+                        values.append("")
+                    values.append(_xlsx_cell_value(cell, shared_strings))
+                    last_index = cell_index
+                if any((value or "").strip() for value in values):
+                    rows.append(values)
+            sheets.append((sheet_name, rows))
+
+        return sheets
+
+
+def _extract_xlsx_text_fallback(file_path: str) -> str:
+    parts: list[str] = []
+    for sheet_name, rows in _extract_xlsx_rows_fallback(file_path):
+        rendered_rows: list[str] = []
+        for row in rows:
+            if any((cell or "").strip() for cell in row):
+                rendered_rows.append("	".join(row))
+        if rendered_rows:
+            parts.append(f"[Sheet: {sheet_name}]\n" + "\n".join(rendered_rows))
+    return "\n\n".join(parts)
 
 
 def _looks_like_meaningful_pdf_text(text: str) -> bool:
@@ -529,6 +635,23 @@ def extract_text(file_path: str) -> str:
             return _strip_html_tags(f.read())
 
     elif ext in (".xlsx", ".xls"):
+        if ext == ".xlsx":
+            try:
+                import openpyxl
+                wb = openpyxl.load_workbook(file_path, data_only=True)
+                parts = []
+                for sheet in wb.worksheets:
+                    rows = []
+                    for row in sheet.iter_rows(values_only=True):
+                        cells = [str(c) if c is not None else "" for c in row]
+                        if any(c.strip() for c in cells):
+                            rows.append("	".join(cells))
+                    if rows:
+                        parts.append(f"[Sheet: {sheet.title}]\n" + "\n".join(rows))
+                return "\n\n".join(parts)
+            except Exception:
+                return _extract_xlsx_text_fallback(file_path)
+
         import openpyxl
         wb = openpyxl.load_workbook(file_path, data_only=True)
         parts = []
@@ -537,7 +660,7 @@ def extract_text(file_path: str) -> str:
             for row in sheet.iter_rows(values_only=True):
                 cells = [str(c) if c is not None else "" for c in row]
                 if any(c.strip() for c in cells):
-                    rows.append("\t".join(cells))
+                    rows.append("	".join(cells))
             if rows:
                 parts.append(f"[Sheet: {sheet.title}]\n" + "\n".join(rows))
         return "\n\n".join(parts)
