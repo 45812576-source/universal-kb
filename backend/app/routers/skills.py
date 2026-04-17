@@ -854,6 +854,8 @@ async def batch_upload_skill_md(
 async def upload_skill_zip(
     file: UploadFile = File(...),
     main_file: str = Form(None),
+    name: str = Form(None),
+    description: str = Form(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -921,12 +923,16 @@ async def upload_skill_zip(
         ]
 
     parsed = _parse_skill_md(md_content)
-    if not parsed["name"]:
-        _os.unlink(tmp_path)
-        raise HTTPException(400, "主 .md 文件缺少 frontmatter 中的 name 字段")
+    fallback_name = (name or "").strip() or _Path(main_md).stem or "外部导入 Skill"
+    fallback_description = (description or "").strip()
+    final_name = parsed["name"] or fallback_name
+    final_description = parsed["description"] or fallback_description
+    final_md_content = md_content
+    if not parsed["name"] or (fallback_description and not parsed["description"]):
+        final_md_content = f"---\nname: {final_name}\ndescription: {final_description}\n---\n\n{parsed['system_prompt']}"
 
     # 检查同名 skill
-    existing = db.query(Skill).filter(Skill.name == parsed["name"]).first()
+    existing = db.query(Skill).filter(Skill.name == final_name).first()
 
     if user.role == Role.SUPER_ADMIN:
         new_status = SkillStatus.PUBLISHED
@@ -953,14 +959,14 @@ async def upload_skill_zip(
             change_note="从 zip 包上传更新",
         )
         db.add(v)
-        if parsed["description"]:
-            existing.description = parsed["description"]
+        if final_description:
+            existing.description = final_description
         action = "updated"
         version = new_ver
     else:
         skill = Skill(
-            name=parsed["name"],
-            description=parsed["description"],
+            name=final_name,
+            description=final_description,
             mode="hybrid",
             status=new_status,
             scope=new_scope,
@@ -1003,7 +1009,7 @@ async def upload_skill_zip(
         action = "created"
         version = 1
 
-    _write_skill_md_file(skill_id, md_content)
+    _write_skill_md_file(skill_id, final_md_content)
 
     # 提取附属文件到 uploads/skills/<skill_id>/
     upload_base = _Path(settings.UPLOAD_DIR) / "skills" / str(skill_id)
@@ -1059,7 +1065,7 @@ async def upload_skill_zip(
     return {
         "action": action,
         "id": skill_id,
-        "name": parsed["name"],
+        "name": final_name,
         "version": version,
         "status": new_status.value if not existing else (existing.status.value),
         "source_files": saved_files,

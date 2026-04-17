@@ -48,6 +48,8 @@ VALID_TASK_STATUSES = {"todo", "in_progress", "done", "skipped"}
 _REF_KEYWORDS = re.compile(r"(参考|知识|资料|API|文档|数据库|手册)", re.IGNORECASE)
 _TOOL_KEYWORDS = re.compile(r"(调用|获取数据|API|查询|计算|执行|搜索|爬取|请求)", re.IGNORECASE)
 _TEMPLATE_KEYWORDS = re.compile(r"(固定格式|模板|输出格式|表格格式|JSON格式|Markdown格式)", re.IGNORECASE)
+_IMPORTED_METADATA_PLACEHOLDER_NAMES = {"外部导入 Skill", "unnamed-skill"}
+_IMPORTED_METADATA_PLACEHOLDER_DESCRIPTION = "从外部导入的 Skill，待补充描述。"
 
 
 def _validate_lifecycle(stage: str) -> str:
@@ -1184,6 +1186,61 @@ def analyze_import(db: Session, skill_id: int, user_id: int) -> dict:
     missing_items: list[dict] = []
     tasks: list[dict] = []
     notices: list[dict] = []
+
+    # 检查导入元信息：自动兜底的 name/description 必须同步到 Memo TODO
+    skill_name = (skill.name or "").strip()
+    skill_description = (skill.description or "").strip()
+    needs_name_review = (not skill_name) or skill_name in _IMPORTED_METADATA_PLACEHOLDER_NAMES
+    needs_description_review = (
+        not skill_description
+        or skill_description == _IMPORTED_METADATA_PLACEHOLDER_DESCRIPTION
+    )
+    if needs_name_review or needs_description_review:
+        task_id = _new_id("task")
+        missing_labels = []
+        if needs_name_review:
+            missing_items.append({
+                "code": "missing_skill_name",
+                "label": "需要确认 Skill 名称",
+                "severity": "warning",
+                "required_to_publish": False,
+                "related_task_id": task_id,
+            })
+            missing_labels.append("名称")
+        if needs_description_review:
+            missing_items.append({
+                "code": "missing_skill_description",
+                "label": "需要补充 Skill 描述",
+                "severity": "warning",
+                "required_to_publish": False,
+                "related_task_id": task_id,
+            })
+            missing_labels.append("描述")
+        notices.append({
+            "id": "notice_missing_import_metadata",
+            "type": "missing_metadata",
+            "title": "需要补齐导入元信息",
+            "message": f"外部导入时未提供完整的 Skill {'/'.join(missing_labels)}，系统已临时补齐，请后续确认。",
+            "blocking": False,
+            "status": "active",
+            "related_task_ids": [task_id],
+        })
+        tasks.append({
+            "id": task_id,
+            "title": "确认 Skill 名称和描述",
+            "type": "edit_skill_md",
+            "status": "todo",
+            "priority": "high",
+            "source": "import_analysis",
+            "description": "确认并补齐外部导入 Skill 的名称和描述，避免使用临时占位信息。",
+            "target_files": ["SKILL.md"],
+            "acceptance_rule": {"mode": "all_target_files_saved_nonempty"},
+            "depends_on": [],
+            "started_at": None,
+            "completed_at": None,
+            "completed_by": None,
+            "result_summary": None,
+        })
 
     # 检查 example
     if not categories.get("example"):

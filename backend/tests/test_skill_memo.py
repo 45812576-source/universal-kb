@@ -983,6 +983,21 @@ class TestImportRemediation:
         # 至少有 missing_example 的 create_file 任务 + run_test
         assert len(tasks) >= 2
 
+    def test_analyze_generates_metadata_todo_when_import_used_placeholder(self, db):
+        """外部导入时如果名称/描述是临时补齐值，应在 Memo 中生成后续确认 TODO。"""
+        user, skill = self._setup(db, source_files=[{"filename": "example-1.md", "size": 100, "category": "example"}])
+        skill.name = "外部导入 Skill"
+        skill.description = "从外部导入的 Skill，待补充描述。"
+        db.commit()
+
+        result = skill_memo_service.analyze_import(db, skill.id, user.id)
+        codes = [m["code"] for m in result["analysis"]["missing_items"]]
+        tasks = result["memo"]["memo"]["tasks"]
+
+        assert "missing_skill_name" in codes
+        assert "missing_skill_description" in codes
+        assert any(task["title"] == "确认 Skill 名称和描述" for task in tasks)
+
     def test_analyze_import_never_generates_rewrite_task_before_test(self, db):
         """导入分析阶段只能补缺项/引导测试，不能生成主文重写任务。"""
         user, skill = self._setup(
