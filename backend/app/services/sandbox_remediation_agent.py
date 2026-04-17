@@ -13,6 +13,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import or_
@@ -263,10 +264,13 @@ def _normalize_edit(
     raw: dict[str, Any],
     task_map: dict[str, dict[str, Any]],
     fallback_task: dict[str, Any] | None,
+    target_contents: dict[tuple[str, str | None], str],
 ) -> dict[str, Any] | None:
     task_id = _coerce_text(raw.get("task_id") or (fallback_task or {}).get("task_id"))
     task = task_map.get(task_id) or fallback_task
     if not task:
+        return None
+    if not task.get("problem_ids"):
         return None
 
     target_type = _coerce_text(raw.get("target_type")).lower()
@@ -287,11 +291,14 @@ def _normalize_edit(
             return None
 
     diff_ops: list[dict[str, str]] = []
+    target_text = target_contents.get((target_type, target_key))
+    if target_text is None:
+        return None
     for op in raw.get("diff_ops") or []:
         if not isinstance(op, dict):
             continue
         normalized = _normalize_diff_op(op)
-        if normalized:
+        if normalized and _diff_op_matches_target(normalized, target_text):
             diff_ops.append(normalized)
     if not diff_ops:
         return None
@@ -310,6 +317,16 @@ def _normalize_edit(
         "diff_ops": diff_ops,
         "task": task,
     }
+
+
+def _diff_op_matches_target(op: dict[str, str], target_text: str) -> bool:
+    action = _coerce_text(op.get("op")).lower()
+    old = _coerce_text(op.get("old"))
+    if action in {"replace", "delete"}:
+        return bool(old and old in target_text)
+    if action == "insert":
+        return bool(old and old in target_text)
+    return False
 
 
 def _latest_skill_version(db: Session, skill_id: int) -> SkillVersion | None:
@@ -387,7 +404,36 @@ def _collect_skill_context(db: Session, skill_id: int) -> dict[str, Any]:
         "bound_tools": _collect_bound_tools(skill),
         "source_files_meta": source_files_meta,
         "source_files_content": source_file_ctx[:24000],
+        "source_file_texts": _collect_source_file_texts(skill.id, skill.source_files or []),
     }
+
+
+def _collect_source_file_texts(skill_id: int, source_files: list[dict[str, Any]]) -> dict[str, str]:
+    results: dict[str, str] = {}
+    base_dir = Path(f"uploads/skills/{skill_id}")
+    for item in source_files:
+        if not isinstance(item, dict):
+            continue
+        filename = _coerce_text(item.get("filename"))
+        if not filename:
+            continue
+        path = base_dir / Path(filename).name
+        if not path.exists():
+            continue
+        try:
+            results[filename] = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+    return results
+
+
+def _build_target_contents(skill_context: dict[str, Any]) -> dict[tuple[str, str | None], str]:
+    target_contents: dict[tuple[str, str | None], str] = {
+        ("system_prompt", None): _coerce_text(skill_context.get("system_prompt")),
+    }
+    for filename, content in (skill_context.get("source_file_texts") or {}).items():
+        target_contents[("source_file", _coerce_text(filename) or None)] = _coerce_text(content)
+    return target_contents
 
 
 def _resolve_remediation_model(db: Session) -> dict[str, Any]:
@@ -432,6 +478,7 @@ async def generate_remediation_plan(
     part3 = report.part3_evaluation or {}
     issues = list(part3.get("issues") or [])
     fallback_tasks = _fallback_tasks(report)
+    target_contents = _build_target_contents(skill_context)
 
     model_config = _resolve_remediation_model(db)
     messages = [
@@ -478,7 +525,7 @@ async def generate_remediation_plan(
         if not isinstance(raw_edit, dict):
             continue
         fallback_task = tasks[index] if index < len(tasks) else (tasks[0] if tasks else None)
-        normalized = _normalize_edit(raw_edit, task_map, fallback_task)
+        normalized = _normalize_edit(raw_edit, task_map, fallback_task, target_contents)
         if normalized:
             normalized_edits.append(normalized)
 

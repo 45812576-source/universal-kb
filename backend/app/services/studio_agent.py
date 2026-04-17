@@ -230,7 +230,7 @@ _AUDIT_SYSTEM_ADDON = """
 # ── 治理动作输出规则段 ──
 _GOVERNANCE_SYSTEM_ADDON = """
 ## 治理动作输出规则
-当你发现 Skill 需要具体修改时，除了文字说明，还应附加治理动作卡片。每张卡片对应一个具体的修改建议：
+当你发现 Skill 需要具体修改时，除了文字说明，还应附加治理动作卡片。每张卡片对应一个具体建议：
 
 ```studio_governance_action
 {"card_id": "<唯一ID如gov_001>", "title": "<简短标题>", "summary": "<问题描述>", "target": "<system_prompt|source_file|tool_binding>", "reason": "<为什么要改>", "risk_level": "<low|medium|high>", "framework": "<对应的分析框架，如 5_whys / mece_issue_tree / pre_mortem / sensitivity_analysis 等>", "phase": "<phase1|phase2|phase3>", "staged_edit": {"ops": [{"type": "append", "content": "<要追加的内容>"}]}}
@@ -238,7 +238,15 @@ _GOVERNANCE_SYSTEM_ADDON = """
 
 原则：
 - 一轮最多输出 2 个治理动作卡片
-- 每个卡片必须有可执行的 staged_edit
+- **如果没有正式质量检测结论**（例如只有导入审计、静态启发式分析、preflight 提示、泛化 memo 提醒）：
+  - 只能输出补缺项建议、绑定表/工具/权限/知识文件引导、example/reference/template 建议、最小护栏增强建议
+  - 禁止输出 `studio_diff`
+  - 禁止生成“替换整段正文”的 draft 或 staged_edit
+  - `studio_governance_action.staged_edit` 可以省略
+- **如果已有正式质量检测结论**（例如 Memo 中已进入“沙盒测试整改模式”，并给出 current_task / target_ref / acceptance_rule / issue evidence）：
+  - 允许输出定向修改草稿
+  - 仅可围绕 `current_task`、`target_ref`、`acceptance_rule`、`issue evidence` 命中的问题出稿
+  - `staged_edit.ops` 必须是最小改动，且不得扩展到未命中的泛化重写
 - staged_edit.ops 的格式与 studio_diff 的 ops 一致
 - framework 字段标注该建议基于哪个分析框架（5_whys / first_principles / jtbd / mece_issue_tree / scenario_planning / pyramid_principle / pre_mortem / red_team / sensitivity_analysis / zero_based）
 - phase 字段标注该建议属于哪个 Skill Architect 阶段
@@ -1051,7 +1059,9 @@ def _build_memo_context(memo_data: dict | None) -> str:
                 "1. 先复述失败主因，让用户确认理解一致\n"
                 "2. 建议从当前整改任务开始修复\n"
                 "3. 根据 target_ref 指向具体文件位置\n"
-                "4. 修改后推动任务完成，建议进行局部重测\n"
+                "4. 只围绕当前任务、问题证据和验收标准给出最小修改\n"
+                "5. 没有精确证据时，只给任务建议，不给 staged diff 或整段替换草稿\n"
+                "6. 修改后推动任务完成，建议进行局部重测\n"
             )
             base += fix_section
 
@@ -1070,7 +1080,7 @@ def _build_memo_context(memo_data: dict | None) -> str:
                 f"\n\n## 沙盒测试待修复\n"
                 f"上次沙盒测试未通过（综合分 {avg_score}），发现以下问题：\n"
                 + "\n".join(lines)
-                + "\n请询问用户是否按此计划逐项修复。"
+                + "\n请询问用户是否按此计划逐项修复。此模式下只能输出任务建议与文件指引，不能直接生成 staged diff。"
             )
             base += fix_section
 
@@ -1596,13 +1606,19 @@ async def run_stream(
 
         # ── studio_governance_action → 也发 governance_card 对齐 ──
         if evt_name == "studio_governance_action":
+            action_type = "staged_edit" if payload.get("staged_edit") else "followup_prompt"
+            actions = (
+                [{"label": "采纳", "type": "adopt"}, {"label": "跳过", "type": "reject"}]
+                if payload.get("staged_edit")
+                else [{"label": "查看建议", "type": "view"}, {"label": "跳过", "type": "reject"}]
+            )
             yield ("governance_card", {
                 "id": payload.get("card_id", ""),
-                "type": "staged_edit",
+                "type": action_type,
                 "title": payload.get("title", ""),
                 "content": payload,
                 "status": "pending",
-                "actions": [{"label": "采纳", "type": "adopt"}, {"label": "跳过", "type": "reject"}],
+                "actions": actions,
             })
 
     # ── 阶段 4: done ──

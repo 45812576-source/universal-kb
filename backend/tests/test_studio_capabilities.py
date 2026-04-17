@@ -266,7 +266,17 @@ class TestWorkflowOrchestrator:
 
         audit_result = SimpleNamespace(
             verdict="needs_work",
-            issues=[{"severity": "high", "category": "structure", "description": "缺少角色定义"}],
+            issues=[{
+                "issue_id": "issue_1",
+                "severity": "high",
+                "category": "structure",
+                "description": "缺少角色定义",
+                "target_kind": "skill_prompt",
+                "target_ref": "SKILL.md",
+                "evidence_snippets": ["你是测试助手。"],
+                "acceptance_rule": "开头必须明确角色身份",
+                "recommended_action": "targeted_edit",
+            }],
             recommended_path="minor_edit",
             audit_id=42,
         )
@@ -296,6 +306,7 @@ class TestWorkflowOrchestrator:
         assert result.route_status["deep_status"] == "pending"
         assert result.audit_summary is not None
         assert result.audit_summary["audit_id"] == 42
+        assert result.workflow_state["metadata"]["audit_summary"]["audit_id"] == 42
         assert len(result.cards) == 1
         assert len(result.staged_edits) == 1
 
@@ -447,8 +458,12 @@ class TestAudit:
         from app.services.studio_auditor import run_audit
 
         mock_response = (
-            '{"verdict": "needs_work", "issues": [{"severity": "high", '
-            '"category": "structure", "description": "缺少角色定义"}], '
+            '{"verdict": "needs_work", "issues": [{"issue_id": "issue_1", "severity": "high", '
+            '"category": "structure", "description": "缺少角色定义", '
+            '"target_kind": "skill_prompt", "target_ref": "SKILL.md", '
+            '"evidence_snippets": ["你是测试助手。"], '
+            '"acceptance_rule": "开头必须明确角色身份", '
+            '"recommended_action": "targeted_edit"}], '
             '"recommended_path": "minor_edit"}'
         )
 
@@ -462,6 +477,9 @@ class TestAudit:
         assert result.verdict == "needs_work"
         assert len(result.issues) == 1
         assert result.issues[0]["severity"] == "high"
+        assert result.issues[0]["issue_id"] == "issue_1"
+        assert result.issues[0]["target_ref"] == "SKILL.md"
+        assert result.issues[0]["recommended_action"] == "targeted_edit"
         assert result.recommended_path == "minor_edit"
 
         # 验证持久化
@@ -478,8 +496,8 @@ class TestAudit:
 
 class TestGovernance:
     @pytest.mark.asyncio
-    async def test_generate_governance_actions(self, db, seeded):
-        """治理引擎生成 cards + staged edits 并持久化。"""
+    async def test_generate_governance_actions_without_formal_evidence_only_cards(self, db, seeded):
+        """导入/静态审计没有正式证据时，只生成 cards，不落 staged edits。"""
         from app.services.studio_governance import generate_governance_actions
 
         # 先创建一个 audit result
@@ -512,15 +530,74 @@ class TestGovernance:
 
         assert len(result.cards) == 1
         assert result.cards[0]["severity"] == "high"
-        assert len(result.staged_edits) == 1
-        assert result.staged_edits[0]["status"] == "pending"
+        assert result.cards[0]["suggested_action"] == "manual_review"
+        assert result.staged_edits == []
 
         # 验证持久化
         se = db.query(StagedEdit).filter(
             StagedEdit.skill_id == seeded["skill"].id
         ).first()
+        assert se is None
+
+    @pytest.mark.asyncio
+    async def test_generate_governance_actions_with_formal_evidence_persists_precise_edit(self, db, seeded):
+        """有正式证据、目标和验收标准时，才允许落精确 staged edit。"""
+        from app.services.studio_governance import generate_governance_actions
+
+        audit_row = SkillAuditResult(
+            skill_id=seeded["skill"].id,
+            quality_verdict="needs_work",
+            issues=[{
+                "issue_id": "issue_1",
+                "severity": "high",
+                "category": "structure",
+                "description": "角色定义不够具体",
+                "target_ref": "SKILL.md",
+                "acceptance_rule": "首句必须说明专业角色",
+                "evidence_snippets": ["你是测试助手。"],
+            }],
+            recommended_path="minor_edit",
+        )
+        db.add(audit_row)
+        db.commit()
+        db.refresh(audit_row)
+
+        mock_response = (
+            '{"cards": [{"title": "补充角色定义", "description": "在 prompt 开头添加角色声明", '
+            '"severity": "high", "category": "structure", "suggested_action": "staged_edit", '
+            '"problem_refs": ["issue_1"], "target_kind": "skill_prompt", "target_ref": "SKILL.md", '
+            '"acceptance_rule": "首句必须说明专业角色", "evidence_snippets": ["你是测试助手。"]}], '
+            '"staged_edits": [{"target_type": "system_prompt", "target_key": null, '
+            '"problem_refs": ["issue_1"], '
+            '"summary": "添加角色定义", "risk_level": "low", '
+            '"diff_ops": [{"op": "replace", "old": "你是测试助手。", "new": "你是一个专业的测试助手。"}]}]}'
+        )
+
+        with patch.object(
+            __import__("app.services.llm_gateway", fromlist=["llm_gateway"]).llm_gateway,
+            "chat",
+            new=AsyncMock(return_value=(mock_response, {})),
+        ):
+            result = await generate_governance_actions(
+                db, seeded["skill"].id, audit_id=audit_row.id,
+            )
+
+        assert len(result.cards) == 1
+        assert len(result.staged_edits) == 1
+        assert result.staged_edits[0]["status"] == "pending"
+        assert result.cards[0]["content"]["problem_refs"] == ["issue_1"]
+        assert result.cards[0]["content"]["target_ref"] == "SKILL.md"
+        assert result.cards[0]["content"]["acceptance_rule"] == "首句必须说明专业角色"
+
+        se = db.query(StagedEdit).filter(
+            StagedEdit.skill_id == seeded["skill"].id
+        ).first()
         assert se is not None
-        assert se.status == "pending"
+        assert se.diff_ops == [{
+            "op": "replace",
+            "old": "你是测试助手。",
+            "new": "你是一个专业的测试助手。",
+        }]
 
 
 class TestStagedEditAdoptReject:

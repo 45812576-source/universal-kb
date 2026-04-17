@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.models.sandbox import SandboxTestReport
 from app.models.sandbox import SandboxTestSession
 from app.services.sandbox_remediation_agent import generate_remediation_plan
-from app.services.preflight_governance import _create_staged_edit, _make_card
+from app.services.preflight_governance import _make_card
 from app.services.skill_memo_service import sync_remediation_tasks
 from app.services.studio_workflow_adapter import normalize_workflow_card, normalize_workflow_staged_edit
 
@@ -59,72 +59,27 @@ def _fallback_fix_items(part3: dict) -> list[dict]:
     return items
 
 
-def _risk_level(priority: str | None) -> str:
-    if priority == "p0":
-        return "high"
-    if priority == "p1":
-        return "medium"
-    return "low"
-
-
-def _fix_plan_patch(item: dict) -> str:
-    title = str(item.get("title", "修复沙盒测试问题")).strip()
-    target_kind = str(item.get("target_kind", "unknown")).strip() or "unknown"
-    target_ref = str(item.get("target_ref", "")).strip()
-    suggested_changes = str(item.get("suggested_changes", "")).strip()
-    acceptance_rule = str(item.get("acceptance_rule", "")).strip()
-    retest_scope = item.get("retest_scope", []) or []
-    lines = [
-        "",
-        "",
-        f"## 沙盒测试整改要求：{title}",
-        f"- 整改对象：{_TARGET_KIND_LABELS.get(target_kind, 'Prompt 逻辑')}" + (f"（{target_ref}）" if target_ref else ""),
-    ]
-    if suggested_changes:
-        lines.append(f"- 具体修改：{suggested_changes}")
-    if acceptance_rule:
-        lines.append(f"- 验收标准：{acceptance_rule}")
-    if retest_scope:
-        lines.append(f"- 回归范围：{', '.join(str(scope) for scope in retest_scope[:5])}")
-    lines.append("- 输出要求：先给结论，再给依据、边界和下一步动作。")
-    return "\n".join(lines) + "\n"
-
-
-def _target_for_item(item: dict) -> tuple[str, str | None]:
-    target_kind = str(item.get("target_kind", "unknown")).strip() or "unknown"
-    target_ref = str(item.get("target_ref", "")).strip()
-    if target_kind == "source_file" and target_ref:
-        return "source_file", target_ref
-    return "system_prompt", None
-
-
-def _default_staged_edit(
-    db: Session,
-    *,
-    skill_id: int,
-    item: dict,
-) -> tuple[dict, dict]:
-    target_type, target_key = _target_for_item(item)
-    staged = _create_staged_edit(
-        db,
-        skill_id=skill_id,
-        target_type=target_type,
-        target_key=target_key,
-        summary=str(item.get("title", "修复沙盒测试问题"))[:200],
-        diff_ops=[{"op": "insert", "old": "", "new": _fix_plan_patch(item)}],
-        risk_level=_risk_level(item.get("priority")),
-    )
+def _task_only_card(skill_id: int, item: dict) -> dict:
     card = _make_card(
         f"sandbox-report-{skill_id}-{item.get('id')}",
         str(item.get("title", "修复沙盒测试问题"))[:120],
-        str(item.get("suggested_changes") or item.get("acceptance_rule") or "已根据沙盒报告生成一键整改建议。")[:300],
+        str(item.get("suggested_changes") or item.get("acceptance_rule") or "已根据沙盒报告生成整改任务。")[:300],
+        card_type="followup_prompt",
         reason=str(item.get("acceptance_rule") or item.get("estimated_gain") or "按沙盒报告要求修复后再回归测试。")[:300],
-        staged_edit_id=int(staged["id"]),
+        preflight_action="open_fix_task",
+        action_payload={
+            "task_id": item.get("id"),
+            "problem_ids": item.get("problem_ids", []),
+            "target_kind": item.get("target_kind", "unknown"),
+            "target_ref": item.get("target_ref", ""),
+            "acceptance_rule": item.get("acceptance_rule", ""),
+            "retest_scope": item.get("retest_scope", []),
+        },
     )
     card["content"]["problem_refs"] = item.get("problem_ids", [])
     card["content"]["target_kind"] = item.get("target_kind", "unknown")
     card["content"]["target_ref"] = item.get("target_ref", "")
-    return staged, card
+    return card
 
 
 async def build_sandbox_report_governance(
@@ -177,9 +132,11 @@ async def build_sandbox_report_governance(
             user_id=session.tester_id if session else None,
         )
         for item in fix_plan[:8]:
-            staged, card = _default_staged_edit(db, skill_id=skill_id, item=item)
-            staged_edits.append(normalize_workflow_staged_edit(staged, source_type="sandbox_remediation"))
-            cards.append(normalize_workflow_card(card, source_type="sandbox_remediation", phase="remediate"))
+            cards.append(normalize_workflow_card(
+                _task_only_card(skill_id, item),
+                source_type="sandbox_remediation",
+                phase="remediate",
+            ))
 
     for item in items_for_followup[:8]:
         target_kind = str(item.get("target_kind", "unknown"))

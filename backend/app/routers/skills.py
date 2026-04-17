@@ -31,6 +31,7 @@ class SkillCreate(BaseModel):
     required_inputs: list[dict] = []
     model_config_id: Optional[int] = None
     output_schema: Optional[dict] = None
+    raw_skill_md: Optional[str] = None
 
 
 class SkillVersionCreate(BaseModel):
@@ -290,6 +291,11 @@ def create_skill(
     if db.query(Skill).filter(Skill.name == req.name, Skill.created_by == user.id).first():
         raise HTTPException(400, f"你已有同名 Skill '{req.name}'，请修改名称或更新已有版本")
 
+    raw_skill_md = req.raw_skill_md if req.raw_skill_md and req.raw_skill_md.strip() else None
+    parsed_raw = _parse_skill_md(raw_skill_md) if raw_skill_md else None
+    effective_system_prompt = parsed_raw["system_prompt"] if parsed_raw else req.system_prompt
+    effective_variables = parsed_raw["variables"] if parsed_raw else req.variables
+
     # 员工创建的 Skill 固定为个人草稿，不可自行设置 scope
     skill = Skill(
         name=req.name,
@@ -308,8 +314,8 @@ def create_skill(
     v = SkillVersion(
         skill_id=skill.id,
         version=1,
-        system_prompt=req.system_prompt,
-        variables=req.variables,
+        system_prompt=effective_system_prompt,
+        variables=effective_variables,
         required_inputs=req.required_inputs,
         model_config_id=req.model_config_id,
         output_schema=req.output_schema,
@@ -317,6 +323,7 @@ def create_skill(
         change_note="初始版本",
     )
     db.add(v)
+    _write_skill_md_file(skill.id, raw_skill_md or _build_skill_md_content(skill, effective_system_prompt))
     try:
         db.commit()
     except IntegrityError:
@@ -354,6 +361,30 @@ def _parse_skill_md(content: str) -> dict:
         "system_prompt": body.strip(),
         "variables": [f"{{{v}}}" for v in variables],
     }
+
+
+def _skill_md_path(skill_id: int):
+    return _safe_skill_dir(skill_id) / "SKILL.md"
+
+
+def _build_skill_md_content(skill: Skill, system_prompt: str = "") -> str:
+    frontmatter = f"---\nname: {skill.name}\ndescription: {skill.description or ''}\n---\n\n"
+    return frontmatter + (system_prompt or "")
+
+
+def _read_skill_md_or_synthesize(skill: Skill) -> str:
+    path = _skill_md_path(skill.id)
+    if path.exists():
+        return path.read_text(encoding="utf-8", errors="replace")
+    latest = skill.versions[0] if skill.versions else None
+    return _build_skill_md_content(skill, latest.system_prompt if latest else "")
+
+
+def _write_skill_md_file(skill_id: int, content: str) -> int:
+    path = _skill_md_path(skill_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return len(content.encode("utf-8"))
 
 
 # ─── 外部 Skill 导入转换 ────────────────────────────────────────────────────
@@ -700,6 +731,7 @@ async def upload_skill_md(
         db.add(v)
         if parsed["description"]:
             existing.description = parsed["description"]
+        _write_skill_md_file(existing.id, content)
         db.commit()
         return {
             "action": "updated",
@@ -735,6 +767,7 @@ async def upload_skill_md(
             change_note="从 md 文件上传创建",
         )
         db.add(v)
+        _write_skill_md_file(skill.id, content)
         db.commit()
         db.refresh(skill)
         return {
@@ -787,6 +820,7 @@ async def batch_upload_skill_md(
             db.add(v)
             if parsed["description"]:
                 existing.description = parsed["description"]
+            _write_skill_md_file(existing.id, content)
             results.append({"filename": f.filename, "action": "updated", "id": existing.id, "name": existing.name, "version": new_ver})
         else:
             skill = Skill(
@@ -809,6 +843,7 @@ async def batch_upload_skill_md(
                 change_note="批量上传创建",
             )
             db.add(v)
+            _write_skill_md_file(skill.id, content)
             results.append({"filename": f.filename, "action": "created", "id": skill.id, "name": parsed["name"], "version": 1})
 
     db.commit()
@@ -902,6 +937,7 @@ async def upload_skill_zip(
         new_scope = "personal"
         initial_stage = "super_pending" if user.role == Role.DEPT_ADMIN else "dept_pending"
 
+    _zip_approval_id = None
     if existing:
         skill_id = existing.id
         latest = existing.versions[0] if existing.versions else None
@@ -944,7 +980,6 @@ async def upload_skill_zip(
             change_note="从 zip 包上传创建",
         )
         db.add(v)
-        _zip_approval_id = None
         if initial_stage:
             from app.models.permission import ApprovalRequest, ApprovalRequestType, ApprovalStatus as AStatus
             # Fix 6: 自动采集证据包
@@ -967,6 +1002,8 @@ async def upload_skill_zip(
             _zip_approval_id = approval.id
         action = "created"
         version = 1
+
+    _write_skill_md_file(skill_id, md_content)
 
     # 提取附属文件到 uploads/skills/<skill_id>/
     upload_base = _Path(settings.UPLOAD_DIR) / "skills" / str(skill_id)
@@ -1152,6 +1189,9 @@ def get_skill_file(
         raise HTTPException(404, "Skill 不存在")
     _check_skill_read_access(skill, user)
 
+    if filename == "SKILL.md":
+        return {"content": _read_skill_md_or_synthesize(skill)}
+
     path = _safe_file_path(skill_id, filename)
     if not path.exists():
         raise HTTPException(404, "文件不存在")
@@ -1165,6 +1205,7 @@ def get_skill_file(
 
 class SkillFileUpdate(BaseModel):
     content: str
+    change_note: str = ""
 
 
 @router.put("/{skill_id}/files/{filename}")
@@ -1181,6 +1222,31 @@ def update_skill_file(
     if not skill:
         raise HTTPException(404, "Skill 不存在")
     _check_skill_write_access(skill, user)
+
+    if filename == "SKILL.md":
+        size = _write_skill_md_file(skill_id, req.content)
+        parsed = _parse_skill_md(req.content)
+        has_frontmatter = bool(re.match(r"^---\s*\n.*?\n---\s*\n", req.content, re.DOTALL))
+        latest = skill.versions[0] if skill.versions else None
+        max_ver = max((v.version for v in skill.versions), default=0)
+        if has_frontmatter and parsed["name"] and parsed["name"] != skill.name:
+            skill.name = parsed["name"]
+        if has_frontmatter and parsed["description"] != (skill.description or ""):
+            skill.description = parsed["description"]
+        if not latest or latest.system_prompt != parsed["system_prompt"]:
+            db.add(SkillVersion(
+                skill_id=skill_id,
+                version=max_ver + 1,
+                system_prompt=parsed["system_prompt"],
+                variables=parsed["variables"],
+                required_inputs=latest.required_inputs if latest else [],
+                model_config_id=latest.model_config_id if latest else None,
+                output_schema=latest.output_schema if latest else None,
+                created_by=user.id,
+                change_note=req.change_note or "手动编辑 SKILL.md",
+            ))
+        db.commit()
+        return {"ok": True, "filename": "SKILL.md", "size": size}
 
     path = _safe_file_path(skill_id, filename)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1251,6 +1317,9 @@ def delete_skill_file(
         raise HTTPException(404, "Skill 不存在")
     _check_skill_write_access(skill, user)
 
+    if filename == "SKILL.md":
+        raise HTTPException(400, "SKILL.md 是主文件，不能删除")
+
     path = _safe_file_path(skill_id, filename)
     if path.exists():
         path.unlink()
@@ -1311,20 +1380,9 @@ def export_skill_zip(
     if not skill:
         raise HTTPException(404, "Skill 不存在")
 
-    # 获取最新 system_prompt
-    latest_ver = (
-        db.query(SkillVersion)
-        .filter(SkillVersion.skill_id == skill_id)
-        .order_by(SkillVersion.version.desc())
-        .first()
-    )
-    system_prompt = latest_ver.system_prompt if latest_ver else ""
-
     buf = _io.BytesIO()
     with _zf.ZipFile(buf, "w", _zf.ZIP_DEFLATED) as zf:
-        # 写入主文件 SKILL.md（带 frontmatter）
-        frontmatter = f"---\nname: {skill.name}\ndescription: {skill.description or ''}\n---\n\n"
-        zf.writestr("SKILL.md", frontmatter + (system_prompt or ""))
+        zf.writestr("SKILL.md", _read_skill_md_or_synthesize(skill))
 
         # 写入附属文件
         for f in (skill.source_files or []):

@@ -1294,6 +1294,120 @@ class TestSandboxReportGovernanceActions:
         assert synced[0]["title"] == "修复结论先行结构"
         assert synced[0]["target_files"] == ["SKILL.md"]
 
+    @pytest.mark.asyncio
+    async def test_build_governance_fallback_only_returns_task_cards(self, db):
+        from app.services.sandbox_governance import build_sandbox_report_governance
+
+        dept = _make_dept(db)
+        user = _make_user(db, "sandbox_governance_fallback_user", Role.SUPER_ADMIN, dept.id)
+        _make_model_config(db)
+        skill = _make_skill(db, user.id, name="沙盒整改回退Skill", status=SkillStatus.PUBLISHED)
+
+        session = SandboxTestSession(
+            target_type="skill",
+            target_id=skill.id,
+            target_version=1,
+            target_name=skill.name,
+            tester_id=user.id,
+            status=SessionStatus.COMPLETED,
+            current_step=SessionStep.DONE,
+            detected_slots=[],
+            tool_review=[],
+            permission_snapshot=[],
+            quality_passed=False,
+            usability_passed=True,
+            anti_hallucination_passed=True,
+            approval_eligible=False,
+        )
+        db.add(session)
+        db.flush()
+
+        report = SandboxTestReport(
+            session_id=session.id,
+            target_type="skill",
+            target_id=skill.id,
+            target_version=1,
+            target_name=skill.name,
+            tester_id=user.id,
+            part1_evidence_check={},
+            part2_test_matrix={},
+            part3_evaluation={
+                "top_issues": [{"source": "quality", "reason": "缺少明确结论"}],
+                "fix_plan": ["增加先结论后依据的输出要求"],
+            },
+            quality_passed=False,
+            usability_passed=True,
+            anti_hallucination_passed=True,
+            approval_eligible=False,
+            report_hash="sandbox-gov-fallback-hash",
+        )
+        db.add(report)
+        db.flush()
+        session.report_id = report.id
+        db.commit()
+
+        result = await build_sandbox_report_governance(db, skill_id=skill.id, report=report)
+
+        assert result.staged_edits == []
+        assert len(result.cards) == 1
+        assert result.cards[0]["type"] == "followup_prompt"
+
+
+class TestPreflightGovernanceBoundaries:
+    def test_prompt_too_short_only_returns_guidance_card(self, db):
+        from app.services.preflight_governance import build_preflight_governance
+
+        dept = _make_dept(db)
+        user = _make_user(db, "preflight_prompt_short_user", Role.SUPER_ADMIN, dept.id)
+        skill, _tool, version = _setup_skill_with_tool(db, user.id)
+        version.system_prompt = "你好"
+        db.commit()
+
+        result = build_preflight_governance(
+            db,
+            skill_id=skill.id,
+            result={
+                "gates": [{
+                    "gate": "structure",
+                    "status": "failed",
+                    "items": [{"ok": False, "code": "prompt_too_short", "issue": "prompt 过短"}],
+                }],
+            },
+        )
+
+        assert result.staged_edits == []
+        assert len(result.cards) == 1
+        assert result.cards[0]["type"] == "followup_prompt"
+        assert result.cards[0]["content"]["preflight_action"] == "open_skill_editor"
+
+    def test_preflight_quality_patch_is_minimal_guardrail(self, db):
+        from app.services.preflight_governance import build_preflight_governance
+
+        dept = _make_dept(db)
+        user = _make_user(db, "preflight_guardrail_user", Role.SUPER_ADMIN, dept.id)
+        skill, _tool, _version = _setup_skill_with_tool(db, user.id)
+        db.commit()
+
+        result = build_preflight_governance(
+            db,
+            skill_id=skill.id,
+            result={
+                "quality_detail": {
+                    "top_deductions": [{
+                        "dimension": "correctness",
+                        "reason": "证据链不足",
+                        "fix_suggestion": "补更多案例",
+                    }],
+                },
+            },
+        )
+
+        assert len(result.staged_edits) == 1
+        patch_text = result.staged_edits[0]["diff_ops"][0]["new"]
+        assert "最小质量护栏" in patch_text
+        assert "证据链不足" in patch_text
+        assert "补更多案例" not in patch_text
+
 
 class TestPreflightDescriptionGenerator:
     """description 缺失时，按 skill 上下文生成更具体的描述。"""

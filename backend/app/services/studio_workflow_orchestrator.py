@@ -429,6 +429,17 @@ async def bootstrap_workflow(
             classified_at=_now_iso(),
         ),
     )
+    if audit_summary is not None:
+        metadata = workflow_state.get("metadata") if isinstance(workflow_state.get("metadata"), dict) else {}
+        metadata = dict(metadata)
+        metadata["audit_summary"] = {
+            "verdict": audit_summary.get("verdict"),
+            "recommended_path": audit_summary.get("recommended_path"),
+            "audit_id": audit_summary.get("audit_id"),
+            "issue_count": len(audit_summary.get("issues") or []),
+            "issues": list(audit_summary.get("issues") or [])[:8],
+        }
+        workflow_state["metadata"] = metadata
     if skill_id:
         from app.services.skill_memo_service import sync_workflow_recovery
 

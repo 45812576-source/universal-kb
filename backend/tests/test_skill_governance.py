@@ -1,11 +1,40 @@
 from tests.conftest import _auth, _login, _make_skill, _make_user
-from app.models.knowledge import KnowledgeEntry, KnowledgeStatus
+from app.models.business import (
+    BusinessTable,
+    SkillDataGrant,
+    SkillTableBinding,
+    TableField,
+    TablePermissionPolicy,
+    TableRoleGroup,
+    TableView,
+)
+from app.models.knowledge import KnowledgeEntry, KnowledgeFolder, KnowledgeStatus
 from app.models.knowledge_block import KnowledgeChunkMapping
-from app.models.business import BusinessTable, TableField
+from app.models.tool import ToolRegistry, ToolType
 from app.models.sandbox import CaseVerdict, SandboxTestCase, SandboxTestReport, SandboxTestSession, SessionStep
 from app.models.skill import SkillVersion
-from app.models.skill_governance import SandboxCaseMaterialization, SkillGovernanceJob
+from app.models.skill_governance import PermissionDeclarationDraft, SandboxCaseMaterialization, SkillGovernanceJob
 from app.models.skill_knowledge_ref import SkillKnowledgeReference
+from app.services.skill_governance_service import resolve_workspace_id, suggest_role_asset_policies, sync_bound_assets
+
+
+def _seed_legacy_bundle(db, skill, user, mode: str = "initial"):
+    workspace_id = resolve_workspace_id(db, skill.id)
+    sync_bound_assets(db, skill, workspace_id)
+    bundle = suggest_role_asset_policies(db, skill, user, workspace_id, mode)
+    db.commit()
+    db.refresh(bundle)
+    return bundle
+
+
+def _assert_legacy_write_deprecated(resp, skill_id: int, endpoint: str):
+    assert resp.status_code == 410, resp.text
+    payload = resp.json()
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "governance.legacy_write_deprecated"
+    assert payload["error"]["details"]["skill_id"] == skill_id
+    assert payload["error"]["details"]["endpoint"] == endpoint
+    assert f"/api/skill-governance/{skill_id}/mount-context" in payload["error"]["details"]["replacement_endpoints"]
 
 
 def test_skill_governance_permission_assistant_flow(client, db):
@@ -56,13 +85,7 @@ def test_skill_governance_permission_assistant_flow(client, db):
     assert assets[0]["asset_type"] == "data_table"
     assert "high_sensitive_fields" in assets[0]["risk_flags"]
 
-    suggest_resp = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    )
-    assert suggest_resp.status_code == 200, suggest_resp.text
-    bundle_id = suggest_resp.json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
 
     policies_resp = client.get(
         f"/api/skill-governance/{skill.id}/role-asset-policies",
@@ -85,6 +108,499 @@ def test_skill_governance_permission_assistant_flow(client, db):
     assert declaration["status"] == "generated"
     assert "招聘主管" in declaration["text"]
     assert "招聘漏斗汇总表" in declaration["text"]
+
+
+def test_mount_context_returns_domain_projection_summary(client, db):
+    user = _make_user(db, username="mount_context_author")
+    skill = _make_skill(db, user.id, name="Mount Context Skill")
+    table = BusinessTable(
+        table_name="mount_context_table",
+        display_name="挂载上下文数据表",
+    )
+    folder = KnowledgeFolder(name="招聘知识库", created_by=user.id)
+    knowledge = KnowledgeEntry(
+        title="候选人沟通手册",
+        content="涉及手机号和沟通边界",
+        status=KnowledgeStatus.APPROVED,
+        created_by=user.id,
+        folder=folder,
+        review_level=3,
+        sensitivity_flags=["phone"],
+    )
+    tool = ToolRegistry(
+        name="mount_context_tool",
+        display_name="外呼同步 Tool",
+        tool_type=ToolType.MCP,
+        config={"manifest": {"permissions": ["read", "write"]}},
+        created_by=user.id,
+    )
+    db.add_all([table, folder, knowledge, tool])
+    db.flush()
+
+    field = TableField(
+        table_id=table.id,
+        field_name="candidate_phone",
+        display_name="候选人手机号",
+        field_type="phone",
+        is_sensitive=True,
+        sort_order=1,
+    )
+    view = TableView(
+        table_id=table.id,
+        name="招聘视图",
+        view_type="grid",
+        config={},
+        created_by=user.id,
+    )
+    role_group = TableRoleGroup(
+        table_id=table.id,
+        name="招聘岗位组",
+        skill_ids=[skill.id],
+    )
+    db.add_all([field, view, role_group])
+    db.flush()
+
+    db.add(SkillTableBinding(
+        skill_id=skill.id,
+        table_id=table.id,
+        view_id=view.id,
+        binding_type="runtime_read",
+        created_by=user.id,
+    ))
+    db.add(SkillDataGrant(
+        skill_id=skill.id,
+        table_id=table.id,
+        view_id=view.id,
+        role_group_id=role_group.id,
+        grant_mode="allow",
+        allowed_actions=["read"],
+        max_disclosure_level="L2",
+        approval_required=False,
+        audit_level="full",
+    ))
+    db.add(TablePermissionPolicy(
+        table_id=table.id,
+        view_id=view.id,
+        role_group_id=role_group.id,
+        row_access_mode="department",
+        field_access_mode="blocklist",
+        blocked_field_ids=[field.id],
+        disclosure_level="L2",
+        masking_rule_json={"candidate_phone": "partial"},
+        tool_permission_mode="readonly",
+        export_permission=False,
+    ))
+    db.add(SkillKnowledgeReference(
+        skill_id=skill.id,
+        knowledge_id=knowledge.id,
+        snapshot_desensitization_level="L2",
+        snapshot_data_type_hits=["phone"],
+        snapshot_mask_rules=[{"data_type": "phone", "mask_action": "summary_only"}],
+        folder_id=folder.id,
+        folder_path="招聘知识库",
+        manager_scope_ok=True,
+        publish_version=1,
+    ))
+    skill.bound_tools.append(tool)
+    db.commit()
+
+    token = _login(client, username="mount_context_author")
+    headers = _auth(token)
+
+    role_resp = client.put(
+        f"/api/skill-governance/{skill.id}/service-roles",
+        headers=headers,
+        json={
+            "roles": [{
+                "org_path": "公司经营发展中心/人力资源部",
+                "position_name": "招聘主管",
+                "position_level": "M0",
+            }]
+        },
+    )
+    assert role_resp.status_code == 200, role_resp.text
+
+    resp = client.get(f"/api/skill-governance/{skill.id}/mount-context", headers=headers)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["source_mode"] == "domain_projection"
+    assert data["permission_summary"]["table_count"] == 1
+    assert data["permission_summary"]["knowledge_count"] == 1
+    assert data["permission_summary"]["tool_count"] == 1
+    assert data["permission_summary"]["high_risk_count"] >= 2
+    assert len(data["roles"]) == 1
+    assert len(data["assets"]) == 3
+    ref_types = {ref["type"] for ref in data["source_refs"]}
+    assert "skill_data_grant" in ref_types
+    assert "skill_knowledge_reference" in ref_types
+    assert "tool_registry" in ref_types
+
+
+def test_mounted_permissions_surface_source_domain_blocking_issues(client, db):
+    user = _make_user(db, username="mounted_permissions_author")
+    skill = _make_skill(db, user.id, name="Mounted Permissions Skill")
+    table = BusinessTable(
+        table_name="mounted_permissions_table",
+        display_name="权限投影数据表",
+    )
+    folder = KnowledgeFolder(name="财务知识库", created_by=user.id)
+    knowledge = KnowledgeEntry(
+        title="发票审核说明",
+        content="包含敏感审批规则",
+        status=KnowledgeStatus.APPROVED,
+        created_by=user.id,
+        folder=folder,
+        review_level=3,
+        sensitivity_flags=["invoice"],
+    )
+    db.add_all([table, folder, knowledge])
+    db.flush()
+
+    field = TableField(
+        table_id=table.id,
+        field_name="invoice_amount",
+        display_name="发票金额",
+        field_type="currency",
+        is_sensitive=True,
+        sort_order=1,
+    )
+    db.add(field)
+    db.flush()
+    db.add(SkillTableBinding(
+        skill_id=skill.id,
+        table_id=table.id,
+        view_id=None,
+        binding_type="runtime_read",
+        created_by=user.id,
+    ))
+    db.add(SkillKnowledgeReference(
+        skill_id=skill.id,
+        knowledge_id=knowledge.id,
+        snapshot_desensitization_level="L3",
+        snapshot_data_type_hits=["invoice"],
+        snapshot_mask_rules=[],
+        folder_id=folder.id,
+        folder_path="财务知识库",
+        manager_scope_ok=False,
+        publish_version=1,
+    ))
+    db.commit()
+
+    token = _login(client, username="mounted_permissions_author")
+    headers = _auth(token)
+
+    resp = client.get(f"/api/skill-governance/{skill.id}/mounted-permissions", headers=headers)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["source_mode"] == "domain_projection"
+    assert "missing_skill_data_grant" in data["blocking_issues"]
+    assert "manager_scope_not_confirmed" in data["blocking_issues"]
+    assert "missing_mask_snapshot" in data["blocking_issues"]
+    assert data["table_permissions"][0]["blocking_issues"] == ["missing_skill_data_grant", "missing_table_permission_policy"]
+    assert "manager_scope_not_confirmed" in data["knowledge_permissions"][0]["blocking_issues"]
+    risk_types = {item["type"] for item in data["risk_controls"]}
+    assert "sensitive_field" in risk_types
+    assert "knowledge_mask_type" in risk_types
+
+
+def test_declaration_generation_prefers_domain_projection_without_bundle(client, db):
+    user = _make_user(db, username="projection_decl_author")
+    skill = _make_skill(db, user.id, name="Projection Declaration Skill")
+    table = BusinessTable(
+        table_name="projection_decl_table",
+        display_name="投影声明数据表",
+    )
+    db.add(table)
+    db.flush()
+    field = TableField(
+        table_id=table.id,
+        field_name="candidate_phone",
+        display_name="候选人手机号",
+        field_type="phone",
+        is_sensitive=True,
+        sort_order=1,
+    )
+    view = TableView(table_id=table.id, name="投影视图", view_type="grid", config={}, created_by=user.id)
+    role_group = TableRoleGroup(table_id=table.id, name="招聘岗位组", skill_ids=[skill.id])
+    db.add_all([field, view, role_group])
+    db.flush()
+    db.add(SkillTableBinding(
+        skill_id=skill.id,
+        table_id=table.id,
+        view_id=view.id,
+        binding_type="runtime_read",
+        created_by=user.id,
+    ))
+    db.add(SkillDataGrant(
+        skill_id=skill.id,
+        table_id=table.id,
+        view_id=view.id,
+        role_group_id=role_group.id,
+        grant_mode="allow",
+        allowed_actions=["read"],
+        max_disclosure_level="L2",
+        approval_required=False,
+        audit_level="full",
+    ))
+    db.add(TablePermissionPolicy(
+        table_id=table.id,
+        view_id=view.id,
+        role_group_id=role_group.id,
+        row_access_mode="department",
+        field_access_mode="blocklist",
+        blocked_field_ids=[field.id],
+        disclosure_level="L2",
+        masking_rule_json={"candidate_phone": "partial"},
+        tool_permission_mode="readonly",
+        export_permission=False,
+    ))
+    db.commit()
+
+    token = _login(client, username="projection_decl_author")
+    headers = _auth(token)
+    role_resp = client.put(
+        f"/api/skill-governance/{skill.id}/service-roles",
+        headers=headers,
+        json={"roles": [{
+            "org_path": "公司经营发展中心/人力资源部",
+            "position_name": "招聘主管",
+            "position_level": "M0",
+        }]},
+    )
+    assert role_resp.status_code == 200, role_resp.text
+
+    generate_resp = client.post(
+        f"/api/skill-governance/{skill.id}/declarations/generate",
+        headers=headers,
+        json={},
+    )
+    assert generate_resp.status_code == 200, generate_resp.text
+    declaration_id = generate_resp.json()["data"]["declaration_id"]
+
+    latest_resp = client.get(
+        f"/api/skill-governance/{skill.id}/declarations/latest",
+        headers=headers,
+    )
+    assert latest_resp.status_code == 200, latest_resp.text
+    latest = latest_resp.json()["data"]
+    assert latest["id"] == declaration_id
+    assert latest["bundle_id"] is None
+    assert latest["source_mode"] == "domain_projection"
+    assert latest["projection_version"] >= 1
+    assert latest["diff_from_previous"]["source_mode"] == "domain_projection"
+    assert any(ref["type"] == "mount_context" for ref in latest["source_refs"])
+    assert any(ref["type"] == "skill_data_grant" for ref in latest["source_refs"])
+    assert "输入模式：domain_projection" in latest["text"]
+
+
+def test_permission_case_plan_generation_uses_domain_projection_without_bundle(client, db):
+    user = _make_user(db, username="projection_case_author")
+    skill = _make_skill(db, user.id, name="Projection Case Plan Skill")
+    table = BusinessTable(
+        table_name="projection_case_table",
+        display_name="投影测试数据表",
+    )
+    db.add(table)
+    db.flush()
+    field = TableField(
+        table_id=table.id,
+        field_name="candidate_phone",
+        display_name="候选人手机号",
+        field_type="phone",
+        is_sensitive=True,
+        sort_order=1,
+    )
+    view = TableView(table_id=table.id, name="投影测试视图", view_type="grid", config={}, created_by=user.id)
+    role_group = TableRoleGroup(table_id=table.id, name="招聘岗位组", skill_ids=[skill.id])
+    db.add_all([field, view, role_group])
+    db.flush()
+    db.add(SkillTableBinding(
+        skill_id=skill.id,
+        table_id=table.id,
+        view_id=view.id,
+        binding_type="runtime_read",
+        created_by=user.id,
+    ))
+    db.add(SkillDataGrant(
+        skill_id=skill.id,
+        table_id=table.id,
+        view_id=view.id,
+        role_group_id=role_group.id,
+        grant_mode="allow",
+        allowed_actions=["read"],
+        max_disclosure_level="L2",
+        approval_required=False,
+        audit_level="full",
+    ))
+    db.add(TablePermissionPolicy(
+        table_id=table.id,
+        view_id=view.id,
+        role_group_id=role_group.id,
+        row_access_mode="department",
+        field_access_mode="blocklist",
+        blocked_field_ids=[field.id],
+        disclosure_level="L2",
+        masking_rule_json={"candidate_phone": "partial"},
+        tool_permission_mode="readonly",
+        export_permission=False,
+    ))
+    db.commit()
+
+    token = _login(client, username="projection_case_author")
+    headers = _auth(token)
+    role_resp = client.put(
+        f"/api/skill-governance/{skill.id}/service-roles",
+        headers=headers,
+        json={"roles": [{
+            "org_path": "公司经营发展中心/人力资源部",
+            "position_name": "招聘主管",
+            "position_level": "M0",
+        }]},
+    )
+    assert role_resp.status_code == 200, role_resp.text
+
+    declaration_id = client.post(
+        f"/api/skill-governance/{skill.id}/declarations/generate",
+        headers=headers,
+        json={},
+    ).json()["data"]["declaration_id"]
+    adopt_resp = client.put(
+        f"/api/skill-governance/{skill.id}/declarations/{declaration_id}/adopt",
+        headers=headers,
+        json={"action": "confirm", "edited_text": None},
+    )
+    assert adopt_resp.status_code == 200, adopt_resp.text
+
+    readiness_resp = client.get(
+        f"/api/sandbox-case-plans/{skill.id}/readiness",
+        headers=headers,
+    )
+    assert readiness_resp.status_code == 200, readiness_resp.text
+    assert readiness_resp.json()["data"]["readiness"]["ready"] is True
+
+    plan_resp = client.post(
+        f"/api/sandbox-case-plans/{skill.id}/generate",
+        headers=headers,
+        json={"mode": "permission_minimal", "max_case_count": 5},
+    )
+    assert plan_resp.status_code == 200, plan_resp.text
+
+    latest_plan_resp = client.get(
+        f"/api/sandbox-case-plans/{skill.id}/latest",
+        headers=headers,
+    )
+    assert latest_plan_resp.status_code == 200, latest_plan_resp.text
+    plan = latest_plan_resp.json()["data"]["plan"]
+    cases = latest_plan_resp.json()["data"]["cases"]
+    assert plan["bundle_id"] is None
+    assert plan["governance_version"] >= 1
+    assert plan["case_count"] >= 2
+    assert all(case["data_source_policy"] == "domain_projection" for case in cases)
+    assert cases[0]["source_refs"][0]["type"] == "mount_context_projection"
+    assert len(cases[0]["controlled_fields"]) >= 1
+
+
+def test_domain_projection_adopt_ignores_stale_legacy_bundle(client, db):
+    user = _make_user(db, username="projection_stale_bundle_author")
+    skill = _make_skill(db, user.id, name="Projection Stale Bundle Skill")
+    table = BusinessTable(
+        table_name="projection_stale_bundle_table",
+        display_name="投影陈旧 Bundle 数据表",
+    )
+    db.add(table)
+    db.flush()
+    field = TableField(
+        table_id=table.id,
+        field_name="candidate_phone",
+        display_name="候选人手机号",
+        field_type="phone",
+        is_sensitive=True,
+        sort_order=1,
+    )
+    view = TableView(table_id=table.id, name="投影视图", view_type="grid", config={}, created_by=user.id)
+    role_group = TableRoleGroup(table_id=table.id, name="招聘岗位组", skill_ids=[skill.id])
+    db.add_all([field, view, role_group])
+    db.flush()
+    db.add(SkillTableBinding(
+        skill_id=skill.id,
+        table_id=table.id,
+        view_id=view.id,
+        binding_type="runtime_read",
+        created_by=user.id,
+    ))
+    db.add(SkillDataGrant(
+        skill_id=skill.id,
+        table_id=table.id,
+        view_id=view.id,
+        role_group_id=role_group.id,
+        grant_mode="allow",
+        allowed_actions=["read"],
+        max_disclosure_level="L2",
+        approval_required=False,
+        audit_level="full",
+    ))
+    db.add(TablePermissionPolicy(
+        table_id=table.id,
+        view_id=view.id,
+        role_group_id=role_group.id,
+        row_access_mode="department",
+        field_access_mode="blocklist",
+        blocked_field_ids=[field.id],
+        disclosure_level="L2",
+        masking_rule_json={"candidate_phone": "partial"},
+        tool_permission_mode="readonly",
+        export_permission=False,
+    ))
+    db.commit()
+
+    token = _login(client, username="projection_stale_bundle_author")
+    headers = _auth(token)
+    role_resp = client.put(
+        f"/api/skill-governance/{skill.id}/service-roles",
+        headers=headers,
+        json={"roles": [{
+            "org_path": "公司经营发展中心/人力资源部",
+            "position_name": "招聘主管",
+            "position_level": "M0",
+        }]},
+    )
+    assert role_resp.status_code == 200, role_resp.text
+
+    stale_bundle = _seed_legacy_bundle(db, skill, user)
+    stale_bundle.status = "stale"
+    db.commit()
+
+    generate_resp = client.post(
+        f"/api/skill-governance/{skill.id}/declarations/generate",
+        headers=headers,
+        json={},
+    )
+    assert generate_resp.status_code == 200, generate_resp.text
+    declaration_id = generate_resp.json()["data"]["declaration_id"]
+
+    latest_resp = client.get(
+        f"/api/skill-governance/{skill.id}/declarations/latest",
+        headers=headers,
+    )
+    assert latest_resp.status_code == 200, latest_resp.text
+    latest = latest_resp.json()["data"]
+    assert latest["id"] == declaration_id
+    assert latest["source_mode"] == "domain_projection"
+    assert latest["bundle_id"] is None
+
+    declaration = db.get(PermissionDeclarationDraft, declaration_id)
+    declaration.bundle_id = stale_bundle.id
+    db.commit()
+
+    adopt_resp = client.put(
+        f"/api/skill-governance/{skill.id}/declarations/{declaration_id}/adopt",
+        headers=headers,
+        json={"action": "confirm", "edited_text": None},
+    )
+    assert adopt_resp.status_code == 200, adopt_resp.text
+    adopt_data = adopt_resp.json()["data"]
+    assert adopt_data["status"] == "confirmed"
+    assert adopt_data["mounted"] is True
 
 
 def test_skill_governance_contract_declaration_endpoints(client, db):
@@ -137,13 +653,7 @@ def test_skill_governance_contract_declaration_endpoints(client, db):
     assert refresh_data["skill_id"] == skill.id
     assert "assets" in refresh_data
 
-    suggest_resp = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    )
-    assert suggest_resp.status_code == 200, suggest_resp.text
-    bundle_id = suggest_resp.json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
 
     generate_resp = client.post(
         f"/api/skill-governance/{skill.id}/declarations/generate",
@@ -235,11 +745,7 @@ def test_mounted_declaration_becomes_stale_after_service_role_change(client, db)
     )
     assert role_resp.status_code == 200, role_resp.text
 
-    bundle_id = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    ).json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
     declaration_id = client.post(
         f"/api/skill-governance/{skill.id}/declarations/generate",
         headers=headers,
@@ -296,7 +802,7 @@ def test_mounted_declaration_becomes_stale_after_service_role_change(client, db)
     assert stale_error["error"]["details"]["declaration_id"] == declaration_id
 
 
-def test_granular_rule_update_requires_override_and_marks_declaration_stale(client, db):
+def test_legacy_granular_rule_update_endpoint_is_deprecated(client, db):
     user = _make_user(db, username="governance_editor")
     skill = _make_skill(db, user.id, name="权限细则编辑 Skill")
     table = BusinessTable(
@@ -334,12 +840,7 @@ def test_granular_rule_update_requires_override_and_marks_declaration_stale(clie
             }]
         },
     )
-    suggest_resp = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    )
-    bundle_id = suggest_resp.json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
     policies_resp = client.get(
         f"/api/skill-governance/{skill.id}/role-asset-policies",
         headers=headers,
@@ -360,7 +861,11 @@ def test_granular_rule_update_requires_override_and_marks_declaration_stale(clie
         headers=headers,
         json={"suggested_policy": "raw", "mask_style": "raw"},
     )
-    assert fail_resp.status_code == 400, fail_resp.text
+    _assert_legacy_write_deprecated(
+        fail_resp,
+        skill.id,
+        "role-asset-policies/{policy_id}/granular-rules/{rule_id}",
+    )
 
     ok_resp = client.put(
         f"/api/skill-governance/{skill.id}/role-asset-policies/{policy['id']}/granular-rules/{rule['id']}",
@@ -372,11 +877,11 @@ def test_granular_rule_update_requires_override_and_marks_declaration_stale(clie
             "author_override_reason": "招聘主管需核验重复候选人联系方式",
         },
     )
-    assert ok_resp.status_code == 200, ok_resp.text
-    updated_rule = ok_resp.json()["data"]["item"]
-    assert updated_rule["suggested_policy"] == "raw"
-    assert updated_rule["confirmed"] is True
-    assert updated_rule["author_override_reason"] == "招聘主管需核验重复候选人联系方式"
+    _assert_legacy_write_deprecated(
+        ok_resp,
+        skill.id,
+        "role-asset-policies/{policy_id}/granular-rules/{rule_id}",
+    )
 
     declaration_state = client.get(
         f"/api/skill-governance/{skill.id}/permission-declaration",
@@ -384,13 +889,13 @@ def test_granular_rule_update_requires_override_and_marks_declaration_stale(clie
     )
     assert declaration_state.status_code == 200, declaration_state.text
     data = declaration_state.json()["data"]
-    assert data["declaration"]["status"] == "stale"
-    assert data["readiness"]["ready"] is False
+    assert data["declaration"]["status"] == "generated"
+    assert data["readiness"]["ready"] is True
     assert data["readiness"]["permission_declaration_version"] == data["declaration"]["id"]
-    assert "missing_confirmed_declaration" in data["readiness"]["blocking_issues"]
+    assert data["readiness"]["blocking_issues"] == []
 
 
-def test_skill_governance_contract_policy_confirm_endpoint(client, db):
+def test_legacy_policy_write_endpoints_are_deprecated(client, db):
     user = _make_user(db, username="policy_confirmer")
     skill = _make_skill(db, user.id, name="策略确认 Contract Skill")
     table = BusinessTable(
@@ -426,14 +931,7 @@ def test_skill_governance_contract_policy_confirm_endpoint(client, db):
             "position_level": "M0",
         }]},
     )
-    suggest_resp = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    )
-    assert suggest_resp.status_code == 200, suggest_resp.text
-    assert suggest_resp.json()["data"]["status"] == "queued"
-    bundle_id = suggest_resp.json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
 
     policies_resp = client.get(
         f"/api/skill-governance/{skill.id}/role-asset-policies",
@@ -441,7 +939,10 @@ def test_skill_governance_contract_policy_confirm_endpoint(client, db):
         params={"bundle_id": bundle_id},
     )
     assert policies_resp.status_code == 200, policies_resp.text
-    policy = policies_resp.json()["data"]["items"][0]
+    policies_data = policies_resp.json()["data"]
+    assert policies_data["deprecated"] is True
+    assert policies_data["read_only"] is True
+    policy = policies_data["items"][0]
 
     confirm_resp = client.put(
         f"/api/skill-governance/{skill.id}/role-asset-policies/confirm",
@@ -458,14 +959,17 @@ def test_skill_governance_contract_policy_confirm_endpoint(client, db):
             }],
         },
     )
-    assert confirm_resp.status_code == 200, confirm_resp.text
-    confirm_data = confirm_resp.json()["data"]
-    assert confirm_data["bundle_id"] == bundle_id
-    assert confirm_data["updated_count"] == 1
-    assert confirm_data["review_status"] == "confirmed"
+    _assert_legacy_write_deprecated(confirm_resp, skill.id, "role-asset-policies/confirm")
+
+    update_resp = client.put(
+        f"/api/skill-governance/{skill.id}/role-asset-policies/{policy['id']}",
+        headers=headers,
+        json={"allowed": False, "review_status": "confirmed"},
+    )
+    _assert_legacy_write_deprecated(update_resp, skill.id, "role-asset-policies/{policy_id}")
 
 
-def test_skill_governance_policy_suggestion_async_job(client, db):
+def test_legacy_policy_suggestion_async_job_endpoint_is_deprecated(client, db):
     user = _make_user(db, username="async_policy_author")
     skill = _make_skill(db, user.id, name="异步策略生成 Skill")
     table = BusinessTable(
@@ -507,36 +1011,11 @@ def test_skill_governance_policy_suggestion_async_job(client, db):
         headers=headers,
         json={"mode": "initial", "async_job": True},
     )
-    assert queued_resp.status_code == 200, queued_resp.text
-    queued_data = queued_resp.json()["data"]
-    assert queued_data["status"] == "queued"
-    assert "bundle_id" not in queued_data
-    job_id = queued_data["job_id"]
-
-    db.expire_all()
-    job = db.get(SkillGovernanceJob, job_id)
-    assert job is not None
-    assert job.job_type == "role_asset_policy_suggestion"
-
-    job_resp = client.get(
-        f"/api/skill-governance/{skill.id}/jobs/{job_id}",
-        headers=headers,
-    )
-    assert job_resp.status_code == 200, job_resp.text
-    job_data = job_resp.json()["data"]
-    assert job_data["status"] == "success"
-    assert job_data["result"]["bundle_id"] > 0
-
-    policies_resp = client.get(
-        f"/api/skill-governance/{skill.id}/role-asset-policies",
-        headers=headers,
-        params={"bundle_id": job_data["result"]["bundle_id"], "include_rules": True},
-    )
-    assert policies_resp.status_code == 200, policies_resp.text
-    assert policies_resp.json()["data"]["items"][0]["granular_rules"][0]["target_ref"] == "candidate_phone"
+    _assert_legacy_write_deprecated(queued_resp, skill.id, "suggest-role-asset-policies")
+    assert db.query(SkillGovernanceJob).filter(SkillGovernanceJob.skill_id == skill.id).count() == 0
 
 
-def test_skill_governance_contract_granular_rules_endpoints(client, db):
+def test_legacy_granular_write_endpoints_are_deprecated_but_readonly_queries_survive(client, db):
     user = _make_user(db, username="granular_contract_author")
     skill = _make_skill(db, user.id, name="高风险规则 Contract Skill")
     table = BusinessTable(
@@ -572,12 +1051,7 @@ def test_skill_governance_contract_granular_rules_endpoints(client, db):
             "position_level": "M0",
         }]},
     )
-    suggest_resp = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    )
-    bundle_id = suggest_resp.json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
 
     declaration_resp = client.post(
         f"/api/skill-governance/{skill.id}/declarations/generate",
@@ -591,8 +1065,7 @@ def test_skill_governance_contract_granular_rules_endpoints(client, db):
         headers=headers,
         json={"bundle_id": bundle_id, "risk_only": True},
     )
-    assert suggest_rules_resp.status_code == 200, suggest_rules_resp.text
-    assert suggest_rules_resp.json()["data"]["status"] == "queued"
+    _assert_legacy_write_deprecated(suggest_rules_resp, skill.id, "suggest-granular-rules")
 
     rules_resp = client.get(
         f"/api/skill-governance/{skill.id}/granular-rules",
@@ -602,6 +1075,8 @@ def test_skill_governance_contract_granular_rules_endpoints(client, db):
     assert rules_resp.status_code == 200, rules_resp.text
     rules_data = rules_resp.json()["data"]
     assert rules_data["bundle_id"] == bundle_id
+    assert rules_data["deprecated"] is True
+    assert rules_data["read_only"] is True
     assert len(rules_data["field_rules"]) == 1
     assert rules_data["chunk_rules"] == []
     field_rule = rules_data["field_rules"][0]
@@ -622,11 +1097,7 @@ def test_skill_governance_contract_granular_rules_endpoints(client, db):
             }],
         },
     )
-    assert confirm_resp.status_code == 200, confirm_resp.text
-    confirm_data = confirm_resp.json()["data"]
-    assert confirm_data["bundle_id"] == bundle_id
-    assert confirm_data["updated_count"] == 1
-    assert confirm_data["review_status"] == "confirmed"
+    _assert_legacy_write_deprecated(confirm_resp, skill.id, "granular-rules/confirm")
 
 
 def test_sandbox_case_plan_contract_alias_endpoints(client, db):
@@ -665,12 +1136,7 @@ def test_sandbox_case_plan_contract_alias_endpoints(client, db):
             "position_level": "M0",
         }]},
     )
-    suggest_resp = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    )
-    bundle_id = suggest_resp.json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
     generate_decl = client.post(
         f"/api/skill-governance/{skill.id}/declarations/generate",
         headers=headers,
@@ -808,11 +1274,7 @@ def test_permission_case_plan_generation_rejects_not_ready_skill(client, db):
             }]
         },
     )
-    client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    )
+    _seed_legacy_bundle(db, skill, user)
 
     sandbox_generate_resp = client.post(
         f"/api/sandbox-case-plans/{skill.id}/generate",
@@ -877,11 +1339,7 @@ def test_permission_declaration_mount_creates_skill_version_and_confirms_declara
             }]
         },
     )
-    bundle_id = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    ).json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
     declaration = client.post(
         f"/api/skill-governance/{skill.id}/permission-declaration",
         headers=headers,
@@ -946,11 +1404,7 @@ def test_manual_edit_of_mounted_declaration_marks_it_stale(client, db):
             }]
         },
     )
-    bundle_id = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    ).json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
     declaration = client.post(
         f"/api/skill-governance/{skill.id}/permission-declaration",
         headers=headers,
@@ -1019,12 +1473,7 @@ def test_permission_case_plan_generation_returns_cases(client, db):
             }]
         },
     )
-    suggest_resp = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    )
-    bundle_id = suggest_resp.json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
     declaration_resp = client.post(
         f"/api/skill-governance/{skill.id}/permission-declaration",
         headers=headers,
@@ -1099,11 +1548,7 @@ def test_permission_case_plan_materialize_creates_sandbox_session(client, db):
             }]
         },
     )
-    bundle_id = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    ).json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
     client.post(
         f"/api/skill-governance/{skill.id}/permission-declaration",
         headers=headers,
@@ -1238,11 +1683,7 @@ def test_permission_case_draft_update_supports_editable_fields(client, db):
             }]
         },
     )
-    bundle_id = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    ).json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
     client.post(
         f"/api/skill-governance/{skill.id}/permission-declaration",
         headers=headers,
@@ -1314,11 +1755,7 @@ def test_permission_case_draft_update_rejects_source_verification_status_overrid
             }]
         },
     )
-    bundle_id = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    ).json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
     client.post(
         f"/api/skill-governance/{skill.id}/permission-declaration",
         headers=headers,
@@ -1386,11 +1823,7 @@ def test_permission_declaration_regeneration_restores_readiness(client, db):
             }]
         },
     )
-    bundle_id = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    ).json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
     policy = client.get(
         f"/api/skill-governance/{skill.id}/role-asset-policies",
         headers=headers,
@@ -1404,17 +1837,14 @@ def test_permission_declaration_regeneration_restores_readiness(client, db):
         json={"bundle_id": bundle_id},
     ).json()["data"]["declaration"]
 
-    stale_resp = client.put(
-        f"/api/skill-governance/{skill.id}/role-asset-policies/{policy['id']}/granular-rules/{rule['id']}",
-        headers=headers,
-        json={
-            "suggested_policy": "raw",
-            "mask_style": "raw",
-            "confirmed": True,
-            "author_override_reason": "招聘主管需核验重复候选人联系方式",
-        },
-    )
-    assert stale_resp.status_code == 200, stale_resp.text
+    declaration_model = db.get(PermissionDeclarationDraft, first_decl["id"])
+    assert declaration_model is not None
+    declaration_model.status = "stale"
+    declaration_model.diff_from_previous_json = {
+        **(declaration_model.diff_from_previous_json or {}),
+        "stale_reason_codes": ["high_risk_rules_changed"],
+    }
+    db.commit()
 
     blocked_state = client.get(
         f"/api/skill-governance/{skill.id}/permission-declaration",
@@ -1502,11 +1932,7 @@ def test_permission_case_plan_generation_supports_chunk_granular_rules(client, d
         },
     )
 
-    bundle_id = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    ).json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
 
     policies_resp = client.get(
         f"/api/skill-governance/{skill.id}/role-asset-policies",
@@ -1581,11 +2007,7 @@ def test_permission_case_plan_latest_reflects_materialization_after_materialize(
             }]
         },
     )
-    bundle_id = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    ).json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
     client.post(
         f"/api/skill-governance/{skill.id}/permission-declaration",
         headers=headers,
@@ -1659,11 +2081,7 @@ def test_sandbox_case_plan_readiness_blocks_skill_content_version_mismatch(clien
             "position_level": "M0",
         }]},
     )
-    bundle_id = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    ).json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
     declaration = client.post(
         f"/api/skill-governance/{skill.id}/permission-declaration",
         headers=headers,
@@ -1742,11 +2160,7 @@ def test_sandbox_case_plan_latest_marks_plan_stale_after_declaration_regenerated
             "position_level": "M0",
         }]},
     )
-    bundle_id = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    ).json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
     client.post(
         f"/api/skill-governance/{skill.id}/permission-declaration",
         headers=headers,
@@ -1814,11 +2228,7 @@ def test_sandbox_case_plan_contract_review_route_returns_latest_review(client, d
             "position_level": "M0",
         }]},
     )
-    bundle_id = client.post(
-        f"/api/skill-governance/{skill.id}/suggest-role-asset-policies",
-        headers=headers,
-        json={"mode": "initial"},
-    ).json()["data"]["bundle_id"]
+    bundle_id = _seed_legacy_bundle(db, skill, user).id
     client.post(
         f"/api/skill-governance/{skill.id}/permission-declaration",
         headers=headers,

@@ -323,6 +323,64 @@ class TestWorkflowRecovery:
         assert fetched["lifecycle_stage"] == "fixing"
         assert fetched["workflow_recovery"]["workflow_state"]["next_action"] == "review_cards"
 
+    def test_sync_workflow_recovery_creates_import_audit_tasks_for_memo(self, db):
+        dept = _make_dept(db, "导入审计联动部门")
+        user = _make_user(db, "workflow_import_audit_user", dept_id=dept.id)
+        skill = _make_skill(db, user.id, name="导入审计联动Skill")
+
+        skill_memo_service.init_memo(db, skill.id, "import_remediation", "目标", user.id)
+        result = skill_memo_service.sync_workflow_recovery(
+            db,
+            skill.id,
+            workflow_state={
+                "workflow_id": "run_import_audit_1",
+                "session_mode": "audit_imported_skill",
+                "workflow_mode": "none",
+                "phase": "review",
+                "next_action": "review_cards",
+                "route_reason": "imported_skill",
+                "metadata": {
+                    "audit_summary": {
+                        "audit_id": 101,
+                        "verdict": "needs_work",
+                        "issue_count": 1,
+                    },
+                },
+            },
+            cards=[{
+                "id": "card_import_audit_1",
+                "title": "补充角色定义",
+                "type": "followup_prompt",
+                "status": "pending",
+                "severity": "high",
+                "content": {
+                    "summary": "当前角色定义过于模糊",
+                    "problem_refs": ["issue_1"],
+                    "target_kind": "skill_prompt",
+                    "target_ref": "SKILL.md",
+                    "acceptance_rule": "开头必须明确角色身份",
+                    "evidence_snippets": ["你是测试助手。"],
+                },
+                "actions": [{"label": "查看建议", "type": "view"}],
+            }],
+            staged_edits=[],
+            user_id=user.id,
+            commit=True,
+        )
+
+        assert result is not None
+        tasks = result["memo"]["tasks"]
+        audit_tasks = [task for task in tasks if task.get("source") == "import_audit"]
+        assert len(audit_tasks) == 1
+        task = audit_tasks[0]
+        assert task["title"] == "补充角色定义"
+        assert task["type"] == "edit_skill_md"
+        assert task["target_files"] == ["SKILL.md"]
+        assert task["problem_refs"] == ["issue_1"]
+        assert task["acceptance_rule_text"] == "开头必须明确角色身份"
+        assert task["evidence_snippets"] == ["你是测试助手。"]
+        assert result["current_task"]["id"] == task["id"]
+
     def test_sync_workflow_recovery_invalidates_digest_cache_entries(self, db):
         dept = _make_dept(db, "workflow缓存失效部门")
         user = _make_user(db, "workflow_cache_invalidate_user", dept_id=dept.id)
@@ -924,6 +982,23 @@ class TestImportRemediation:
         tasks = memo["memo"]["tasks"]
         # 至少有 missing_example 的 create_file 任务 + run_test
         assert len(tasks) >= 2
+
+    def test_analyze_import_never_generates_rewrite_task_before_test(self, db):
+        """导入分析阶段只能补缺项/引导测试，不能生成主文重写任务。"""
+        user, skill = self._setup(
+            db,
+            prompt="你是营销助手。请根据参考资料调用工具，按照固定格式输出。",
+            source_files=[],
+        )
+        result = skill_memo_service.analyze_import(db, skill.id, user.id)
+        tasks = result["memo"]["memo"]["tasks"]
+        task_types = {task["type"] for task in tasks}
+        task_sources = {task["source"] for task in tasks}
+
+        assert task_sources == {"import_analysis"}
+        assert "edit_skill_md" not in task_types
+        assert "rewrite_skill_md" not in task_types
+        assert task_types.issubset({"create_file", "bind_tool", "run_test"})
 
     def test_analyze_always_has_test_task(self, db):
         """即使结构完整，也应有 run_test 任务。"""
@@ -1986,6 +2061,50 @@ class TestStudioAgentIntegration:
         )
         assert "editing" in system
         assert "Memo" in system
+
+    def test_build_system_governance_guardrails_without_formal_conclusion(self):
+        from app.services.studio_agent import _build_system, StudioSessionState
+        system = _build_system(
+            selected_skill_id=1,
+            editor_prompt="你是助手。",
+            editor_is_dirty=False,
+            memo_context={
+                "lifecycle_stage": "editing",
+                "status_summary": "进行中",
+                "current_task": {"title": "补充 example", "target_files": ["example-1.md"]},
+                "next_task": None,
+                "persistent_notices": [{"title": "缺少 template"}],
+                "latest_test": None,
+                "memo": {"progress_log": []},
+            },
+            session_state=StudioSessionState(session_mode="optimize_existing_skill"),
+        )
+        assert "如果没有正式质量检测结论" in system
+        assert "禁止输出 `studio_diff`" in system
+        assert "`studio_governance_action.staged_edit` 可以省略" in system
+
+    def test_build_memo_context_fixing_fallback_blocks_generic_diff(self):
+        from app.services.studio_agent import _build_memo_context
+        memo_data = {
+            "lifecycle_stage": "fixing",
+            "status_summary": "整改中",
+            "current_task": None,
+            "next_task": None,
+            "persistent_notices": [],
+            "latest_test": {
+                "status": "failed",
+                "summary": "上次沙盒测试失败",
+                "details": {
+                    "quality_detail": {
+                        "avg_score": 48,
+                        "top_deductions": [{"dimension": "correctness", "reason": "证据不足", "fix_suggestion": "补证据"}],
+                    },
+                },
+            },
+            "memo": {"progress_log": [], "tasks": []},
+        }
+        result = _build_memo_context(memo_data)
+        assert "不能直接生成 staged diff" in result
 
     def test_build_system_without_memo(self):
         from app.services.studio_agent import _build_system

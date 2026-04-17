@@ -202,19 +202,11 @@ def _default_description(skill: Skill) -> str:
     return f"{scene}，{inputs}，{output}。"
 
 
-def _structure_prompt_patch() -> str:
+def _minimal_guardrail_patch() -> str:
     return (
-        "\n\n## 角色定位\n"
-        "- 明确你要解决的问题、适用场景和交付目标\n\n"
-        "## 输入要求\n"
-        "- 列出完成任务所需的关键信息；信息不足时先追问再继续\n\n"
-        "## 处理步骤\n"
-        "1. 先确认目标、约束和可用资料\n"
-        "2. 再结合知识库或工具完成分析\n"
-        "3. 最后输出结构化结论与建议\n\n"
-        "## 输出要求\n"
-        "- 先给结论，再给依据、风险和下一步动作\n\n"
-        "## 边界与禁止项\n"
+        "\n\n## 最小运行护栏\n"
+        "- 信息不足时先追问，不要自行补全未提供的事实\n"
+        "- 输出先给结论，再补充依据、边界和下一步动作\n"
         "- 无依据时明确说明不确定\n"
         "- 禁止编造数据、来源或权限外信息\n"
     )
@@ -237,13 +229,10 @@ def _placeholder_reference(skill: Skill) -> str:
 def _quality_patch(deduction: dict) -> str:
     dimension = str(deduction.get("dimension", "quality"))
     reason = str(deduction.get("reason", "")).strip()
-    fix = str(deduction.get("fix_suggestion", "")).strip()
     snippet = _QUALITY_SNIPPETS.get(dimension, "输出前先复核质量风险，并显式说明依据与边界。")
-    lines = [f"\n\n## 质量整改要求（{dimension}）", f"- {snippet}"]
+    lines = [f"\n\n## 最小质量护栏（{dimension}）", f"- {snippet}"]
     if reason:
-        lines.append(f"- 本轮重点问题：{reason}")
-    if fix:
-        lines.append(f"- 执行要求：{fix}")
+        lines.append(f"- 当前重点风险：{reason}")
     return "\n".join(lines) + "\n"
 
 
@@ -270,21 +259,19 @@ def build_preflight_governance(
                     continue
                 code = item.get("code")
                 if code == "prompt_too_short":
-                    staged = _create_staged_edit(
-                        db,
-                        skill_id=skill_id,
-                        target_type="system_prompt",
-                        summary="补齐 SKILL.md 的基础结构与边界要求",
-                        diff_ops=[{"op": "insert", "old": "", "new": _structure_prompt_patch()}],
-                        risk_level="medium",
-                    )
-                    staged_edits.append(staged)
                     cards.append(_make_card(
                         f"preflight-structure-prompt-{skill_id}",
-                        "补齐 Prompt 结构",
+                        "补齐 Prompt 缺失项",
                         item.get("issue", "System Prompt 过短"),
-                        reason="当前 Prompt 信息不足，无法满足结构完整性检查。",
-                        staged_edit_id=int(staged["id"]),
+                        card_type="followup_prompt",
+                        reason="无正式质量检测结论前，只引导补角色、输入、输出与示例，不直接重写主体内容。",
+                        preflight_action="open_skill_editor",
+                        action_payload={
+                            "target_file": "SKILL.md",
+                            "allowed_actions": ["fill_missing_sections", "add_examples", "add_templates", "add_guardrails"],
+                            "forbidden_actions": ["rewrite_full_prompt", "replace_main_body"],
+                            "suggested_sections": ["角色定位", "输入要求", "输出要求", "example/reference/template"],
+                        },
                     ))
                 elif code == "missing_description":
                     staged = _create_staged_edit(
@@ -395,21 +382,21 @@ def build_preflight_governance(
 
     quality_detail = result.get("quality_detail", {}) or {}
     top_deductions = quality_detail.get("top_deductions", []) or []
-    for idx, deduction in enumerate(top_deductions[:3], start=1):
+    for idx, deduction in enumerate(top_deductions[:2], start=1):
         staged = _create_staged_edit(
             db,
             skill_id=skill_id,
             target_type="system_prompt",
-            summary=f"质量整改：{deduction.get('dimension', 'quality')} · {deduction.get('reason', '未达标')}",
+            summary=f"补充最小质量护栏：{deduction.get('dimension', 'quality')}",
             diff_ops=[{"op": "insert", "old": "", "new": _quality_patch(deduction)}],
-            risk_level="medium",
+            risk_level="low",
         )
         staged_edits.append(staged)
         cards.append(_make_card(
             f"preflight-quality-{skill_id}-{idx}",
-            f"修复质量扣分项：{deduction.get('dimension', 'quality')}",
+            f"补充质量护栏：{deduction.get('dimension', 'quality')}",
             deduction.get("reason", "质量未达标"),
-            reason=deduction.get("fix_suggestion") or "按沙盒标准补齐质量约束。",
+            reason="preflight 阶段仅允许追加最小护栏，不生成整段重写草稿。",
             staged_edit_id=int(staged["id"]),
         ))
 

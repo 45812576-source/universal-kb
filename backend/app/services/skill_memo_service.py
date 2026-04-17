@@ -335,6 +335,178 @@ def _link_workflow_recovery_tasks(payload: dict[str, Any], recovery: dict[str, A
     return changed
 
 
+def _workflow_card_acceptance_rule(card: dict[str, Any]) -> str:
+    content = _workflow_card_content(card)
+    value = content.get("acceptance_rule")
+    if value in (None, ""):
+        value = _workflow_card_action_payload(card).get("acceptance_rule")
+    return str(value or "").strip()
+
+
+def _workflow_card_evidence_snippets(card: dict[str, Any]) -> list[str]:
+    content = _workflow_card_content(card)
+    snippets = content.get("evidence_snippets")
+    if not isinstance(snippets, list):
+        snippets = _workflow_card_action_payload(card).get("evidence_snippets")
+    return [str(item).strip() for item in (snippets or []) if str(item).strip()]
+
+
+def _audit_task_type_from_card(card: dict[str, Any]) -> str:
+    target_kind = _workflow_card_target_kind(card)
+    if target_kind == "skill_prompt":
+        return "edit_skill_md"
+    if target_kind == "source_file":
+        return "update_file"
+    if target_kind == "tool_binding":
+        return "bind_tool"
+    return "edit_skill_md"
+
+
+def _audit_task_target_files(card: dict[str, Any]) -> list[str]:
+    target_kind = _workflow_card_target_kind(card)
+    target_ref = _workflow_card_target_ref(card)
+    if target_kind == "skill_prompt":
+        return ["SKILL.md"]
+    if target_kind == "source_file" and target_ref:
+        return [target_ref]
+    return []
+
+
+def _priority_from_severity(value: str | None) -> str:
+    severity = str(value or "").strip().lower()
+    if severity == "high":
+        return "high"
+    if severity == "medium":
+        return "medium"
+    return "low"
+
+
+def _sync_import_audit_tasks_from_recovery(payload: dict[str, Any], recovery: dict[str, Any]) -> bool:
+    workflow_state = recovery.get("workflow_state") if isinstance(recovery.get("workflow_state"), dict) else {}
+    if str(workflow_state.get("session_mode") or "") != "audit_imported_skill":
+        return False
+
+    tasks = payload.get("tasks", [])
+    if not isinstance(tasks, list):
+        return False
+    cards = recovery.get("cards", [])
+    if not isinstance(cards, list) or not cards:
+        return False
+
+    changed = False
+    pending_audit_task_ids: list[str] = []
+    active_card_ids: set[str] = set()
+    existing_by_card_id: dict[str, dict[str, Any]] = {}
+    for task in tasks:
+        if not isinstance(task, dict) or str(task.get("source") or "") != "import_audit":
+            continue
+        for card_id in _normalize_string_list(task.get("workflow_card_ids")):
+            existing_by_card_id[card_id] = task
+
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        card_id = str(card.get("id") or "").strip()
+        if not card_id:
+            continue
+        active_card_ids.add(card_id)
+        task = existing_by_card_id.get(card_id)
+        target_kind = _workflow_card_target_kind(card) or "unknown"
+        target_ref = _workflow_card_target_ref(card)
+        acceptance_rule = _workflow_card_acceptance_rule(card)
+        problem_refs = _workflow_card_problem_refs(card)
+        evidence_snippets = _workflow_card_evidence_snippets(card)
+        desired_status = "todo" if str(card.get("status") or "pending") == "pending" else "done" if str(card.get("status")) == "adopted" else "skipped"
+
+        if task is None:
+            task = {
+                "id": _new_id("task"),
+                "title": str(card.get("title") or "审计整改任务")[:200],
+                "type": _audit_task_type_from_card(card),
+                "status": desired_status,
+                "priority": _priority_from_severity(card.get("severity")),
+                "source": "import_audit",
+                "description": str(
+                    (_workflow_card_content(card).get("summary"))
+                    or (_workflow_card_content(card).get("reason"))
+                    or card.get("summary")
+                    or ""
+                )[:500],
+                "target_files": _audit_task_target_files(card),
+                "acceptance_rule": {"mode": "custom", "text": acceptance_rule},
+                "depends_on": [],
+                "started_at": None,
+                "completed_at": None,
+                "completed_by": None,
+                "result_summary": None,
+                "problem_refs": problem_refs,
+                "target_kind": target_kind,
+                "target_ref": target_ref,
+                "acceptance_rule_text": acceptance_rule,
+                "evidence_snippets": evidence_snippets,
+                "workflow_card_ids": [card_id],
+            }
+            staged_edit_id = str(_workflow_card_content(card).get("staged_edit_id") or "").strip()
+            if staged_edit_id:
+                task["workflow_staged_edit_ids"] = [staged_edit_id]
+            tasks.append(task)
+            existing_by_card_id[card_id] = task
+            changed = True
+        else:
+            updated_fields = {
+                "title": str(card.get("title") or task.get("title") or "审计整改任务")[:200],
+                "type": _audit_task_type_from_card(card),
+                "priority": _priority_from_severity(card.get("severity")),
+                "description": str(
+                    (_workflow_card_content(card).get("summary"))
+                    or (_workflow_card_content(card).get("reason"))
+                    or card.get("summary")
+                    or task.get("description")
+                    or ""
+                )[:500],
+                "target_files": _audit_task_target_files(card),
+                "problem_refs": problem_refs,
+                "target_kind": target_kind,
+                "target_ref": target_ref,
+                "acceptance_rule_text": acceptance_rule,
+                "evidence_snippets": evidence_snippets,
+            }
+            for field, value in updated_fields.items():
+                if task.get(field) != value:
+                    task[field] = value
+                    changed = True
+            acceptance_payload = {"mode": "custom", "text": acceptance_rule}
+            if task.get("acceptance_rule") != acceptance_payload:
+                task["acceptance_rule"] = acceptance_payload
+                changed = True
+            if task.get("status") != desired_status and task.get("status") not in {"done", "skipped"}:
+                task["status"] = desired_status
+                changed = True
+            changed |= _append_unique(task, "workflow_card_ids", card_id)
+            staged_edit_id = str(_workflow_card_content(card).get("staged_edit_id") or "").strip()
+            if staged_edit_id:
+                changed |= _append_unique(task, "workflow_staged_edit_ids", staged_edit_id)
+
+        if task.get("status") in {"todo", "in_progress"}:
+            pending_audit_task_ids.append(str(task.get("id") or ""))
+
+    for task in tasks:
+        if not isinstance(task, dict) or str(task.get("source") or "") != "import_audit":
+            continue
+        linked_ids = set(_normalize_string_list(task.get("workflow_card_ids")))
+        if linked_ids and not (linked_ids & active_card_ids) and task.get("status") in {"todo", "in_progress"}:
+            task["status"] = "skipped"
+            task["result_summary"] = "已被新一轮审计结果替代"
+            changed = True
+
+    if pending_audit_task_ids and str(workflow_state.get("next_action") or "") == "review_cards":
+        next_audit_task_id = pending_audit_task_ids[0]
+        if payload.get("current_task_id") != next_audit_task_id:
+            payload["current_task_id"] = next_audit_task_id
+            changed = True
+    return changed
+
+
 def _resolve_related_notices(payload: dict[str, Any], task_ids: list[str]) -> bool:
     if not task_ids:
         return False
@@ -1929,6 +2101,7 @@ def sync_workflow_recovery(
         "staged_edits": list(staged_edits or []),
         "updated_at": _now_iso(),
     }
+    _sync_import_audit_tasks_from_recovery(payload, workflow_recovery)
     _link_workflow_recovery_tasks(payload, workflow_recovery)
     payload["workflow_recovery"] = workflow_recovery
 

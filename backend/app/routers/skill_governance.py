@@ -23,6 +23,9 @@ from app.services.skill_governance_service import (
     active_assets,
     active_roles,
     assert_skill_governance_access,
+    build_mount_context,
+    build_mounted_permissions,
+    declaration_source_mode,
     ensure_permission_declaration_prompt_sync,
     find_position,
     generate_declaration,
@@ -63,6 +66,36 @@ from app.services.skill_governance_jobs import (
 )
 
 router = APIRouter(prefix="/api/skill-governance", tags=["skill-governance"])
+
+
+def _legacy_governance_replacements(skill_id: int) -> list[str]:
+    return [
+        f"/api/skill-governance/{skill_id}/mount-context",
+        f"/api/skill-governance/{skill_id}/mounted-permissions",
+        f"/api/skill-governance/{skill_id}/declarations/generate",
+        f"/api/sandbox-case-plans/{skill_id}/generate",
+    ]
+
+
+def _raise_legacy_governance_write_deprecated(
+    skill_id: int,
+    endpoint: str,
+    **extra: object,
+) -> None:
+    details = {
+        "skill_id": skill_id,
+        "endpoint": endpoint,
+        "source_mode": "domain_projection",
+        "historical_access": "read_only",
+        "replacement_endpoints": _legacy_governance_replacements(skill_id),
+        **extra,
+    }
+    raise_api_error(
+        410,
+        "governance.legacy_write_deprecated",
+        "旧治理写入接口已冻结，请改用源域权限投影与声明/测试计划流程",
+        details,
+    )
 
 
 class ServiceRoleInput(BaseModel):
@@ -177,24 +210,26 @@ def get_governance_summary(
     if declaration_changed:
         db.commit()
     roles = active_roles(db, skill_id)
+    mount_context = build_mount_context(db, skill)
     blocking_issues: list[str] = []
     if not roles:
         blocking_issues.append("missing_service_roles")
     if not assets:
         blocking_issues.append("missing_bound_assets")
-    if not bundle or not bundle.policies:
+    if declaration and declaration_source_mode(declaration) == "legacy_bundle" and (not bundle or not bundle.policies):
         blocking_issues.append("missing_role_asset_policies")
+    blocking_issues.extend(mount_context["permission_summary"]["blocking_issues"])
     if not declaration or declaration.status == "stale":
         blocking_issues.append("missing_confirmed_declaration")
     return ok({
         "skill_id": skill_id,
-        "governance_version": bundle.governance_version if bundle else 0,
+        "governance_version": mount_context["projection_version"] if mount_context else (bundle.governance_version if bundle else 0),
         "bundle": serialize_bundle(bundle),
         "declaration": serialize_declaration(declaration),
         "summary": {
             "service_role_count": len(roles),
             "bound_asset_count": len(assets),
-            "blocking_issues": blocking_issues,
+            "blocking_issues": sorted(set(blocking_issues)),
             "stale": bool((bundle and bundle.status == "stale") or (declaration and declaration.status == "stale")),
         },
     })
@@ -311,6 +346,36 @@ def get_bound_assets(
     })
 
 
+@router.get("/{skill_id}/mount-context")
+def get_mount_context(
+    skill_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    skill = assert_skill_governance_access(db, skill_id, user)
+    workspace_id = resolve_workspace_id(db, skill_id)
+    _, changed = sync_bound_assets(db, skill, workspace_id)
+    if changed:
+        db.commit()
+        db.refresh(skill)
+    return ok(build_mount_context(db, skill))
+
+
+@router.get("/{skill_id}/mounted-permissions")
+def get_mounted_permissions(
+    skill_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    skill = assert_skill_governance_access(db, skill_id, user)
+    workspace_id = resolve_workspace_id(db, skill_id)
+    _, changed = sync_bound_assets(db, skill, workspace_id)
+    if changed:
+        db.commit()
+        db.refresh(skill)
+    return ok(build_mounted_permissions(db, skill))
+
+
 @router.post("/{skill_id}/bound-assets/refresh")
 def refresh_bound_assets(
     skill_id: int,
@@ -366,7 +431,7 @@ def refresh_bound_assets(
     })
 
 
-@router.post("/{skill_id}/suggest-role-asset-policies")
+@router.post("/{skill_id}/suggest-role-asset-policies", deprecated=True)
 def suggest_policies(
     skill_id: int,
     req: SuggestPoliciesRequest,
@@ -374,34 +439,14 @@ def suggest_policies(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    skill = assert_skill_governance_access(db, skill_id, user)
-    workspace_id = resolve_workspace_id(db, skill_id)
-    sync_bound_assets(db, skill, workspace_id)
-    if req.async_job:
-        job = create_governance_job(
-            db,
-            skill_id=skill_id,
-            workspace_id=workspace_id,
-            job_type="role_asset_policy_suggestion",
-            payload={"mode": req.mode, "bundle_scope": req.bundle_scope},
-            created_by=user.id,
-        )
-        db.commit()
-        background_tasks.add_task(process_governance_job, job.id, session_factory_for_current_bind(db))
-        return ok({
-            "job_id": job.id,
-            "status": "queued",
-            "job": serialize_governance_job(job),
-        })
-    bundle = suggest_role_asset_policies(db, skill, user, workspace_id, req.mode)
-    db.commit()
-    return ok({
-        "job_id": f"governance-policy-{skill_id}-{bundle.bundle_version}",
-        "bundle_id": bundle.id,
-        "bundle_version": bundle.bundle_version,
-        "status": "queued",
-        "bundle_status": bundle.status,
-    })
+    assert_skill_governance_access(db, skill_id, user)
+    _raise_legacy_governance_write_deprecated(
+        skill_id,
+        "suggest-role-asset-policies",
+        mode=req.mode,
+        bundle_scope=req.bundle_scope,
+        async_job=req.async_job,
+    )
 
 
 @router.get("/{skill_id}/jobs/{job_id}")
@@ -423,7 +468,7 @@ def get_governance_job(
     return ok(serialize_governance_job(job))
 
 
-@router.get("/{skill_id}/role-asset-policies")
+@router.get("/{skill_id}/role-asset-policies", deprecated=True)
 def get_role_asset_policies(
     skill_id: int,
     bundle_id: Optional[int] = Query(None),
@@ -441,6 +486,10 @@ def get_role_asset_policies(
             "bundle_id": bundle_id,
             "bundle_version": 0,
             "review_status": "draft",
+            "source_mode": "legacy_bundle",
+            "deprecated": True,
+            "read_only": True,
+            "replacement_endpoints": _legacy_governance_replacements(skill_id),
             "items": [],
         })
     items = (
@@ -454,11 +503,15 @@ def get_role_asset_policies(
         "bundle_version": bundle.bundle_version,
         "governance_version": bundle.governance_version,
         "review_status": bundle.status,
+        "source_mode": "legacy_bundle",
+        "deprecated": True,
+        "read_only": True,
+        "replacement_endpoints": _legacy_governance_replacements(skill_id),
         "items": [serialize_policy(policy, include_rules=include_rules) for policy in items],
     })
 
 
-@router.put("/{skill_id}/role-asset-policies/confirm")
+@router.put("/{skill_id}/role-asset-policies/confirm", deprecated=True)
 def confirm_role_asset_policies(
     skill_id: int,
     req: ConfirmRoleAssetPoliciesRequest,
@@ -466,48 +519,15 @@ def confirm_role_asset_policies(
     user: User = Depends(get_current_user),
 ):
     assert_skill_governance_access(db, skill_id, user)
-    bundle = db.get(RolePolicyBundle, req.bundle_id)
-    if not bundle or bundle.skill_id != skill_id:
-        raise_api_error(404, "governance.bundle_not_found", "Bundle not found", {"skill_id": skill_id, "bundle_id": req.bundle_id})
-
-    updated_count = 0
-    for item in req.policies:
-        policy = db.get(RoleAssetPolicy, item.id)
-        if not policy or policy.bundle_id != bundle.id:
-            raise_api_error(
-                404,
-                "governance.policy_not_found",
-                f"Policy {item.id} not found",
-                {"skill_id": skill_id, "bundle_id": bundle.id, "policy_id": item.id},
-            )
-        payload = item.model_dump(exclude_unset=True)
-        if "allowed" in payload:
-            policy.allowed = payload["allowed"]
-        if "default_output_style" in payload:
-            policy.default_output_style = payload["default_output_style"]
-        if "insufficient_evidence_behavior" in payload:
-            policy.insufficient_evidence_behavior = payload["insufficient_evidence_behavior"]
-        if "allowed_question_types" in payload:
-            policy.allowed_question_types_json = payload["allowed_question_types"] or []
-        if "forbidden_question_types" in payload:
-            policy.forbidden_question_types_json = payload["forbidden_question_types"] or []
-        policy.review_status = "confirmed"
-        updated_count += 1
-
-    if updated_count:
-        bundle.status = "confirmed"
-        declaration = latest_declaration(db, skill_id)
-        if declaration:
-            mark_declaration_stale(declaration, ["role_asset_policies_changed"])
-    db.commit()
-    return ok({
-        "bundle_id": bundle.id,
-        "updated_count": updated_count,
-        "review_status": bundle.status,
-    })
+    _raise_legacy_governance_write_deprecated(
+        skill_id,
+        "role-asset-policies/confirm",
+        bundle_id=req.bundle_id,
+        policy_ids=[item.id for item in req.policies],
+    )
 
 
-@router.put("/{skill_id}/role-asset-policies/{policy_id}")
+@router.put("/{skill_id}/role-asset-policies/{policy_id}", deprecated=True)
 def update_role_asset_policy(
     skill_id: int,
     policy_id: int,
@@ -516,28 +536,14 @@ def update_role_asset_policy(
     user: User = Depends(get_current_user),
 ):
     assert_skill_governance_access(db, skill_id, user)
-    policy = db.get(RoleAssetPolicy, policy_id)
-    if not policy or not policy.bundle or policy.bundle.skill_id != skill_id:
-        raise_api_error(404, "governance.policy_not_found", "Policy not found", {"skill_id": skill_id, "policy_id": policy_id})
-    data = req.model_dump(exclude_unset=True)
-    for field in ("allowed", "default_output_style", "insufficient_evidence_behavior", "review_status", "risk_level"):
-        if field in data:
-            setattr(policy, field, data[field])
-    if "allowed_question_types" in data:
-        policy.allowed_question_types_json = data["allowed_question_types"]
-    if "forbidden_question_types" in data:
-        policy.forbidden_question_types_json = data["forbidden_question_types"]
-    if req.review_status == "confirmed":
-        policy.bundle.status = "confirmed"
-    declaration = latest_declaration(db, skill_id)
-    if declaration:
-        mark_declaration_stale(declaration, ["role_asset_policies_changed"])
-    db.commit()
-    db.refresh(policy)
-    return ok({"item": serialize_policy(policy, include_rules=True)})
+    _raise_legacy_governance_write_deprecated(
+        skill_id,
+        "role-asset-policies/{policy_id}",
+        policy_id=policy_id,
+    )
 
 
-@router.post("/{skill_id}/suggest-granular-rules")
+@router.post("/{skill_id}/suggest-granular-rules", deprecated=True)
 def suggest_granular_rules(
     skill_id: int,
     req: SuggestGranularRulesRequest,
@@ -545,16 +551,15 @@ def suggest_granular_rules(
     user: User = Depends(get_current_user),
 ):
     assert_skill_governance_access(db, skill_id, user)
-    bundle = db.get(RolePolicyBundle, req.bundle_id)
-    if not bundle or bundle.skill_id != skill_id:
-        raise_api_error(404, "governance.bundle_not_found", "Bundle not found", {"skill_id": skill_id, "bundle_id": req.bundle_id})
-    return ok({
-        "job_id": f"governance-granular-{skill_id}-{bundle.id}",
-        "status": "queued",
-    })
+    _raise_legacy_governance_write_deprecated(
+        skill_id,
+        "suggest-granular-rules",
+        bundle_id=req.bundle_id,
+        risk_only=req.risk_only,
+    )
 
 
-@router.get("/{skill_id}/granular-rules")
+@router.get("/{skill_id}/granular-rules", deprecated=True)
 def get_granular_rules(
     skill_id: int,
     bundle_id: int = Query(...),
@@ -582,12 +587,16 @@ def get_granular_rules(
             target.append(serialized)
     return ok({
         "bundle_id": bundle.id,
+        "source_mode": "legacy_bundle",
+        "deprecated": True,
+        "read_only": True,
+        "replacement_endpoints": _legacy_governance_replacements(skill_id),
         "field_rules": field_rules,
         "chunk_rules": chunk_rules,
     })
 
 
-@router.put("/{skill_id}/granular-rules/confirm")
+@router.put("/{skill_id}/granular-rules/confirm", deprecated=True)
 def confirm_granular_rules(
     skill_id: int,
     req: ConfirmGranularRulesRequest,
@@ -595,65 +604,15 @@ def confirm_granular_rules(
     user: User = Depends(get_current_user),
 ):
     assert_skill_governance_access(db, skill_id, user)
-    bundle = db.get(RolePolicyBundle, req.bundle_id)
-    if not bundle or bundle.skill_id != skill_id:
-        raise_api_error(404, "governance.bundle_not_found", "Bundle not found", {"skill_id": skill_id, "bundle_id": req.bundle_id})
-
-    updated_count = 0
-    for item in req.rules:
-        rule = db.get(RoleAssetGranularRule, item.id)
-        if not rule:
-            raise_api_error(
-                404,
-                "governance.granular_rule_not_found",
-                f"Rule {item.id} not found",
-                {"skill_id": skill_id, "bundle_id": bundle.id, "rule_id": item.id},
-            )
-        policy = db.get(RoleAssetPolicy, rule.role_asset_policy_id)
-        if not policy or policy.bundle_id != bundle.id:
-            raise_api_error(
-                404,
-                "governance.granular_rule_not_in_bundle",
-                f"Rule {item.id} not found in bundle",
-                {"skill_id": skill_id, "bundle_id": bundle.id, "rule_id": item.id},
-            )
-
-        payload = item.model_dump(exclude_unset=True)
-        next_policy = payload.get("suggested_policy", rule.suggested_policy)
-        next_mask_style = payload["mask_style"] if "mask_style" in payload else rule.mask_style
-        override_reason = (payload.get("author_override_reason") or rule.author_override_reason or "").strip()
-        if granular_rule_requires_override(rule, next_policy, next_mask_style) and not override_reason:
-            raise_api_error(
-                400,
-                "governance.high_risk_override_reason_required",
-                "高风险放开需填写 author_override_reason",
-                {"skill_id": skill_id, "bundle_id": bundle.id, "rule_id": item.id},
-            )
-
-        if "suggested_policy" in payload:
-            rule.suggested_policy = payload["suggested_policy"]
-        if "mask_style" in payload:
-            rule.mask_style = payload["mask_style"] or None
-        if "confirmed" in payload:
-            rule.confirmed = bool(payload["confirmed"])
-        if "author_override_reason" in payload:
-            rule.author_override_reason = payload["author_override_reason"] or None
-        policy.review_status = "confirmed" if rule.confirmed else policy.review_status
-        updated_count += 1
-
-    if updated_count:
-        declaration = latest_declaration(db, skill_id)
-        if declaration:
-            mark_declaration_stale(declaration, ["high_risk_rules_changed"])
-    db.commit()
-    return ok({
-        "bundle_id": bundle.id,
-        "updated_count": updated_count,
-        "review_status": "confirmed",
-    })
+    _raise_legacy_governance_write_deprecated(
+        skill_id,
+        "granular-rules/confirm",
+        bundle_id=req.bundle_id,
+        rule_ids=[item.id for item in req.rules],
+    )
 
 
-@router.get("/{skill_id}/role-asset-policies/{policy_id}/granular-rules")
+@router.get("/{skill_id}/role-asset-policies/{policy_id}/granular-rules", deprecated=True)
 def get_policy_granular_rules(
     skill_id: int,
     policy_id: int,
@@ -666,6 +625,10 @@ def get_policy_granular_rules(
         raise_api_error(404, "governance.policy_not_found", "Policy not found", {"skill_id": skill_id, "policy_id": policy_id})
     return ok({
         "policy_id": policy_id,
+        "source_mode": "legacy_bundle",
+        "deprecated": True,
+        "read_only": True,
+        "replacement_endpoints": _legacy_governance_replacements(skill_id),
         "items": [serialize_granular_rule(rule) for rule in policy.granular_rules],
     })
 
@@ -876,7 +839,7 @@ def mount_permission_declaration(
     })
 
 
-@router.put("/{skill_id}/role-asset-policies/{policy_id}/granular-rules/{rule_id}")
+@router.put("/{skill_id}/role-asset-policies/{policy_id}/granular-rules/{rule_id}", deprecated=True)
 def update_policy_granular_rule(
     skill_id: int,
     policy_id: int,
@@ -886,52 +849,12 @@ def update_policy_granular_rule(
     user: User = Depends(get_current_user),
 ):
     assert_skill_governance_access(db, skill_id, user)
-    policy = db.get(RoleAssetPolicy, policy_id)
-    if not policy or not policy.bundle or policy.bundle.skill_id != skill_id:
-        raise_api_error(404, "governance.policy_not_found", "Policy not found", {"skill_id": skill_id, "policy_id": policy_id})
-    rule = db.get(RoleAssetGranularRule, rule_id)
-    if not rule or rule.role_asset_policy_id != policy_id:
-        raise_api_error(
-            404,
-            "governance.granular_rule_not_found",
-            "Granular rule not found",
-            {"skill_id": skill_id, "policy_id": policy_id, "rule_id": rule_id},
-        )
-
-    data = req.model_dump(exclude_unset=True)
-    next_policy = data.get("suggested_policy", rule.suggested_policy)
-    next_mask_style = data["mask_style"] if "mask_style" in data else rule.mask_style
-    override_reason = (data.get("author_override_reason") or rule.author_override_reason or "").strip()
-
-    if granular_rule_requires_override(rule, next_policy, next_mask_style) and not override_reason:
-        raise_api_error(
-            400,
-            "governance.high_risk_override_reason_required",
-            "高风险放开需填写 author_override_reason",
-            {"skill_id": skill_id, "policy_id": policy_id, "rule_id": rule_id},
-        )
-
-    if "suggested_policy" in data:
-        rule.suggested_policy = data["suggested_policy"]
-    if "mask_style" in data:
-        rule.mask_style = data["mask_style"] or None
-    if "confirmed" in data:
-        rule.confirmed = bool(data["confirmed"])
-    if "author_override_reason" in data:
-        rule.author_override_reason = data["author_override_reason"] or None
-
-    if any(key in data for key in ("suggested_policy", "mask_style", "author_override_reason")):
-        policy.review_status = "edited"
-    declaration = latest_declaration(db, skill_id)
-    reason_codes = ["high_risk_rules_changed"] if granular_rule_is_high_risk(rule) else ["role_asset_policies_changed"]
-    if declaration:
-        mark_declaration_stale(declaration, reason_codes)
-    db.commit()
-    db.refresh(rule)
-    return ok({
-        "policy_id": policy_id,
-        "item": serialize_granular_rule(rule),
-    })
+    _raise_legacy_governance_write_deprecated(
+        skill_id,
+        "role-asset-policies/{policy_id}/granular-rules/{rule_id}",
+        policy_id=policy_id,
+        rule_id=rule_id,
+    )
 
 
 @router.get("/{skill_id}/permission-case-plans/latest")
