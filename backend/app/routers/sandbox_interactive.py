@@ -63,6 +63,32 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/sandbox/interactive", tags=["sandbox-interactive"])
 
 
+def _load_session_cases(session_id: int, db: Session) -> list[SandboxTestCase]:
+    return (
+        db.query(SandboxTestCase)
+        .filter(SandboxTestCase.session_id == session_id)
+        .order_by(SandboxTestCase.case_index)
+        .all()
+    )
+
+
+def _load_permission_plan_cases(session_id: int, db: Session) -> list[SandboxTestCase]:
+    return [
+        case
+        for case in _load_session_cases(session_id, db)
+        if isinstance(case.input_provenance, dict)
+        and case.input_provenance.get("source") == "permission_case_plan"
+    ]
+
+
+def _is_permission_case_plan_session(session: SandboxTestSession, db: Session) -> bool:
+    step_statuses = dict(session.step_statuses or {})
+    materialization = step_statuses.get("permission_case_materialization") or {}
+    if materialization.get("status") == "completed":
+        return True
+    return len(_load_permission_plan_cases(session.id, db)) > 0
+
+
 def _ensure_skill_test_can_start(db: Session, skill_id: int) -> None:
     from app.services.skill_memo_service import assess_test_start
 
@@ -1569,13 +1595,23 @@ async def run_tests(
     semantic_combos = None
     system_prompt = None
     test_input_text = None
+    materialized_permission_cases: list[SandboxTestCase] = []
+    is_permission_case_plan_session = _is_permission_case_plan_session(session, db)
 
     if _step_completed("case_generation"):
-        # 恢复中间产物：从 DB 重建 semantic_combos
-        semantic_combos, _ = _generate_semantic_matrix(session)
-        test_input_text = _build_test_input_from_evidence(session, db)
         system_prompt = _get_system_prompt_for_session(session, db)
-        logger.info("sandbox run: skipping case_generation (already completed) for session %s", session_id)
+        if is_permission_case_plan_session:
+            materialized_permission_cases = _load_permission_plan_cases(session_id, db)
+            logger.info(
+                "sandbox run: skipping case_generation and reusing permission plan (%d cases) for session %s",
+                len(materialized_permission_cases),
+                session_id,
+            )
+        else:
+            # 恢复中间产物：从 DB 重建 semantic_combos
+            semantic_combos, _ = _generate_semantic_matrix(session)
+            test_input_text = _build_test_input_from_evidence(session, db)
+            logger.info("sandbox run: skipping case_generation (already completed) for session %s", session_id)
     else:
         _mark_step("case_generation", "running")
         try:
@@ -1610,17 +1646,21 @@ async def run_tests(
 
     if _step_completed("case_execution"):
         # 恢复: 从 DB 读取已持久化的 cases
-        cases = (
-            db.query(SandboxTestCase)
-            .filter(SandboxTestCase.session_id == session_id)
-            .order_by(SandboxTestCase.case_index)
-            .all()
-        )
+        cases = _load_session_cases(session_id, db)
         logger.info("sandbox run: skipping case_execution (already completed, %d cases) for session %s", len(cases), session_id)
     else:
         _mark_step("case_execution", "running")
         try:
-            cases = await _step_case_execution(session, session_id, semantic_combos, system_prompt, test_input_text, db)
+            if is_permission_case_plan_session:
+                cases = await _execute_permission_plan_cases(
+                    session=session,
+                    session_id=session_id,
+                    system_prompt=system_prompt or _get_system_prompt_for_session(session, db),
+                    db=db,
+                    prebuilt_cases=materialized_permission_cases,
+                )
+            else:
+                cases = await _step_case_execution(session, session_id, semantic_combos, system_prompt, test_input_text, db)
             session.executed_case_count = len(cases)
             session.current_step = SessionStep.EVALUATION
             _mark_step("case_execution", "completed")
@@ -1986,6 +2026,66 @@ async def _step_case_execution(
         db.add(case)
         cases.append(case)
 
+    return cases
+
+
+async def _execute_permission_plan_cases(
+    session: SandboxTestSession,
+    session_id: int,
+    system_prompt: str,
+    db: Session,
+    prebuilt_cases: list[SandboxTestCase] | None = None,
+) -> list[SandboxTestCase]:
+    """执行已 materialize 的 permission case plan，不再重新猜测 case。"""
+    from app.services.llm_gateway import llm_gateway
+
+    cases = prebuilt_cases or _load_permission_plan_cases(session_id, db)
+    if not cases:
+        raise HTTPException(400, "当前 session 未找到已 materialize 的 permission case")
+
+    for case in cases:
+        permission_meta = case.input_provenance if isinstance(case.input_provenance, dict) else {}
+        permission_injection = (
+            "\n\n## 当前权限测试上下文\n"
+            f"- 来源: permission_case_plan\n"
+            f"- 计划 ID: {permission_meta.get('plan_id') or 'unknown'}\n"
+            f"- 岗位: {permission_meta.get('role_label') or 'unknown'}\n"
+            f"- 资产: {permission_meta.get('asset_name') or 'unknown'} ({permission_meta.get('asset_type') or 'unknown'})\n"
+            f"- Case 类型: {permission_meta.get('case_type') or 'unknown'}\n"
+            f"- 受控字段/chunk: {', '.join(permission_meta.get('controlled_fields') or []) or '无'}\n"
+            f"- 来源校验: {permission_meta.get('source_verification_status') or 'unknown'}\n"
+        )
+        full_prompt = system_prompt + permission_injection
+        case.system_prompt_used = full_prompt[:5000]
+
+        if case.tool_precondition == "precondition_failed":
+            case.verdict = CaseVerdict.SKIPPED
+            case.verdict_reason = "工具前置条件不满足，跳过执行"
+            case.execution_duration_ms = 0
+            continue
+
+        t0 = time.time()
+        try:
+            model_cfg = llm_gateway.resolve_config(db, "sandbox.interactive_exec")
+            response, _ = await llm_gateway.chat(
+                model_config=model_cfg,
+                messages=[
+                    {"role": "system", "content": full_prompt},
+                    {"role": "user", "content": case.test_input or ""},
+                ],
+                temperature=0.0,
+                max_tokens=1500,
+            )
+            case.llm_response = response
+            case.execution_duration_ms = int((time.time() - t0) * 1000)
+            case.verdict = CaseVerdict.PASSED
+        except Exception as e:
+            case.llm_response = f"执行错误: {e}"
+            case.execution_duration_ms = int((time.time() - t0) * 1000)
+            case.verdict = CaseVerdict.ERROR
+            case.verdict_reason = str(e)
+
+    db.flush()
     return cases
 
 

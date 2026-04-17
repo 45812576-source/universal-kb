@@ -5,10 +5,13 @@ import uuid
 from pathlib import Path
 from contextvars import ContextVar
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
+
+from app.api_envelope import ApiEnvelopeException, api_envelope_exception_handler
 
 # ── L1: 请求追踪 ID（线程/协程安全） ─────────────────────────────────────────
 request_id_var: ContextVar[str] = ContextVar("request_id", default="")
@@ -34,6 +37,9 @@ logging.root.addHandler(_handler)
 logging.root.setLevel(logging.INFO)
 
 app = FastAPI(title="Universal KB API", version="0.1.0")
+app.add_exception_handler(ApiEnvelopeException, api_envelope_exception_handler)
+app.add_exception_handler(HTTPException, api_envelope_exception_handler)
+app.add_exception_handler(StarletteHTTPException, api_envelope_exception_handler)
 
 _default_origins = ["http://localhost:3000", "http://localhost:5173", "http://localhost:5023"]
 _extra = os.getenv("FRONTEND_ORIGIN", "")
@@ -245,9 +251,11 @@ async def startup_event():
             backfill_missing_ai_notes,
             backfill_ununderstood,
         )
+        from app.services.skill_governance_jobs import process_queued_governance_jobs
         # 每 2 分钟回收超时 stuck job（必须在 process 之前执行）
         upstream_scheduler.add_job(recover_stuck_jobs, "interval", minutes=2, id="knowledge_recover_stuck")
         upstream_scheduler.add_job(process_knowledge_jobs, "interval", seconds=30, id="knowledge_job_worker")
+        upstream_scheduler.add_job(process_queued_governance_jobs, "interval", seconds=5, id="skill_governance_job_worker")
         # 每 10 分钟补偿未分类条目
         upstream_scheduler.add_job(backfill_unclassified, "interval", minutes=10, id="knowledge_backfill_classify")
         # 每 10 分钟补偿渲染失败条目
@@ -346,6 +354,9 @@ from app.routers import permission_changes  # noqa: E402
 from app.routers import user_capabilities  # noqa: E402
 from app.routers import events  # noqa: E402
 from app.routers import org_management  # noqa: E402
+from app.routers import org_memory  # noqa: E402
+from app.routers import skill_governance  # noqa: E402
+from app.routers import sandbox_case_plans  # noqa: E402
 app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(skills.router)
@@ -393,6 +404,9 @@ app.include_router(permission_changes.router)
 app.include_router(user_capabilities.router)
 app.include_router(events.router)
 app.include_router(org_management.router)
+app.include_router(org_memory.router)
+app.include_router(skill_governance.router)
+app.include_router(sandbox_case_plans.router)
 
 # 头像静态文件服务
 _avatar_dir = Path("./uploads/avatars")

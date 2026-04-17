@@ -2,18 +2,23 @@
 import os
 import uuid
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from sqlalchemy import create_engine, text, LargeBinary, event
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base, get_db
 from app.config import settings
+from app.api_envelope import ApiEnvelopeException, api_envelope_exception_handler
 from app.models.user import User, Role, Department
 from app.models.skill import ModelConfig, Skill, SkillStatus, SkillMode, SkillVersion
 import app.models.sandbox  # noqa: F401 — ensure sandbox tables exist in test DB
 import app.models.knowledge_job  # noqa: F401 — ensure knowledge_jobs table exists in test DB
+import app.models.skill_knowledge_ref  # noqa: F401 — ensure skill knowledge ref tables exist in test DB
+import app.models.skill_governance  # noqa: F401 — ensure skill governance tables exist in test DB
+import app.models.org_memory  # noqa: F401 — ensure org memory tables exist in test DB
 from app.services.auth_service import hash_password
 
 # Use an in-memory SQLite for speed; override as needed
@@ -102,10 +107,14 @@ def client():
         tasks, projects, permissions, skill_policies, approvals,
         handoff, output_schemas, sandbox, sandbox_interactive,
         skill_memos, collab, knowledge_admin, knowledge_tags,
-        dev_studio, events,
+        dev_studio, events, skill_governance, sandbox_case_plans,
+        org_memory,
     )
 
     test_app = FastAPI(title="Universal KB Test API")
+    test_app.add_exception_handler(ApiEnvelopeException, api_envelope_exception_handler)
+    test_app.add_exception_handler(HTTPException, api_envelope_exception_handler)
+    test_app.add_exception_handler(StarletteHTTPException, api_envelope_exception_handler)
     test_app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -152,6 +161,9 @@ def client():
     test_app.include_router(knowledge_tags.router)
     test_app.include_router(dev_studio.router)
     test_app.include_router(events.router)
+    test_app.include_router(org_memory.router)
+    test_app.include_router(skill_governance.router)
+    test_app.include_router(sandbox_case_plans.router)
     test_app.dependency_overrides[get_db] = override_get_db
 
     with TestClient(test_app, raise_server_exceptions=True) as c:

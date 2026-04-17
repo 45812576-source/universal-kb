@@ -1,6 +1,28 @@
 import { test, expect } from "./fixtures";
 
 test.describe("知识库", () => {
+  test("录入表单展示扩展后的上传类型", async ({ authedPage: page }) => {
+    await page.goto("/knowledge/my");
+    await page.getByRole("button", { name: /录入新知识/ }).click();
+    await page.getByRole("button", { name: "文件上传" }).click();
+
+    const fileInput = page.locator('input[type="file"][name="file"]');
+    await expect(fileInput).toBeVisible();
+    await expect(fileInput).toHaveAttribute(
+      "accept",
+      ".txt,.pdf,.docx,.pptx,.md,.html,.htm,.xlsx,.xls,.csv,.jpg,.jpeg,.png,.webp,.bmp,.gif,.mp3,.wav,.m4a,.ogg,.flac,.zip",
+    );
+  });
+
+  test("录入表单支持切换到飞书导入模式", async ({ authedPage: page }) => {
+    await page.goto("/knowledge/my");
+    await page.getByRole("button", { name: /录入新知识/ }).click();
+    await page.getByRole("button", { name: "飞书导入" }).click();
+
+    await expect(page.locator('input[name="lark_url"]')).toBeVisible();
+    await expect(page.getByText("已连接飞书账号时，可导入你有权限访问的飞书文档并生成可编辑工作台副本。")).toBeVisible();
+  });
+
   test("员工可以提交知识条目", async ({ authedPage: page }) => {
     await page.goto("/knowledge/my");
     await page.getByRole("button", { name: /录入新知识/ }).click();

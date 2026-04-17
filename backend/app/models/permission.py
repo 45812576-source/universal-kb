@@ -363,6 +363,7 @@ class ApprovalRequestType(str, enum.Enum):
     FIELD_SENSITIVITY_CHANGE = "field_sensitivity_change"
     SMALL_SAMPLE_CHANGE = "small_sample_change"
     PERMISSION_CHANGE = "permission_change"
+    ORG_MEMORY_PROPOSAL = "org_memory_proposal"
 
 
 class ApprovalStatus(str, enum.Enum):

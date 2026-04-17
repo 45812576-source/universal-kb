@@ -29,6 +29,18 @@ from app.models.pev_job import PEVJob, PEVStep, PEVJobStatus, PEVStepStatus  # n
 from app.models.event_bus import UnifiedEvent  # noqa: F401
 from app.models.lark_approval import LarkApprovalInstance  # noqa: F401
 from app.models.skill_memo import SkillMemo  # noqa: F401
+from app.models.skill_governance import (  # noqa: F401
+    PermissionDeclarationDraft,
+    RoleAssetGranularRule,
+    RoleAssetPolicy,
+    RolePolicyBundle,
+    SandboxCaseMaterialization,
+    SkillGovernanceJob,
+    SkillBoundAsset,
+    SkillServiceRole,
+    TestCaseDraft,
+    TestCasePlanDraft,
+)
 from app.models.org_management import (  # noqa: F401
     OrgImportSession, OrgChangeEvent,
     OkrPeriod, OkrObjective, OkrKeyResult,
@@ -36,6 +48,14 @@ from app.models.org_management import (  # noqa: F401
     DataAssetOwnership, DeptCollaborationLink, PositionAccessRule,
     OrgBaseline, PositionCompetencyModel, ResourceLibraryDefinition,
     KrResourceMapping, CollabProtocol, OrgChangeImpact,
+)
+from app.models.org_memory import (  # noqa: F401
+    OrgMemorySource,
+    OrgMemorySnapshot,
+    OrgMemoryProposal,
+    OrgMemoryAppliedConfig,
+    OrgMemoryConfigVersion,
+    OrgMemoryApprovalLink,
 )
 from app.models.opencode import StudioRegistration  # noqa: F401
 from app.models.permission import (  # noqa: F401

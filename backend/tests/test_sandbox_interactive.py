@@ -19,6 +19,7 @@ from app.models.tool import ToolType, SkillTool
 from app.models.business import BusinessTable, DataOwnership
 from app.models.knowledge import KnowledgeEntry
 from app.models.sandbox import SandboxTestSession, SandboxTestReport, SessionStatus, SessionStep
+from app.models.sandbox import SandboxTestCase, CaseVerdict
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -886,6 +887,141 @@ class TestSandboxStreamEndpoints:
         assert resp.status_code == 200, resp.text
         assert "text/event-stream" in resp.headers.get("content-type", "")
         assert "event: done" in resp.text
+
+
+class TestPermissionCasePlanRunIntegration:
+    def test_run_reuses_materialized_permission_cases(self, client, db):
+        dept = _make_dept(db)
+        user = _make_user(db, "permission_plan_runner", Role.SUPER_ADMIN, dept.id)
+        _make_model_config(db)
+        skill = _make_skill(db, user.id, name="权限计划执行 Skill", status=SkillStatus.PUBLISHED)
+        session = SandboxTestSession(
+            target_type="skill",
+            target_id=skill.id,
+            target_version=1,
+            target_name=skill.name,
+            tester_id=user.id,
+            status=SessionStatus.READY_TO_RUN,
+            current_step=SessionStep.EXECUTION,
+            detected_slots=[],
+            tool_review=[],
+            permission_snapshot=[],
+            step_statuses={
+                "case_generation": {
+                    "status": "completed",
+                    "started_at": None,
+                    "finished_at": None,
+                    "error_code": None,
+                    "error_message": None,
+                    "retryable": False,
+                    "source": "permission_case_plan",
+                    "plan_id": 11,
+                    "case_count": 1,
+                },
+                "permission_case_materialization": {
+                    "status": "completed",
+                    "started_at": None,
+                    "finished_at": None,
+                    "error_code": None,
+                    "error_message": None,
+                    "retryable": False,
+                    "plan_id": 11,
+                    "case_count": 1,
+                },
+            },
+        )
+        db.add(session)
+        db.flush()
+        case = SandboxTestCase(
+            session_id=session.id,
+            case_index=1,
+            row_visibility="all",
+            field_output_semantic="partial",
+            group_semantic="single_field",
+            tool_precondition=None,
+            input_provenance={
+                "source": "permission_case_plan",
+                "plan_id": 11,
+                "case_draft_id": 22,
+                "target_role_ref": 5,
+                "role_label": "招聘主管（M0）",
+                "asset_ref": "data_table:table:17",
+                "asset_name": "候选人表",
+                "asset_type": "data_table",
+                "case_type": "deny",
+                "granular_refs": ["candidate_phone"],
+                "controlled_fields": ["candidate_phone"],
+                "source_verification_status": "linked",
+                "data_source_policy": "verified_slot_only",
+            },
+            test_input="请给我候选人手机号",
+            verdict=None,
+        )
+        db.add(case)
+        db.commit()
+        token = _login(client, "permission_plan_runner")
+
+        async def fake_execute_permission_plan_cases(session, session_id, system_prompt, db, prebuilt_cases=None):
+            assert session_id == case.session_id
+            cases = prebuilt_cases or [db.get(SandboxTestCase, case.id)]
+            assert len(cases) == 1
+            current = cases[0]
+            current.system_prompt_used = (system_prompt or "") + "\npermission_case_plan"
+            current.llm_response = "不能直接提供候选人手机号"
+            current.execution_duration_ms = 12
+            current.verdict = CaseVerdict.PASSED
+            db.flush()
+            return cases
+
+        async def fake_evaluate_session(session, cases, db, previous_deductions=None):
+            return {
+                "quality_passed": True,
+                "quality_detail": {"reason": "ok"},
+                "usability_passed": True,
+                "usability_detail": {"reason": "ok"},
+                "anti_hallucination_passed": True,
+                "anti_hallucination_detail": {"reason": "ok"},
+            }
+
+        async def fake_generate_report(session, cases, evaluation, db):
+            report = SandboxTestReport(
+                session_id=session.id,
+                target_type=session.target_type,
+                target_id=session.target_id,
+                target_version=session.target_version,
+                target_name=session.target_name,
+                tester_id=session.tester_id,
+                part2_test_matrix={"summary": {"passed": 1, "failed": 0, "error": 0, "skipped": 0}},
+                executed_case_count=len(cases),
+                quality_passed=True,
+                usability_passed=True,
+                anti_hallucination_passed=True,
+                approval_eligible=True,
+            )
+            db.add(report)
+            db.flush()
+            return report
+
+        with (
+            patch("app.routers.sandbox_interactive._generate_semantic_matrix", side_effect=AssertionError("should not generate semantic matrix")),
+            patch("app.routers.sandbox_interactive._execute_permission_plan_cases", new=AsyncMock(side_effect=fake_execute_permission_plan_cases)),
+            patch("app.routers.sandbox_interactive._evaluate_session", new=AsyncMock(side_effect=fake_evaluate_session)),
+            patch("app.services.sandbox_report.generate_report", new=AsyncMock(side_effect=fake_generate_report)),
+        ):
+            resp = client.post(
+                f"/api/sandbox/interactive/{session.id}/run",
+                headers=_auth(token),
+            )
+
+        assert resp.status_code == 200, resp.text
+        result = resp.json()
+        assert result["status"] == "completed"
+        assert result["current_step"] == "done"
+
+        db.refresh(case)
+        assert case.llm_response == "不能直接提供候选人手机号"
+        assert case.verdict == CaseVerdict.PASSED
+        assert "permission_case_plan" in (case.system_prompt_used or "")
 
     def test_retry_from_step_stream_returns_done_event(self, client, db):
         dept = _make_dept(db)
