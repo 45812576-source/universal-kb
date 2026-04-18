@@ -128,11 +128,16 @@ class WorkflowActionResult:
     action: str
     card_id: str | None = None
     staged_edit_id: str | None = None
+    target_type: str | None = None
+    target_key: str | None = None
     updated_card_status: str | None = None
     updated_staged_edit_status: str | None = None
     workflow_state_patch: dict[str, Any] = field(default_factory=dict)
     memo_refresh_required: bool = False
     editor_refresh_required: bool = False
+    recovery_source: str | None = None
+    recovery_revision: int | None = None
+    recovery_updated_at: str | None = None
     next_cards: list[dict[str, Any]] = field(default_factory=list)
     result: dict[str, Any] = field(default_factory=dict)
     error: str | None = None

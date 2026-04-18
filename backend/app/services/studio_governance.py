@@ -483,7 +483,13 @@ def adopt_staged_edit(db: Session, edit_id: int, user_id: int) -> dict:
     except Exception as memo_err:
         logger.warning("record_post_test_diff failed for staged_edit %s: %s", edit.id, memo_err)
 
-    result = {"ok": True, "skill_id": skill.id, "target_type": edit.target_type}
+    result = {
+        "ok": True,
+        "skill_id": skill.id,
+        "staged_edit_id": edit.id,
+        "target_type": edit.target_type,
+        "target_key": edit.target_key,
+    }
     if new_version_created:
         result["new_version"] = new_version.version  # type: ignore[possibly-undefined]
     return result
@@ -504,4 +510,10 @@ def reject_staged_edit(db: Session, edit_id: int, user_id: int) -> dict:
     edit.resolved_by = user_id
     db.commit()
 
-    return {"ok": True}
+    return {
+        "ok": True,
+        "skill_id": edit.skill_id,
+        "staged_edit_id": edit.id,
+        "target_type": edit.target_type,
+        "target_key": edit.target_key,
+    }

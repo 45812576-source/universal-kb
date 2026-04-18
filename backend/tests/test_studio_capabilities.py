@@ -717,6 +717,8 @@ class TestWorkflowActionEndpoint:
         assert data["updated_staged_edit_status"] == "adopted"
         assert data["memo_refresh_required"] is True
         assert data["workflow_state_patch"] == {}
+        assert data["target_type"] == "system_prompt"
+        assert data["target_key"] is None
         assert data["result"]["target_type"] == "system_prompt"
 
     def test_workflow_action_reject_staged_edit(self, client, token, seeded, db):
@@ -732,6 +734,8 @@ class TestWorkflowActionEndpoint:
         assert data["ok"] is True
         assert data["action"] == "reject_staged_edit"
         assert data["updated_staged_edit_status"] == "rejected"
+        assert data["target_type"] == "system_prompt"
+        assert data["target_key"] is None
 
     def test_workflow_action_returns_recovery_workflow_state_patch(self, client, token, seeded, db):
         from app.services import skill_memo_service
@@ -778,6 +782,8 @@ class TestWorkflowActionEndpoint:
         assert data["ok"] is True
         assert data["workflow_state_patch"]["workflow_mode"] == "preflight_remediation"
         assert data["workflow_state_patch"]["next_action"] == "continue_chat"
+        assert data["recovery_source"] == "skill_memo"
+        assert data["recovery_revision"] is not None
 
     def test_workflow_action_prepare_next_step_returns_recommendation(self, client, token, seeded, db):
         from app.services import skill_memo_service

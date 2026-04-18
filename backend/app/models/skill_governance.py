@@ -1,6 +1,6 @@
 import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import relationship
 
@@ -138,6 +138,86 @@ class RoleAssetGranularRule(Base):
 
     __table_args__ = (
         UniqueConstraint("role_asset_policy_id", "granularity_type", "target_ref", name="uq_role_asset_granular_rule"),
+    )
+
+
+class SkillRolePackage(Base):
+    __tablename__ = "skill_role_packages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skill_id = Column(Integer, ForeignKey("skills.id", ondelete="CASCADE"), nullable=False)
+    workspace_id = Column(Integer, nullable=False, default=0)
+    skill_service_role_id = Column(Integer, ForeignKey("skill_service_roles.id", ondelete="SET NULL"), nullable=True)
+    role_key = Column(String(768), nullable=False)
+    org_path = Column(String(512), nullable=False)
+    position_name = Column(String(128), nullable=False)
+    position_level = Column(String(64), nullable=True)
+    role_label = Column(String(256), nullable=False)
+    package_version = Column(Integer, nullable=False, default=1)
+    governance_version = Column(Integer, nullable=False, default=1)
+    status = Column(String(32), nullable=False, default="active")
+    field_rules_json = Column(JSON, default=list)
+    source_projection_version = Column(Integer, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    skill = relationship("Skill", foreign_keys=[skill_id])
+    role = relationship("SkillServiceRole", foreign_keys=[skill_service_role_id])
+    knowledge_overrides = relationship("SkillRoleKnowledgeOverride", back_populates="package", cascade="all, delete-orphan")
+    asset_overrides = relationship("SkillRoleAssetMountOverride", back_populates="package", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("idx_srp_skill_status", "skill_id", "status"),
+    )
+
+
+class SkillRoleKnowledgeOverride(Base):
+    __tablename__ = "skill_role_knowledge_overrides"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    package_id = Column(Integer, ForeignKey("skill_role_packages.id", ondelete="CASCADE"), nullable=False)
+    skill_id = Column(Integer, ForeignKey("skills.id", ondelete="CASCADE"), nullable=False)
+    role_key = Column(String(768), nullable=False)
+    asset_id = Column(Integer, ForeignKey("skill_bound_assets.id", ondelete="CASCADE"), nullable=False)
+    asset_ref = Column(String(128), nullable=False)
+    knowledge_id = Column(Integer, ForeignKey("knowledge_entries.id", ondelete="CASCADE"), nullable=False)
+    desensitization_level = Column(String(32), nullable=False, default="inherit")
+    grant_actions_json = Column(JSON, default=list)
+    enabled = Column(Boolean, nullable=False, default=True)
+    source_refs_json = Column(JSON, default=list)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    package = relationship("SkillRolePackage", back_populates="knowledge_overrides")
+    asset = relationship("SkillBoundAsset", foreign_keys=[asset_id])
+
+    __table_args__ = (
+        Index("idx_srko_skill", "skill_id"),
+    )
+
+
+class SkillRoleAssetMountOverride(Base):
+    __tablename__ = "skill_role_asset_mount_overrides"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    package_id = Column(Integer, ForeignKey("skill_role_packages.id", ondelete="CASCADE"), nullable=False)
+    skill_id = Column(Integer, ForeignKey("skills.id", ondelete="CASCADE"), nullable=False)
+    role_key = Column(String(768), nullable=False)
+    asset_id = Column(Integer, ForeignKey("skill_bound_assets.id", ondelete="CASCADE"), nullable=False)
+    asset_ref_type = Column(String(32), nullable=False)
+    asset_ref_id = Column(Integer, nullable=False)
+    binding_mode = Column(String(32), nullable=False)
+    enabled = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    package = relationship("SkillRolePackage", back_populates="asset_overrides")
+    asset = relationship("SkillBoundAsset", foreign_keys=[asset_id])
+
+    __table_args__ = (
+        Index("idx_sramo_skill", "skill_id"),
     )
 
 

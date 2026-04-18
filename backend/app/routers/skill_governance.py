@@ -14,6 +14,10 @@ from app.models.skill_governance import (
     RoleAssetPolicy,
     RolePolicyBundle,
     SkillGovernanceJob,
+    SkillRoleAssetMountOverride,
+    SkillRoleKnowledgeOverride,
+    SkillRolePackage,
+    SkillBoundAsset,
     SkillServiceRole,
     TestCaseDraft,
     TestCasePlanDraft,
@@ -25,14 +29,17 @@ from app.services.skill_governance_service import (
     assert_skill_governance_access,
     build_mount_context,
     build_mounted_permissions,
+    bump_governance_version,
     declaration_source_mode,
     ensure_permission_declaration_prompt_sync,
     find_position,
+    find_role_by_role_key,
     generate_declaration,
     generate_permission_case_plan,
     granular_rule_is_high_risk,
     materialize_permission_case_plan,
     mark_declaration_stale,
+    mark_case_plan_stale,
     mount_permission_declaration_to_skill,
     granular_rule_requires_override,
     goal_summary_for_position,
@@ -53,6 +60,7 @@ from app.services.skill_governance_service import (
     serialize_granular_rule,
     serialize_policy,
     serialize_role,
+    role_key_for_role,
     split_org_path,
     suggest_role_asset_policies,
     sync_bound_assets,
@@ -193,6 +201,98 @@ class UpdateCaseDraftRequest(BaseModel):
     source_verification_status: Optional[str] = Field(default=None, min_length=1, max_length=32)
 
 
+class RolePackageRoleInput(BaseModel):
+    org_path: str = Field(min_length=1, max_length=512)
+    position_name: str = Field(min_length=1, max_length=128)
+    position_level: str = ""
+    role_label: str = Field(min_length=1, max_length=256)
+
+
+class RolePackageFieldRuleInput(BaseModel):
+    policy_id: int
+    rule_id: int
+    asset_id: int
+    target_ref: str = Field(min_length=1, max_length=255)
+    suggested_policy: str = Field(min_length=1, max_length=32)
+    mask_style: Optional[str] = Field(default=None, max_length=32)
+    confirmed: bool = False
+    author_override_reason: Optional[str] = None
+
+
+class RolePackageKnowledgeInput(BaseModel):
+    asset_id: int
+    asset_ref: str = Field(min_length=1, max_length=128)
+    knowledge_id: int
+    desensitization_level: str = Field(default="inherit", min_length=1, max_length=32)
+    grant_actions: list[str] = []
+    enabled: bool = True
+    source_refs: list[dict[str, object]] = []
+
+
+class RolePackageAssetMountInput(BaseModel):
+    asset_id: int
+    asset_ref_type: str = Field(min_length=1, max_length=32)
+    asset_ref_id: int
+    binding_mode: str = Field(min_length=1, max_length=32)
+    enabled: bool = True
+
+
+class RolePackageContentInput(BaseModel):
+    field_rules: list[RolePackageFieldRuleInput] = []
+    knowledge_permissions: list[RolePackageKnowledgeInput] = []
+    asset_mounts: list[RolePackageAssetMountInput] = []
+
+
+class SaveRolePackageRequest(BaseModel):
+    role_key: str = Field(min_length=1, max_length=768)
+    role: RolePackageRoleInput
+    writeback_mode: str = Field(default="upsert_role_package", pattern="^upsert_role_package$")
+    stale_downstream: list[str] = []
+    package: RolePackageContentInput
+
+
+def _serialize_role_package(package: SkillRolePackage) -> dict[str, object]:
+    return {
+        "id": package.id,
+        "skill_id": package.skill_id,
+        "role_key": package.role_key,
+        "role": {
+            "org_path": package.org_path,
+            "position_name": package.position_name,
+            "position_level": package.position_level or "",
+            "role_label": package.role_label,
+        },
+        "package_version": package.package_version,
+        "governance_version": package.governance_version,
+        "status": package.status,
+        "field_rules": package.field_rules_json or [],
+        "knowledge_permissions": [
+            {
+                "asset_id": item.asset_id,
+                "asset_ref": item.asset_ref,
+                "knowledge_id": item.knowledge_id,
+                "desensitization_level": item.desensitization_level,
+                "grant_actions": item.grant_actions_json or [],
+                "enabled": bool(item.enabled),
+                "source_refs": item.source_refs_json or [],
+            }
+            for item in package.knowledge_overrides
+        ],
+        "asset_mounts": [
+            {
+                "asset_id": item.asset_id,
+                "asset_ref_type": item.asset_ref_type,
+                "asset_ref_id": item.asset_ref_id,
+                "binding_mode": item.binding_mode,
+                "enabled": bool(item.enabled),
+            }
+            for item in package.asset_overrides
+        ],
+        "source_projection_version": package.source_projection_version,
+        "updated_at": package.updated_at.isoformat() if package.updated_at else None,
+    }
+
+
 @router.get("/{skill_id}/summary")
 def get_governance_summary(
     skill_id: int,
@@ -325,6 +425,255 @@ def save_service_roles(
         "bundle_status": (bundle.status if bundle else "draft"),
         "stale_downstream": sorted(set(stale_downstream)),
         "roles": [serialize_role(role) for role in active_roles(db, skill_id)],
+    })
+
+
+@router.get("/{skill_id}/role-packages")
+def list_role_packages(
+    skill_id: int,
+    include_projection: bool = Query(False),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    assert_skill_governance_access(db, skill_id, user)
+    packages = (
+        db.query(SkillRolePackage)
+        .filter(SkillRolePackage.skill_id == skill_id)
+        .order_by(SkillRolePackage.role_label, SkillRolePackage.id)
+        .all()
+    )
+    data: dict[str, object] = {
+        "skill_id": skill_id,
+        "packages": [_serialize_role_package(package) for package in packages],
+    }
+    if include_projection:
+        data["projection_roles"] = [serialize_role(role) for role in active_roles(db, skill_id)]
+    return ok(data)
+
+
+@router.put("/{skill_id}/role-packages/{role_key:path}")
+def save_role_package(
+    skill_id: int,
+    role_key: str,
+    req: SaveRolePackageRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    skill = assert_skill_governance_access(db, skill_id, user)
+    workspace_id = resolve_workspace_id(db, skill_id)
+    request_role_key = req.role_key.strip()
+    if request_role_key != role_key.strip():
+        raise_api_error(
+            400,
+            "governance.role_package_key_mismatch",
+            "路径中的角色 key 与请求体不一致",
+            {"path_role_key": role_key, "body_role_key": req.role_key},
+        )
+    role = find_role_by_role_key(db, skill_id, request_role_key)
+    if not role:
+        raise_api_error(
+            404,
+            "governance.service_role_not_found",
+            "角色 package 对应的服务角色不存在",
+            {"skill_id": skill_id, "role_key": request_role_key},
+        )
+
+    field_rule_payloads: list[dict[str, object]] = []
+    for item in req.package.field_rules:
+        rule = db.get(RoleAssetGranularRule, item.rule_id)
+        if not rule or rule.policy.bundle.skill_id != skill_id:
+            raise_api_error(
+                404,
+                "governance.granular_rule_not_found",
+                "字段规则不存在或不属于当前 Skill",
+                {"skill_id": skill_id, "rule_id": item.rule_id},
+            )
+        if rule.policy.id != item.policy_id or rule.policy.asset.id != item.asset_id:
+            raise_api_error(
+                400,
+                "governance.granular_rule_ref_mismatch",
+                "字段规则引用与当前策略不一致",
+                {"rule_id": item.rule_id, "policy_id": item.policy_id, "asset_id": item.asset_id},
+            )
+        if role_key_for_role(rule.policy.role) != request_role_key:
+            raise_api_error(
+                400,
+                "governance.granular_rule_role_mismatch",
+                "字段规则不属于当前角色 package",
+                {"rule_id": item.rule_id, "role_key": request_role_key},
+            )
+        if granular_rule_requires_override(rule, item.suggested_policy, item.mask_style) and not (item.author_override_reason or "").strip():
+            raise_api_error(
+                400,
+                "governance.override_reason_required",
+                "高风险字段放开原值或取消脱敏时必须填写原因",
+                {"rule_id": item.rule_id, "target_ref": item.target_ref},
+            )
+        rule.suggested_policy = item.suggested_policy
+        rule.mask_style = item.mask_style
+        rule.confirmed = item.confirmed
+        rule.author_override_reason = (item.author_override_reason or "").strip() or None
+        field_rule_payloads.append(item.model_dump())
+
+    knowledge_asset_ids = {item.asset_id for item in req.package.knowledge_permissions}
+    asset_mount_ids = {item.asset_id for item in req.package.asset_mounts}
+    all_asset_ids = knowledge_asset_ids | asset_mount_ids
+    if all_asset_ids:
+        existing_assets = {
+            asset.id: asset
+            for asset in db.query(SkillBoundAsset)
+            .filter(SkillBoundAsset.skill_id == skill_id, SkillBoundAsset.id.in_(all_asset_ids))
+            .all()
+        }
+        missing_asset_ids = sorted(all_asset_ids - set(existing_assets))
+        if missing_asset_ids:
+            raise_api_error(
+                404,
+                "governance.package_asset_not_found",
+                "package 中包含不存在或不属于当前 Skill 的资产",
+                {"skill_id": skill_id, "asset_ids": missing_asset_ids},
+            )
+    else:
+        existing_assets = {}
+
+    governance_version = bump_governance_version(
+        db,
+        skill,
+        user,
+        workspace_id,
+        "role_package_changed",
+    )
+    package = (
+        db.query(SkillRolePackage)
+        .filter(SkillRolePackage.skill_id == skill_id, SkillRolePackage.role_key == request_role_key)
+        .first()
+    )
+    if package:
+        package.package_version = int(package.package_version or 0) + 1
+        package.skill_service_role_id = role.id
+        package.org_path = req.role.org_path.strip()
+        package.position_name = req.role.position_name.strip()
+        package.position_level = (req.role.position_level or "").strip()
+        package.role_label = req.role.role_label.strip()
+        package.field_rules_json = field_rule_payloads
+        package.governance_version = governance_version
+        package.source_projection_version = governance_version
+        package.status = "active"
+        package.updated_by = user.id
+    else:
+        package = SkillRolePackage(
+            skill_id=skill_id,
+            workspace_id=workspace_id,
+            skill_service_role_id=role.id,
+            role_key=request_role_key,
+            org_path=req.role.org_path.strip(),
+            position_name=req.role.position_name.strip(),
+            position_level=(req.role.position_level or "").strip(),
+            role_label=req.role.role_label.strip(),
+            package_version=1,
+            governance_version=governance_version,
+            status="active",
+            field_rules_json=field_rule_payloads,
+            source_projection_version=governance_version,
+            created_by=user.id,
+            updated_by=user.id,
+        )
+        db.add(package)
+        db.flush()
+
+    existing_knowledge = {
+        item.knowledge_id: item
+        for item in db.query(SkillRoleKnowledgeOverride)
+        .filter(SkillRoleKnowledgeOverride.skill_id == skill_id, SkillRoleKnowledgeOverride.role_key == request_role_key)
+        .all()
+    }
+    requested_knowledge_ids = {item.knowledge_id for item in req.package.knowledge_permissions}
+    for knowledge_id, override in list(existing_knowledge.items()):
+        if knowledge_id not in requested_knowledge_ids:
+            db.delete(override)
+    for item in req.package.knowledge_permissions:
+        asset = existing_assets[item.asset_id]
+        if asset.asset_type != "knowledge_base":
+            raise_api_error(
+                400,
+                "governance.package_asset_type_mismatch",
+                "知识遮蔽 package 只能引用知识库资产",
+                {"asset_id": item.asset_id, "asset_type": asset.asset_type},
+            )
+        override = existing_knowledge.get(item.knowledge_id)
+        payload = {
+            "package_id": package.id,
+            "skill_id": skill_id,
+            "role_key": request_role_key,
+            "asset_id": item.asset_id,
+            "asset_ref": item.asset_ref,
+            "knowledge_id": item.knowledge_id,
+            "desensitization_level": item.desensitization_level,
+            "grant_actions_json": item.grant_actions,
+            "enabled": item.enabled,
+            "source_refs_json": item.source_refs,
+        }
+        if override:
+            for field, value in payload.items():
+                setattr(override, field, value)
+        else:
+            db.add(SkillRoleKnowledgeOverride(**payload))
+
+    existing_mounts = {
+        item.asset_id: item
+        for item in db.query(SkillRoleAssetMountOverride)
+        .filter(SkillRoleAssetMountOverride.skill_id == skill_id, SkillRoleAssetMountOverride.role_key == request_role_key)
+        .all()
+    }
+    requested_mount_asset_ids = {item.asset_id for item in req.package.asset_mounts}
+    for asset_id, override in list(existing_mounts.items()):
+        if asset_id not in requested_mount_asset_ids:
+            db.delete(override)
+    for item in req.package.asset_mounts:
+        asset = existing_assets[item.asset_id]
+        payload = {
+            "package_id": package.id,
+            "skill_id": skill_id,
+            "role_key": request_role_key,
+            "asset_id": item.asset_id,
+            "asset_ref_type": item.asset_ref_type,
+            "asset_ref_id": item.asset_ref_id,
+            "binding_mode": item.binding_mode,
+            "enabled": item.enabled,
+        }
+        if asset.asset_ref_type != item.asset_ref_type or asset.asset_ref_id != item.asset_ref_id:
+            raise_api_error(
+                400,
+                "governance.package_asset_ref_mismatch",
+                "资产挂载 package 引用与已绑定资产不一致",
+                {"asset_id": item.asset_id, "asset_ref_type": item.asset_ref_type, "asset_ref_id": item.asset_ref_id},
+            )
+        override = existing_mounts.get(item.asset_id)
+        if override:
+            for field, value in payload.items():
+                setattr(override, field, value)
+        else:
+            db.add(SkillRoleAssetMountOverride(**payload))
+
+    stale_downstream = [
+        "role_package",
+        "mounted_permissions",
+        "permission_declaration",
+        "sandbox_case_plan",
+    ]
+    declaration = latest_declaration(db, skill_id)
+    mark_declaration_stale(declaration, ["role_package_changed"])
+    mark_case_plan_stale(db, skill_id, ["role_package_changed"])
+    db.commit()
+    db.refresh(package)
+    return ok({
+        "skill_id": skill_id,
+        "role_key": request_role_key,
+        "package_id": package.id,
+        "package_version": package.package_version,
+        "governance_version": governance_version,
+        "stale_downstream": stale_downstream,
+        "package": _serialize_role_package(package),
     })
 
 

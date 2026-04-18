@@ -123,6 +123,8 @@ def _empty_payload() -> dict:
             "workflow_state": None,
             "cards": [],
             "staged_edits": [],
+            "source": "skill_memo",
+            "revision": 0,
             "updated_at": None,
         },
         "context_digest_cache": {
@@ -138,8 +140,25 @@ def _empty_workflow_recovery() -> dict:
         "workflow_state": None,
         "cards": [],
         "staged_edits": [],
+        "source": "skill_memo",
+        "revision": 0,
         "updated_at": None,
     }
+
+
+def _normalize_recovery_revision(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed >= 0 else 0
+
+
+def _mark_workflow_recovery_updated(recovery: dict[str, Any], *, source: str = "skill_memo") -> dict[str, Any]:
+    recovery["source"] = source
+    recovery["revision"] = _normalize_recovery_revision(recovery.get("revision")) + 1
+    recovery["updated_at"] = _now_iso()
+    return recovery
 
 
 def _empty_context_digest_cache() -> dict[str, Any]:
@@ -201,6 +220,9 @@ def _get_workflow_recovery(payload: dict[str, Any]) -> dict[str, Any]:
         base["cards"] = raw.get("cards")
     if isinstance(raw.get("staged_edits"), list):
         base["staged_edits"] = raw.get("staged_edits")
+    if isinstance(raw.get("source"), str) and raw.get("source"):
+        base["source"] = raw.get("source")
+    base["revision"] = _normalize_recovery_revision(raw.get("revision"))
     if raw.get("updated_at") is not None:
         base["updated_at"] = raw.get("updated_at")
     return base
@@ -582,7 +604,7 @@ def _refresh_workflow_recovery_state(payload: dict[str, Any]) -> bool:
 
     if changed:
         recovery["workflow_state"] = workflow_state
-        recovery["updated_at"] = _now_iso()
+        _mark_workflow_recovery_updated(recovery)
         payload["workflow_recovery"] = recovery
     return changed
 
@@ -675,7 +697,7 @@ def _sync_workflow_recovery_from_completed_tasks(payload: dict[str, Any], comple
                 changed = True
 
     if changed:
-        recovery["updated_at"] = _now_iso()
+        _mark_workflow_recovery_updated(recovery)
         payload["workflow_recovery"] = recovery
         changed = _refresh_workflow_recovery_state(payload) or changed
     return changed
@@ -788,7 +810,7 @@ def _sync_workflow_recovery_after_test_result(
 
     workflow_state["metadata"] = metadata
     recovery["workflow_state"] = workflow_state
-    recovery["updated_at"] = _now_iso()
+    _mark_workflow_recovery_updated(recovery)
     payload["workflow_recovery"] = recovery
 
 
@@ -2156,8 +2178,11 @@ def sync_workflow_recovery(
         "workflow_state": workflow_state,
         "cards": list(cards or []),
         "staged_edits": list(staged_edits or []),
-        "updated_at": _now_iso(),
+        "source": "skill_memo",
+        "revision": 0,
+        "updated_at": None,
     }
+    _mark_workflow_recovery_updated(workflow_recovery)
     _sync_import_audit_tasks_from_recovery(payload, workflow_recovery)
     _link_workflow_recovery_tasks(payload, workflow_recovery)
     payload["workflow_recovery"] = workflow_recovery
@@ -2237,7 +2262,7 @@ def patch_workflow_recovery_action(
     if not changed:
         return get_memo(db, skill_id)
 
-    recovery["updated_at"] = _now_iso()
+    _mark_workflow_recovery_updated(recovery)
     payload["workflow_recovery"] = recovery
     if workflow_state:
         memo.status_summary = _workflow_status_summary(workflow_state)

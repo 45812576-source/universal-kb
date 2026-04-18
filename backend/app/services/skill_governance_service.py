@@ -31,6 +31,7 @@ from app.models.skill_governance import (
     RolePolicyBundle,
     SandboxCaseMaterialization,
     SkillBoundAsset,
+    SkillRolePackage,
     SkillServiceRole,
     TestCaseDraft,
     TestCasePlanDraft,
@@ -249,8 +250,80 @@ def mark_downstream_stale(
     declaration = latest_declaration(db, skill_id)
     if mark_declaration_stale(declaration, reasons):
         stale_targets.append("permission_declaration")
+    if mark_case_plan_stale(db, skill_id, reasons):
+        stale_targets.append("sandbox_case_plan")
     return stale_targets
 
+
+
+def role_key_for_parts(org_path: str, position_name: str, position_level: str | None = None) -> str:
+    return f"{org_path.strip()}::{position_name.strip()}::{(position_level or '').strip()}"
+
+
+def role_key_for_role(role: SkillServiceRole) -> str:
+    return role_key_for_parts(role.org_path, role.position_name, role.position_level)
+
+
+def find_role_by_role_key(db: Session, skill_id: int, role_key: str) -> SkillServiceRole | None:
+    for role in active_roles(db, skill_id):
+        if role_key_for_role(role) == role_key:
+            return role
+    return None
+
+
+def bump_governance_version(
+    db: Session,
+    skill: Skill,
+    user: User,
+    workspace_id: int,
+    reason_code: str,
+) -> int:
+    bundle = latest_bundle(db, skill.id)
+    roles = active_roles(db, skill.id)
+    assets = active_assets(db, skill.id)
+    if bundle:
+        bundle.governance_version = int(bundle.governance_version or bundle.bundle_version or 0) + 1
+        bundle.skill_content_version = latest_skill_content_version(skill)
+        bundle.service_role_count = len(roles)
+        bundle.bound_asset_count = len(assets)
+        bundle.status = "stale"
+        bundle.change_reason = reason_code
+        return int(bundle.governance_version)
+    bundle = RolePolicyBundle(
+        skill_id=skill.id,
+        workspace_id=workspace_id,
+        bundle_version=next_bundle_version(db, skill.id),
+        skill_content_version=latest_skill_content_version(skill),
+        governance_version=2,
+        service_role_count=len(roles),
+        bound_asset_count=len(assets),
+        status="stale",
+        change_reason=reason_code,
+        created_by=user.id,
+    )
+    db.add(bundle)
+    db.flush()
+    return int(bundle.governance_version)
+
+
+def mark_case_plan_stale(
+    db: Session,
+    skill_id: int,
+    reason_codes: list[str] | None = None,
+) -> bool:
+    plan = latest_case_plan(db, skill_id)
+    if not plan:
+        return False
+    changed = False
+    if plan.status != "stale":
+        plan.status = "stale"
+        changed = True
+    before = list(plan.blocking_issues_json or [])
+    merged = _unique_issue_codes(before, list(reason_codes or []))
+    if merged != before:
+        plan.blocking_issues_json = merged
+        changed = True
+    return changed
 
 def role_label(role: SkillServiceRole) -> str:
     level = f"（{role.position_level}）" if role.position_level else ""

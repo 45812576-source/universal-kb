@@ -1,3 +1,5 @@
+from urllib.parse import quote
+
 from tests.conftest import _auth, _login, _make_skill, _make_user
 from app.models.business import (
     BusinessTable,
@@ -13,7 +15,7 @@ from app.models.knowledge_block import KnowledgeChunkMapping
 from app.models.tool import ToolRegistry, ToolType
 from app.models.sandbox import CaseVerdict, SandboxTestCase, SandboxTestReport, SandboxTestSession, SessionStep
 from app.models.skill import SkillVersion
-from app.models.skill_governance import PermissionDeclarationDraft, SandboxCaseMaterialization, SkillGovernanceJob
+from app.models.skill_governance import PermissionDeclarationDraft, RoleAssetGranularRule, SandboxCaseMaterialization, SkillGovernanceJob, SkillRoleAssetMountOverride, SkillRoleKnowledgeOverride, SkillRolePackage
 from app.models.skill_knowledge_ref import SkillKnowledgeReference
 from app.services.skill_governance_service import resolve_workspace_id, suggest_role_asset_policies, sync_bound_assets
 
@@ -2249,3 +2251,214 @@ def test_sandbox_case_plan_contract_review_route_returns_latest_review(client, d
     assert review_data["plan"]["id"] == plan["id"]
     assert review_data["review"]["status"] == "not_materialized"
     assert review_data["plan_state"]["status"] == "generated"
+
+def test_role_package_writeback_persists_overrides_and_marks_downstream_stale(client, db):
+    user = _make_user(db, username="role_package_author")
+    skill = _make_skill(db, user.id, name="Role Package Skill")
+    table = BusinessTable(
+        table_name="role_package_candidate_table",
+        display_name="Role Package 候选人表",
+    )
+    folder = KnowledgeFolder(name="Role Package 知识库", created_by=user.id)
+    knowledge = KnowledgeEntry(
+        title="候选人沟通规范",
+        content="包含手机号与沟通边界",
+        status=KnowledgeStatus.APPROVED,
+        created_by=user.id,
+        folder=folder,
+        review_level=3,
+        sensitivity_flags=["phone"],
+    )
+    db.add_all([table, folder, knowledge])
+    db.flush()
+    field = TableField(
+        table_id=table.id,
+        field_name="candidate_phone",
+        display_name="候选人手机号",
+        field_type="phone",
+        is_sensitive=True,
+        sort_order=1,
+    )
+    view = TableView(
+        table_id=table.id,
+        name="招聘视图",
+        view_type="grid",
+        config={},
+        created_by=user.id,
+    )
+    role_group = TableRoleGroup(
+        table_id=table.id,
+        name="招聘岗位组",
+        skill_ids=[skill.id],
+    )
+    db.add_all([field, view, role_group])
+    db.flush()
+    db.add(SkillTableBinding(
+        skill_id=skill.id,
+        table_id=table.id,
+        view_id=view.id,
+        binding_type="runtime_read",
+        created_by=user.id,
+    ))
+    db.add(SkillDataGrant(
+        skill_id=skill.id,
+        table_id=table.id,
+        view_id=view.id,
+        role_group_id=role_group.id,
+        grant_mode="allow",
+        allowed_actions=["read"],
+        max_disclosure_level="L2",
+        approval_required=False,
+        audit_level="full",
+    ))
+    db.add(TablePermissionPolicy(
+        table_id=table.id,
+        view_id=view.id,
+        role_group_id=role_group.id,
+        row_access_mode="department",
+        field_access_mode="blocklist",
+        blocked_field_ids=[field.id],
+        disclosure_level="L2",
+        masking_rule_json={"candidate_phone": "partial"},
+        tool_permission_mode="readonly",
+        export_permission=False,
+    ))
+    db.add(SkillKnowledgeReference(
+        skill_id=skill.id,
+        knowledge_id=knowledge.id,
+        snapshot_desensitization_level="L2",
+        snapshot_data_type_hits=["phone"],
+        snapshot_mask_rules=[{"data_type": "phone", "mask_action": "summary_only"}],
+        folder_id=folder.id,
+        folder_path="Role Package 知识库",
+        manager_scope_ok=True,
+        publish_version=1,
+    ))
+    skill.data_queries = [{
+        "query_name": "read_role_package_candidate_table",
+        "query_type": "read",
+        "table_name": "role_package_candidate_table",
+        "description": "Role Package 候选人表",
+    }]
+    db.commit()
+
+    token = _login(client, username="role_package_author")
+    headers = _auth(token)
+    role_resp = client.put(
+        f"/api/skill-governance/{skill.id}/service-roles",
+        headers=headers,
+        json={"roles": [{
+            "org_path": "公司经营发展中心/人力资源部",
+            "position_name": "招聘主管",
+            "position_level": "M0",
+        }]},
+    )
+    assert role_resp.status_code == 200, role_resp.text
+    role = role_resp.json()["data"]["roles"][0]
+    role_key = f"{role['org_path']}::{role['position_name']}::{role['position_level']}"
+
+    bundle = _seed_legacy_bundle(db, skill, user)
+    policies_resp = client.get(
+        f"/api/skill-governance/{skill.id}/role-asset-policies",
+        headers=headers,
+        params={"bundle_id": bundle.id, "include_rules": True},
+    )
+    policies = policies_resp.json()["data"]["items"]
+    table_policy = next(item for item in policies if item["asset"]["asset_type"] == "data_table")
+    rule = table_policy["granular_rules"][0]
+    mounted = client.get(f"/api/skill-governance/{skill.id}/mounted-permissions", headers=headers).json()["data"]
+    knowledge_permission = mounted["knowledge_permissions"][0]
+    mount_context = client.get(f"/api/skill-governance/{skill.id}/mount-context", headers=headers).json()["data"]
+    table_asset = next(item for item in mount_context["assets"] if item["asset_type"] == "data_table")
+    knowledge_asset = next(item for item in mount_context["assets"] if item["asset_type"] == "knowledge_base")
+
+    declaration = client.post(
+        f"/api/skill-governance/{skill.id}/permission-declaration",
+        headers=headers,
+        json={"bundle_id": bundle.id},
+    ).json()["data"]["declaration"]
+    plan_resp = client.post(
+        f"/api/skill-governance/{skill.id}/permission-case-plans",
+        headers=headers,
+        json={"focus_mode": "risk_focused", "max_cases": 5},
+    )
+    assert plan_resp.status_code == 200, plan_resp.text
+    plan = plan_resp.json()["data"]["plan"]
+
+    save_resp = client.put(
+        f"/api/skill-governance/{skill.id}/role-packages/{quote(role_key, safe='')}",
+        headers=headers,
+        json={
+            "role_key": role_key,
+            "role": {
+                "org_path": role["org_path"],
+                "position_name": role["position_name"],
+                "position_level": role["position_level"],
+                "role_label": role["role_label"],
+            },
+            "writeback_mode": "upsert_role_package",
+            "stale_downstream": ["mounted_permissions", "permission_declaration", "sandbox_case_plan"],
+            "package": {
+                "field_rules": [{
+                    "policy_id": table_policy["id"],
+                    "rule_id": rule["id"],
+                    "asset_id": table_policy["asset"]["id"],
+                    "target_ref": rule["target_ref"],
+                    "suggested_policy": "mask",
+                    "mask_style": "hash",
+                    "confirmed": True,
+                    "author_override_reason": None,
+                }],
+                "knowledge_permissions": [{
+                    "asset_id": knowledge_asset["id"],
+                    "asset_ref": knowledge_permission["asset_ref"],
+                    "knowledge_id": knowledge_permission["knowledge_id"],
+                    "desensitization_level": "L3",
+                    "grant_actions": ["read"],
+                    "enabled": False,
+                    "source_refs": knowledge_permission["source_refs"],
+                }],
+                "asset_mounts": [{
+                    "asset_id": table_asset["id"],
+                    "asset_ref_type": table_asset["asset_ref_type"],
+                    "asset_ref_id": table_asset["asset_ref_id"],
+                    "binding_mode": "reference_only",
+                    "enabled": False,
+                }],
+            },
+        },
+    )
+    assert save_resp.status_code == 200, save_resp.text
+    saved = save_resp.json()["data"]
+    assert saved["package_version"] == 1
+    assert saved["governance_version"] == bundle.governance_version + 1
+    assert "permission_declaration" in saved["stale_downstream"]
+    assert "sandbox_case_plan" in saved["stale_downstream"]
+
+    package = db.query(SkillRolePackage).filter_by(skill_id=skill.id, role_key=role_key).one()
+    assert package.package_version == 1
+    assert package.field_rules_json[0]["mask_style"] == "hash"
+    knowledge_override = db.query(SkillRoleKnowledgeOverride).filter_by(package_id=package.id).one()
+    assert knowledge_override.desensitization_level == "L3"
+    assert knowledge_override.enabled is False
+    asset_override = db.query(SkillRoleAssetMountOverride).filter_by(package_id=package.id).one()
+    assert asset_override.binding_mode == "reference_only"
+    assert asset_override.enabled is False
+
+    updated_rule = db.get(RoleAssetGranularRule, rule["id"])
+    assert updated_rule.mask_style == "hash"
+    assert updated_rule.confirmed is True
+
+    latest_declaration = db.get(PermissionDeclarationDraft, declaration["id"])
+    assert latest_declaration.status == "stale"
+    assert "role_package_changed" in latest_declaration.diff_from_previous_json["stale_reason_codes"]
+    latest_plan = client.get(f"/api/skill-governance/{skill.id}/permission-case-plans/latest", headers=headers).json()["data"]["plan"]
+    assert latest_plan["id"] == plan["id"]
+    assert latest_plan["status"] == "stale"
+    assert "role_package_changed" in latest_plan["blocking_issues"]
+
+    list_resp = client.get(f"/api/skill-governance/{skill.id}/role-packages", headers=headers)
+    assert list_resp.status_code == 200, list_resp.text
+    listed = list_resp.json()["data"]["packages"]
+    assert listed[0]["role_key"] == role_key
+    assert listed[0]["knowledge_permissions"][0]["desensitization_level"] == "L3"

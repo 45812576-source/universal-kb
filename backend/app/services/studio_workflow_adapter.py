@@ -15,6 +15,21 @@ from app.services.studio_workflow_protocol import (
 )
 
 
+def _recovery_meta(memo: dict[str, Any] | None) -> dict[str, Any]:
+    recovery = memo.get("workflow_recovery") if isinstance(memo, dict) else None
+    if not isinstance(recovery, dict):
+        return {
+            "recovery_source": None,
+            "recovery_revision": None,
+            "recovery_updated_at": None,
+        }
+    return {
+        "recovery_source": recovery.get("source") if isinstance(recovery.get("source"), str) else None,
+        "recovery_revision": int(recovery.get("revision")) if isinstance(recovery.get("revision"), int) else None,
+        "recovery_updated_at": recovery.get("updated_at") if isinstance(recovery.get("updated_at"), str) else None,
+    }
+
+
 def normalize_workflow_card(
     raw: dict[str, Any],
     *,
@@ -142,6 +157,7 @@ def dispatch_workflow_action(
             workflow_state_patch=dict(workflow_state),
             memo_refresh_required=False,
             editor_refresh_required=False,
+            **_recovery_meta(memo if isinstance(memo, dict) else None),
             result={
                 "next_action": workflow_state.get("next_action"),
                 "phase": workflow_state.get("phase"),
@@ -164,6 +180,7 @@ def dispatch_workflow_action(
             ).to_dict()
         adopted = adopt_staged_edit(db, staged_edit_id, user_id)
         workflow_state_patch: dict[str, Any] = {}
+        memo: dict[str, Any] | None = None
         if adopted.get("ok"):
             memo = patch_workflow_recovery_action(
                 db,
@@ -185,11 +202,14 @@ def dispatch_workflow_action(
             action=action,
             card_id=card_id,
             staged_edit_id=str(staged_edit_id),
+            target_type=str(adopted.get("target_type")) if adopted.get("target_type") is not None else None,
+            target_key=str(adopted.get("target_key")) if adopted.get("target_key") is not None else None,
             updated_card_status="adopted" if adopted.get("ok") else None,
             updated_staged_edit_status="adopted" if adopted.get("ok") else None,
             workflow_state_patch=workflow_state_patch,
             memo_refresh_required=True,
             editor_refresh_required=True,
+            **_recovery_meta(memo),
             result=adopted,
             error=None if adopted.get("ok") else str(adopted.get("error") or "adopt_failed"),
         ).to_dict()
@@ -208,6 +228,7 @@ def dispatch_workflow_action(
             ).to_dict()
         rejected = reject_staged_edit(db, staged_edit_id, user_id)
         workflow_state_patch: dict[str, Any] = {}
+        memo: dict[str, Any] | None = None
         if rejected.get("ok"):
             memo = patch_workflow_recovery_action(
                 db,
@@ -229,11 +250,14 @@ def dispatch_workflow_action(
             action=action,
             card_id=card_id,
             staged_edit_id=str(staged_edit_id),
+            target_type=str(rejected.get("target_type")) if rejected.get("target_type") is not None else None,
+            target_key=str(rejected.get("target_key")) if rejected.get("target_key") is not None else None,
             updated_card_status="rejected" if rejected.get("ok") else None,
             updated_staged_edit_status="rejected" if rejected.get("ok") else None,
             workflow_state_patch=workflow_state_patch,
             memo_refresh_required=True,
             editor_refresh_required=False,
+            **_recovery_meta(memo),
             result=rejected,
             error=None if rejected.get("ok") else str(rejected.get("error") or "reject_failed"),
         ).to_dict()
@@ -323,6 +347,7 @@ def dispatch_workflow_action(
 
         workflow_state_patch: dict[str, Any] = {}
         memo_refresh_required = False
+        memo: dict[str, Any] | None = None
         if result.get("ok") and card_id:
             memo = patch_workflow_recovery_action(
                 db,
@@ -347,6 +372,7 @@ def dispatch_workflow_action(
             workflow_state_patch=workflow_state_patch,
             memo_refresh_required=memo_refresh_required,
             editor_refresh_required=False,
+            **_recovery_meta(memo),
             result=result,
             error=None if result.get("ok") else str(result.get("error") or "followup_action_failed"),
         ).to_dict()

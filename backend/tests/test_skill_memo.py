@@ -492,6 +492,8 @@ class TestWorkflowRecovery:
         assert result["workflow_recovery"]["staged_edits"][0]["status"] == "adopted"
         assert result["workflow_recovery"]["workflow_state"]["next_action"] == "run_preflight"
         assert result["workflow_recovery"]["workflow_state"]["phase"] == "validate"
+        assert result["workflow_recovery"]["source"] == "skill_memo"
+        assert result["workflow_recovery"]["revision"] >= 2
         recommendation = result["workflow_recovery"]["workflow_state"]["metadata"]["test_recommendation"]
         assert recommendation["scope"] == "preflight"
 
