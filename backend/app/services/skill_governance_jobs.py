@@ -138,6 +138,15 @@ def process_governance_job(job_id: int, session_factory: Callable[[], Session] =
                 focus_mode=payload.get("focus_mode") or "risk_focused",
                 max_cases=int(payload.get("max_cases") or 12),
             )
+            # 回写测试流谱系元数据
+            if payload.get("generation_mode"):
+                plan.generation_mode = payload["generation_mode"]
+            if payload.get("source_plan_id"):
+                plan.source_plan_id = payload["source_plan_id"]
+            if payload.get("entry_source"):
+                plan.entry_source = payload["entry_source"]
+            if payload.get("conversation_id") is not None:
+                plan.conversation_id = payload["conversation_id"]
             job.result_json = {
                 "plan_id": plan.id,
                 "plan": serialize_case_plan(plan),

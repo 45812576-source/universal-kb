@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_db, SessionLocal
+from app.services.test_flow_history import decorate_history, decorate_report, decorate_session
 from app.dependencies import get_current_user
 from app.utils.sql_safe import qi
 from app.models.user import User, Role
@@ -985,7 +986,7 @@ async def list_history(
         .all()
     )
 
-    return [
+    items = [
         {
             **_serialize_session(session),
             "has_report": session.report_id is not None,
@@ -997,6 +998,7 @@ async def list_history(
         }
         for session in sessions
     ]
+    return decorate_history(db, items)
 
 
 @router.get("/{session_id}")
@@ -1010,7 +1012,7 @@ async def get_session(
     if not session:
         raise HTTPException(404, "测试会话不存在")
     _check_session_access(session, user)
-    return _serialize_session(session)
+    return decorate_session(db, _serialize_session(session))
 
 
 @router.post("/{session_id}/input-slots")
@@ -2243,7 +2245,7 @@ async def get_report(
         for c in cases
     ]
 
-    return {
+    report_dict = {
         "report_id": report.id,
         "session_id": report.session_id,
         "target_type": report.target_type,
@@ -2267,6 +2269,7 @@ async def get_report(
         "created_at": report.created_at.isoformat() if report.created_at else None,
         "supporting_findings": (report.part3_evaluation or {}).get("supporting_findings", []),
     }
+    return decorate_report(db, report_dict)
 
 
 @router.get("/{session_id}/issues")

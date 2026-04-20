@@ -41,6 +41,10 @@ class GenerateSandboxCasePlanRequest(BaseModel):
     risk_focus: list[str] = []
     max_case_count: int = Field(default=10, ge=1, le=50)
     async_job: bool = False
+    generation_mode: Optional[str] = None
+    source_plan_id: Optional[int] = None
+    entry_source: Optional[str] = None
+    conversation_id: Optional[int] = None
 
 
 class ReviewSandboxCasePlanRequest(BaseModel):
@@ -62,6 +66,10 @@ class UpdateSandboxCaseDraftRequest(BaseModel):
 
 class MaterializeSandboxCasePlanRequest(BaseModel):
     sandbox_session_id: Optional[int] = None
+    entry_source: Optional[str] = None
+    decision_mode: Optional[str] = None
+    conversation_id: Optional[int] = None
+    workflow_id: Optional[int] = None
 
 
 @router.get("/{skill_id}/readiness")
@@ -104,10 +112,16 @@ def get_latest_sandbox_case_plan(
         declaration=declaration,
         bundle=bundle,
     )
+    plan_data = serialize_case_plan(plan)
+    if plan_data and plan:
+        plan_data["summary_json"] = plan.summary_json
+        plan_data["source_plan_id"] = plan.source_plan_id
+        plan_data["generation_mode"] = plan.generation_mode
+        plan_data["latest_materialized_session_id"] = plan.latest_materialized_session_id
     return ok({
         "skill_id": skill_id,
         "readiness": readiness,
-        "plan": serialize_case_plan(plan),
+        "plan": plan_data,
         "cases": [serialize_case_draft(case) for case in list(plan.cases or [])] if plan else [],
         "plan_state": plan_state,
     })
@@ -142,7 +156,15 @@ def generate_sandbox_case_plan(
             skill_id=skill_id,
             workspace_id=workspace_id,
             job_type="permission_case_plan_generation",
-            payload={"focus_mode": req.mode, "max_cases": req.max_case_count, "risk_focus": req.risk_focus},
+            payload={
+                "focus_mode": req.mode,
+                "max_cases": req.max_case_count,
+                "risk_focus": req.risk_focus,
+                "generation_mode": req.generation_mode,
+                "source_plan_id": req.source_plan_id,
+                "entry_source": req.entry_source,
+                "conversation_id": req.conversation_id,
+            },
             created_by=user.id,
         )
         db.commit()
@@ -160,6 +182,15 @@ def generate_sandbox_case_plan(
         focus_mode=req.mode,
         max_cases=req.max_case_count,
     )
+    # 写入测试流扩展字段
+    if req.generation_mode:
+        plan.generation_mode = req.generation_mode
+    if req.source_plan_id:
+        plan.source_plan_id = req.source_plan_id
+    if req.entry_source:
+        plan.entry_source = req.entry_source
+    if req.conversation_id is not None:
+        plan.conversation_id = req.conversation_id
     db.commit()
     return ok({
         "job_id": (
@@ -270,8 +301,50 @@ def materialize_sandbox_case_plan(
     if not plan:
         raise_api_error(404, "sandbox.case_plan_not_found", "Case plan not found", {"plan_id": plan_id})
     skill = assert_skill_governance_access(db, plan.skill_id, user)
+
+    # 测试流来源的 plan 必须先 confirm 才能 materialize
+    if req.entry_source and plan.entry_source and not plan.confirmed_at:
+        raise_api_error(
+            400,
+            "sandbox.plan_not_confirmed",
+            "该测试计划需先确认（confirm）后才能执行",
+            {"plan_id": plan_id},
+        )
+
     result = materialize_permission_case_plan(db, skill, user, plan)
+
+    # 回写 plan 字段
+    import datetime as _dt
+    plan.latest_materialized_session_id = result["sandbox_session_id"]
+    plan.last_used_at = _dt.datetime.utcnow()
+
+    # 创建 run link
+    from app.services.test_flow_history import create_run_link
+    create_run_link(
+        db,
+        session_id=result["sandbox_session_id"],
+        skill_id=plan.skill_id,
+        plan_id=plan.id,
+        plan_version=plan.plan_version,
+        case_count=result["case_count"],
+        created_by=user.id,
+        entry_source=req.entry_source,
+        decision_mode=req.decision_mode,
+        conversation_id=req.conversation_id,
+        workflow_id=req.workflow_id,
+    )
+
     db.commit()
+
+    # workflow event: 执行开始
+    from app.services.test_flow_workflow import emit_test_flow_execution_started
+    emit_test_flow_execution_started(
+        db, skill_id=plan.skill_id, user_id=user.id,
+        plan_id=plan.id, plan_version=plan.plan_version,
+        sandbox_session_id=result["sandbox_session_id"],
+        decision_mode=req.decision_mode,
+    )
+
     return ok({
         "materialized_count": result["case_count"],
         "sandbox_session_id": result["sandbox_session_id"],

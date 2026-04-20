@@ -61,6 +61,7 @@ from app.models.org_memory import (  # noqa: F401
     OrgMemoryApprovalLink,
 )
 from app.models.opencode import StudioRegistration  # noqa: F401
+from app.models.test_flow import TestFlowRunLink  # noqa: F401
 from app.models.permission import (  # noqa: F401
     Position, DataDomain, DataScopePolicy,
     MaskAction, PublishScope,
