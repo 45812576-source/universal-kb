@@ -406,6 +406,12 @@ class StudioRunRegistry:
                 selected_skill_id=run.skill_id,
                 editor_prompt=req_payload.get("editor_prompt"),
                 editor_is_dirty=bool(req_payload.get("editor_is_dirty")),
+                selected_source_filename=req_payload.get("selected_source_filename"),
+                active_card_id=req_payload.get("active_card_id"),
+                active_card_title=req_payload.get("active_card_title"),
+                active_card_mode=req_payload.get("active_card_mode"),
+                active_card_target=req_payload.get("active_card_target"),
+                active_card_validation_source=req_payload.get("active_card_validation_source"),
             ):
                 if run.cancel_requested:
                     raise asyncio.CancelledError()

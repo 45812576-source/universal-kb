@@ -285,6 +285,12 @@ class SkillStudioAgentProfile:
         selected_skill_id: Optional[int] = None,
         editor_prompt: Optional[str] = None,
         editor_is_dirty: bool = False,
+        selected_source_filename: Optional[str] = None,
+        active_card_id: Optional[str] = None,
+        active_card_title: Optional[str] = None,
+        active_card_mode: Optional[str] = None,
+        active_card_target: Optional[str] = None,
+        active_card_validation_source: Optional[dict[str, Any]] = None,
     ) -> AsyncIterator[HarnessEvent]:
         """流式执行 Skill Studio 请求 — 唯一主链。
 
@@ -334,7 +340,7 @@ class SkillStudioAgentProfile:
             run_id=run.run_id,
             step_type=StepType.CONTEXT_ASSEMBLED,
             seq=1,
-            input_summary=f"skill_id={selected_skill_id} editor_dirty={editor_is_dirty}",
+            input_summary=f"skill_id={selected_skill_id} editor_dirty={editor_is_dirty} active_card={active_card_id or '-'}",
         )
         self.store.add_step(ctx_step, db=db)
 
@@ -525,8 +531,14 @@ class SkillStudioAgentProfile:
                         available_tools=available_tools,
                         source_files=source_files,
                         source_files_content=source_files_content,
+                        selected_source_filename=selected_source_filename,
                         memo_context=memo_context,
                         skill_metadata=skill_metadata,
+                        active_card_id=active_card_id,
+                        active_card_title=active_card_title,
+                        active_card_mode=active_card_mode,
+                        active_card_target=active_card_target,
+                        active_card_validation_source=active_card_validation_source,
                     ):
                         await queue.put(item)
                 except BaseException as exc:  # noqa: BLE001

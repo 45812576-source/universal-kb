@@ -1098,6 +1098,11 @@ def _build_system(
     memo_context: dict | None = None,
     session_state: StudioSessionState | None = None,
     skill_metadata: dict | None = None,
+    active_card_id: str | None = None,
+    active_card_title: str | None = None,
+    active_card_mode: str | None = None,
+    active_card_target: str | None = None,
+    active_card_validation_source: dict | None = None,
 ) -> str:
     if editor_prompt and editor_prompt.strip():
         line_count = editor_prompt.count("\n") + 1
@@ -1150,6 +1155,20 @@ def _build_system(
 
     if selected_source_filename:
         result += f"\n\n> 用户当前正在编辑器中查看附属文件：**{selected_source_filename}**。当用户说「这个文件」、「当前文件」时，指的就是它。\n"
+
+    if active_card_id or active_card_title or active_card_mode or active_card_target:
+        result += "\n\n## 当前焦点卡片\n"
+        result += "当前对话围绕同一张工作台卡片推进。优先将本轮用户反馈理解为对该卡片的补充、澄清或推进，而不是开启无关新话题。\n"
+        if active_card_id:
+            result += f"- 卡片 ID：{active_card_id}\n"
+        if active_card_title:
+            result += f"- 卡片标题：{active_card_title}\n"
+        if active_card_mode:
+            result += f"- 工作区模式：{active_card_mode}\n"
+        if active_card_target:
+            result += f"- 当前目标：{active_card_target}\n"
+        if active_card_validation_source:
+            result += f"- 验证来源：{json.dumps(active_card_validation_source, ensure_ascii=False)}\n"
 
     # ── 辅助 Skill 策略注入 ──
     if session_state and session_state.session_mode:
@@ -1271,6 +1290,11 @@ async def run_stream(
     selected_source_filename: str | None = None,
     memo_context: dict | None = None,
     skill_metadata: dict | None = None,
+    active_card_id: str | None = None,
+    active_card_title: str | None = None,
+    active_card_mode: str | None = None,
+    active_card_target: str | None = None,
+    active_card_validation_source: dict | None = None,
 ) -> AsyncIterator[tuple[str, dict] | str]:
     """流式运行 studio agent (V2)。"""
 
@@ -1463,6 +1487,11 @@ async def run_stream(
         available_tools, source_files, source_files_content,
         selected_source_filename, memo_context, session_state,
         skill_metadata=skill_metadata,
+        active_card_id=active_card_id,
+        active_card_title=active_card_title,
+        active_card_mode=active_card_mode,
+        active_card_target=active_card_target,
+        active_card_validation_source=active_card_validation_source,
     )
     if workspace_system_context:
         system_content = system_content + "\n\n## 额外上下文\n" + workspace_system_context

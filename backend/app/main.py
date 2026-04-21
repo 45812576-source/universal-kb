@@ -358,6 +358,7 @@ from app.routers import org_memory  # noqa: E402
 from app.routers import skill_governance  # noqa: E402
 from app.routers import sandbox_case_plans  # noqa: E402
 from app.routers import test_flow  # noqa: E402
+from app.routers import studio_sessions  # noqa: E402
 app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(skills.router)
@@ -409,6 +410,7 @@ app.include_router(org_memory.router)
 app.include_router(skill_governance.router)
 app.include_router(sandbox_case_plans.router)
 app.include_router(test_flow.router)
+app.include_router(studio_sessions.router)
 
 # 头像静态文件服务
 _avatar_dir = Path("./uploads/avatars")

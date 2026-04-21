@@ -98,6 +98,13 @@ class SendMessage(BaseModel):
     editor_prompt: str | None = None
     editor_is_dirty: bool = False
     selected_source_filename: str | None = None
+    active_card_id: str | None = None
+    active_card_title: str | None = None
+    active_card_mode: str | None = None
+    active_card_target: str | None = None
+    active_card_source_card_id: str | None = None
+    active_card_staged_edit_id: str | None = None
+    active_card_validation_source: dict | None = None
 
     @field_validator("content")
     @classmethod
@@ -786,8 +793,22 @@ async def stream_message(
     _user_meta: dict = {}
     if req.selected_skill_id:
         _user_meta["skill_id"] = req.selected_skill_id
+    if req.active_card_id:
+        _user_meta["active_card_id"] = req.active_card_id
+    if req.active_card_source_card_id:
+        _user_meta["active_card_source_card_id"] = req.active_card_source_card_id
+    if req.active_card_staged_edit_id:
+        _user_meta["active_card_staged_edit_id"] = req.active_card_staged_edit_id
     if _ws_type_stream == "skill_studio":
         _user_meta["studio_scope"] = "skill_studio"
+        if req.active_card_title:
+            _user_meta["active_card_title"] = req.active_card_title
+        if req.active_card_mode:
+            _user_meta["active_card_mode"] = req.active_card_mode
+        if req.active_card_target:
+            _user_meta["active_card_target"] = req.active_card_target
+        if req.active_card_validation_source:
+            _user_meta["active_card_validation_source"] = req.active_card_validation_source
     if req.editor_prompt:
         _user_meta["editor_target"] = True
     if _h_req:
@@ -817,6 +838,13 @@ async def stream_message(
                 "editor_prompt": req.editor_prompt,
                 "editor_is_dirty": req.editor_is_dirty,
                 "selected_source_filename": req.selected_source_filename,
+                "active_card_id": req.active_card_id,
+                "active_card_title": req.active_card_title,
+                "active_card_mode": req.active_card_mode,
+                "active_card_target": req.active_card_target,
+                "active_card_source_card_id": req.active_card_source_card_id,
+                "active_card_staged_edit_id": req.active_card_staged_edit_id,
+                "active_card_validation_source": req.active_card_validation_source,
             },
         )
         return StreamingResponse(

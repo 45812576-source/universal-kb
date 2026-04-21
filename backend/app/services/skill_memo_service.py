@@ -78,6 +78,14 @@ class OptimisticLockError(Exception):
     """Raised when a memo was modified concurrently."""
 
 
+def save_memo_payload_atomic(db: Session, memo: SkillMemo, payload: dict) -> None:
+    """公共原子写入接口 — 供 studio_card_service 等外部 service 使用。
+
+    与 _save_memo_payload 相同：WHERE version= 原子检查 + digest cache 失效。
+    """
+    _save_memo_payload(db, memo, payload)
+
+
 def _save_memo_payload(db: Session, memo: SkillMemo, payload: dict) -> None:
     """M18: Atomically update memo_payload with optimistic version check."""
     payload = _invalidate_context_digest_cache(
@@ -135,6 +143,12 @@ def _empty_payload() -> dict:
     }
 
 
+# 当前 recovery schema 版本：
+# v1 = 旧格式（无 unified_architecture 标志）
+# v2 = 统一架构格式（含 unified_architecture 标志、cards merge 语义）
+RECOVERY_SCHEMA_VERSION = 2
+
+
 def _empty_workflow_recovery() -> dict:
     return {
         "workflow_state": None,
@@ -143,6 +157,7 @@ def _empty_workflow_recovery() -> dict:
         "source": "skill_memo",
         "revision": 0,
         "updated_at": None,
+        "schema_version": RECOVERY_SCHEMA_VERSION,
     }
 
 
@@ -225,7 +240,107 @@ def _get_workflow_recovery(payload: dict[str, Any]) -> dict[str, Any]:
     base["revision"] = _normalize_recovery_revision(raw.get("revision"))
     if raw.get("updated_at") is not None:
         base["updated_at"] = raw.get("updated_at")
+    # 保留既有 schema_version，旧数据默认 1
+    base["schema_version"] = raw.get("schema_version") or 1
     return base
+
+
+def _is_unified_architecture(workflow_state: dict[str, Any] | None) -> bool:
+    """检测当前 workflow 是否处于统一架构模式。
+
+    使用显式 metadata.unified_architecture 标志，不依赖 active_card_id
+    （它在所有卡片处理完后会变为 None）。
+    """
+    if not isinstance(workflow_state, dict):
+        return False
+    metadata = workflow_state.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("unified_architecture"):
+        return True
+    return False
+
+
+def _merge_cards(
+    existing: list[dict[str, Any]],
+    incoming: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """合并 cards 列表 — 统一架构模式下防止 bootstrap 覆写已有卡片。
+
+    逻辑：以 existing 为基础，incoming 中 id 相同的用 incoming 版本替换（更新），
+    id 不同的追加到末尾（新增）。
+    """
+    existing_by_id: dict[str, dict[str, Any]] = {}
+    for card in existing:
+        if isinstance(card, dict) and card.get("id"):
+            existing_by_id[str(card["id"])] = card
+
+    result_by_id: dict[str, dict[str, Any]] = dict(existing_by_id)
+    new_ids_order: list[str] = []
+    for card in incoming:
+        if not isinstance(card, dict):
+            continue
+        cid = str(card.get("id") or "")
+        if cid:
+            if cid not in result_by_id:
+                new_ids_order.append(cid)
+            result_by_id[cid] = card  # 更新或新增
+        else:
+            # 无 id 的卡片直接追加
+            new_ids_order.append(f"__noid_{id(card)}")
+            result_by_id[f"__noid_{id(card)}"] = card
+
+    # 保持原有顺序 + 新卡片追加到末尾
+    ordered = []
+    seen = set()
+    for card in existing:
+        if isinstance(card, dict) and card.get("id"):
+            cid = str(card["id"])
+            if cid in result_by_id and cid not in seen:
+                ordered.append(result_by_id[cid])
+                seen.add(cid)
+    for cid in new_ids_order:
+        if cid not in seen:
+            ordered.append(result_by_id[cid])
+            seen.add(cid)
+    return ordered
+
+
+def _merge_staged_edits(
+    existing: list[dict[str, Any]],
+    incoming: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """合并 staged_edits 列表 — 与 _merge_cards 同理。"""
+    existing_by_id: dict[str, dict[str, Any]] = {}
+    for edit in existing:
+        if isinstance(edit, dict) and edit.get("id"):
+            existing_by_id[str(edit["id"])] = edit
+
+    result_by_id: dict[str, dict[str, Any]] = dict(existing_by_id)
+    new_ids_order: list[str] = []
+    for edit in incoming:
+        if not isinstance(edit, dict):
+            continue
+        eid = str(edit.get("id") or "")
+        if eid:
+            if eid not in result_by_id:
+                new_ids_order.append(eid)
+            result_by_id[eid] = edit
+        else:
+            new_ids_order.append(f"__noid_{id(edit)}")
+            result_by_id[f"__noid_{id(edit)}"] = edit
+
+    ordered = []
+    seen = set()
+    for edit in existing:
+        if isinstance(edit, dict) and edit.get("id"):
+            eid = str(edit["id"])
+            if eid in result_by_id and eid not in seen:
+                ordered.append(result_by_id[eid])
+                seen.add(eid)
+    for eid in new_ids_order:
+        if eid not in seen:
+            ordered.append(result_by_id[eid])
+            seen.add(eid)
+    return ordered
 
 
 def _normalize_string_list(values: Any) -> list[str]:
@@ -581,6 +696,12 @@ def _refresh_workflow_recovery_state(payload: dict[str, Any]) -> bool:
         return False
 
     changed = False
+
+    # 守卫：统一架构模式下 phase/next_action 由 studio_card_service 管理，
+    # 此处不自动推进。检查显式标志（即使 active_card_id 为 None 也成立）。
+    if _is_unified_architecture(workflow_state):
+        return False
+
     pending_staged_edits = [
         edit for edit in recovery["staged_edits"]
         if isinstance(edit, dict) and str(edit.get("status") or "pending") == "pending"
@@ -607,6 +728,26 @@ def _refresh_workflow_recovery_state(payload: dict[str, Any]) -> bool:
         _mark_workflow_recovery_updated(recovery)
         payload["workflow_recovery"] = recovery
     return changed
+
+
+def sync_tasks_from_workflow_action(
+    payload: dict[str, Any],
+    *,
+    card_id: str | None,
+    staged_edit_id: str | None,
+    updated_card_status: str | None,
+    updated_staged_edit_status: str | None,
+    user_id: int | None = None,
+) -> bool:
+    """公共接口 — 供 studio_card_service 等外部 service 调用 tasks 双向同步。"""
+    return _sync_tasks_from_workflow_action(
+        payload,
+        card_id=card_id,
+        staged_edit_id=staged_edit_id,
+        updated_card_status=updated_card_status,
+        updated_staged_edit_status=updated_staged_edit_status,
+        user_id=user_id,
+    )
 
 
 def _sync_tasks_from_workflow_action(
@@ -766,6 +907,35 @@ def _sync_workflow_recovery_after_test_result(
     recovery = _get_workflow_recovery(payload)
     workflow_state = recovery.get("workflow_state") if isinstance(recovery.get("workflow_state"), dict) else None
     if not workflow_state:
+        return
+
+    # 统一架构模式检测：使用显式标志，不依赖 active_card_id（可能为 None）。
+    if _is_unified_architecture(workflow_state):
+        from app.services.studio_validation_service import apply_test_result_to_recovery
+
+        test_status = "pass" if status == "passed" else "fail"
+        apply_test_result_to_recovery(
+            recovery,
+            test_status=test_status,
+            test_summary=summary,
+            validation_type=source,
+            report_id=source_report_id,
+        )
+        # 也写入 last_test 元数据保持兼容
+        metadata = workflow_state.get("metadata") if isinstance(workflow_state.get("metadata"), dict) else {}
+        metadata = dict(metadata)
+        metadata["last_test"] = {
+            "source": source,
+            "status": status,
+            "approval_eligible": approval_eligible,
+            "summary": summary,
+            "source_report_id": source_report_id,
+            "updated_at": _now_iso(),
+        }
+        workflow_state["metadata"] = metadata
+        recovery["workflow_state"] = workflow_state
+        _mark_workflow_recovery_updated(recovery)
+        payload["workflow_recovery"] = recovery
         return
 
     metadata = workflow_state.get("metadata") if isinstance(workflow_state.get("metadata"), dict) else {}
@@ -2174,13 +2344,45 @@ def sync_workflow_recovery(
         return None
 
     payload = copy.deepcopy(memo.memo_payload or _empty_payload())
+
+    # 从既有 recovery 中 merge 统一架构字段，防止 bootstrap 覆写时丢失
+    existing_recovery = _get_workflow_recovery(payload)
+    existing_ws = existing_recovery.get("workflow_state") if isinstance(existing_recovery.get("workflow_state"), dict) else {}
+    for _merge_key in ("active_card_id", "workspace_mode"):
+        if _merge_key not in workflow_state or workflow_state[_merge_key] is None:
+            existing_val = existing_ws.get(_merge_key)
+            if existing_val is not None:
+                workflow_state[_merge_key] = existing_val
+    # merge metadata 中的 global_constraints 和 unified_architecture 标志
+    if isinstance(existing_ws.get("metadata"), dict):
+        new_metadata = workflow_state.get("metadata") or {}
+        if isinstance(new_metadata, dict):
+            if "global_constraints" not in new_metadata:
+                existing_gc = existing_ws["metadata"].get("global_constraints")
+                if existing_gc:
+                    new_metadata["global_constraints"] = existing_gc
+            # 传播 unified_architecture 标志 — 防止 bootstrap 覆写丢失
+            if existing_ws["metadata"].get("unified_architecture") and "unified_architecture" not in new_metadata:
+                new_metadata["unified_architecture"] = True
+            workflow_state["metadata"] = new_metadata
+
+    # 统一架构模式下 cards/staged_edits 做 merge 而非覆写
+    is_unified = _is_unified_architecture(workflow_state) or _is_unified_architecture(existing_ws)
+    if is_unified and (cards is not None or staged_edits is not None):
+        merged_cards = _merge_cards(existing_recovery.get("cards") or [], list(cards or []))
+        merged_edits = _merge_staged_edits(existing_recovery.get("staged_edits") or [], list(staged_edits or []))
+    else:
+        merged_cards = list(cards or [])
+        merged_edits = list(staged_edits or [])
+
     workflow_recovery = {
         "workflow_state": workflow_state,
-        "cards": list(cards or []),
-        "staged_edits": list(staged_edits or []),
+        "cards": merged_cards,
+        "staged_edits": merged_edits,
         "source": "skill_memo",
-        "revision": 0,
+        "revision": _normalize_recovery_revision(existing_recovery.get("revision")),
         "updated_at": None,
+        "schema_version": RECOVERY_SCHEMA_VERSION,
     }
     _mark_workflow_recovery_updated(workflow_recovery)
     _sync_import_audit_tasks_from_recovery(payload, workflow_recovery)
