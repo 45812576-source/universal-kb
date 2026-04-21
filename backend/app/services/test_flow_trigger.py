@@ -93,11 +93,22 @@ def resolve_test_flow_entry(db: Session, payload: dict[str, Any]) -> dict[str, A
         plan = latest_case_plan(db, skill_id)
         return {
             "action": "mount_blocked",
-            "reason": "skill_mount_not_ready",
+            "reason": "case_generation_gate_blocked",
             "skill": skill_info,
             "blocking_issues": readiness.get("blocking_issues", ["missing_permission_mount"]),
             "mount_cta": readiness.get("mount_cta"),
             "latest_plan": _summarize_plan(serialize_case_plan(plan)),
+            # 门禁语义字段
+            "blocked_stage": readiness.get("blocked_stage"),
+            "blocked_before": readiness.get("blocked_before"),
+            "case_generation_allowed": readiness.get("case_generation_allowed", False),
+            "quality_evaluation_started": readiness.get("quality_evaluation_started", False),
+            "verdict_label": readiness.get("verdict_label"),
+            "verdict_reason": readiness.get("verdict_reason"),
+            "gate_summary": readiness.get("gate_summary"),
+            "gate_reasons": readiness.get("gate_reasons", []),
+            "guided_steps": readiness.get("guided_steps", []),
+            "primary_action": readiness.get("primary_action"),
         }
 
     # 5) ready → 检查是否有历史 plan

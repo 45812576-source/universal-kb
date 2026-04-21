@@ -87,17 +87,24 @@ def emit_test_flow_blocked(
     user_id: int,
     blocking_issues: list[str],
     mount_cta: str | None = None,
+    gate_summary: str | None = None,
+    primary_action: str | None = None,
 ) -> None:
     """挂载阻断事件。"""
+    payload: dict[str, Any] = {
+        "blocking_issues": blocking_issues,
+        "mount_cta": mount_cta,
+    }
+    if gate_summary is not None:
+        payload["gate_summary"] = gate_summary
+    if primary_action is not None:
+        payload["primary_action"] = primary_action
     event_bus.emit(
         db,
         event_type="test_flow_blocked",
         source_type="test_flow",
         source_id=skill_id,
-        payload={
-            "blocking_issues": blocking_issues,
-            "mount_cta": mount_cta,
-        },
+        payload=payload,
         user_id=user_id,
     )
 

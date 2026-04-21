@@ -707,6 +707,16 @@ def _sync_preflight_memo(
 
 def _ensure_preflight_can_start(db: Session, skill_id: int) -> None:
     from app.services.skill_memo_service import assess_test_start
+    from app.services.test_flow_readiness import check_readiness
+
+    # 门禁检查：绑定表 / 权限声明 / 表治理 必须就绪
+    readiness = check_readiness(db, skill_id)
+    if not readiness.get("ready"):
+        gate_summary = readiness.get("gate_summary", "前置条件未满足")
+        raise HTTPException(
+            409,
+            f"质量检测门禁未通过：{gate_summary}。请先在治理面板补齐前置条件。",
+        )
 
     result = assess_test_start(db, skill_id)
     if not result.get("allowed", False):

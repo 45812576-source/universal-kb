@@ -60,13 +60,21 @@ def resolve_entry(
     emit_test_flow_resolution(
         db, skill_id=skill_id, user_id=user.id,
         action=action, reason=result.get("reason"),
-        payload_extra={"entry_source": req.entry_source},
+        payload_extra={
+            "entry_source": req.entry_source,
+            "blocked_stage": result.get("blocked_stage"),
+            "blocked_before": result.get("blocked_before"),
+            "case_generation_allowed": result.get("case_generation_allowed"),
+            "quality_evaluation_started": result.get("quality_evaluation_started"),
+        },
     )
     if action == "mount_blocked":
         emit_test_flow_blocked(
             db, skill_id=skill_id or 0, user_id=user.id,
             blocking_issues=result.get("blocking_issues", []),
             mount_cta=result.get("mount_cta"),
+            gate_summary=result.get("gate_summary"),
+            primary_action=result.get("primary_action"),
         )
 
     return ok(result)

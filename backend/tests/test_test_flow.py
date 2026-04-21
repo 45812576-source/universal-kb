@@ -115,6 +115,218 @@ class TestResolveTestFlowEntry:
         assert result["action"] == "chat_default"
         assert result["reason"] == "missing_skill_target"
 
+    @patch("app.services.test_flow_trigger.check_readiness")
+    @patch("app.services.test_flow_trigger.latest_case_plan")
+    def test_not_ready_returns_case_generation_gate_blocked(self, mock_latest, mock_readiness):
+        """missing_bound_assets 时返回门禁语义字段。"""
+        mock_readiness.return_value = {
+            "ready": False,
+            "blocking_issues": ["missing_bound_assets"],
+            "mount_cta": "mount_data_assets",
+            "blocked_stage": "case_generation_gate",
+            "blocked_before": "case_generation",
+            "case_generation_allowed": False,
+            "quality_evaluation_started": False,
+            "verdict_label": "尚未开始质量检测",
+            "verdict_reason": "前置条件未完成：未绑定可测试数据资产",
+            "gate_summary": "需要先完成：未绑定可测试数据资产",
+            "gate_reasons": [{"code": "missing_bound_assets", "title": "未绑定可测试数据资产", "detail": "Skill 未绑定任何数据表，无法生成测试用例。请先在治理面板绑定数据资产。", "severity": "critical", "step_id": "bind_assets", "action": "go_bound_assets"}],
+            "guided_steps": [],
+            "primary_action": "go_bound_assets",
+        }
+        mock_latest.return_value = None
+
+        result = self._call({
+            "content": "@销售助手 生成测试用例",
+            "mentioned_skill_ids": [7],
+            "candidate_skills": [{"id": 7, "name": "销售助手"}],
+        })
+        assert result["action"] == "mount_blocked"
+        assert result["reason"] == "case_generation_gate_blocked"
+        assert result["blocked_stage"] == "case_generation_gate"
+        assert result["blocked_before"] == "case_generation"
+        assert result["case_generation_allowed"] is False
+        assert result["quality_evaluation_started"] is False
+        assert result["verdict_label"] == "尚未开始质量检测"
+        assert result["primary_action"] == "go_bound_assets"
+        assert len(result["gate_reasons"]) == 1
+        assert result["gate_reasons"][0]["code"] == "missing_bound_assets"
+
+    @patch("app.services.test_flow_trigger.check_readiness")
+    @patch("app.services.test_flow_trigger.latest_case_plan")
+    def test_missing_declaration_guides_to_declaration_step(self, mock_latest, mock_readiness):
+        """missing_confirmed_declaration 时 primary_action 为 generate_declaration。"""
+        mock_readiness.return_value = {
+            "ready": False,
+            "blocking_issues": ["missing_confirmed_declaration"],
+            "mount_cta": "complete_permission_declaration",
+            "blocked_stage": "case_generation_gate",
+            "blocked_before": "case_generation",
+            "case_generation_allowed": False,
+            "quality_evaluation_started": False,
+            "verdict_label": "尚未开始质量检测",
+            "verdict_reason": "前置条件未完成：未确认权限声明",
+            "gate_summary": "需要先完成：未确认权限声明",
+            "gate_reasons": [{"code": "missing_confirmed_declaration", "title": "未确认权限声明", "detail": "权限声明尚未生成或确认。请先生成并采纳权限声明。", "severity": "critical", "step_id": "confirm_declaration", "action": "generate_declaration"}],
+            "guided_steps": [],
+            "primary_action": "generate_declaration",
+        }
+        mock_latest.return_value = None
+
+        result = self._call({
+            "content": "@销售助手 生成测试用例",
+            "mentioned_skill_ids": [7],
+            "candidate_skills": [{"id": 7, "name": "销售助手"}],
+        })
+        assert result["action"] == "mount_blocked"
+        assert result["primary_action"] == "generate_declaration"
+        assert result["gate_reasons"][0]["step_id"] == "confirm_declaration"
+
+    @patch("app.services.test_flow_trigger.check_readiness")
+    @patch("app.services.test_flow_trigger.latest_case_plan")
+    def test_table_governance_issues_grouped(self, mock_latest, mock_readiness):
+        """多个表治理阻断原因正确分组。"""
+        mock_readiness.return_value = {
+            "ready": False,
+            "blocking_issues": ["missing_skill_data_grant", "missing_table_permission_policy"],
+            "mount_cta": "resolve_blocking_issues",
+            "blocked_stage": "case_generation_gate",
+            "blocked_before": "case_generation",
+            "case_generation_allowed": False,
+            "quality_evaluation_started": False,
+            "verdict_label": "尚未开始质量检测",
+            "verdict_reason": "前置条件未完成：数据表授权未配置、表权限策略未配置",
+            "gate_summary": "需要先完成：数据表授权未配置、表权限策略未配置",
+            "gate_reasons": [
+                {"code": "missing_skill_data_grant", "title": "数据表授权未配置", "detail": "Skill 的数据表授权尚未配置，请在治理面板补齐。", "severity": "critical", "step_id": "complete_table_governance", "action": "go_readiness"},
+                {"code": "missing_table_permission_policy", "title": "表权限策略未配置", "detail": "数据表的权限策略尚未配置，请在治理面板补齐。", "severity": "critical", "step_id": "complete_table_governance", "action": "go_readiness"},
+            ],
+            "guided_steps": [],
+            "primary_action": "go_readiness",
+        }
+        mock_latest.return_value = None
+
+        result = self._call({
+            "content": "@销售助手 生成测试用例",
+            "mentioned_skill_ids": [7],
+            "candidate_skills": [{"id": 7, "name": "销售助手"}],
+        })
+        assert result["action"] == "mount_blocked"
+        assert len(result["gate_reasons"]) == 2
+        assert result["gate_reasons"][0]["step_id"] == "complete_table_governance"
+        assert result["gate_reasons"][1]["step_id"] == "complete_table_governance"
+        assert result["primary_action"] == "go_readiness"
+
+    @patch("app.services.test_flow_trigger.check_readiness")
+    @patch("app.services.test_flow_trigger.latest_case_plan")
+    def test_ready_allows_case_generation(self, mock_latest, mock_readiness):
+        """readiness ready 时 case_generation_allowed=True, quality_evaluation_started=False。"""
+        mock_readiness.return_value = {
+            "ready": True,
+            "blocking_issues": [],
+            "blocked_stage": None,
+            "blocked_before": None,
+            "case_generation_allowed": True,
+            "quality_evaluation_started": False,
+            "verdict_label": "可生成测试用例",
+            "verdict_reason": None,
+            "gate_summary": None,
+            "gate_reasons": [],
+            "guided_steps": [],
+            "primary_action": None,
+        }
+        mock_latest.return_value = None
+
+        result = self._call({
+            "content": "@销售助手 生成测试用例",
+            "mentioned_skill_ids": [7],
+            "candidate_skills": [{"id": 7, "name": "销售助手"}],
+        })
+        assert result["action"] == "generate_cases"
+        assert "blocked_stage" not in result  # ready 路径不带门禁字段
+        assert "case_generation_allowed" not in result  # ready 路径走 generate_cases，不带这些字段
+
+
+# ── _build_case_generation_gate_details 单元测试 ─────────────────────────────
+
+
+class TestBuildCaseGenerationGateDetails:
+    """直接测试 _build_case_generation_gate_details 的 guided_steps 状态逻辑。"""
+
+    def _call(self, blocking_issues):
+        from app.services.test_flow_readiness import _build_case_generation_gate_details
+        readiness = {"ready": False, "blocking_issues": blocking_issues}
+        return _build_case_generation_gate_details(readiness)
+
+    def test_missing_bound_assets_steps_blocked_then_todo(self):
+        """第 1 步 blocked，后续步骤全部 todo。"""
+        result = self._call(["missing_bound_assets"])
+        steps = result["guided_steps"]
+        assert len(steps) == 4
+        assert steps[0]["id"] == "bind_assets"
+        assert steps[0]["status"] == "blocked"
+        assert steps[1]["status"] == "todo"
+        assert steps[2]["status"] == "todo"
+        assert steps[3]["status"] == "todo"
+
+    def test_missing_declaration_first_step_done(self):
+        """bind_assets 不阻断（done），confirm_declaration 阻断（blocked），后续 todo。"""
+        result = self._call(["missing_confirmed_declaration"])
+        steps = result["guided_steps"]
+        assert steps[0]["id"] == "bind_assets"
+        assert steps[0]["status"] == "done"
+        assert steps[1]["id"] == "confirm_declaration"
+        assert steps[1]["status"] == "blocked"
+        assert steps[2]["status"] == "todo"
+        assert steps[3]["status"] == "todo"
+
+    def test_table_governance_blocked_middle(self):
+        """只有 complete_table_governance 阻断时，前两步 done，第 3 步 blocked，第 4 步 todo。"""
+        result = self._call(["missing_skill_data_grant"])
+        steps = result["guided_steps"]
+        assert steps[0]["status"] == "done"
+        assert steps[1]["status"] == "done"
+        assert steps[2]["id"] == "complete_table_governance"
+        assert steps[2]["status"] == "blocked"
+        assert steps[3]["status"] == "todo"
+
+    def test_multiple_blocks_only_first_highlighted(self):
+        """多个阻断只高亮第一个，后续即使 blocked 也标 todo。"""
+        result = self._call(["missing_bound_assets", "missing_confirmed_declaration", "missing_skill_data_grant"])
+        steps = result["guided_steps"]
+        assert steps[0]["status"] == "blocked"  # bind_assets
+        assert steps[1]["status"] == "todo"     # confirm_declaration (本身也 blocked 但排在后面)
+        assert steps[2]["status"] == "todo"     # complete_table_governance
+        assert steps[3]["status"] == "todo"     # refresh_governance
+
+    def test_gate_reasons_sorted_by_priority(self):
+        """gate_reasons 按优先级排序。"""
+        result = self._call(["missing_skill_data_grant", "missing_bound_assets"])
+        reasons = result["gate_reasons"]
+        assert reasons[0]["code"] == "missing_bound_assets"
+        assert reasons[1]["code"] == "missing_skill_data_grant"
+
+    def test_primary_action_from_first_reason(self):
+        """primary_action 取第一个 gate_reason 的 action。"""
+        result = self._call(["missing_confirmed_declaration", "missing_skill_data_grant"])
+        assert result["primary_action"] == "generate_declaration"
+
+    def test_unknown_code_handled(self):
+        """未知阻断 code 不崩溃，fallback 到默认值。"""
+        result = self._call(["some_unknown_issue"])
+        assert len(result["gate_reasons"]) == 1
+        assert result["gate_reasons"][0]["code"] == "some_unknown_issue"
+        assert result["gate_reasons"][0]["step_id"] == "unknown"
+
+    def test_verdict_fields(self):
+        """基本字段正确。"""
+        result = self._call(["missing_bound_assets"])
+        assert result["blocked_stage"] == "case_generation_gate"
+        assert result["blocked_before"] == "case_generation"
+        assert result["case_generation_allowed"] is False
+        assert result["quality_evaluation_started"] is False
+        assert result["verdict_label"] == "尚未开始质量检测"
+
 
 # ── fork_case_plan ───────────────────────────────────────────────────────────
 
