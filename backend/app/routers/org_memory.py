@@ -1,6 +1,8 @@
+import os
+import tempfile
 from typing import Any, List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -9,6 +11,7 @@ from app.dependencies import get_current_user
 from app.models.org_memory import OrgMemoryProposal, OrgMemorySnapshot, OrgMemorySource
 from app.models.user import User
 from app.services import org_memory_service as service
+from app.utils.file_parser import extract_text
 
 
 router = APIRouter(prefix="/api/org-memory", tags=["org-memory"])
@@ -50,6 +53,47 @@ def ingest_source(
     return {"source_id": source.id, "status": source.ingest_status}
 
 
+@router.post("/sources/upload")
+async def upload_source(
+    file: UploadFile = File(...),
+    title: str = Form(None),
+    owner_name: str = Form(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    suffix = os.path.splitext(file.filename or "")[1].lower()
+    if not suffix:
+        raise HTTPException(400, "无法识别文件类型，请上传带扩展名的文件")
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    try:
+        content = await file.read()
+        os.write(tmp_fd, content)
+        os.close(tmp_fd)
+
+        text = extract_text(tmp_path)
+        if not text or not text.strip():
+            raise HTTPException(422, "文件内容为空或无法解析")
+
+        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+        raw_records = [{"content": p} for p in paragraphs]
+        raw_fields = [{"name": "content", "type": "text"}]
+
+        payload = {
+            "title": title or file.filename or "上传文件",
+            "source_type": "upload",
+            "source_uri": f"upload://{file.filename or 'unknown'}",
+            "owner_name": owner_name,
+            "raw_fields": raw_fields,
+            "raw_records": raw_records,
+        }
+        source = service.create_source(db, user, payload)
+        return {"source_id": source.id, "status": source.ingest_status}
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
 @router.delete("/sources/{source_id}")
 def delete_source(
     source_id: int,
@@ -68,7 +112,7 @@ class BatchSnapshotRequest(BaseModel):
 
 
 @router.post("/sources/batch-snapshot")
-def batch_snapshot(
+async def batch_snapshot(
     req: BatchSnapshotRequest,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -79,14 +123,14 @@ def batch_snapshot(
         if not source:
             raise HTTPException(404, f"源文档 #{sid} 不存在")
         sources.append(source)
-    snapshots = service.batch_create_snapshots(db, sources)
+    snapshots = await service.batch_create_snapshots(db, sources)
     return {
         "snapshots": [{"snapshot_id": s.id, "source_id": s.source_id, "status": s.parse_status} for s in snapshots],
     }
 
 
 @router.post("/sources/{source_id}/snapshots")
-def create_snapshot(
+async def create_snapshot(
     source_id: int,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -94,7 +138,7 @@ def create_snapshot(
     source = db.get(OrgMemorySource, source_id)
     if not source:
         raise HTTPException(404, "组织 Memory 源文档不存在")
-    snapshot = service.create_snapshot(db, source)
+    snapshot = await service.create_snapshot(db, source)
     return {"snapshot_id": snapshot.id, "status": snapshot.parse_status}
 
 

@@ -1,7 +1,13 @@
 import datetime
+import json
+import logging
 from typing import Any
 
 from sqlalchemy.orm import Session
+
+from app.services.llm_gateway import llm_gateway
+
+logger = logging.getLogger(__name__)
 
 from app.models.org_memory import (
     OrgMemoryAppliedConfig,
@@ -140,12 +146,14 @@ def create_source(db: Session, user: User, payload: dict[str, Any]) -> OrgMemory
     now = _now()
     raw_fields = payload.get("raw_fields")
     raw_records = payload.get("raw_records")
-    has_bitable_data = bool(raw_fields or raw_records)
-    parse_note = (
-        f"已解析飞书多维表格数据，{len(raw_fields or [])} 个字段、{len(raw_records or [])} 条记录。"
-        if has_bitable_data
-        else "资料已添加，可与其他资料一起生成快照。"
-    )
+    source_type = payload.get("source_type") or "markdown"
+    has_structured_data = bool(raw_fields or raw_records)
+    if has_structured_data and source_type == "upload":
+        parse_note = f"已解析上传文件，{len(raw_records or [])} 个段落。"
+    elif has_structured_data:
+        parse_note = f"已解析飞书多维表格数据，{len(raw_fields or [])} 个字段、{len(raw_records or [])} 条记录。"
+    else:
+        parse_note = "资料已添加，可与其他资料一起生成快照。"
     source = OrgMemorySource(
         title=str(payload.get("title") or "组织 Memory 源文档"),
         source_type=str(payload.get("source_type") or "markdown"),
@@ -172,10 +180,10 @@ def delete_source(db: Session, source: OrgMemorySource) -> None:
     db.commit()
 
 
-def batch_create_snapshots(db: Session, sources: list[OrgMemorySource]) -> list[OrgMemorySnapshot]:
+async def batch_create_snapshots(db: Session, sources: list[OrgMemorySource]) -> list[OrgMemorySnapshot]:
     snapshots = []
     for source in sources:
-        snapshot = create_snapshot(db, source)
+        snapshot = await create_snapshot(db, source)
         snapshots.append(snapshot)
     return snapshots
 
@@ -245,6 +253,113 @@ def _snapshot_payload(source: OrgMemorySource, snapshot_id: int) -> dict[str, An
     }
 
 
+async def _llm_extract_org_objects(db: Session, source: OrgMemorySource, snapshot_id: int) -> dict[str, Any]:
+    """调用 LLM 分析飞书多维表格数据，提取六类组织对象。失败时 fallback 到硬编码模板。"""
+    fields = source.raw_fields_json or []
+    records = source.raw_records_json or []
+
+    field_desc = "\n".join(f"- {f.get('name', '?')}（{f.get('type', '?')}）" for f in fields)
+    sample_records = records[:30]
+    records_text = json.dumps(sample_records, ensure_ascii=False, default=str)
+    # 截断避免 token 过长
+    if len(records_text) > 12000:
+        records_text = records_text[:12000] + "\n... (已截断)"
+
+    prompt = f"""你是组织分析专家。根据飞书多维表格数据，提取组织结构信息。
+
+## 字段定义
+{field_desc}
+
+## 数据（前{len(sample_records)}条）
+{records_text}
+
+请从数据中去重提取以下六类对象，返回严格 JSON：
+- units: 去重的部门/事业部列表，每项 {{"name": "部门名", "unit_type": "department", "responsibilities": ["职责1"]}}
+- roles: 去重的岗位列表，每项 {{"name": "岗位名", "department_name": "所属部门"}}
+- people: 如有具体人名，每项 {{"name": "姓名", "department_name": "部门", "role_name": "岗位"}}
+- okrs: 如有绩效目标/KPI，每项 {{"objective": "目标描述", "key_results": ["KR1"]}}
+- processes: 如有流程，每项 {{"name": "流程名", "participants": ["参与方"]}}
+- summary: 一句话描述这份数据的内容
+- entity_counts: 各类计数 {{"units": N, "roles": N, "people": N, "okrs": N, "processes": N}}
+
+要求：
+1. 从数据中去重提取，不要编造不存在的信息
+2. 某类不存在则返回空数组
+3. 只输出 JSON，不要输出其他文字"""
+
+    try:
+        config = llm_gateway.resolve_config(db, "governance.classify")
+        messages = [{"role": "user", "content": prompt}]
+        content, _usage = await llm_gateway.chat(config, messages, temperature=0.1, max_tokens=4096)
+
+        # 提取 JSON：支持 ```json ... ``` 包裹或直接 JSON
+        text = content.strip()
+        if "```" in text:
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start >= 0 and end > start:
+                text = text[start:end]
+        parsed = json.loads(text)
+
+        # 为每个对象补充 id 和 evidence_refs
+        evidence = [{"label": "飞书多维表格", "section": source.external_version or "latest", "excerpt": source.title}]
+        for i, unit in enumerate(parsed.get("units", [])):
+            unit.setdefault("id", snapshot_id * 100 + i + 1)
+            unit.setdefault("unit_type", "department")
+            unit.setdefault("parent_name", "公司")
+            unit.setdefault("leader_name", None)
+            unit.setdefault("responsibilities", [])
+            unit["evidence_refs"] = evidence
+        for i, role in enumerate(parsed.get("roles", [])):
+            role.setdefault("id", snapshot_id * 100 + 50 + i + 1)
+            role.setdefault("responsibilities", [])
+            role["evidence_refs"] = evidence
+        for i, person in enumerate(parsed.get("people", [])):
+            person.setdefault("id", snapshot_id * 100 + 200 + i + 1)
+            person.setdefault("manager_name", None)
+            person.setdefault("employment_status", "active")
+            person["evidence_refs"] = evidence
+        for i, okr in enumerate(parsed.get("okrs", [])):
+            okr.setdefault("id", snapshot_id * 100 + 300 + i + 1)
+            okr.setdefault("owner_name", "")
+            okr.setdefault("period", "当前周期")
+            okr.setdefault("key_results", [])
+            okr["evidence_refs"] = evidence
+        for i, proc in enumerate(parsed.get("processes", [])):
+            proc.setdefault("id", snapshot_id * 100 + 400 + i + 1)
+            proc.setdefault("owner_name", "")
+            proc.setdefault("participants", [])
+            proc.setdefault("outputs", [])
+            proc.setdefault("risk_points", [])
+            proc["evidence_refs"] = evidence
+
+        units = parsed.get("units", [])
+        roles = parsed.get("roles", [])
+        people = parsed.get("people", [])
+        okrs = parsed.get("okrs", [])
+        processes = parsed.get("processes", [])
+
+        return {
+            "summary": parsed.get("summary", ""),
+            "entity_counts": parsed.get("entity_counts", {
+                "units": len(units),
+                "roles": len(roles),
+                "people": len(people),
+                "okrs": len(okrs),
+                "processes": len(processes),
+            }),
+            "units": units,
+            "roles": roles,
+            "people": people,
+            "okrs": okrs,
+            "processes": processes,
+            "low_confidence_items": [],
+        }
+    except Exception as e:
+        logger.warning(f"LLM 提取组织对象失败，fallback 到硬编码模板: {e}")
+        return _snapshot_payload(source, snapshot_id)
+
+
 def _bitable_snapshot_summary(source: OrgMemorySource) -> str:
     fields = source.raw_fields_json or []
     records = source.raw_records_json or []
@@ -267,7 +382,7 @@ def _bitable_snapshot_summary(source: OrgMemorySource) -> str:
     return summary
 
 
-def create_snapshot(db: Session, source: OrgMemorySource) -> OrgMemorySnapshot:
+async def create_snapshot(db: Session, source: OrgMemorySource) -> OrgMemorySnapshot:
     has_bitable_data = bool(source.raw_fields_json or source.raw_records_json)
     if has_bitable_data:
         summary_text = _bitable_snapshot_summary(source)
@@ -283,7 +398,15 @@ def create_snapshot(db: Session, source: OrgMemorySource) -> OrgMemorySnapshot:
     )
     db.add(snapshot)
     db.flush()
-    payload = _snapshot_payload(source, snapshot.id)
+
+    if has_bitable_data:
+        payload = await _llm_extract_org_objects(db, source, snapshot.id)
+        # LLM 返回的 summary 覆盖默认摘要
+        if payload.get("summary"):
+            snapshot.summary = payload["summary"]
+    else:
+        payload = _snapshot_payload(source, snapshot.id)
+
     snapshot.snapshot_version = f"snapshot-{datetime.date.today().isoformat()}-{snapshot.id:02d}"
     snapshot.entity_counts_json = payload["entity_counts"]
     snapshot.units_json = payload["units"]
@@ -291,7 +414,7 @@ def create_snapshot(db: Session, source: OrgMemorySource) -> OrgMemorySnapshot:
     snapshot.people_json = payload["people"]
     snapshot.okrs_json = payload["okrs"]
     snapshot.processes_json = payload["processes"]
-    snapshot.low_confidence_items_json = payload["low_confidence_items"]
+    snapshot.low_confidence_items_json = payload.get("low_confidence_items", [])
     source.ingest_status = "ready"
     source.fetched_at = _now()
     source.latest_snapshot_id = snapshot.id
