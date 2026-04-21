@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, List
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -19,6 +19,10 @@ class SourceIngestRequest(BaseModel):
     source_uri: str
     title: str
     owner_name: str | None = None
+    bitable_app_token: str | None = None
+    bitable_table_id: str | None = None
+    raw_fields: list[dict[str, Any]] | None = None
+    raw_records: list[dict[str, Any]] | None = None
 
 
 @router.get("/sources")
@@ -44,6 +48,41 @@ def ingest_source(
 ):
     source = service.create_source(db, user, req.model_dump())
     return {"source_id": source.id, "status": source.ingest_status}
+
+
+@router.delete("/sources/{source_id}")
+def delete_source(
+    source_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    source = db.get(OrgMemorySource, source_id)
+    if not source:
+        raise HTTPException(404, "组织 Memory 源文档不存在")
+    service.delete_source(db, source)
+    return {"ok": True}
+
+
+class BatchSnapshotRequest(BaseModel):
+    source_ids: List[int]
+
+
+@router.post("/sources/batch-snapshot")
+def batch_snapshot(
+    req: BatchSnapshotRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    sources = []
+    for sid in req.source_ids:
+        source = db.get(OrgMemorySource, sid)
+        if not source:
+            raise HTTPException(404, f"源文档 #{sid} 不存在")
+        sources.append(source)
+    snapshots = service.batch_create_snapshots(db, sources)
+    return {
+        "snapshots": [{"snapshot_id": s.id, "source_id": s.source_id, "status": s.parse_status} for s in snapshots],
+    }
 
 
 @router.post("/sources/{source_id}/snapshots")

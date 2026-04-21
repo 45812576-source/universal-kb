@@ -40,6 +40,10 @@ def source_to_dto(source: OrgMemorySource) -> dict[str, Any]:
         "latest_snapshot_id": source.latest_snapshot_id,
         "latest_snapshot_version": source.latest_snapshot_version,
         "latest_parse_note": source.latest_parse_note,
+        "bitable_app_token": source.bitable_app_token,
+        "bitable_table_id": source.bitable_table_id,
+        "raw_fields": source.raw_fields_json,
+        "raw_records_count": len(source.raw_records_json) if source.raw_records_json else 0,
     }
 
 
@@ -134,6 +138,14 @@ def list_proposals(db: Session) -> list[dict[str, Any]]:
 
 def create_source(db: Session, user: User, payload: dict[str, Any]) -> OrgMemorySource:
     now = _now()
+    raw_fields = payload.get("raw_fields")
+    raw_records = payload.get("raw_records")
+    has_bitable_data = bool(raw_fields or raw_records)
+    parse_note = (
+        f"已解析飞书多维表格数据，{len(raw_fields or [])} 个字段、{len(raw_records or [])} 条记录。"
+        if has_bitable_data
+        else "资料已添加，可与其他资料一起生成快照。"
+    )
     source = OrgMemorySource(
         title=str(payload.get("title") or "组织 Memory 源文档"),
         source_type=str(payload.get("source_type") or "markdown"),
@@ -141,14 +153,31 @@ def create_source(db: Session, user: User, payload: dict[str, Any]) -> OrgMemory
         owner_name=str(payload.get("owner_name") or "组织运营组"),
         external_version=f"v{now.strftime('%Y.%m.%d.%H%M%S')}",
         fetched_at=now,
-        ingest_status="processing",
-        latest_parse_note="源文档已导入，等待生成结构化快照。",
+        ingest_status="ready",
+        latest_parse_note=parse_note,
+        bitable_app_token=payload.get("bitable_app_token"),
+        bitable_table_id=payload.get("bitable_table_id"),
+        raw_fields_json=raw_fields,
+        raw_records_json=raw_records,
         created_by=user.id,
     )
     db.add(source)
     db.commit()
     db.refresh(source)
     return source
+
+
+def delete_source(db: Session, source: OrgMemorySource) -> None:
+    db.delete(source)
+    db.commit()
+
+
+def batch_create_snapshots(db: Session, sources: list[OrgMemorySource]) -> list[OrgMemorySnapshot]:
+    snapshots = []
+    for source in sources:
+        snapshot = create_snapshot(db, source)
+        snapshots.append(snapshot)
+    return snapshots
 
 
 def _snapshot_payload(source: OrgMemorySource, snapshot_id: int) -> dict[str, Any]:
@@ -216,13 +245,41 @@ def _snapshot_payload(source: OrgMemorySource, snapshot_id: int) -> dict[str, An
     }
 
 
+def _bitable_snapshot_summary(source: OrgMemorySource) -> str:
+    fields = source.raw_fields_json or []
+    records = source.raw_records_json or []
+    field_names = [f.get("name", "?") for f in fields[:8]]
+    sample_lines = []
+    for row in records[:3]:
+        parts = []
+        for fn in field_names[:4]:
+            val = row.get(fn)
+            if val is not None:
+                text = str(val)[:30]
+                parts.append(f"{fn}={text}")
+        if parts:
+            sample_lines.append("  " + ", ".join(parts))
+    summary = f"飞书多维表格数据：{len(fields)} 个字段、{len(records)} 条记录。"
+    if field_names:
+        summary += f"\n字段：{', '.join(field_names)}"
+    if sample_lines:
+        summary += "\n前几行样本：\n" + "\n".join(sample_lines)
+    return summary
+
+
 def create_snapshot(db: Session, source: OrgMemorySource) -> OrgMemorySnapshot:
+    has_bitable_data = bool(source.raw_fields_json or source.raw_records_json)
+    if has_bitable_data:
+        summary_text = _bitable_snapshot_summary(source)
+    else:
+        summary_text = f"已从《{source.title}》抽取组织、岗位、人员、OKR 与流程对象，可继续生成统一草案。"
+
     snapshot = OrgMemorySnapshot(
         source_id=source.id,
         snapshot_version="pending",
         parse_status="ready",
-        confidence_score=0.82 if source.source_type == "upload" else 0.9,
-        summary=f"已从《{source.title}》抽取组织、岗位、人员、OKR 与流程对象，可继续生成统一草案。",
+        confidence_score=0.95 if has_bitable_data else (0.82 if source.source_type == "upload" else 0.9),
+        summary=summary_text,
     )
     db.add(snapshot)
     db.flush()
@@ -239,7 +296,11 @@ def create_snapshot(db: Session, source: OrgMemorySource) -> OrgMemorySnapshot:
     source.fetched_at = _now()
     source.latest_snapshot_id = snapshot.id
     source.latest_snapshot_version = snapshot.snapshot_version
-    source.latest_parse_note = "已生成结构化快照，六类组织对象字段齐全。"
+    source.latest_parse_note = (
+        f"已生成结构化快照，包含 {len(source.raw_fields_json or [])} 个字段、{len(source.raw_records_json or [])} 条记录的实际数据。"
+        if has_bitable_data
+        else "已生成结构化快照，六类组织对象字段齐全。"
+    )
     db.commit()
     db.refresh(snapshot)
     return snapshot
