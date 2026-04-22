@@ -10,9 +10,11 @@ from alembic import context
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.database import Base  # noqa: E402
+from app.config import settings  # noqa: E402
 import app.models  # noqa: E402, F401 — registers all models with Base.metadata
 
 config = context.config
+config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
