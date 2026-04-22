@@ -53,10 +53,6 @@ from app.models.org_management import (  # noqa: F401
     KrResourceMapping, CollabProtocol, OrgChangeImpact,
 )
 from app.models.org_memory import (  # noqa: F401
-    OrgGovernanceSnapshot,
-    OrgGovernanceSnapshotRun,
-    OrgGovernanceSnapshotSourceLink,
-    OrgGovernanceSnapshotTab,
     OrgMemorySource,
     OrgMemorySnapshot,
     OrgMemoryProposal,
