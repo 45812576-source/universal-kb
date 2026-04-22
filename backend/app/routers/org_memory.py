@@ -1,16 +1,20 @@
+from __future__ import annotations
+
 import os
 import tempfile
-from typing import Any, List
+from typing import Any, List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models.org_memory import OrgMemoryProposal, OrgMemorySnapshot, OrgMemorySource
+from app.models.org_memory import OrgGovernanceSnapshot, OrgGovernanceSnapshotRun, OrgMemoryProposal, OrgMemorySnapshot, OrgMemorySource
 from app.models.user import User
+from app.schemas.org_governance_snapshot import SaveTabMarkdownRequest, WorkspaceSnapshotEventRequest
 from app.services import org_memory_service as service
+from app.services import org_governance_snapshot_service as governance_snapshot_service
 from app.utils.file_parser import extract_text
 
 
@@ -21,11 +25,96 @@ class SourceIngestRequest(BaseModel):
     source_type: str = "markdown"
     source_uri: str
     title: str
-    owner_name: str | None = None
-    bitable_app_token: str | None = None
-    bitable_table_id: str | None = None
-    raw_fields: list[dict[str, Any]] | None = None
-    raw_records: list[dict[str, Any]] | None = None
+    owner_name: Optional[str] = None
+    bitable_app_token: Optional[str] = None
+    bitable_table_id: Optional[str] = None
+    raw_fields: Optional[list[dict[str, Any]]] = None
+    raw_records: Optional[list[dict[str, Any]]] = None
+
+
+@router.post("/workspace-snapshot-events")
+def handle_workspace_snapshot_event(
+    req: WorkspaceSnapshotEventRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    return governance_snapshot_service.handle_snapshot_event(db, req, user)
+
+
+@router.get("/workspace-snapshot-runs/{run_id}")
+def get_workspace_snapshot_run(
+    run_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    run = (
+        db.query(OrgGovernanceSnapshotRun)
+        .filter(OrgGovernanceSnapshotRun.run_id == run_id)
+        .first()
+    )
+    if not run:
+        raise HTTPException(404, "组织治理快照运行记录不存在")
+    return governance_snapshot_service.run_to_dto(run)
+
+
+@router.get("/workspace-snapshots")
+def list_workspace_snapshots(
+    workspace_id: Optional[str] = Query(None),
+    app: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    return {"items": governance_snapshot_service.list_workspace_snapshots(db, workspace_id, app)}
+
+
+@router.get("/workspace-snapshots/{snapshot_id}")
+def get_workspace_snapshot(
+    snapshot_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    snapshot = db.get(OrgGovernanceSnapshot, snapshot_id)
+    if not snapshot:
+        raise HTTPException(404, "组织治理快照不存在")
+    return governance_snapshot_service.snapshot_to_detail(snapshot)
+
+
+@router.put("/workspace-snapshots/{snapshot_id}/tabs/{tab_key}/markdown")
+def save_workspace_snapshot_tab_markdown(
+    snapshot_id: int,
+    tab_key: str,
+    req: SaveTabMarkdownRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    return governance_snapshot_service.save_tab_markdown(db, snapshot_id, tab_key, req.markdown, user)
+
+
+@router.post("/workspace-snapshots/{snapshot_id}/sync")
+def sync_workspace_snapshot_markdown(
+    snapshot_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    return governance_snapshot_service.sync_all_markdown(db, snapshot_id, user)
+
+
+@router.get("/workspace-snapshots/{snapshot_id}/governance-version")
+def get_workspace_snapshot_governance_version(
+    snapshot_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    return governance_snapshot_service.get_workspace_snapshot_governance_version(db, snapshot_id)
+
+
+@router.post("/workspace-snapshots/{snapshot_id}/governance-version")
+def derive_workspace_snapshot_governance_version(
+    snapshot_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    return governance_snapshot_service.derive_governance_version(db, snapshot_id)
 
 
 @router.get("/sources")

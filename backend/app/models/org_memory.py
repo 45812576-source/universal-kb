@@ -1,6 +1,6 @@
 import datetime
 
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import relationship
 
@@ -125,3 +125,94 @@ class OrgMemoryApprovalLink(Base):
     callback_payload_json = Column(JSON, nullable=True)
 
     proposal = relationship("OrgMemoryProposal")
+
+
+class OrgGovernanceSnapshotRun(Base):
+    __tablename__ = "org_governance_snapshot_runs"
+    __table_args__ = (
+        Index("ix_org_gov_snapshot_runs_run_id", "run_id"),
+        Index("ix_org_gov_snapshot_runs_workspace", "workspace_id", "app", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(64), nullable=False, unique=True)
+    event_type = Column(String(80), nullable=False)
+    workspace_id = Column(String(255), nullable=False)
+    workspace_type = Column(String(80), nullable=False, default="workspace")
+    app = Column(String(80), nullable=False, default="universal-kb")
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    status = Column(String(50), nullable=False, default="running")
+    request_payload_json = Column(JSON, nullable=True)
+    response_summary_json = Column(JSON, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+
+class OrgGovernanceSnapshot(Base):
+    __tablename__ = "org_governance_snapshots"
+    __table_args__ = (
+        Index("ix_org_gov_snapshots_workspace", "workspace_id", "app", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    workspace_id = Column(String(255), nullable=False)
+    workspace_type = Column(String(80), nullable=False, default="workspace")
+    app = Column(String(80), nullable=False, default="universal-kb")
+    title = Column(String(255), nullable=False)
+    version = Column(String(100), nullable=False)
+    status = Column(String(50), nullable=False, default="draft")
+    scope = Column(String(50), nullable=False, default="all")
+    source_snapshot_id = Column(Integer, ForeignKey("org_memory_snapshots.id"), nullable=True)
+    base_snapshot_id = Column(Integer, ForeignKey("org_governance_snapshots.id"), nullable=True)
+    confidence_score = Column(Float, nullable=False, default=0.0)
+    markdown_by_tab_json = Column(JSON, default=dict)
+    structured_by_tab_json = Column(JSON, default=dict)
+    governance_outputs_json = Column(JSON, default=dict)
+    missing_items_json = Column(JSON, default=list)
+    conflicts_json = Column(JSON, default=list)
+    low_confidence_items_json = Column(JSON, default=list)
+    separation_of_duty_risks_json = Column(JSON, default=list)
+    change_summary_json = Column(JSON, default=dict)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    tabs = relationship("OrgGovernanceSnapshotTab", back_populates="snapshot", cascade="all, delete-orphan")
+    source_links = relationship("OrgGovernanceSnapshotSourceLink", back_populates="snapshot", cascade="all, delete-orphan")
+    source_snapshot = relationship("OrgMemorySnapshot", foreign_keys=[source_snapshot_id])
+
+
+class OrgGovernanceSnapshotSourceLink(Base):
+    __tablename__ = "org_governance_snapshot_source_links"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(Integer, ForeignKey("org_governance_snapshots.id"), nullable=False)
+    source_type = Column(String(80), nullable=False, default="org_memory_source")
+    source_id = Column(String(255), nullable=True)
+    source_uri = Column(String(1024), nullable=True)
+    title = Column(String(255), nullable=True)
+    evidence_refs_json = Column(JSON, default=list)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    snapshot = relationship("OrgGovernanceSnapshot", back_populates="source_links")
+
+
+class OrgGovernanceSnapshotTab(Base):
+    __tablename__ = "org_governance_snapshot_tabs"
+    __table_args__ = (
+        Index("ix_org_gov_snapshot_tabs_snapshot_tab", "snapshot_id", "tab_key", unique=True),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(Integer, ForeignKey("org_governance_snapshots.id"), nullable=False)
+    tab_key = Column(String(50), nullable=False)
+    markdown = Column(Text, nullable=False, default="")
+    structured_json = Column(JSON, default=dict)
+    sync_status_json = Column(JSON, default=dict)
+    parser_warnings_json = Column(JSON, default=list)
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    snapshot = relationship("OrgGovernanceSnapshot", back_populates="tabs")

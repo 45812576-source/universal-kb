@@ -1,4 +1,6 @@
 """Extract plain text from uploaded documents."""
+from __future__ import annotations
+
 import base64
 import html
 import os
