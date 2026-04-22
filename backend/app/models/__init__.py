@@ -53,6 +53,10 @@ from app.models.org_management import (  # noqa: F401
     KrResourceMapping, CollabProtocol, OrgChangeImpact,
 )
 from app.models.org_memory import (  # noqa: F401
+    OrgGovernanceSnapshot,
+    OrgGovernanceSnapshotRun,
+    OrgGovernanceSnapshotSourceLink,
+    OrgGovernanceSnapshotTab,
     OrgMemorySource,
     OrgMemorySnapshot,
     OrgMemoryProposal,
@@ -62,6 +66,7 @@ from app.models.org_memory import (  # noqa: F401
 )
 from app.models.opencode import StudioRegistration  # noqa: F401
 from app.models.test_flow import TestFlowRunLink  # noqa: F401
+from app.models.agent_run import AgentRun, AgentRunEvent  # noqa: F401
 from app.models.permission import (  # noqa: F401
     Position, DataDomain, DataScopePolicy,
     MaskAction, PublishScope,

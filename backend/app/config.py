@@ -62,6 +62,9 @@ class Settings(BaseSettings):
     SKILL_STUDIO_ROLLOUT_DEPARTMENT_IDS: str = ""
     SKILL_STUDIO_ROLLOUT_SESSION_MODES: str = ""
 
+    # ── Harness Gateway 主链灰度 ─────────────────────────────────────────────
+    GATEWAY_MAIN_CHAIN_ENABLED: bool = False  # True = 走 gateway.dispatch(), False = legacy
+
     # 百炼 Coding Plan 三窗口额度，达到任一窗口 90% 自动切换 ARK
     BAILIAN_QUOTA_5H: int = 6000    # 每 5 小时最多请求数
     BAILIAN_QUOTA_7D: int = 45000   # 每 7 天最多请求数

@@ -37,11 +37,15 @@ class WorkspaceType(str, enum.Enum):
 class RunStatus(str, enum.Enum):
     """一次运行的生命周期状态。"""
     CREATED = "created"
+    QUEUED = "queued"
     RUNNING = "running"
     WAITING_APPROVAL = "waiting_approval"
+    WAITING_TOOL = "waiting_tool"
+    WAITING_USER = "waiting_user"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    SUPERSEDED = "superseded"
 
 
 class StepType(str, enum.Enum):

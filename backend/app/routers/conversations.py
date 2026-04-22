@@ -349,16 +349,46 @@ class ConversationCreate(BaseModel):
 @router.get("/{conv_id}/studio-runs/active")
 async def get_active_studio_run(
     conv_id: int,
+    skill_id: Optional[int] = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    """获取 active run — 先查热缓存，不存在时查 DB。
+
+    支持后端重启后恢复：热缓存为空时，从 DB 返回最近 run 的最终状态。
+    """
     conv = db.get(Conversation, conv_id)
     if not conv or conv.user_id != user.id:
         raise HTTPException(404, "Conversation not found")
     from app.services.studio_runs import studio_run_registry
+    from app.services import studio_run_event_store
 
+    # 1. 先查热缓存
     run = await studio_run_registry.get_active(conv_id, user.id)
-    return {"run": run.summary() if run else None}
+    if run:
+        return {"run": run.summary(), "source": "memory"}
+
+    # 2. 热缓存无 active run → 查 DB active run
+    try:
+        db_run = studio_run_event_store.get_active_run(db, conv_id, user_id=user.id, skill_id=skill_id)
+        if db_run:
+            return {
+                "run": _agent_run_to_summary(db_run),
+                "source": "db",
+            }
+
+        # 3. 查最近一次已完成的 run（用于刷新恢复）
+        recent = studio_run_event_store.get_recent_run(db, conv_id, user_id=user.id)
+        if recent:
+            return {
+                "run": _agent_run_to_summary(recent),
+                "source": "db_recent",
+            }
+    except Exception:
+        # agent_runs 表可能不存在（migration 未执行），优雅降级
+        pass
+
+    return {"run": None, "source": "none"}
 
 
 @router.get("/{conv_id}/studio-runs/{run_id}/events")
@@ -368,17 +398,35 @@ async def stream_studio_run_events(
     after: int = 0,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    request: Request = None,
 ):
+    """SSE event stream — 热缓存存在时实时流，否则从 DB replay。
+
+    支持 after_sequence 精准补齐（断线重连）。
+    """
     conv = db.get(Conversation, conv_id)
     if not conv or conv.user_id != user.id:
         raise HTTPException(404, "Conversation not found")
     from app.services.studio_runs import studio_run_registry
 
+    # 1. 热缓存中的 live run → 实时 SSE
     run = await studio_run_registry.get(run_id, user.id)
-    if not run or run.conversation_id != conv_id:
+    if run and run.conversation_id == conv_id:
+        return StreamingResponse(
+            _stream_with_keepalive(studio_run_registry.stream(run, after=after), request),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # 2. 热缓存中无此 run → 从 DB replay
+    from app.services import studio_run_event_store
+
+    db_run = studio_run_event_store.get_run(db, run_id)
+    if not db_run or db_run.conversation_id != conv_id or db_run.user_id != user.id:
         raise HTTPException(404, "Studio run not found")
+
     return StreamingResponse(
-        studio_run_registry.stream(run, after=after),
+        _replay_from_db(run_id, after),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -671,11 +719,11 @@ async def send_message(
     db.add(user_msg)
     db.commit()
 
-    # G3: skill_studio 同步路径统一走 SkillStudioAgentProfile（消除 system_context 直聊双轨）
+    # G3/Phase8: skill_studio 同步路径 — 灰度走 gateway 或 legacy profile
     if _ws_obj and _ws_obj.workspace_type == "skill_studio":
         try:
-            from app.harness.profiles.skill_studio import skill_studio_profile
             from app.harness.adapters import build_skill_studio_request
+            from app.harness.gateway import is_gateway_main_chain
             _studio_req = build_skill_studio_request(
                 user_id=user.id,
                 workspace_id=conv.workspace_id or 0,
@@ -683,31 +731,58 @@ async def send_message(
                 conversation_id=conv_id,
                 user_message=req.content,
                 stream=False,
-                metadata={"source": "conversations.send_message"},
+                metadata={
+                    "source": "conversations.send_message",
+                    "editor_prompt": req.editor_prompt,
+                    "editor_is_dirty": req.editor_is_dirty,
+                    "selected_source_filename": req.selected_source_filename,
+                    "active_card_id": req.active_card_id,
+                    "active_card_title": req.active_card_title,
+                    "active_card_mode": req.active_card_mode,
+                    "active_card_target": req.active_card_target,
+                    "active_card_source_card_id": req.active_card_source_card_id,
+                    "active_card_staged_edit_id": req.active_card_staged_edit_id,
+                    "active_card_phase": req.active_card_phase,
+                    "active_card_validation_source": req.active_card_validation_source,
+                    "active_card_file_role": req.active_card_file_role,
+                    "active_card_handoff_policy": req.active_card_handoff_policy,
+                    "active_card_route_kind": req.active_card_route_kind,
+                    "active_card_destination": req.active_card_destination,
+                    "active_card_return_to": req.active_card_return_to,
+                    "active_card_queue_window": req.active_card_queue_window,
+                    "active_card_contract_id": req.active_card_contract_id,
+                    "active_card_context_summary": req.active_card_context_summary,
+                },
             )
-            _studio_resp = await skill_studio_profile.run_sync(
-                _studio_req, db, conv,
-                selected_skill_id=req.selected_skill_id,
-                editor_prompt=req.editor_prompt,
-                editor_is_dirty=req.editor_is_dirty,
-                selected_source_filename=req.selected_source_filename,
-                active_card_id=req.active_card_id,
-                active_card_title=req.active_card_title,
-                active_card_mode=req.active_card_mode,
-                active_card_target=req.active_card_target,
-                active_card_source_card_id=req.active_card_source_card_id,
-                active_card_staged_edit_id=req.active_card_staged_edit_id,
-                active_card_phase=req.active_card_phase,
-                active_card_validation_source=req.active_card_validation_source,
-                active_card_file_role=req.active_card_file_role,
-                active_card_handoff_policy=req.active_card_handoff_policy,
-                active_card_route_kind=req.active_card_route_kind,
-                active_card_destination=req.active_card_destination,
-                active_card_return_to=req.active_card_return_to,
-                active_card_queue_window=req.active_card_queue_window,
-                active_card_contract_id=req.active_card_contract_id,
-                active_card_context_summary=req.active_card_context_summary,
-            )
+            if is_gateway_main_chain():
+                from app.harness.gateway import create_gateway
+                _gateway = create_gateway()
+                _studio_resp = _gateway.dispatch_sync(_studio_req, db)
+            else:
+                from app.harness.profiles.skill_studio import skill_studio_profile
+                _studio_resp = await skill_studio_profile.run_sync(
+                    _studio_req, db, conv,
+                    selected_skill_id=req.selected_skill_id,
+                    editor_prompt=req.editor_prompt,
+                    editor_is_dirty=req.editor_is_dirty,
+                    selected_source_filename=req.selected_source_filename,
+                    active_card_id=req.active_card_id,
+                    active_card_title=req.active_card_title,
+                    active_card_mode=req.active_card_mode,
+                    active_card_target=req.active_card_target,
+                    active_card_source_card_id=req.active_card_source_card_id,
+                    active_card_staged_edit_id=req.active_card_staged_edit_id,
+                    active_card_phase=req.active_card_phase,
+                    active_card_validation_source=req.active_card_validation_source,
+                    active_card_file_role=req.active_card_file_role,
+                    active_card_handoff_policy=req.active_card_handoff_policy,
+                    active_card_route_kind=req.active_card_route_kind,
+                    active_card_destination=req.active_card_destination,
+                    active_card_return_to=req.active_card_return_to,
+                    active_card_queue_window=req.active_card_queue_window,
+                    active_card_contract_id=req.active_card_contract_id,
+                    active_card_context_summary=req.active_card_context_summary,
+                )
             if _studio_resp.error:
                 raise HTTPException(503, _studio_resp.error)
             _resp_text = _studio_resp.content
@@ -1135,38 +1210,75 @@ async def stream_message(
                                     logger.warning(f"[studio] auto-audit failed: {_audit_err}")
                                     yield _sse("fallback_text", {"text": f"审计未能完成: {_audit_err}"})
 
-                    # G3: 通过 SkillStudioAgentProfile 执行（唯一主链）
+                    # G3/Phase8: 通过 Gateway 或 legacy profile 执行（灰度切换）
+                    from app.harness.gateway import is_gateway_main_chain as _is_gw
                     _final_content = ""
-                    async for _harness_evt in skill_studio_profile.run_stream(
-                        _studio_req, db, conv,
-                        selected_skill_id=req.selected_skill_id,
-                        editor_prompt=req.editor_prompt,
-                        editor_is_dirty=req.editor_is_dirty,
-                        selected_source_filename=req.selected_source_filename,
-                        active_card_id=req.active_card_id,
-                        active_card_title=req.active_card_title,
-                        active_card_mode=req.active_card_mode,
-                        active_card_target=req.active_card_target,
-                        active_card_source_card_id=req.active_card_source_card_id,
-                        active_card_staged_edit_id=req.active_card_staged_edit_id,
-                        active_card_phase=req.active_card_phase,
-                        active_card_validation_source=req.active_card_validation_source,
-                        active_card_file_role=req.active_card_file_role,
-                        active_card_handoff_policy=req.active_card_handoff_policy,
-                        active_card_route_kind=req.active_card_route_kind,
-                        active_card_destination=req.active_card_destination,
-                        active_card_return_to=req.active_card_return_to,
-                        active_card_queue_window=req.active_card_queue_window,
-                        active_card_context_summary=req.active_card_context_summary,
-                        active_card_contract_id=req.active_card_contract_id,
-                    ):
-                        # HarnessEvent → SSE 文本
-                        yield _harness_evt.to_sse()
-                        # 捕获最终内容（从 REPLACE 或 DELTA 事件）
-                        if _harness_evt.event.value == "replace":
-                            _final_content = _harness_evt.data.get("text", _final_content)
-                        elif _harness_evt.event.value == "delta":
-                            _final_content += _harness_evt.data.get("text", "")
+
+                    if _is_gw():
+                        from app.harness.gateway import create_gateway as _create_gw
+                        _gw = _create_gw()
+                        _studio_req.metadata.update({
+                            "editor_prompt": req.editor_prompt,
+                            "editor_is_dirty": req.editor_is_dirty,
+                            "selected_source_filename": req.selected_source_filename,
+                            "active_card_id": req.active_card_id,
+                            "active_card_title": req.active_card_title,
+                            "active_card_mode": req.active_card_mode,
+                            "active_card_target": req.active_card_target,
+                            "active_card_source_card_id": req.active_card_source_card_id,
+                            "active_card_staged_edit_id": req.active_card_staged_edit_id,
+                            "active_card_phase": req.active_card_phase,
+                            "active_card_validation_source": req.active_card_validation_source,
+                            "active_card_file_role": req.active_card_file_role,
+                            "active_card_handoff_policy": req.active_card_handoff_policy,
+                            "active_card_route_kind": req.active_card_route_kind,
+                            "active_card_destination": req.active_card_destination,
+                            "active_card_return_to": req.active_card_return_to,
+                            "active_card_queue_window": req.active_card_queue_window,
+                            "active_card_context_summary": req.active_card_context_summary,
+                            "active_card_contract_id": req.active_card_contract_id,
+                        })
+                        async for _harness_evt in _gw.dispatch(_studio_req, db):
+                            evt_name = _harness_evt.event.value
+                            # 跳过 gateway lifecycle 事件
+                            if evt_name in {"run_created", "run_started", "run_completed", "run_failed"}:
+                                continue
+                            yield _harness_evt.to_sse()
+                            if evt_name == "replace":
+                                _final_content = _harness_evt.data.get("text", _final_content)
+                            elif evt_name == "delta":
+                                _final_content += _harness_evt.data.get("text", "")
+                    else:
+                        async for _harness_evt in skill_studio_profile.run_stream(
+                            _studio_req, db, conv,
+                            selected_skill_id=req.selected_skill_id,
+                            editor_prompt=req.editor_prompt,
+                            editor_is_dirty=req.editor_is_dirty,
+                            selected_source_filename=req.selected_source_filename,
+                            active_card_id=req.active_card_id,
+                            active_card_title=req.active_card_title,
+                            active_card_mode=req.active_card_mode,
+                            active_card_target=req.active_card_target,
+                            active_card_source_card_id=req.active_card_source_card_id,
+                            active_card_staged_edit_id=req.active_card_staged_edit_id,
+                            active_card_phase=req.active_card_phase,
+                            active_card_validation_source=req.active_card_validation_source,
+                            active_card_file_role=req.active_card_file_role,
+                            active_card_handoff_policy=req.active_card_handoff_policy,
+                            active_card_route_kind=req.active_card_route_kind,
+                            active_card_destination=req.active_card_destination,
+                            active_card_return_to=req.active_card_return_to,
+                            active_card_queue_window=req.active_card_queue_window,
+                            active_card_context_summary=req.active_card_context_summary,
+                            active_card_contract_id=req.active_card_contract_id,
+                        ):
+                            # HarnessEvent → SSE 文本
+                            yield _harness_evt.to_sse()
+                            # 捕获最终内容（从 REPLACE 或 DELTA 事件）
+                            if _harness_evt.event.value == "replace":
+                                _final_content = _harness_evt.data.get("text", _final_content)
+                            elif _harness_evt.event.value == "delta":
+                                _final_content += _harness_evt.data.get("text", "")
 
                     _fast_msg = Message(
                         conversation_id=conv_id,
@@ -2205,3 +2317,39 @@ def compress_by_task(
             {"role": "assistant", "text": "接下来继续下一个任务。"},
         ]
     }
+
+
+# ── DB Replay / Recovery Helpers ──────────────────────────────────────────────
+
+
+def _agent_run_to_summary(row) -> dict:
+    """把 AgentRun DB 行转为前端可消费的 run summary。"""
+    return {
+        "id": row.public_run_id,
+        "public_run_id": row.public_run_id,
+        "run_id": row.public_run_id,
+        "run_version": row.run_version,
+        "harness_run_id": row.harness_run_id,
+        "parent_run_id": row.parent_run_id,
+        "conversation_id": row.conversation_id,
+        "skill_id": row.skill_id,
+        "status": row.status,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": (row.completed_at or row.cancelled_at or row.created_at or "").isoformat() if hasattr(row.completed_at or row.cancelled_at or row.created_at, "isoformat") else None,
+        "error": row.error_message,
+        "message_id": row.message_id,
+        "superseded_by": row.superseded_by,
+    }
+
+
+async def _replay_from_db(public_run_id: str, after_sequence: int = 0):
+    """从 DB 读取 events 生成 SSE 流 — 用于后端重启后的断线恢复。"""
+    db = SessionLocal()
+    try:
+        from app.services import studio_run_event_store
+
+        events = studio_run_event_store.get_events_after(db, public_run_id, after_sequence)
+        for evt in events:
+            yield f"event: {evt.event_type}\ndata: {json.dumps(evt.payload_json or {}, ensure_ascii=False)}\n\n"
+    finally:
+        db.close()

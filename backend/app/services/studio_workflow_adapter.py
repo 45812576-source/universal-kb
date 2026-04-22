@@ -52,11 +52,15 @@ def _infer_handoff_policy(*, file_role: str | None, workspace_mode: str | None, 
 
 
 def _route_kind_for_policy(handoff_policy: str | None) -> str | None:
-    if handoff_policy in {"open_development_studio", "open_opencode"}:
-        return "external"
-    if handoff_policy in {"open_file_workspace", "open_governance_panel", "stay_in_studio_chat"}:
-        return "internal"
-    return None
+    """B8: 委托给 studio_card_transition_service.classify_route()。"""
+    if not handoff_policy:
+        return None
+    from app.services import studio_card_transition_service
+    route_info = studio_card_transition_service.classify_route(
+        card={"handoff_policy": handoff_policy},
+    )
+    kind = route_info.get("route_kind")
+    return kind if kind in ("external", "internal") else None
 
 
 def _destination_for_policy(handoff_policy: str | None) -> str | None:

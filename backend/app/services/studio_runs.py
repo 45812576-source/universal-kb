@@ -1,8 +1,8 @@
-"""In-memory Skill Studio background runs.
+"""Skill Studio background runs — hot cache + DB-backed event log.
 
-This keeps Studio Chat execution alive when the browser route changes. It is
-intentionally lightweight: runs survive client disconnects within the current
-backend process and expose replayable SSE events for reconnecting clients.
+Phase B1/B2: public_run_id 是前端唯一 run 身份，内层 harness_run_id 只做审计。
+StudioRunRegistry 做热缓存（进程内 SSE 流），每个 event append 同步写 DB。
+后端重启后可从 DB replay 恢复。
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from app.models.conversation import Conversation, Message, MessageRole
 from app.services.studio_patch_bus import attach_run_context, build_patch_envelope, patch_type_for_event
 from app.services.studio_rollout import rollout_flag_from_workflow_state
 from app.services.studio_workflow_adapter import build_workflow_event_envelope
+from app.services import studio_run_event_store
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +32,16 @@ def _sse(event: str, data: dict) -> str:
 
 @dataclass
 class StudioRun:
-    id: str
+    """热缓存中的 run 对象。id 即 public_run_id。"""
+    id: str  # public_run_id
     conversation_id: int
     user_id: int
     skill_id: int | None
     content: str
     req_payload: dict[str, Any] = field(default_factory=dict)
     run_version: int = 1
+    harness_run_id: str | None = None
+    parent_run_id: str | None = None
     status: str = "queued"
     created_at: datetime.datetime = field(default_factory=datetime.datetime.utcnow)
     updated_at: datetime.datetime = field(default_factory=datetime.datetime.utcnow)
@@ -52,12 +56,21 @@ class StudioRun:
     patch_protocol_enabled: bool = True
     frontend_run_protocol_enabled: bool = True
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    # DB row 是否已创建
+    _db_persisted: bool = False
+
+    @property
+    def public_run_id(self) -> str:
+        return self.id
 
     def summary(self) -> dict:
         return {
             "id": self.id,
+            "public_run_id": self.id,
             "run_id": self.id,
             "run_version": self.run_version,
+            "harness_run_id": self.harness_run_id,
+            "parent_run_id": self.parent_run_id,
             "conversation_id": self.conversation_id,
             "skill_id": self.skill_id,
             "status": self.status,
@@ -72,6 +85,12 @@ class StudioRun:
 
 
 class StudioRunRegistry:
+    """进程内热缓存 + DB 持久化。
+
+    - 热缓存服务 SSE 流（低延迟）
+    - DB 服务 replay / 恢复 / 审计
+    """
+
     def __init__(self) -> None:
         self._runs: dict[str, StudioRun] = {}
         self._active_by_conversation: dict[int, str] = {}
@@ -107,6 +126,10 @@ class StudioRunRegistry:
             self._runs[run.id] = run
             self._active_by_conversation[conversation_id] = run.id
             self._version_by_conversation[conversation_id] = next_version
+
+            # DB 持久化: 创建 agent_runs 记录
+            self._persist_run_create(run)
+
             run.task = asyncio.create_task(self._execute(run, req_payload))
             return run
 
@@ -126,15 +149,29 @@ class StudioRunRegistry:
             return run
 
     async def cancel(self, run_id: str, user_id: int) -> StudioRun | None:
+        """取消 run — Phase B5: 显式停止 harness + pending tool，输出 cancel patches。"""
         run = await self.get(run_id, user_id)
         if not run:
             return None
         run.cancel_requested = True
         if run.task and not run.task.done():
             run.task.cancel()
+
+        # 1. stale_patch — 此 run 所有产出标记 stale
+        await self._append(run, "stale_patch", {
+            "stale_run_id": run.id,
+            "stale_run_version": run.run_version,
+            "reason": "user_cancelled",
+        })
+
+        # 2. status 事件
         await self._append(run, "status", {"stage": "cancelled"})
+
         run.status = "cancelled"
         run.updated_at = datetime.datetime.utcnow()
+
+        # DB 持久化
+        self._persist_run_status(run, "cancelled")
         return run
 
     async def stream(self, run: StudioRun, after: int = 0):
@@ -152,6 +189,16 @@ class StudioRunRegistry:
                 except asyncio.TimeoutError:
                     yield ": ping\n\n"
 
+    async def replay_from_db(self, public_run_id: str):
+        """从 DB 读取事件流，用于后端重启后恢复。"""
+        db = SessionLocal()
+        try:
+            events = studio_run_event_store.get_all_events(db, public_run_id)
+            for evt in events:
+                yield _sse(evt.event_type, evt.payload_json or {})
+        finally:
+            db.close()
+
     async def _append(self, run: StudioRun, event: str, data: dict) -> None:
         payload = attach_run_context(
             data,
@@ -160,15 +207,26 @@ class StudioRunRegistry:
             workflow_id=run.id,
         )
         async with run.condition:
-            run.events.append((len(run.events) + 1, event, payload))
+            seq = len(run.events) + 1
+            run.events.append((seq, event, payload))
+
+            # DB 持久化: 写入 event
+            self._persist_event(run, seq, event, payload)
+
             if run.patch_protocol_enabled:
                 patch = self._build_patch_event(run, event, payload)
                 if patch is not None:
-                    run.events.append((len(run.events) + 1, "patch_applied", patch))
+                    patch_seq = len(run.events) + 1
+                    run.events.append((patch_seq, "patch_applied", patch))
+                    self._persist_event(run, patch_seq, "patch_applied", patch, patch_type=str(patch.get("patch_type", "")))
+
             if event != "workflow_event" and run.frontend_run_protocol_enabled:
                 envelope = self._build_workflow_event(run, event, payload)
                 if envelope is not None:
-                    run.events.append((len(run.events) + 1, "workflow_event", envelope))
+                    wf_seq = len(run.events) + 1
+                    run.events.append((wf_seq, "workflow_event", envelope))
+                    self._persist_event(run, wf_seq, "workflow_event", envelope)
+
             run.updated_at = datetime.datetime.utcnow()
             run.condition.notify_all()
 
@@ -230,18 +288,37 @@ class StudioRunRegistry:
         ]
 
     async def _supersede(self, run: StudioRun, *, superseded_by: str) -> None:
+        """标记旧 run 为 superseded，发出 stale 信号防止污染新 run。
+
+        Phase B5: 旧 run 的所有 pending card/artifact/staged_edit 标记 stale。
+        """
         run.cancel_requested = True
         run.status = "superseded"
         run.superseded_by = superseded_by
         run.superseded_at = datetime.datetime.utcnow().isoformat()
         if run.task and not run.task.done():
             run.task.cancel()
+
+        # 1. run_superseded 事件
         await self._append(run, "run_superseded", {
             **run.summary(),
             "status": "superseded",
             "superseded_by": superseded_by,
         })
+
+        # 2. stale_patch — 告知前端此 run 的所有产出均为 stale
+        await self._append(run, "stale_patch", {
+            "stale_run_id": run.id,
+            "stale_run_version": run.run_version,
+            "superseded_by": superseded_by,
+            "reason": "new_message_superseded",
+        })
+
+        # 3. status 事件
         await self._append(run, "status", {"stage": "superseded", "superseded_by": superseded_by})
+
+        # DB 持久化
+        self._persist_run_status(run, "superseded", superseded_by=superseded_by)
 
     async def _emit_deep_lane_patches(
         self,
@@ -323,6 +400,7 @@ class StudioRunRegistry:
     async def _execute(self, run: StudioRun, req_payload: dict[str, Any]) -> None:
         db = SessionLocal()
         run.status = "running"
+        self._persist_run_status(run, "running")
         await self._append(run, "studio_run", run.summary())
         final_content = ""
         deep_lane_expected = False
@@ -340,7 +418,6 @@ class StudioRunRegistry:
             await self._append(run, "status", {"stage": "preparing"})
 
             from app.harness.adapters import build_skill_studio_request
-            from app.harness.profiles.skill_studio import skill_studio_profile
             from app.config import settings as app_settings
 
             studio_req = build_skill_studio_request(
@@ -350,7 +427,12 @@ class StudioRunRegistry:
                 conversation_id=run.conversation_id,
                 user_message=run.content,
                 stream=True,
-                metadata={"source": "studio_runs"},
+                metadata={
+                    "source": "studio_runs",
+                    "public_run_id": run.id,
+                    "run_version": run.run_version,
+                    **{k: v for k, v in req_payload.items() if v is not None},
+                },
             )
 
             if app_settings.STUDIO_STRUCTURED_MODE == "on":
@@ -401,54 +483,101 @@ class StudioRunRegistry:
                     logger.warning("[studio_run] workflow bootstrap failed: %s", bootstrap_err)
                     await self._append(run, "fallback_text", {"text": f"工作流初始化失败: {bootstrap_err}"})
 
-            async for harness_evt in skill_studio_profile.run_stream(
-                studio_req,
-                db,
-                conv,
-                selected_skill_id=run.skill_id,
-                editor_prompt=req_payload.get("editor_prompt"),
-                editor_is_dirty=bool(req_payload.get("editor_is_dirty")),
-                selected_source_filename=req_payload.get("selected_source_filename"),
-                active_card_id=req_payload.get("active_card_id"),
-                active_card_title=req_payload.get("active_card_title"),
-                active_card_mode=req_payload.get("active_card_mode"),
-                active_card_target=req_payload.get("active_card_target"),
-                active_card_source_card_id=req_payload.get("active_card_source_card_id"),
-                active_card_staged_edit_id=req_payload.get("active_card_staged_edit_id"),
-                active_card_phase=req_payload.get("active_card_phase"),
-                active_card_validation_source=req_payload.get("active_card_validation_source"),
-                active_card_file_role=req_payload.get("active_card_file_role"),
-                active_card_handoff_policy=req_payload.get("active_card_handoff_policy"),
-                active_card_route_kind=req_payload.get("active_card_route_kind"),
-                active_card_destination=req_payload.get("active_card_destination"),
-                active_card_return_to=req_payload.get("active_card_return_to"),
-                active_card_queue_window=req_payload.get("active_card_queue_window"),
-                active_card_context_summary=req_payload.get("active_card_context_summary"),
-                active_card_contract_id=req_payload.get("active_card_contract_id"),
-            ):
-                if run.cancel_requested:
-                    raise asyncio.CancelledError()
-                event_name = harness_evt.event.value
-                data = dict(harness_evt.data or {})
-                await self._append(run, event_name, data)
-                if event_name == "status":
-                    stage = str(data.get("stage") or "")
-                    if stage == "first_useful_response":
-                        first_useful_response_seen = True
-                    elif stage in {"deep_started", "two_stage_forced"}:
-                        deep_started_seen = True
-                    elif stage == "deep_completed":
-                        deep_completed_seen = True
-                elif event_name == "audit_summary":
-                    audit_summary = data
-                elif event_name == "governance_card":
-                    governance_card_count += 1
-                elif event_name == "staged_edit_notice":
-                    staged_edit_count += 1
-                if event_name == "replace":
-                    final_content = data.get("text", final_content)
-                elif event_name == "delta":
-                    final_content += data.get("text", "")
+            # Phase 8: 灰度分支 — gateway 主链 vs legacy 直调
+            from app.harness.gateway import is_gateway_main_chain
+            _use_gateway = is_gateway_main_chain()
+
+            if _use_gateway:
+                # Gateway 主链：dispatch 负责 executor 调用 + event DB 写入
+                from app.harness.gateway import create_gateway
+                gateway = create_gateway()
+                async for harness_evt in gateway.dispatch(studio_req, db):
+                    if run.cancel_requested:
+                        raise asyncio.CancelledError()
+                    event_name = harness_evt.event.value
+                    data = dict(harness_evt.data or {})
+                    # 跳过 gateway lifecycle 事件（run_created/run_started/run_completed）
+                    # 这些由 StudioRunRegistry 自己管理
+                    if event_name in {"run_created", "run_started", "run_completed", "run_failed"}:
+                        if event_name == "run_started":
+                            run.harness_run_id = data.get("run_id")
+                        continue
+                    await self._append(run, event_name, data)
+                    if event_name == "status":
+                        stage = str(data.get("stage") or "")
+                        if stage == "first_useful_response":
+                            first_useful_response_seen = True
+                        elif stage in {"deep_started", "two_stage_forced"}:
+                            deep_started_seen = True
+                        elif stage == "deep_completed":
+                            deep_completed_seen = True
+                    elif event_name == "audit_summary":
+                        audit_summary = data
+                    elif event_name == "governance_card":
+                        governance_card_count += 1
+                    elif event_name == "staged_edit_notice":
+                        staged_edit_count += 1
+                    if event_name == "replace":
+                        final_content = data.get("text", final_content)
+                    elif event_name == "delta":
+                        final_content += data.get("text", "")
+            else:
+                # Legacy 直调：SkillStudioAgentProfile.run_stream()
+                from app.harness.profiles.skill_studio import skill_studio_profile
+                async for harness_evt in skill_studio_profile.run_stream(
+                    studio_req,
+                    db,
+                    conv,
+                    selected_skill_id=run.skill_id,
+                    editor_prompt=req_payload.get("editor_prompt"),
+                    editor_is_dirty=bool(req_payload.get("editor_is_dirty")),
+                    selected_source_filename=req_payload.get("selected_source_filename"),
+                    active_card_id=req_payload.get("active_card_id"),
+                    active_card_title=req_payload.get("active_card_title"),
+                    active_card_mode=req_payload.get("active_card_mode"),
+                    active_card_target=req_payload.get("active_card_target"),
+                    active_card_source_card_id=req_payload.get("active_card_source_card_id"),
+                    active_card_staged_edit_id=req_payload.get("active_card_staged_edit_id"),
+                    active_card_phase=req_payload.get("active_card_phase"),
+                    active_card_validation_source=req_payload.get("active_card_validation_source"),
+                    active_card_file_role=req_payload.get("active_card_file_role"),
+                    active_card_handoff_policy=req_payload.get("active_card_handoff_policy"),
+                    active_card_route_kind=req_payload.get("active_card_route_kind"),
+                    active_card_destination=req_payload.get("active_card_destination"),
+                    active_card_return_to=req_payload.get("active_card_return_to"),
+                    active_card_queue_window=req_payload.get("active_card_queue_window"),
+                    active_card_context_summary=req_payload.get("active_card_context_summary"),
+                    active_card_contract_id=req_payload.get("active_card_contract_id"),
+                ):
+                    if run.cancel_requested:
+                        raise asyncio.CancelledError()
+                    event_name = harness_evt.event.value
+                    data = dict(harness_evt.data or {})
+                    # Legacy 路径也跳过 profile 内部 lifecycle 事件，
+                    # 避免内部 harness_run_id 泄漏到 replay DB
+                    if event_name in {"run_created", "run_started", "run_completed", "run_failed"}:
+                        if event_name == "run_started":
+                            run.harness_run_id = data.get("run_id")
+                        continue
+                    await self._append(run, event_name, data)
+                    if event_name == "status":
+                        stage = str(data.get("stage") or "")
+                        if stage == "first_useful_response":
+                            first_useful_response_seen = True
+                        elif stage in {"deep_started", "two_stage_forced"}:
+                            deep_started_seen = True
+                        elif stage == "deep_completed":
+                            deep_completed_seen = True
+                    elif event_name == "audit_summary":
+                        audit_summary = data
+                    elif event_name == "governance_card":
+                        governance_card_count += 1
+                    elif event_name == "staged_edit_notice":
+                        staged_edit_count += 1
+                    if event_name == "replace":
+                        final_content = data.get("text", final_content)
+                    elif event_name == "delta":
+                        final_content += data.get("text", "")
 
             await self._emit_deep_lane_patches(
                 run,
@@ -486,6 +615,7 @@ class StudioRunRegistry:
             db.commit()
             run.message_id = assistant_msg.id
             run.status = "completed"
+            self._persist_run_status(run, "completed", message_id=assistant_msg.id)
             await self._append(run, "done", {"message_id": assistant_msg.id, "metadata": {}})
         except asyncio.CancelledError:
             db.rollback()
@@ -493,12 +623,14 @@ class StudioRunRegistry:
                 await self._append(run, "done", {"superseded": True, "superseded_by": run.superseded_by})
             else:
                 run.status = "cancelled"
+                self._persist_run_status(run, "cancelled")
                 await self._append(run, "done", {"cancelled": True})
         except Exception as exc:
             db.rollback()
             run.status = "failed"
             run.error = str(exc) or type(exc).__name__
             logger.exception("[studio_run] run failed")
+            self._persist_run_status(run, "failed", error_message=run.error)
             await self._append(run, "error", {
                 "message": run.error,
                 "error_type": "server_error",
@@ -516,6 +648,87 @@ class StudioRunRegistry:
                     and run.status in {"completed", "failed", "cancelled", "superseded"}
                 ):
                     self._active_by_conversation.pop(run.conversation_id, None)
+
+    # ── DB Persistence Helpers ────────────────────────────────────────────────
+
+    @staticmethod
+    def _persist_run_create(run: StudioRun) -> None:
+        """创建 agent_runs DB 记录。独立 session 避免与执行 session 冲突。"""
+        db = SessionLocal()
+        try:
+            studio_run_event_store.create_run(
+                db,
+                public_run_id=run.id,
+                conversation_id=run.conversation_id,
+                user_id=run.user_id,
+                skill_id=run.skill_id,
+                run_version=run.run_version,
+                parent_run_id=run.parent_run_id,
+            )
+            db.commit()
+            run._db_persisted = True
+        except Exception:
+            db.rollback()
+            logger.exception("[studio_run] DB persist run create failed for %s", run.id)
+        finally:
+            db.close()
+
+    @staticmethod
+    def _persist_run_status(
+        run: StudioRun,
+        status: str,
+        *,
+        superseded_by: str | None = None,
+        message_id: int | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """更新 agent_runs DB 状态。"""
+        db = SessionLocal()
+        try:
+            studio_run_event_store.update_run_status(
+                db,
+                run.id,
+                status,
+                superseded_by=superseded_by,
+                message_id=message_id,
+                error_message=error_message,
+                harness_run_id=run.harness_run_id,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("[studio_run] DB persist status update failed for %s -> %s", run.id, status)
+        finally:
+            db.close()
+
+    @staticmethod
+    def _persist_event(
+        run: StudioRun,
+        sequence: int,
+        event_type: str,
+        payload: dict,
+        *,
+        patch_type: str | None = None,
+    ) -> None:
+        """追加 event 到 agent_run_events。使用独立 session，失败不影响热缓存。"""
+        db = SessionLocal()
+        try:
+            studio_run_event_store.append_event(
+                db,
+                public_run_id=run.id,
+                run_version=run.run_version,
+                sequence=sequence,
+                event_type=event_type,
+                payload=payload,
+                patch_type=patch_type,
+                harness_run_id=run.harness_run_id,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.debug("[studio_run] DB event append failed for %s seq=%d", run.id, sequence)
+        finally:
+            db.close()
 
 
 studio_run_registry = StudioRunRegistry()

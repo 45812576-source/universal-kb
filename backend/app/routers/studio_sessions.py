@@ -557,3 +557,60 @@ def get_skill_run_links(
 ):
     """获取 skill 的所有 run links。"""
     return studio_test_flow_service.get_run_links_by_skill(db, skill_id)
+
+
+# ── Card Contract API (Phase B6) ─────────────────────────────────────────────
+
+@router.get("/api/studio/card-contracts")
+def list_card_contracts(
+    user: User = Depends(get_current_user),
+):
+    """获取所有 card contract 摘要 — 后端 canonical owner。"""
+    from app.services import studio_card_contract_service
+    return {"contracts": studio_card_contract_service.get_all_contract_summaries()}
+
+
+@router.get("/api/studio/card-contracts/{contract_id}")
+def get_card_contract(
+    contract_id: str,
+    user: User = Depends(get_current_user),
+):
+    """获取单个 card contract 详情。"""
+    from app.services import studio_card_contract_service
+    contract = studio_card_contract_service.get_contract(contract_id)
+    if not contract:
+        raise HTTPException(status_code=404, detail=f"Contract {contract_id} 不存在")
+    return {"contract": contract.to_dict()}
+
+
+# ── Timeline API (Phase B11) ────────────────────────────────────────────────
+
+@router.get("/api/skills/{skill_id}/studio/timeline")
+def get_timeline(
+    skill_id: int,
+    mode: str = "fast",
+    after_sequence: int = 0,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """获取 studio 时间线 — fast 或 deep 模式。"""
+    from app.services import studio_timeline_service
+    if mode == "deep":
+        return studio_timeline_service.get_deep_timeline(db, skill_id)
+    return studio_timeline_service.get_fast_timeline(
+        db, skill_id, after_sequence=after_sequence,
+    )
+
+
+@router.get("/api/studio/runs/{run_id}/timeline")
+def get_run_timeline(
+    run_id: str,
+    after_sequence: int = 0,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """获取单个 run 的完整事件时间线。"""
+    from app.services import studio_timeline_service
+    return studio_timeline_service.get_run_timeline(
+        db, run_id, after_sequence=after_sequence,
+    )

@@ -1044,3 +1044,64 @@ class SkillStudioAgentProfile:
 
 # 模块级单例
 skill_studio_profile = SkillStudioAgentProfile()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Gateway Executor 注册
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def _skill_studio_executor(
+    request: HarnessRequest,
+    db: Session,
+    store: SessionStore,
+) -> AsyncIterator[HarnessEvent]:
+    """Gateway executor 桥接 — 将 Gateway dispatch 接入 SkillStudioAgentProfile。
+
+    profile.run_stream() 内部创建自己的 HarnessRun（内部短 ID），
+    但 DB replay 要求所有事件的 run_id 使用 public_run_id。
+    这里做透明替换，确保写入 agent_run_events 的 payload 不泄漏内部 ID。
+    """
+    profile = SkillStudioAgentProfile(store=store)
+    conv = db.get(Conversation, request.context.conversation_id)
+    if not conv:
+        yield emit(EventName.ERROR, {"message": "Conversation not found"})
+        return
+    meta = request.metadata
+    public_run_id = meta.get("public_run_id")
+    internal_run_id: str | None = None
+
+    async for evt in profile.run_stream(
+        request, db, conv,
+        selected_skill_id=request.context.skill_id,
+        editor_prompt=meta.get("editor_prompt"),
+        editor_is_dirty=bool(meta.get("editor_is_dirty")),
+        selected_source_filename=meta.get("selected_source_filename"),
+        active_card_id=meta.get("active_card_id"),
+        active_card_title=meta.get("active_card_title"),
+        active_card_mode=meta.get("active_card_mode"),
+        active_card_target=meta.get("active_card_target"),
+        active_card_source_card_id=meta.get("active_card_source_card_id"),
+        active_card_staged_edit_id=meta.get("active_card_staged_edit_id"),
+        active_card_phase=meta.get("active_card_phase"),
+        active_card_validation_source=meta.get("active_card_validation_source"),
+        active_card_file_role=meta.get("active_card_file_role"),
+        active_card_handoff_policy=meta.get("active_card_handoff_policy"),
+        active_card_route_kind=meta.get("active_card_route_kind"),
+        active_card_destination=meta.get("active_card_destination"),
+        active_card_return_to=meta.get("active_card_return_to"),
+        active_card_queue_window=meta.get("active_card_queue_window"),
+        active_card_contract_id=meta.get("active_card_contract_id"),
+        active_card_context_summary=meta.get("active_card_context_summary"),
+    ):
+        # 捕获 profile 内部 run_id 并替换为 public_run_id
+        if public_run_id and evt.event == EventName.RUN_STARTED:
+            internal_run_id = evt.data.get("run_id")
+        if public_run_id and internal_run_id and evt.data.get("run_id") == internal_run_id:
+            evt.data["run_id"] = public_run_id
+        if public_run_id and evt.run_id and evt.run_id == internal_run_id:
+            evt.run_id = public_run_id
+        yield evt
+
+
+from app.harness.gateway import register_executor
+register_executor(AgentType.SKILL_STUDIO, _skill_studio_executor)

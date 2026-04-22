@@ -422,14 +422,17 @@ _INTERNAL_ROUTE_POLICIES = frozenset({
 
 
 def _classify_route_kind(handoff_policy: str | None) -> str:
-    """internal | external | none."""
+    """internal | external | none.
+
+    B8: 委托给 studio_card_transition_service.classify_route() 做统一判定。
+    """
     if not handoff_policy:
         return "none"
-    if handoff_policy in _EXTERNAL_HANDOFF_POLICIES:
-        return "external"
-    if handoff_policy in _INTERNAL_ROUTE_POLICIES:
-        return "internal"
-    return "none"
+    from app.services import studio_card_transition_service
+    route_info = studio_card_transition_service.classify_route(
+        card={"handoff_policy": handoff_policy},
+    )
+    return route_info.get("route_kind", "none")
 
 
 def _destination_for_policy(handoff_policy: str | None) -> str | None:

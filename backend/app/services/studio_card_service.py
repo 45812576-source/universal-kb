@@ -25,6 +25,8 @@ from app.services.studio_workflow_protocol import (
     _now_iso,
 )
 from app.services import studio_workspace_service
+from app.services import studio_card_transition_service
+from app.services import studio_card_contract_service
 
 logger = logging.getLogger(__name__)
 
@@ -753,16 +755,23 @@ def handoff_card(
     内部路由（open_file_workspace / open_governance_panel / stay_in_studio_chat）
     不走 handoff，由前端直接处理。
 
+    M4 边界（B8）:
+    - 治理、绑定、权限、索引、文件确认 → internal route → 前端直接处理
+    - Tool / script / API / function / automation → external handoff → 此函数
+    使用 studio_card_transition_service.classify_route() 做统一判定。
+
     流程：
-    1. 验证 handoff_policy 属于外部类型
+    1. 验证 handoff_policy 属于外部类型（classify_route）
     2. 设置源卡片 external_state = waiting_external_build
     3. 创建衍生卡（继承 workflow_id、phase、关联 source_card_id）
     4. 记录 handoff_created 到 card_exit_log
     5. 返回 route_kind / destination / return_to / explanation
     """
-    # guard: 只允许外部 handoff
-    route_kind = _classify_route_kind(handoff_policy)
-    if route_kind != "external":
+    # guard: 用 transition service 统一判定 — 只允许外部 handoff
+    route_info = studio_card_transition_service.classify_route(
+        card={"handoff_policy": handoff_policy, "file_role": target_role, "title": ""},
+    )
+    if route_info.get("route_kind") != "external":
         return _err(
             "invalid_handoff_policy",
             f"handoff_card 仅用于外部交接 (open_development_studio / open_opencode)，"
@@ -913,10 +922,11 @@ def bind_back_card(
 ) -> dict[str, Any]:
     """外部编辑回绑 — 作为"回程路由器"创建 confirm/validate 后续卡。
 
-    M4 重构：不再简单恢复原卡状态，而是：
+    M4 重构（B8 收口）：不再简单恢复原卡状态，而是：
     1. 更新源卡 external_state → returned_waiting_bindback
-    2. 创建 confirm_external_result 确认卡（让用户验收外部产物）
+    2. 创建 confirm_external_result 确认卡（使用 confirm.bind_back 标准 contract）
     3. 如果有 required_checks，额外创建 validate_external 验证卡
+       （使用 validation.test_ready 标准 contract）
     4. 激活确认卡
     5. 记录 external_edit_returned 到 card_exit_log
     6. 返回 route_kind / destination / return_to / explanation
@@ -956,19 +966,22 @@ def bind_back_card(
     context["last_bind_back"] = bind_back_entry
     target_card["content"] = context
 
-    # ── 创建 confirm_external_result 确认卡 ──
+    # ── 创建 confirm_external_result 确认卡（B8: 使用标准 contract） ──
     confirm_id = _new_id("confirm")
     source_title = target_card.get("title", "")
+    # B8: 使用后端 canonical contract_id，confirm.bind_back 已在 contract registry 中定义
+    confirm_contract_id = "confirm.bind_back"
+    confirm_contract = studio_card_contract_service.get_contract(confirm_contract_id)
     confirm_card = {
         "id": confirm_id,
-        "contract_id": f"confirm.{target_card.get('contract_id', card_id)}",
+        "contract_id": confirm_contract_id,
         "workflow_id": target_card.get("workflow_id") or workflow_state.get("workflow_id"),
         "source": "bind_back",
         "type": "confirm",
         "card_type": "confirm",
         "phase": target_card.get("phase", ""),
         "title": f"验收外部产物：{source_title}",
-        "summary": summary or f"外部实现已返回，请确认是否符合预期",
+        "summary": summary or (confirm_contract.objective if confirm_contract else "外部实现已返回，请确认是否符合预期"),
         "status": CardStatus.ACTIVE,
         "priority": "high",
         "workspace_mode": "analysis",
@@ -999,9 +1012,11 @@ def bind_back_card(
     validate_id: str | None = None
     if required_checks:
         validate_id = _new_id("validate")
+        # B8: 使用标准 contract_id，validation.test_ready 已在 contract registry 中定义
+        validate_contract_id = "validation.test_ready"
         validate_card = {
             "id": validate_id,
-            "contract_id": f"validate.{target_card.get('contract_id', card_id)}",
+            "contract_id": validate_contract_id,
             "workflow_id": target_card.get("workflow_id") or workflow_state.get("workflow_id"),
             "source": "bind_back",
             "type": "validation",
@@ -1130,18 +1145,40 @@ _INTERNAL_ROUTE_POLICIES = frozenset({
 
 
 def _classify_route_kind(handoff_policy: str | None) -> str:
-    """internal | external | none."""
+    """internal | external | none.
+
+    B8: 委托给 studio_card_transition_service.classify_route() 做统一判定。
+    保留此函数兼容已有调用点。
+    """
     if not handoff_policy:
         return "none"
-    if handoff_policy in _EXTERNAL_HANDOFF_POLICIES:
-        return "external"
-    if handoff_policy in _INTERNAL_ROUTE_POLICIES:
-        return "internal"
-    return "none"
+    route_info = studio_card_transition_service.classify_route(
+        card={"handoff_policy": handoff_policy},
+    )
+    return route_info.get("route_kind", "none")
 
 
-def _infer_handoff_policy(file_role: str | None, workspace_mode: str | None, target_file: str | None) -> str | None:
-    """推断 handoff_policy — 仅返回策略值，route_kind 由 _classify_route_kind 判定。"""
+def _infer_handoff_policy(
+    file_role: str | None,
+    workspace_mode: str | None,
+    target_file: str | None,
+    contract_id: str | None = None,
+) -> str | None:
+    """推断 handoff_policy — 仅返回策略值，route_kind 由 classify_route 判定。
+
+    B8: 如果有 contract_id，优先从 contract 的 drawer_policy 推断。
+    M4 边界: governance/file workspace = internal, tool/script = external。
+    """
+    # 优先: 如果 contract 有明确定义，使用 classify_route
+    if contract_id:
+        contract = studio_card_contract_service.get_contract(contract_id)
+        if contract:
+            # contract phase 暗示路由方向
+            if contract.phase in ("governance", "confirm"):
+                return "stay_in_studio_chat"
+            if contract.phase == "validation":
+                return "open_governance_panel"
+
     if file_role == "tool":
         return "open_development_studio"
     if workspace_mode == WorkspaceMode.REPORT:
