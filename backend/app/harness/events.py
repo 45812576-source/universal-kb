@@ -67,6 +67,13 @@ class EventName(str, Enum):
     GOVERNANCE_CARD = "governance_card"
     STAGED_EDIT_NOTICE = "staged_edit_notice"
 
+    # studio card orchestration
+    CARD_PATCH = "card_patch"
+    CARD_STATUS_PATCH = "card_status_patch"
+    ARTIFACT_PATCH = "artifact_patch"
+    STALE_PATCH = "stale_patch"
+    QUEUE_WINDOW_PATCH = "queue_window_patch"
+
     # pev
     PEV_ERROR = "pev_error"
 
@@ -104,6 +111,11 @@ _CATEGORY_MAP: dict[EventName, EventCategory] = {
     EventName.AUDIT_SUMMARY: EventCategory.STUDIO,
     EventName.GOVERNANCE_CARD: EventCategory.STUDIO,
     EventName.STAGED_EDIT_NOTICE: EventCategory.STUDIO,
+    EventName.CARD_PATCH: EventCategory.STUDIO,
+    EventName.CARD_STATUS_PATCH: EventCategory.STUDIO,
+    EventName.ARTIFACT_PATCH: EventCategory.STUDIO,
+    EventName.STALE_PATCH: EventCategory.STUDIO,
+    EventName.QUEUE_WINDOW_PATCH: EventCategory.STUDIO,
     EventName.PEV_ERROR: EventCategory.ERROR,
     EventName.ERROR: EventCategory.ERROR,
 }

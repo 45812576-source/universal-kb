@@ -131,9 +131,17 @@ def _empty_payload() -> dict:
             "workflow_state": None,
             "cards": [],
             "staged_edits": [],
+            "card_order": [],
+            "queue_window": None,
+            "card_queue_ledger": None,
+            "completed_card_ids": [],
+            "card_artifacts": {},
+            "stale_card_ids": [],
+            "card_exit_log": [],
             "source": "skill_memo",
             "revision": 0,
             "updated_at": None,
+            "schema_version": RECOVERY_SCHEMA_VERSION,
         },
         "context_digest_cache": {
             "schema_version": 1,
@@ -146,7 +154,8 @@ def _empty_payload() -> dict:
 # 当前 recovery schema 版本：
 # v1 = 旧格式（无 unified_architecture 标志）
 # v2 = 统一架构格式（含 unified_architecture 标志、cards merge 语义）
-RECOVERY_SCHEMA_VERSION = 2
+# v3 = 卡片队列恢复格式（card_order / queue_window / card_queue_ledger / artifacts）
+RECOVERY_SCHEMA_VERSION = 3
 
 
 def _empty_workflow_recovery() -> dict:
@@ -154,6 +163,13 @@ def _empty_workflow_recovery() -> dict:
         "workflow_state": None,
         "cards": [],
         "staged_edits": [],
+        "card_order": [],
+        "queue_window": None,
+        "card_queue_ledger": None,
+        "completed_card_ids": [],
+        "card_artifacts": {},
+        "stale_card_ids": [],
+        "card_exit_log": [],
         "source": "skill_memo",
         "revision": 0,
         "updated_at": None,
@@ -235,6 +251,20 @@ def _get_workflow_recovery(payload: dict[str, Any]) -> dict[str, Any]:
         base["cards"] = raw.get("cards")
     if isinstance(raw.get("staged_edits"), list):
         base["staged_edits"] = raw.get("staged_edits")
+    if isinstance(raw.get("card_order"), list):
+        base["card_order"] = [str(item) for item in raw.get("card_order") if isinstance(item, str) and item.strip()]
+    if isinstance(raw.get("queue_window"), dict):
+        base["queue_window"] = raw.get("queue_window")
+    if isinstance(raw.get("card_queue_ledger"), dict):
+        base["card_queue_ledger"] = raw.get("card_queue_ledger")
+    if isinstance(raw.get("completed_card_ids"), list):
+        base["completed_card_ids"] = [str(item) for item in raw.get("completed_card_ids") if item is not None and str(item).strip()]
+    if isinstance(raw.get("card_artifacts"), dict):
+        base["card_artifacts"] = raw.get("card_artifacts")
+    if isinstance(raw.get("stale_card_ids"), list):
+        base["stale_card_ids"] = [str(item) for item in raw.get("stale_card_ids") if item is not None and str(item).strip()]
+    if isinstance(raw.get("card_exit_log"), list):
+        base["card_exit_log"] = [item for item in raw.get("card_exit_log") if isinstance(item, dict)]
     if isinstance(raw.get("source"), str) and raw.get("source"):
         base["source"] = raw.get("source")
     base["revision"] = _normalize_recovery_revision(raw.get("revision"))
@@ -2368,17 +2398,37 @@ def sync_workflow_recovery(
 
     # 统一架构模式下 cards/staged_edits 做 merge 而非覆写
     is_unified = _is_unified_architecture(workflow_state) or _is_unified_architecture(existing_ws)
+    existing_cards = list(existing_recovery.get("cards") or [])
+    existing_edits = list(existing_recovery.get("staged_edits") or [])
     if is_unified and (cards is not None or staged_edits is not None):
-        merged_cards = _merge_cards(existing_recovery.get("cards") or [], list(cards or []))
-        merged_edits = _merge_staged_edits(existing_recovery.get("staged_edits") or [], list(staged_edits or []))
+        merged_cards = _merge_cards(existing_cards, list(cards or [])) if cards is not None else existing_cards
+        merged_edits = _merge_staged_edits(existing_edits, list(staged_edits or [])) if staged_edits is not None else existing_edits
     else:
-        merged_cards = list(cards or [])
-        merged_edits = list(staged_edits or [])
+        merged_cards = existing_cards if cards is None else list(cards or [])
+        merged_edits = existing_edits if staged_edits is None else list(staged_edits or [])
+
+    merged_card_order = list(existing_recovery.get("card_order") or [])
+    merged_card_ids = [str(card.get("id")) for card in merged_cards if isinstance(card, dict) and card.get("id")]
+    if merged_card_ids:
+        merged_card_order = [card_id for card_id in merged_card_order if card_id in merged_card_ids]
+        merged_card_order.extend(card_id for card_id in merged_card_ids if card_id not in merged_card_order)
+    else:
+        merged_card_order = []
+    queue_window = existing_recovery.get("queue_window")
+    if isinstance(workflow_state.get("queue_window"), dict):
+        queue_window = workflow_state["queue_window"]
 
     workflow_recovery = {
         "workflow_state": workflow_state,
         "cards": merged_cards,
         "staged_edits": merged_edits,
+        "card_order": merged_card_order,
+        "queue_window": queue_window,
+        "card_queue_ledger": existing_recovery.get("card_queue_ledger"),
+        "completed_card_ids": list(existing_recovery.get("completed_card_ids") or []),
+        "card_artifacts": copy.deepcopy(existing_recovery.get("card_artifacts") or {}),
+        "stale_card_ids": list(existing_recovery.get("stale_card_ids") or []),
+        "card_exit_log": list(existing_recovery.get("card_exit_log") or []),
         "source": "skill_memo",
         "revision": _normalize_recovery_revision(existing_recovery.get("revision")),
         "updated_at": None,

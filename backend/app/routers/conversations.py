@@ -105,6 +105,15 @@ class SendMessage(BaseModel):
     active_card_source_card_id: str | None = None
     active_card_staged_edit_id: str | None = None
     active_card_validation_source: dict | None = None
+    active_card_file_role: str | None = None
+    active_card_handoff_policy: str | None = None
+    active_card_route_kind: str | None = None
+    active_card_destination: str | None = None
+    active_card_return_to: str | None = None
+    active_card_queue_window: dict | None = None
+    active_card_context_summary: str | None = None
+    active_card_contract_id: str | None = None
+    active_card_phase: str | None = None
 
     @field_validator("content")
     @classmethod
@@ -115,6 +124,43 @@ class SendMessage(BaseModel):
         if len(v) > 8192:
             raise ValueError("消息内容超过最大长度限制 (8192 字符)")
         return v
+
+
+def _active_card_meta(req: SendMessage) -> dict:
+    """从 SendMessage 中提取 active_card 核心字段用于 assistant metadata。"""
+    m: dict = {}
+    for field_name, field_value in (
+        ("active_card_id", req.active_card_id),
+        ("active_card_title", req.active_card_title),
+        ("active_card_mode", req.active_card_mode),
+        ("active_card_target", req.active_card_target),
+        ("active_card_source_card_id", req.active_card_source_card_id),
+        ("active_card_staged_edit_id", req.active_card_staged_edit_id),
+        ("active_card_validation_source", req.active_card_validation_source),
+        ("active_card_file_role", req.active_card_file_role),
+        ("active_card_handoff_policy", req.active_card_handoff_policy),
+        ("active_card_route_kind", req.active_card_route_kind),
+        ("active_card_destination", req.active_card_destination),
+        ("active_card_return_to", req.active_card_return_to),
+        ("active_card_queue_window", req.active_card_queue_window),
+        ("active_card_context_summary", req.active_card_context_summary),
+        ("active_card_contract_id", req.active_card_contract_id),
+        ("active_card_phase", req.active_card_phase),
+    ):
+        if field_value is not None:
+            m[field_name] = field_value
+    return m
+
+
+def _studio_context_meta(req: SendMessage) -> dict:
+    """提取 Studio 请求上下文元数据，避免同步/流式路径挑字段导致降级。"""
+    m = _active_card_meta(req)
+    if req.selected_source_filename is not None:
+        m["selected_source_filename"] = req.selected_source_filename
+    m["editor_is_dirty"] = req.editor_is_dirty
+    if req.editor_prompt is not None:
+        m["editor_target"] = True
+    return m
 
 
 @router.get("/studio-entry")
@@ -615,6 +661,7 @@ async def send_message(
         _user_msg_meta["skill_id"] = req.selected_skill_id
     if _ws_obj and _ws_obj.workspace_type == "skill_studio":
         _user_msg_meta["studio_scope"] = "skill_studio"
+        _user_msg_meta.update(_studio_context_meta(req))
     user_msg = Message(
         conversation_id=conv_id,
         role=MessageRole.USER,
@@ -632,7 +679,7 @@ async def send_message(
             _studio_req = build_skill_studio_request(
                 user_id=user.id,
                 workspace_id=conv.workspace_id or 0,
-                skill_id=req.selected_skill_id or conv.skill_id or 0,
+                skill_id=req.selected_skill_id if req.selected_skill_id is not None else (conv.skill_id or 0),
                 conversation_id=conv_id,
                 user_message=req.content,
                 stream=False,
@@ -643,6 +690,23 @@ async def send_message(
                 selected_skill_id=req.selected_skill_id,
                 editor_prompt=req.editor_prompt,
                 editor_is_dirty=req.editor_is_dirty,
+                selected_source_filename=req.selected_source_filename,
+                active_card_id=req.active_card_id,
+                active_card_title=req.active_card_title,
+                active_card_mode=req.active_card_mode,
+                active_card_target=req.active_card_target,
+                active_card_source_card_id=req.active_card_source_card_id,
+                active_card_staged_edit_id=req.active_card_staged_edit_id,
+                active_card_phase=req.active_card_phase,
+                active_card_validation_source=req.active_card_validation_source,
+                active_card_file_role=req.active_card_file_role,
+                active_card_handoff_policy=req.active_card_handoff_policy,
+                active_card_route_kind=req.active_card_route_kind,
+                active_card_destination=req.active_card_destination,
+                active_card_return_to=req.active_card_return_to,
+                active_card_queue_window=req.active_card_queue_window,
+                active_card_contract_id=req.active_card_contract_id,
+                active_card_context_summary=req.active_card_context_summary,
             )
             if _studio_resp.error:
                 raise HTTPException(503, _studio_resp.error)
@@ -656,7 +720,7 @@ async def send_message(
             conversation_id=conv_id,
             role=MessageRole.ASSISTANT,
             content=_resp_text,
-            metadata_={"skill_id": req.selected_skill_id, "studio_scope": "skill_studio"},
+            metadata_={**({"skill_id": req.selected_skill_id} if req.selected_skill_id is not None else {}), "studio_scope": "skill_studio", **_studio_context_meta(req)},
         )
         db.add(_assistant_msg)
         msg_count = db.query(Message).filter(Message.conversation_id == conv_id).count()
@@ -698,7 +762,7 @@ async def send_message(
     # Extract token usage from guide_meta
     llm_usage = guide_meta.pop("llm_usage", {})
     msg_metadata = {
-        "skill_id": req.selected_skill_id or conv.skill_id,
+        "skill_id": req.selected_skill_id if req.selected_skill_id is not None else conv.skill_id,
         "skill_name": skill_name,
         "model_id": llm_usage.get("model_id"),
         "input_tokens": llm_usage.get("input_tokens", 0),
@@ -756,12 +820,12 @@ async def stream_message(
             _h_req = build_skill_studio_request(
                 user_id=user.id,
                 workspace_id=conv.workspace_id or 0,
-                skill_id=req.selected_skill_id or conv.skill_id or 0,
+                skill_id=req.selected_skill_id if req.selected_skill_id is not None else (conv.skill_id or 0),
                 conversation_id=conv_id,
                 user_message=req.content,
                 stream=True,
                 metadata={"source": "conversations.stream"},
-            ) if (req.selected_skill_id or conv.skill_id) else None
+            ) if (req.selected_skill_id is not None or conv.skill_id) else None
         else:
             _h_req = build_chat_request(
                 user_id=user.id,
@@ -791,26 +855,11 @@ async def stream_message(
 
     # Persist user message — commit immediately so it survives if SSE is dropped mid-stream
     _user_meta: dict = {}
-    if req.selected_skill_id:
+    if req.selected_skill_id is not None:
         _user_meta["skill_id"] = req.selected_skill_id
-    if req.active_card_id:
-        _user_meta["active_card_id"] = req.active_card_id
-    if req.active_card_source_card_id:
-        _user_meta["active_card_source_card_id"] = req.active_card_source_card_id
-    if req.active_card_staged_edit_id:
-        _user_meta["active_card_staged_edit_id"] = req.active_card_staged_edit_id
     if _ws_type_stream == "skill_studio":
         _user_meta["studio_scope"] = "skill_studio"
-        if req.active_card_title:
-            _user_meta["active_card_title"] = req.active_card_title
-        if req.active_card_mode:
-            _user_meta["active_card_mode"] = req.active_card_mode
-        if req.active_card_target:
-            _user_meta["active_card_target"] = req.active_card_target
-        if req.active_card_validation_source:
-            _user_meta["active_card_validation_source"] = req.active_card_validation_source
-    if req.editor_prompt:
-        _user_meta["editor_target"] = True
+        _user_meta.update(_studio_context_meta(req))
     if _h_req:
         _user_meta["_harness_request_id"] = _h_req.request_id
     user_msg = Message(
@@ -832,7 +881,7 @@ async def stream_message(
         run = await studio_run_registry.create(
             conversation_id=conv_id,
             user_id=current_user_id,
-            skill_id=req.selected_skill_id or conv.skill_id,
+            skill_id=req.selected_skill_id if req.selected_skill_id is not None else conv.skill_id,
             content=req.content,
             req_payload={
                 "editor_prompt": req.editor_prompt,
@@ -845,6 +894,15 @@ async def stream_message(
                 "active_card_source_card_id": req.active_card_source_card_id,
                 "active_card_staged_edit_id": req.active_card_staged_edit_id,
                 "active_card_validation_source": req.active_card_validation_source,
+                "active_card_file_role": req.active_card_file_role,
+                "active_card_handoff_policy": req.active_card_handoff_policy,
+                "active_card_route_kind": req.active_card_route_kind,
+                "active_card_destination": req.active_card_destination,
+                "active_card_return_to": req.active_card_return_to,
+                "active_card_queue_window": req.active_card_queue_window,
+                "active_card_context_summary": req.active_card_context_summary,
+                "active_card_contract_id": req.active_card_contract_id,
+                "active_card_phase": req.active_card_phase,
             },
         )
         return StreamingResponse(
@@ -958,7 +1016,7 @@ async def stream_message(
                     _studio_req = _build_studio_req(
                         user_id=current_user_id,
                         workspace_id=conv.workspace_id or 0,
-                        skill_id=req.selected_skill_id or conv.skill_id or 0,
+                        skill_id=req.selected_skill_id if req.selected_skill_id is not None else (conv.skill_id or 0),
                         conversation_id=conv_id,
                         user_message=req.content,
                         stream=True,
@@ -1084,6 +1142,23 @@ async def stream_message(
                         selected_skill_id=req.selected_skill_id,
                         editor_prompt=req.editor_prompt,
                         editor_is_dirty=req.editor_is_dirty,
+                        selected_source_filename=req.selected_source_filename,
+                        active_card_id=req.active_card_id,
+                        active_card_title=req.active_card_title,
+                        active_card_mode=req.active_card_mode,
+                        active_card_target=req.active_card_target,
+                        active_card_source_card_id=req.active_card_source_card_id,
+                        active_card_staged_edit_id=req.active_card_staged_edit_id,
+                        active_card_phase=req.active_card_phase,
+                        active_card_validation_source=req.active_card_validation_source,
+                        active_card_file_role=req.active_card_file_role,
+                        active_card_handoff_policy=req.active_card_handoff_policy,
+                        active_card_route_kind=req.active_card_route_kind,
+                        active_card_destination=req.active_card_destination,
+                        active_card_return_to=req.active_card_return_to,
+                        active_card_queue_window=req.active_card_queue_window,
+                        active_card_context_summary=req.active_card_context_summary,
+                        active_card_contract_id=req.active_card_contract_id,
                     ):
                         # HarnessEvent → SSE 文本
                         yield _harness_evt.to_sse()
@@ -1097,7 +1172,7 @@ async def stream_message(
                         conversation_id=conv_id,
                         role=MessageRole.ASSISTANT,
                         content=_final_content,
-                        metadata_={"skill_id": req.selected_skill_id, "studio_scope": "skill_studio"} if req.selected_skill_id else {"studio_scope": "skill_studio"},
+                        metadata_={**({"skill_id": req.selected_skill_id} if req.selected_skill_id is not None else {}), "studio_scope": "skill_studio", **_studio_context_meta(req)},
                     )
                     db.add(_fast_msg)
                     _msg_count = db.query(Message).filter(Message.conversation_id == conv_id).count()
@@ -1195,7 +1270,7 @@ async def stream_message(
                         early_meta = evt_data.get("metadata", {})
                         llm_usage = early_meta.pop("llm_usage", {}) if isinstance(early_meta, dict) else {}
                         msg_metadata = {
-                            "skill_id": req.selected_skill_id or conv.skill_id,
+                            "skill_id": req.selected_skill_id if req.selected_skill_id is not None else conv.skill_id,
                             "skill_name": None,
                             "model_id": llm_usage.get("model_id"),
                             "input_tokens": llm_usage.get("input_tokens", 0),
@@ -1204,6 +1279,7 @@ async def stream_message(
                         }
                         if _ws_type_stream == "skill_studio":
                             msg_metadata["studio_scope"] = "skill_studio"
+                            msg_metadata.update(_studio_context_meta(req))
                         assistant_msg = Message(
                             conversation_id=conv_id,
                             role=MessageRole.ASSISTANT,
@@ -1238,7 +1314,7 @@ async def stream_message(
 
             # --- 持久化 + done ---
             msg_metadata = {
-                "skill_id": req.selected_skill_id or conv.skill_id,
+                "skill_id": req.selected_skill_id if req.selected_skill_id is not None else conv.skill_id,
                 "skill_name": skill_name,
                 **tool_meta,
             }

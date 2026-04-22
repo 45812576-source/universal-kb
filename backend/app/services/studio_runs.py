@@ -36,6 +36,7 @@ class StudioRun:
     user_id: int
     skill_id: int | None
     content: str
+    req_payload: dict[str, Any] = field(default_factory=dict)
     run_version: int = 1
     status: str = "queued"
     created_at: datetime.datetime = field(default_factory=datetime.datetime.utcnow)
@@ -100,6 +101,7 @@ class StudioRunRegistry:
                 user_id=user_id,
                 skill_id=skill_id,
                 content=content,
+                req_payload=dict(req_payload or {}),
                 run_version=next_version,
             )
             self._runs[run.id] = run
@@ -411,7 +413,18 @@ class StudioRunRegistry:
                 active_card_title=req_payload.get("active_card_title"),
                 active_card_mode=req_payload.get("active_card_mode"),
                 active_card_target=req_payload.get("active_card_target"),
+                active_card_source_card_id=req_payload.get("active_card_source_card_id"),
+                active_card_staged_edit_id=req_payload.get("active_card_staged_edit_id"),
+                active_card_phase=req_payload.get("active_card_phase"),
                 active_card_validation_source=req_payload.get("active_card_validation_source"),
+                active_card_file_role=req_payload.get("active_card_file_role"),
+                active_card_handoff_policy=req_payload.get("active_card_handoff_policy"),
+                active_card_route_kind=req_payload.get("active_card_route_kind"),
+                active_card_destination=req_payload.get("active_card_destination"),
+                active_card_return_to=req_payload.get("active_card_return_to"),
+                active_card_queue_window=req_payload.get("active_card_queue_window"),
+                active_card_context_summary=req_payload.get("active_card_context_summary"),
+                active_card_contract_id=req_payload.get("active_card_contract_id"),
             ):
                 if run.cancel_requested:
                     raise asyncio.CancelledError()
@@ -449,11 +462,22 @@ class StudioRunRegistry:
                 staged_edit_count=staged_edit_count,
             )
 
+            _card_meta = {
+                key: value
+                for key, value in (run.req_payload or {}).items()
+                if key.startswith("active_card_") and value is not None
+            }
+            if run.req_payload.get("selected_source_filename") is not None:
+                _card_meta["selected_source_filename"] = run.req_payload["selected_source_filename"]
+            if "editor_is_dirty" in (run.req_payload or {}):
+                _card_meta["editor_is_dirty"] = bool(run.req_payload.get("editor_is_dirty"))
+            if run.req_payload.get("editor_prompt") is not None:
+                _card_meta["editor_target"] = True
             assistant_msg = Message(
                 conversation_id=run.conversation_id,
                 role=MessageRole.ASSISTANT,
                 content=final_content,
-                metadata_={"skill_id": run.skill_id, "studio_scope": "skill_studio"} if run.skill_id else {"studio_scope": "skill_studio"},
+                metadata_={**({"skill_id": run.skill_id} if run.skill_id else {}), "studio_scope": "skill_studio", **_card_meta},
             )
             db.add(assistant_msg)
             msg_count = db.query(Message).filter(Message.conversation_id == run.conversation_id).count()

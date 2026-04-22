@@ -69,6 +69,14 @@ def _mode_from_card_type(card_type: str) -> str:
         "remediation": WorkspaceMode.FILE,
         "preflight": WorkspaceMode.REPORT,
         "sandbox_report": WorkspaceMode.REPORT,
+        # M5: 新增卡片类型映射
+        "confirm": WorkspaceMode.REPORT,
+        "external_build": WorkspaceMode.FILE,
+        "fixing": WorkspaceMode.FILE,
+        "release": WorkspaceMode.REPORT,
+        "refine": WorkspaceMode.FILE,
+        "optimize": WorkspaceMode.FILE,
+        "audit": WorkspaceMode.REPORT,
     }
     return mapping.get(card_type, WorkspaceMode.FILE)
 
@@ -164,7 +172,7 @@ def _resolve_governance_drawer(
     card_type = card.get("type") or card.get("card_type") or ""
 
     # governance 卡片执行期间自动展开抽屉
-    if card_type in ("governance", "audit_issue", "quality_issue", "remediation"):
+    if card_type in ("governance", "audit_issue", "quality_issue", "remediation", "confirm", "fixing"):
         status = card.get("status", "")
         if status in ("active", "drafting", "diff_ready", "reviewing"):
             return "expanded"

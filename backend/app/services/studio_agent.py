@@ -17,7 +17,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from sqlalchemy.orm import Session
 
@@ -871,7 +871,7 @@ _CARD_MODE_DIRECTIVES: dict[str, str] = {
         "- 目标文件：{card_target}\n\n"
         "## 执行规则\n"
         "1. 你的唯一任务是完成对目标文件的修改\n"
-        "2. 用户说什么就改什么——直接输出 studio_diff 或 studio_draft，不要追问\n"
+        "2. 仅当文件角色允许直接改稿时，才输出 studio_diff 或 studio_draft\n"
         "3. 当用户给出修改意见时，立即执行修改并输出结果\n"
         "4. 如果用户的指令不够具体，给出最合理的修改方案并执行，让用户在结果上调整\n"
         "5. 禁止主动发起与当前文件修改无关的追问"
@@ -902,6 +902,214 @@ _CARD_MODE_DIRECTIVES: dict[str, str] = {
     ),
 }
 
+_FILE_ROLE_DIRECTIVES: dict[str, str] = {
+    "main_prompt": (
+        "你是 Skill Studio 的主 Prompt 编排 Agent。当前目标文件是 Skill 的主 Prompt。\n\n"
+        "## 当前任务（最高优先级，必须严格执行）\n"
+        "- 任务标题：{card_title}\n"
+        "- 文件角色：main_prompt\n"
+        "- 目标文件：{card_target}\n\n"
+        "## 当前身份\n"
+        "你负责把用户需求沉淀为可运行、可治理、可验证的 `SKILL.md` 主指令。\n\n"
+        "## 当前任务\n"
+        "沿 Why / What / How / Governance / Validation 主线推进主 Prompt 的定义、改写、收敛和测试准备。\n\n"
+        "## 可输出结构化块\n"
+        "- `studio_summary`：需要用户确认主线理解时使用\n"
+        "- `studio_draft`：生成完整主 Prompt 草稿时使用\n"
+        "- `studio_diff`：对当前主 Prompt 做最小 staged edit 时使用\n"
+        "- `studio_file_split`：主 Prompt 需要拆出 Example / Reference / KB / Template 时使用\n"
+        "- `studio_tool_suggestion`：识别到工具能力缺口时使用\n"
+        "- `studio_phase_progress`：完成 Skill Architect 阶段时使用\n\n"
+        "## 禁止输出结构化块\n"
+        "- 禁止输出 `studio_card_handoff` 作为替代修改结果；只有确需跨文件承接时才输出\n"
+        "- 禁止把 Tool 代码实现伪装成 `studio_draft` 或 `studio_diff`\n\n"
+        "## staged edit 权限\n"
+        "- 允许 `studio_draft` 和 `studio_diff`\n"
+        "- 所有修改必须围绕主 Prompt 规则本身，不能把 Example / Reference / KB 原文整段塞回主 Prompt\n\n"
+        "## Handoff 规则\n"
+        "- 用户要求新增示例、资料、模板或知识库文件时，输出 `studio_file_split` 或 `studio_card_handoff`\n"
+        "- 用户要求实现工具时，输出工具需求交接，不在当前卡内实现代码\n\n"
+        "## 用户确认规则\n"
+        "- 影响主 Prompt 架构、输入输出契约、治理约束或发布路径时，先用 `studio_summary` 让用户确认\n"
+        "- 用户已经明确要求修改时，直接给最小可采纳 diff，不要机械追问\n\n"
+        "## 退场条件\n"
+        "- 主 Prompt 草稿或 diff 已产出，并明确下一步 Sandbox / Preflight / Governance 验收路径\n"
+    ),
+    "example": (
+        "你是 Skill Studio 的 Example 创作与校准 Agent。当前目标文件是示例文件。\n\n"
+        "## 当前任务（最高优先级，必须严格执行）\n"
+        "- 任务标题：{card_title}\n"
+        "- 文件角色：example\n"
+        "- 目标文件：{card_target}\n\n"
+        "## 当前身份\n"
+        "你负责把抽象规则落成可测试示例、边界样例和反例，不负责重写主 Skill 架构。\n\n"
+        "## 当前任务\n"
+        "围绕示例场景、用户输入、期望输出、边界/反例、规则映射和 Sandbox 测试提示推进。\n\n"
+        "## 可输出结构化块\n"
+        "- `studio_summary`：总结示例覆盖范围或待确认边界时使用\n"
+        "- `studio_diff`：只允许改当前 Example 文件的 staged edit\n"
+        "- `studio_test_result`：示例可转成测试样例时使用\n"
+        "- `studio_card_handoff`：示例规则需要同步主 Prompt 时使用\n"
+        "- `studio_queue_update`：说明示例卡完成后建议显示/处理的下一张卡\n\n"
+        "## 禁止输出结构化块\n"
+        "- 禁止输出重写主 Prompt 的 `studio_draft`\n"
+        "- 禁止在 Example 卡里直接输出针对 `SKILL.md` 的 `studio_diff`\n"
+        "- 禁止输出发布、治理通过或工具已完成的结论\n\n"
+        "## staged edit 权限\n"
+        "- 允许对当前 Example 文件输出 `studio_diff`\n"
+        "- 不允许在当前卡混写主 Prompt；如需主 Prompt 配套调整，创建 handoff\n\n"
+        "## Handoff 规则\n"
+        "- 用户说“主 Prompt 也要体现这个规则”时，输出 `studio_card_handoff`，target_role 为 `main_prompt`\n"
+        "- 用户要求新增另一个示例时，输出 `studio_card_handoff` 或建议创建新的 example 卡\n\n"
+        "## 用户确认规则\n"
+        "- 示例期望输出、反例边界、测试通过标准不明确时，只问一个确认问题\n"
+        "- 不要继续追问“这个 Skill 要解决什么根因”\n\n"
+        "## 退场条件\n"
+        "- 示例文件可用于 Sandbox 测试，且已标注它映射到主 Prompt 的哪条规则\n"
+    ),
+    "reference": (
+        "你是 Skill Studio 的 Reference 资料整理 Agent。当前目标文件是参考资料。\n\n"
+        "## 当前任务（最高优先级，必须严格执行）\n"
+        "- 任务标题：{card_title}\n"
+        "- 文件角色：reference\n"
+        "- 目标文件：{card_target}\n\n"
+        "## 当前身份\n"
+        "你负责从资料中提取可引用规则、适用边界和风险提醒，不把资料直接改写成 Skill 主指令。\n\n"
+        "## 当前任务\n"
+        "做资料摘要、引用边界、可用性评估，并提出主 Prompt 或 KB 绑定建议。\n\n"
+        "## 可输出结构化块\n"
+        "- `studio_summary`：总结资料价值、限制和可引用点\n"
+        "- `studio_diff`：只允许整理当前 Reference 文件的结构\n"
+        "- `studio_file_role_decision`：资料角色不清时说明分类依据\n"
+        "- `studio_card_handoff`：需要把规则转写到主 Prompt 或 KB 时使用\n\n"
+        "## 禁止输出结构化块\n"
+        "- 禁止输出直接重写主 Prompt 的 `studio_draft`\n"
+        "- 禁止把 reference 原文当成主 Skill 指令输出\n\n"
+        "## staged edit 权限\n"
+        "- 允许整理当前 Reference 文件\n"
+        "- 不允许在当前卡直接改主 Prompt\n\n"
+        "## Handoff 规则\n"
+        "- 用户说“把这个写进 Skill”时，输出到 `main_prompt` 的 handoff 建议\n"
+        "- 用户说“做成可检索知识”时，输出到 `knowledge_base` 或治理绑定的 handoff 建议\n\n"
+        "## 用户确认规则\n"
+        "- 引用范围、资料可信度或敏感限制不清时，先要求确认\n\n"
+        "## 退场条件\n"
+        "- 已给出可引用规则清单、不可引用边界和下一步交接对象\n"
+    ),
+    "knowledge_base": (
+        "你是 Skill Studio 的 Knowledge Base 结构化 Agent。当前目标文件是知识库文件。\n\n"
+        "## 当前任务（最高优先级，必须严格执行）\n"
+        "- 任务标题：{card_title}\n"
+        "- 文件角色：knowledge_base\n"
+        "- 目标文件：{card_target}\n\n"
+        "## 当前身份\n"
+        "你负责把资料整理成可检索、可绑定、可治理的知识条目，不把知识库膨胀进主 Prompt。\n\n"
+        "## 当前任务\n"
+        "做知识条目化、标签建议、检索边界、缺口分析和绑定/索引建议。\n\n"
+        "## 可输出结构化块\n"
+        "- `studio_summary`：总结知识结构和缺口\n"
+        "- `studio_diff`：整理当前 KB 文件时使用\n"
+        "- `studio_card_handoff`：需要治理绑定、索引或权限声明时使用\n"
+        "- `studio_bind_back_request`：外部索引或绑定完成后请求回绑验证时使用\n\n"
+        "## 禁止输出结构化块\n"
+        "- 禁止输出主 Prompt 完整草稿 `studio_draft`\n"
+        "- 禁止跳过知识绑定、索引状态和权限边界直接声称可用\n\n"
+        "## staged edit 权限\n"
+        "- 允许整理当前 KB 文件\n"
+        "- 不允许把 KB 内容直接复制进主 Prompt\n\n"
+        "## Handoff 规则\n"
+        "- 涉及绑定、索引、权限或治理状态时，交接到 governance 或 bind-back 卡\n\n"
+        "## 用户确认规则\n"
+        "- 知识来源、权限、更新频率和检索边界不明确时，先要求确认\n\n"
+        "## 退场条件\n"
+        "- 知识条目结构、标签、检索边界和绑定下一步已明确\n"
+    ),
+    "template": (
+        "你是 Skill Studio 的 Template 设计 Agent。当前目标文件是输出模板。\n\n"
+        "## 当前任务（最高优先级，必须严格执行）\n"
+        "- 任务标题：{card_title}\n"
+        "- 文件角色：template\n"
+        "- 目标文件：{card_target}\n\n"
+        "## 当前身份\n"
+        "你负责优化输出结构、变量位、格式约束和质量标准，不把模板改造成完整 Skill。\n\n"
+        "## 当前任务\n"
+        "设计模板结构、变量字段、可选段落、示例填充和主 Prompt 调用方式。\n\n"
+        "## 可输出结构化块\n"
+        "- `studio_summary`：总结模板变量和输出标准\n"
+        "- `studio_diff`：只允许改当前 Template 文件\n"
+        "- `studio_card_handoff`：需要主 Prompt 调用模板时使用\n\n"
+        "## 禁止输出结构化块\n"
+        "- 禁止输出主 Prompt 完整草稿 `studio_draft`\n"
+        "- 禁止把模板变量和主 Prompt 规则混在一个未确认 diff 中\n\n"
+        "## staged edit 权限\n"
+        "- 允许整理当前 Template 文件\n"
+        "- 主 Prompt 如何调用模板必须单独交接或让用户确认\n\n"
+        "## Handoff 规则\n"
+        "- 用户要求“让 Skill 使用这个模板”时，交接到 `main_prompt`\n\n"
+        "## 用户确认规则\n"
+        "- 变量含义、必填/可选、输出样式或缺省值不明确时，先要求确认\n\n"
+        "## 退场条件\n"
+        "- 模板变量、输出格式和主 Prompt 调用建议已明确\n"
+    ),
+    "tool": (
+        "你是 Skill Studio 的 Tool 需求交接 Agent。当前目标是工具、接口、脚本或自动化能力。\n\n"
+        "## 当前任务（最高优先级，必须严格执行）\n"
+        "- 任务标题：{card_title}\n"
+        "- 文件角色：tool\n"
+        "- 目标文件：{card_target}\n\n"
+        "## 当前身份\n"
+        "你只负责把工具需求整理成可交给 OpenCode / Development Studio 的交接包，不在 Studio Chat 中假装开发完成。\n\n"
+        "## 当前任务\n"
+        "生成工具目标、输入 schema、输出 schema、权限要求、错误处理、测试样例、Skill 绑定方式和回流验收条件。\n\n"
+        "## 可输出结构化块\n"
+        "- `studio_card_handoff`：创建 Tool handoff 卡时使用\n"
+        "- `studio_external_edit_request`：请求打开 OpenCode / Development Studio 时使用\n"
+        "- `studio_summary`：需求还需确认时总结工具规格\n"
+        "- `studio_tool_suggestion`：记录 create_new 或 bind_existing 工具建议\n\n"
+        "## 禁止输出结构化块\n"
+        "- 严禁输出 `studio_diff`\n"
+        "- 严禁输出 `studio_draft`\n"
+        "- 严禁输出“工具已实现 / 已可用 / 已绑定完成”的结论，除非收到 external edit returned 和绑定验证证据\n\n"
+        "## staged edit 权限\n"
+        "- 不允许 staged edit Tool 代码\n"
+        "- 只允许输出需求交接包、外部编辑请求和回流验收条件\n\n"
+        "## Handoff 规则\n"
+        "- 用户说“帮我实现这个工具 / 接口 / 脚本 / 自动化”时，输出 `studio_external_edit_request`\n"
+        "- handoff_policy 优先使用 `open_opencode` 或 `open_development_studio`\n"
+        "- 外部编辑完成后，要求回到 Studio 创建 `confirm.bind_back` 确认卡，并继续进入验证\n\n"
+        "## 用户确认规则\n"
+        "- 输入输出 schema、权限、错误处理或验收样例缺失时，先用一个问题确认最关键缺口\n\n"
+        "## 退场条件\n"
+        "- 已生成可交付外部开发的工具交接包，并明确回流绑定与 Sandbox 验收条件\n"
+    ),
+    "unknown_asset": (
+        "你是 Skill Studio 的文件角色分类 Agent。当前目标文件角色尚不确定。\n\n"
+        "## 当前任务（最高优先级，必须严格执行）\n"
+        "- 任务标题：{card_title}\n"
+        "- 文件角色：unknown_asset\n"
+        "- 目标文件：{card_target}\n\n"
+        "## 当前身份\n"
+        "你负责先判断当前文件更像主 Prompt、Example、Reference、KB、Template 还是 Tool，再做最小推进。\n\n"
+        "## 当前任务\n"
+        "先分类，再说明可执行的最小下一步；不要在角色不清时直接大幅改稿。\n\n"
+        "## 可输出结构化块\n"
+        "- `studio_file_role_decision`：说明识别到的文件角色、置信度和依据\n"
+        "- `studio_summary`：需要用户确认分类时使用\n"
+        "- `studio_card_handoff`：分类后应交给其他文件角色卡时使用\n\n"
+        "## 禁止输出结构化块\n"
+        "- 禁止输出 `studio_draft`\n"
+        "- 禁止在未分类前输出大范围 `studio_diff`\n\n"
+        "## staged edit 权限\n"
+        "- 默认不允许直接改稿；只有用户明确要求且修改不依赖文件角色时，才给最小整理建议\n\n"
+        "## Handoff 规则\n"
+        "- 分类结果指向其他角色时，创建或建议切换到对应角色卡\n\n"
+        "## 用户确认规则\n"
+        "- 分类置信度不足或目标文件用途不清时，只问一个分类确认问题\n\n"
+        "## 退场条件\n"
+        "- 文件角色已确认，或已交接给合适的文件角色卡\n"
+    ),
+}
+
 _DEFAULT_DIRECTIVE = (
     "你是 Skill Studio 的高级创作顾问。你的使命是帮助用户快速构建有深度、架构正确的 AI Skill（系统提示词）。\n\n"
     "## 核心行为规则（优先级从高到低，严格遵守，违反任何一条视为严重错误）\n\n"
@@ -912,8 +1120,60 @@ _DEFAULT_DIRECTIVE = (
     "5. **错误上下文要降权**：如果你之前走错了方向并被用户纠正，不要再受旧方向影响。参考上下文摘要而非长历史。\n\n"
     "6. **文件不是默认前置条件**：不主动追问文件。只有用户主动提到文件、或你能具体说明缺什么信息导致无法判断什么时，才可提及文件。且必须提供无文件的替代路径。\n\n"
     "7. **不重复追问**：同一类别的问题（文件/目标用户/输出格式/约束/工具）只问一次。用户已回答的不再问，用户已拒绝的不再提。\n\n"
-    "8. **先响应，再引导**：每轮回复优先序 = 回应用户刚才说的话 → 更新当前理解 → 给出推进动作 → 如仍缺信息则问最多 1 个问题。"
+    "8. **先响应，再引导**：每轮回复优先序 = 回应用户刚才说的话 → 更新当前理解 → 给出推进动作 → 如仍缺信息则问最多 1 个问题。\n\n"
+    "9. **活跃卡片优先**：当用户正在处理某张卡片（上下文中会注明 active card 信息），你的回复应围绕该卡片的目标展开，不要偏离到其他话题，除非用户主动切换。"
 )
+
+
+def _collect_prior_artifacts(
+    current_contract_id: str,
+    card_artifacts: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """收集当前卡之前所有已完成卡的 artifact，按 contract_id 排序。"""
+    if not card_artifacts or not current_contract_id:
+        return []
+    prefix_parts = current_contract_id.split(".")
+    if len(prefix_parts) < 2:
+        return []
+    domain = prefix_parts[0]
+    results: list[dict[str, Any]] = []
+    for cid, artifacts in card_artifacts.items():
+        if cid == current_contract_id:
+            continue
+        if not isinstance(artifacts, dict):
+            continue
+        if cid.split(".")[0] == domain:
+            for key, data in artifacts.items():
+                results.append({"contract_id": cid, "artifact_key": key, "data": data})
+    return sorted(results, key=lambda x: x["contract_id"])
+
+
+def _format_artifacts_for_prompt(artifacts: list[dict[str, Any]], max_chars: int = 12000) -> str:
+    """将 artifact list 转为 LLM-readable markdown 文本，限制总长度。"""
+    if not artifacts:
+        return ""
+    parts: list[str] = []
+    total = 0
+    for art in artifacts:
+        cid = art.get("contract_id", "")
+        key = art.get("artifact_key", "")
+        data = art.get("data")
+        if isinstance(data, dict):
+            # 提取 summary 或 phase_summary 作为摘要
+            summary = data.get("summary") or data.get("phase_summary") or data.get("title") or ""
+            if not summary:
+                summary = json.dumps(data, ensure_ascii=False)[:500]
+        elif isinstance(data, str):
+            summary = data[:500]
+        else:
+            summary = str(data)[:500]
+        entry = f"### {cid} / {key}\n{summary}\n"
+        if total + len(entry) > max_chars:
+            parts.append(f"\n（已截断，共 {len(artifacts)} 个 artifact，超出长度限制）")
+            break
+        parts.append(entry)
+        total += len(entry)
+    return "\n".join(parts)
 
 
 def _build_card_directive(
@@ -921,22 +1181,84 @@ def _build_card_directive(
     active_card_title: str | None,
     active_card_target: str | None,
     active_card_id: str | None,
-    active_card_validation_source: dict | None,
+    active_card_source_card_id: str | None = None,
+    active_card_staged_edit_id: str | None = None,
+    active_card_phase: str | None = None,
+    active_card_validation_source: dict | None = None,
+    active_card_file_role: str | None = None,
+    active_card_handoff_policy: str | None = None,
+    active_card_route_kind: str | None = None,
+    active_card_destination: str | None = None,
+    active_card_return_to: str | None = None,
+    active_card_queue_window: dict | None = None,
+    active_card_contract_id: str | None = None,
+    active_card_context_summary: str | None = None,
+    card_artifacts: dict[str, Any] | None = None,
 ) -> str:
     """当有 active card 时，生成任务驱动的指令；否则返回默认创作顾问身份。"""
-    if not active_card_mode or active_card_mode not in _CARD_MODE_DIRECTIVES:
-        return _DEFAULT_DIRECTIVE
+    mode_matched = bool(active_card_mode and active_card_mode in _CARD_MODE_DIRECTIVES)
 
-    directive = _CARD_MODE_DIRECTIVES[active_card_mode].format(
-        card_title=active_card_title or "未命名任务",
-        card_target=active_card_target or "未指定",
-    )
+    # ── 选择 directive 主体 ──
+    if not mode_matched:
+        directive = _DEFAULT_DIRECTIVE
+    elif active_card_mode == "file":
+        template = _FILE_ROLE_DIRECTIVES.get(active_card_file_role or "", _FILE_ROLE_DIRECTIVES["unknown_asset"])
+        directive = template.format(
+            card_title=active_card_title or "未命名任务",
+            card_target=active_card_target or "未指定",
+        )
+    else:
+        template = _CARD_MODE_DIRECTIVES[active_card_mode]
+        directive = template.format(
+            card_title=active_card_title or "未命名任务",
+            card_target=active_card_target or "未指定",
+        )
 
-    # 追加卡片元数据
-    if active_card_id:
-        directive += f"\n- 卡片 ID：{active_card_id}"
-    if active_card_validation_source:
-        directive += f"\n- 验证来源：{json.dumps(active_card_validation_source, ensure_ascii=False)}"
+    # ── 统一追加卡片元数据（所有路径共享，无降级） ──
+    _meta_lines: list[str] = []
+    if active_card_id is not None:
+        _meta_lines.append(f"- 卡片 ID：{active_card_id}")
+    if active_card_source_card_id is not None:
+        _meta_lines.append(f"- 源卡片 ID：{active_card_source_card_id}")
+    if active_card_staged_edit_id is not None:
+        _meta_lines.append(f"- 关联 staged edit：{active_card_staged_edit_id}")
+    if active_card_contract_id is not None:
+        _meta_lines.append(f"- 卡片 Contract：{active_card_contract_id}")
+    if active_card_phase is not None:
+        _meta_lines.append(f"- 卡片阶段：{active_card_phase}")
+    if active_card_title is not None and not mode_matched:
+        # mode 命中模板时 title 已在模板内，仅 fallback 路径需额外注入
+        _meta_lines.append(f"- 卡片标题：{active_card_title}")
+    if active_card_target is not None and not mode_matched:
+        # mode 命中模板时 target 已在模板内，仅 fallback 路径需额外注入
+        _meta_lines.append(f"- 卡片目标：{active_card_target}")
+    if active_card_file_role is not None:
+        _meta_lines.append(f"- 文件角色：{active_card_file_role}")
+    if active_card_handoff_policy is not None:
+        _meta_lines.append(f"- 交接策略：{active_card_handoff_policy}")
+    if active_card_route_kind is not None:
+        _meta_lines.append(f"- 路由类型：{active_card_route_kind}")
+    if active_card_destination is not None:
+        _meta_lines.append(f"- 路由目标：{active_card_destination}")
+    if active_card_return_to is not None:
+        _meta_lines.append(f"- 回流目标：{active_card_return_to}")
+    if active_card_queue_window is not None:
+        _meta_lines.append(f"- 当前队列窗口：{json.dumps(active_card_queue_window, ensure_ascii=False)}")
+    if active_card_context_summary is not None:
+        _meta_lines.append(f"- 当前卡片上下文摘要：{active_card_context_summary.strip()[:1200]}")
+    if active_card_validation_source is not None:
+        _meta_lines.append(f"- 验证来源：{json.dumps(active_card_validation_source, ensure_ascii=False)}")
+
+    if _meta_lines:
+        directive += "\n\n## 当前活跃卡片\n" + "\n".join(_meta_lines)
+
+    # M4 B5: 注入前序卡片产物
+    if card_artifacts and active_card_contract_id:
+        prior = _collect_prior_artifacts(active_card_contract_id, card_artifacts)
+        if prior:
+            formatted = _format_artifacts_for_prompt(prior)
+            if formatted:
+                directive += "\n\n## 前序卡片产物\n以下是已完成卡片的分析产物，你可以参考这些内容来推进当前任务：\n" + formatted
 
     return directive
 
@@ -997,6 +1319,44 @@ _STUDIO_SYSTEM = """{card_directive}
 ```
   - 文件命名规范：example 前缀 `example-`，知识库后缀 `-kb`，参考资料前缀 `reference-`，模板前缀 `template-`
   - category 可选值：`example` / `knowledge-base` / `reference` / `template`
+- 当你判断当前文件角色、需要显式说明分类依据时，附加：
+```studio_file_role_decision
+{{"file_role": "main_prompt", "confidence": "high", "reasoning": ["命中文件名 SKILL.md", "当前任务围绕主 Prompt 规则"], "next_action": "continue_current_card"}}
+```
+- 当你判断需要跨文件承接当前工作时，附加：
+```studio_card_handoff
+{{"target_role": "main_prompt", "target_file": "SKILL.md", "handoff_policy": "open_file_workspace", "summary": "把当前 example 中确认的规则同步到主 Prompt", "activate": true}}
+```
+- 当你判断当前队列应推进、切换或预告下一张卡时，附加：
+```studio_queue_update
+{{"intent": "switch_to_existing_card", "reason": "当前 example 已完成，下一步应处理主 Prompt 同步", "suggested_target_card_id": "card_main_prompt_1"}}
+```
+- 当你需要请求外部编辑器实现工具时，附加：
+```studio_external_edit_request
+{{"target": "open_opencode", "summary": "创建天气查询工具", "input_schema": {{}}, "output_schema": {{}}, "acceptance_criteria": ["能成功返回天气结果"]}}
+```
+- 当你需要在外部编辑完成后引导回绑时，附加：
+```studio_bind_back_request
+{{"source": "external_edit_returned", "summary": "工具代码已返回，下一步绑定 Skill 并做 Sandbox 验证", "required_checks": ["权限声明", "工具绑定", "Sandbox 测试"]}}
+```
+- 当你完成 M5 默认链路中的内部节点时，按节点附加对应块：
+```studio_governance_complete
+{{"card_id": "当前治理卡ID", "contract_id": "governance.xxx", "result": "pass"}}
+```
+```studio_refine_staged
+{{"origin_card_id": "当前整改卡ID", "contract_id": "refine.xxx", "summary": "已生成待确认修改"}}
+```
+```studio_audit_scan_complete
+{{"card_id": "当前审计卡ID", "contract_id": "audit.xxx", "issues_count": 0, "max_severity": "low"}}
+```
+```studio_fixing_complete
+{{"card_id": "当前修复卡ID", "contract_id": "fixing.xxx", "result": "ready_for_validation"}}
+```
+- 当你建议新增后续卡片时，附加：
+```card_proposals
+{{"proposals": [{{"title": "补充示例", "summary": "为主 Prompt 增加一个边界样例", "card_type": "governance", "target_file": "example-boundary.md", "file_role": "example"}}]}}
+```
+- 如果 file_role 判定、queue_window、active_card 恢复、handoff、bind_back、governance route 或 staged_edit 任一核心链路无法继续，不要输出成功块；必须用普通文本说明失败步骤、当前未自动推进、可执行的补救动作。
 - 当你完成 Skill Architect 的某个阶段时，在回复末尾附加：
 ```studio_phase_progress
 {{"completed_phase": "phase1", "phase_label": "问题定义", "deliverables": ["根因定义", "使用场景", "复杂度分类"], "next_phase": "phase2", "next_label": "要素拆解"}}
@@ -1004,7 +1364,8 @@ _STUDIO_SYSTEM = """{card_directive}
   - completed_phase: phase1 / phase2 / phase3
   - deliverables: 该阶段的产出清单
   - next_phase: 下一阶段（phase3 完成后为 null）
-- 除 studio_tool_suggestion、studio_file_split、studio_governance_action、studio_phase_progress 和 architect_* 块外，其他结构化块每次回复最多输出一个。JSON 必须合法。
+- 文件角色 directive 对结构化块的允许/禁止范围优先于这里的通用说明。
+- 除 `studio_tool_suggestion`、`studio_file_split`、`studio_governance_action`、`studio_phase_progress`、`studio_card_handoff`、`studio_queue_update`、`card_proposals` 和 `architect_*` 块外，其他结构化块每次回复最多输出一个。JSON 必须合法。
 - 不要解释这些代码块的格式，直接输出。
 
 ## Skill Architect 工作流事件（当处于 architect_mode 时使用）
@@ -1177,7 +1538,19 @@ def _build_system(
     active_card_title: str | None = None,
     active_card_mode: str | None = None,
     active_card_target: str | None = None,
+    active_card_source_card_id: str | None = None,
+    active_card_staged_edit_id: str | None = None,
+    active_card_phase: str | None = None,
     active_card_validation_source: dict | None = None,
+    active_card_file_role: str | None = None,
+    active_card_handoff_policy: str | None = None,
+    active_card_route_kind: str | None = None,
+    active_card_destination: str | None = None,
+    active_card_return_to: str | None = None,
+    active_card_queue_window: dict | None = None,
+    active_card_contract_id: str | None = None,
+    active_card_context_summary: str | None = None,
+    card_artifacts: dict[str, Any] | None = None,
 ) -> str:
     if editor_prompt and editor_prompt.strip():
         line_count = editor_prompt.count("\n") + 1
@@ -1221,7 +1594,19 @@ def _build_system(
         active_card_title=active_card_title,
         active_card_target=active_card_target,
         active_card_id=active_card_id,
+        active_card_source_card_id=active_card_source_card_id,
+        active_card_staged_edit_id=active_card_staged_edit_id,
+        active_card_phase=active_card_phase,
         active_card_validation_source=active_card_validation_source,
+        active_card_file_role=active_card_file_role,
+        active_card_handoff_policy=active_card_handoff_policy,
+        active_card_route_kind=active_card_route_kind,
+        active_card_destination=active_card_destination,
+        active_card_return_to=active_card_return_to,
+        active_card_queue_window=active_card_queue_window,
+        active_card_contract_id=active_card_contract_id,
+        active_card_context_summary=active_card_context_summary,
+        card_artifacts=card_artifacts,
     )
 
     result = _STUDIO_SYSTEM.format(
@@ -1306,7 +1691,7 @@ def _trim_history_with_rollup(
 # ══════════════════════════════════════════════════════════════════════════════
 
 _BLOCK_PATTERN = re.compile(
-    r"```(studio_draft|studio_diff|studio_test_result|studio_summary|studio_tool_suggestion|studio_file_split|studio_memo_status|studio_task_focus|studio_editor_target|studio_persistent_notices|studio_context_rollup|studio_audit|studio_governance_action|studio_phase_progress|architect_question|architect_phase_summary|architect_structure|architect_priority_matrix|architect_ooda_decision|architect_ready_for_draft)\s*\n([\s\S]*?)\n```",
+    r"```(studio_draft|studio_diff|studio_test_result|studio_summary|studio_tool_suggestion|studio_file_split|studio_file_role_decision|studio_card_handoff|studio_queue_update|studio_external_edit_request|studio_bind_back_request|studio_memo_status|studio_task_focus|studio_editor_target|studio_persistent_notices|studio_context_rollup|studio_audit|studio_governance_action|studio_phase_progress|studio_governance_complete|studio_refine_staged|studio_audit_scan_complete|studio_fixing_complete|card_proposals|architect_question|architect_phase_summary|architect_structure|architect_priority_matrix|architect_ooda_decision|architect_ready_for_draft)\s*\n([\s\S]*?)\n```",
     re.IGNORECASE,
 )
 
@@ -1341,6 +1726,98 @@ def _strip_wrapper_codeblock(text: str) -> str:
     return text
 
 
+def _policy_from_external_target(target: Any, fallback: str | None = None) -> str:
+    """Normalize AI-facing external target names to backend handoff policies."""
+    value = str(target or fallback or "").strip().lower()
+    mapping = {
+        "open_opencode": "open_opencode",
+        "opencode": "open_opencode",
+        "open-code": "open_opencode",
+        "open_development_studio": "open_development_studio",
+        "development_studio": "open_development_studio",
+        "dev_studio": "open_development_studio",
+        "dev-studio": "open_development_studio",
+    }
+    return mapping.get(value, "open_development_studio")
+
+
+def _as_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if item is not None and str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _normalize_external_handoff_payload(
+    evt_name: str,
+    payload: dict[str, Any],
+    *,
+    active_card_target: str | None,
+    active_card_file_role: str | None,
+    active_card_handoff_policy: str | None,
+) -> dict[str, Any]:
+    """Convert AI handoff blocks into the stable M4 handoff_card contract."""
+    if evt_name == "studio_external_edit_request":
+        handoff_policy = _policy_from_external_target(
+            payload.get("target") or payload.get("destination") or payload.get("handoff_policy"),
+            active_card_handoff_policy,
+        )
+        handoff_summary = str(
+            payload.get("handoff_summary")
+            or payload.get("summary")
+            or payload.get("title")
+            or "外部实现请求"
+        ).strip()
+        target_role = str(
+            payload.get("target_role")
+            or payload.get("file_role")
+            or active_card_file_role
+            or "tool"
+        ).strip()
+        return {
+            "target_role": target_role or "tool",
+            "target_file": payload.get("target_file") or payload.get("file_path") or active_card_target,
+            "handoff_policy": handoff_policy,
+            "summary": handoff_summary,
+            "handoff_summary": handoff_summary,
+            "acceptance_criteria": _as_string_list(payload.get("acceptance_criteria")),
+            "activate": bool(payload.get("activate", True)),
+        }
+
+    return {
+        "target_role": str(payload.get("target_role") or active_card_file_role or "tool").strip() or "tool",
+        "target_file": payload.get("target_file") or active_card_target,
+        "handoff_policy": str(payload.get("handoff_policy") or active_card_handoff_policy or "open_development_studio").strip(),
+        "summary": str(payload.get("summary") or payload.get("handoff_summary") or "外部实现请求").strip(),
+        "handoff_summary": str(payload.get("handoff_summary") or payload.get("summary") or "外部实现请求").strip(),
+        "acceptance_criteria": _as_string_list(payload.get("acceptance_criteria")),
+        "activate": bool(payload.get("activate", True)),
+    }
+
+
+def _orchestration_error(
+    *,
+    step: str,
+    message: str,
+    active_card_id: str | None,
+    payload: dict[str, Any] | None = None,
+    retryable: bool = False,
+) -> dict[str, Any]:
+    """M5 explicit error contract: report failure and do not auto-advance."""
+    snapshot = dict(payload or {})
+    return {
+        "message": message,
+        "error_type": "studio_orchestration_error",
+        "step": step,
+        "active_card_id": active_card_id,
+        "auto_advanced": False,
+        "retryable": retryable,
+        "recovery_hint": "当前卡片未自动推进；请重试该动作，或先补齐交接包后再继续。",
+        "payload_snapshot": snapshot,
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 9. Stream runner
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1365,9 +1842,32 @@ async def run_stream(
     active_card_title: str | None = None,
     active_card_mode: str | None = None,
     active_card_target: str | None = None,
+    active_card_source_card_id: str | None = None,
+    active_card_staged_edit_id: str | None = None,
+    active_card_phase: str | None = None,
     active_card_validation_source: dict | None = None,
+    active_card_file_role: str | None = None,
+    active_card_handoff_policy: str | None = None,
+    active_card_route_kind: str | None = None,
+    active_card_destination: str | None = None,
+    active_card_return_to: str | None = None,
+    active_card_queue_window: dict | None = None,
+    active_card_contract_id: str | None = None,
+    active_card_context_summary: str | None = None,
 ) -> AsyncIterator[tuple[str, dict] | str]:
     """流式运行 studio agent (V2)。"""
+
+    # ── M4 B5: 从 memo 加载 card_artifacts 供 prompt 注入 ──
+    _card_artifacts: dict[str, Any] | None = None
+    if selected_skill_id:
+        try:
+            from app.models.skill_memo import SkillMemo
+            _memo = db.query(SkillMemo).filter(SkillMemo.skill_id == selected_skill_id).first()
+            if _memo:
+                _recovery = (_memo.memo_payload or {}).get("workflow_recovery") or {}
+                _card_artifacts = _recovery.get("card_artifacts") or None
+        except Exception:
+            pass
 
     # ── 1. 会话状态提取 + Fact Reconciliation ──
     session_state = _extract_session_state(
@@ -1562,7 +2062,19 @@ async def run_stream(
         active_card_title=active_card_title,
         active_card_mode=active_card_mode,
         active_card_target=active_card_target,
+        active_card_source_card_id=active_card_source_card_id,
+        active_card_staged_edit_id=active_card_staged_edit_id,
+        active_card_phase=active_card_phase,
         active_card_validation_source=active_card_validation_source,
+        active_card_file_role=active_card_file_role,
+        active_card_handoff_policy=active_card_handoff_policy,
+        active_card_route_kind=active_card_route_kind,
+        active_card_destination=active_card_destination,
+        active_card_return_to=active_card_return_to,
+        active_card_queue_window=active_card_queue_window,
+        active_card_contract_id=active_card_contract_id,
+        active_card_context_summary=active_card_context_summary,
+        card_artifacts=_card_artifacts,
     )
     if workspace_system_context:
         system_content = system_content + "\n\n## 额外上下文\n" + workspace_system_context
@@ -1647,10 +2159,33 @@ async def run_stream(
                 "initial_phase": phase_entry,
             })
 
-        # ── architect_phase_summary 确认 → 推进阶段 ──
+        # ── architect_phase_summary 确认 → 推进阶段 + artifact_patch ──
         if evt_name == "architect_phase_summary":
             completed_phase = payload.get("phase", "")
             ready = payload.get("ready_for_next", False)
+
+            # 保存阶段产物到 card_artifacts
+            if completed_phase and selected_skill_id:
+                try:
+                    from app.services.studio_card_service import save_card_artifact
+                    contract_id = f"architect.phase.{completed_phase}"
+                    save_card_artifact(
+                        db, selected_skill_id,
+                        card_id=f"create:architect:{completed_phase}",
+                        contract_id=contract_id,
+                        artifact_key="phase_summary",
+                        artifact_data=payload,
+                        user_id=user_id,
+                    )
+                    yield ("artifact_patch", {
+                        "contract_id": contract_id,
+                        "artifact_key": "phase_summary",
+                        "phase": completed_phase,
+                        "data": payload,
+                    })
+                except Exception as e:
+                    logger.warning(f"[studio_agent] save artifact error: {e}")
+
             if ready and completed_phase and arch_state:
                 try:
                     # 标记阶段已确认
@@ -1684,7 +2219,35 @@ async def run_stream(
                         arch_state.workflow_phase = "ready_for_draft"
                     elif "phase_" in decision:
                         # 回调到指定阶段
-                        arch_state.workflow_phase = decision.replace("回调到", "").strip()
+                        callback_phase = decision.replace("回调到", "").strip()
+                        arch_state.workflow_phase = callback_phase
+
+                        # M4 B7: 回调时标记后续阶段已完成卡 stale（M5: 多模式支持）
+                        if selected_skill_id:
+                            try:
+                                from app.services.studio_card_resolver import _MODE_REGISTRY
+                                from app.services.studio_card_service import mark_cards_stale as _mark_stale
+                                from app.models.skill_memo import SkillMemo as _SM
+                                _mode_entry = _MODE_REGISTRY.get(session_mode)
+                                _registry = _mode_entry[0] if _mode_entry else []
+                                _m = db.query(_SM).filter(_SM.skill_id == selected_skill_id).first()
+                                _completed = set()
+                                if _m:
+                                    _rec = (_m.memo_payload or {}).get("workflow_recovery") or {}
+                                    _completed = set(_rec.get("completed_card_ids") or [])
+                                if _completed:
+                                    _phase_order = ["phase_1_why", "phase_2_what", "phase_3_how"]
+                                    _cb_idx = _phase_order.index(callback_phase) if callback_phase in _phase_order else -1
+                                    _later = set(_phase_order[_cb_idx + 1:]) if _cb_idx >= 0 else set()
+                                    _stale_ids = [
+                                        c["id"] for c in _registry
+                                        if c["phase"] in _later and c["id"] in _completed
+                                    ]
+                                    if _stale_ids:
+                                        _mark_stale(db, selected_skill_id, card_ids=_stale_ids, reason=f"ooda_callback_to_{callback_phase}", user_id=user_id)
+                                        yield ("stale_patch", {"card_ids": _stale_ids, "reason": f"ooda_callback_to_{callback_phase}"})
+                            except Exception as e_stale:
+                                logger.warning(f"[studio_agent] stale marking on OODA callback error: {e_stale}")
                     db.commit()
                     yield ("architect_phase_status", {
                         "phase": arch_state.workflow_phase,
@@ -1695,7 +2258,7 @@ async def run_stream(
                 except Exception as e:
                     logger.warning(f"[studio_agent] OODA update error: {e}")
 
-        # ── architect_ready_for_draft → 标记就绪 ──
+        # ── architect_ready_for_draft → 标记就绪 + card_status_patch ──
         if evt_name == "architect_ready_for_draft":
             if arch_state:
                 try:
@@ -1703,6 +2266,192 @@ async def run_stream(
                     db.commit()
                 except Exception:
                     pass
+
+            # 标记当前 architect 卡 adopted + emit card_status_patch
+            if selected_skill_id:
+                try:
+                    from app.services.studio_card_service import complete_card as _complete_card
+                    active_arch_card_id = active_card_id or f"create:architect:{arch_phase}"
+                    _complete_card(
+                        db, selected_skill_id,
+                        card_id=active_arch_card_id,
+                        contract_id=f"architect.ready_for_draft",
+                        exit_reason="ready_for_draft",
+                        user_id=user_id,
+                    )
+                    yield ("card_status_patch", {
+                        "card_id": active_arch_card_id,
+                        "new_status": "adopted",
+                        "reason": "architect_ready_for_draft",
+                    })
+                except Exception as e:
+                    logger.warning(f"[studio_agent] complete_card on ready_for_draft error: {e}")
+
+        # ── studio_phase_progress → 标记该 phase 所有卡 adopted + 激活下一 phase 首卡 ──
+        if evt_name == "studio_phase_progress" and selected_skill_id:
+            completed_phase_label = payload.get("completed_phase", "")
+            next_phase_label = payload.get("next_phase")
+            try:
+                from app.services.studio_card_resolver import _MODE_REGISTRY
+                from app.services.studio_card_service import complete_card as _complete_card
+
+                # M5: 根据 session_mode 选择对应注册表
+                _pp_mode_entry = _MODE_REGISTRY.get(session_mode)
+                _phase_registry = _pp_mode_entry[0] if _pp_mode_entry else []
+
+                # 将 phase1/phase2/phase3 映射为内部 phase 名（M5: 扩展 optimize/audit phase）
+                _phase_label_map = {
+                    "phase1": "phase_1_why",
+                    "phase2": "phase_2_what",
+                    "phase3": "phase_3_how",
+                    "governance": "governance",
+                    "refine": "refine",
+                    "validation": "validation",
+                    "audit": "audit",
+                    "fixing": "fixing",
+                    "release": "release",
+                }
+                internal_phase = _phase_label_map.get(completed_phase_label, completed_phase_label)
+                internal_next = _phase_label_map.get(next_phase_label, next_phase_label) if next_phase_label else None
+
+                # 找到该 phase 下所有卡并标记完成（M5: 使用模式对应注册表）
+                phase_cards = [c for c in _phase_registry if c["phase"] == internal_phase]
+                next_phase_first_card = None
+                if internal_next:
+                    next_cards = [c for c in _phase_registry if c["phase"] == internal_next]
+                    next_phase_first_card = next_cards[0]["id"] if next_cards else None
+
+                for i, card_def in enumerate(phase_cards):
+                    is_last = (i == len(phase_cards) - 1)
+                    _complete_card(
+                        db, selected_skill_id,
+                        card_id=card_def["id"],
+                        contract_id=card_def["contract_id"],
+                        exit_reason="phase_completed",
+                        next_card_id=next_phase_first_card if is_last else None,
+                        user_id=user_id,
+                    )
+                    yield ("card_status_patch", {
+                        "card_id": card_def["id"],
+                        "new_status": "adopted",
+                        "reason": f"phase_completed:{completed_phase_label}",
+                    })
+            except Exception as e:
+                logger.warning(f"[studio_agent] studio_phase_progress card handling error: {e}")
+
+        # ── M5 B11a: studio_governance_complete → 治理审查完成（optimize/audit） ──
+        if evt_name == "studio_governance_complete" and selected_skill_id:
+            completed_governance_card_id = payload.get("card_id") or active_card_id
+            governance_result = payload.get("result", "pass")
+            if completed_governance_card_id:
+                try:
+                    from app.services.studio_card_service import complete_card as _complete_card
+                    _complete_card(
+                        db, selected_skill_id,
+                        card_id=completed_governance_card_id,
+                        contract_id=payload.get("contract_id", ""),
+                        exit_reason=f"governance_{governance_result}",
+                        user_id=user_id,
+                    )
+                    yield ("card_status_patch", {
+                        "card_id": completed_governance_card_id,
+                        "new_status": "adopted",
+                        "reason": f"governance_complete:{governance_result}",
+                    })
+                except Exception as e_gc:
+                    logger.warning(f"[studio_agent] studio_governance_complete error: {e_gc}")
+
+        # ── M5 B11b: studio_refine_staged → optimize refine 产出 staged_edit ──
+        if evt_name == "studio_refine_staged" and selected_skill_id:
+            origin_card_id = payload.get("origin_card_id") or active_card_id
+            if origin_card_id:
+                yield ("card_status_patch", {
+                    "card_id": origin_card_id,
+                    "new_status": "diff_ready",
+                    "reason": "staged_edit_produced",
+                })
+
+        # ── M5 B11c: studio_audit_scan_complete → 审计扫描完成 ──
+        if evt_name == "studio_audit_scan_complete" and selected_skill_id:
+            scan_card_id = payload.get("card_id") or active_card_id
+            issues_found = payload.get("issues_count", 0)
+            severity = payload.get("max_severity", "low")
+            if scan_card_id:
+                try:
+                    from app.services.studio_card_service import save_card_artifact, complete_card as _complete_card
+                    save_card_artifact(
+                        db, selected_skill_id,
+                        card_id=scan_card_id,
+                        contract_id=payload.get("contract_id", f"audit.scan.{scan_card_id}"),
+                        artifact_key="scan_result",
+                        artifact_data=payload,
+                        user_id=user_id,
+                    )
+                    yield ("artifact_patch", {
+                        "contract_id": payload.get("contract_id", ""),
+                        "artifact_key": "scan_result",
+                        "data": payload,
+                    })
+                    _complete_card(
+                        db, selected_skill_id,
+                        card_id=scan_card_id,
+                        contract_id=payload.get("contract_id", ""),
+                        exit_reason=f"scan_complete:issues={issues_found}",
+                        user_id=user_id,
+                    )
+                    yield ("card_status_patch", {
+                        "card_id": scan_card_id,
+                        "new_status": "adopted",
+                        "reason": f"audit_scan_complete:severity={severity}",
+                    })
+                except Exception as e_asc:
+                    logger.warning(f"[studio_agent] studio_audit_scan_complete error: {e_asc}")
+
+        # ── M5 B11d: studio_fixing_complete → 整改完成（audit fixing） ──
+        if evt_name == "studio_fixing_complete" and selected_skill_id:
+            fixing_card_id = payload.get("card_id") or active_card_id
+            if fixing_card_id:
+                try:
+                    from app.services.studio_card_service import complete_card as _complete_card
+                    _complete_card(
+                        db, selected_skill_id,
+                        card_id=fixing_card_id,
+                        contract_id=payload.get("contract_id", ""),
+                        exit_reason="fixing_complete",
+                        user_id=user_id,
+                    )
+                    yield ("card_status_patch", {
+                        "card_id": fixing_card_id,
+                        "new_status": "adopted",
+                        "reason": "fixing_complete",
+                    })
+                except Exception as e_fc:
+                    logger.warning(f"[studio_agent] studio_fixing_complete error: {e_fc}")
+
+        # ── M4 B8 + M5 B11f: 卡片状态变更后推送 queue_window_patch ──
+        if evt_name in (
+            "architect_ready_for_draft", "studio_phase_progress", "architect_phase_summary",
+            "studio_governance_complete", "studio_audit_scan_complete",
+            "studio_fixing_complete", "studio_refine_staged",
+        ) and selected_skill_id:
+            try:
+                from app.models.skill_memo import SkillMemo as _QSM
+                from app.services.studio_session_service import _build_card_queue_window
+                _qm = db.query(_QSM).filter(_QSM.skill_id == selected_skill_id).first()
+                if _qm:
+                    _qrec = (_qm.memo_payload or {}).get("workflow_recovery") or {}
+                    _qcards = _qrec.get("cards") or []
+                    _qcompleted = _qrec.get("completed_card_ids") or []
+                    _qws = _qrec.get("workflow_state") or {}
+                    _qwindow = _build_card_queue_window(
+                        _qcards, _qws.get("active_card_id"), _qws,
+                        completed_card_ids=_qcompleted,
+                        staged_edits=_qrec.get("staged_edits") or [],
+                    )
+                    if _qwindow:
+                        yield ("queue_window_patch", _qwindow)
+            except Exception as e_qw:
+                logger.warning(f"[studio_agent] queue_window_patch error: {e_qw}")
 
         # ── studio_governance_action → 也发 governance_card 对齐 ──
         if evt_name == "studio_governance_action":
@@ -1720,6 +2469,170 @@ async def run_stream(
                 "status": "pending",
                 "actions": actions,
             })
+
+    # ── M4: studio_card_handoff / studio_external_edit_request — 区分 internal vs external ──
+    for evt_name, payload in events:
+        if evt_name in ("studio_card_handoff", "studio_external_edit_request") and selected_skill_id:
+            _handoff_payload = _normalize_external_handoff_payload(
+                evt_name,
+                payload,
+                active_card_target=active_card_target,
+                active_card_file_role=active_card_file_role,
+                active_card_handoff_policy=active_card_handoff_policy,
+            )
+            _ho_policy = _handoff_payload.get("handoff_policy", "open_file_workspace")
+            from app.services.studio_card_service import _classify_route_kind
+            _route_kind = _classify_route_kind(_ho_policy)
+
+            if _route_kind == "external":
+                # 真正的外部 handoff → 调用 handoff_card 服务
+                try:
+                    from app.services.studio_card_service import handoff_card as _handoff
+                    _source_card_id = active_card_id or payload.get("source_card_id", "")
+                    if not _source_card_id:
+                        yield ("error", _orchestration_error(
+                            step="handoff",
+                            message="无法创建外部交接：缺少 active_card_id，当前未自动推进。",
+                            active_card_id=active_card_id,
+                            payload=payload,
+                        ))
+                        continue
+                    _ho_result = _handoff(
+                        db, selected_skill_id, _source_card_id,
+                        target_role=_handoff_payload.get("target_role", "tool"),
+                        target_file=_handoff_payload.get("target_file"),
+                        handoff_policy=_ho_policy,
+                        summary=_handoff_payload.get("summary", ""),
+                        handoff_summary=_handoff_payload.get("handoff_summary", ""),
+                        acceptance_criteria=_handoff_payload.get("acceptance_criteria") or [],
+                        activate_target=bool(_handoff_payload.get("activate", True)),
+                        user_id=user_id,
+                    )
+                    if _ho_result.get("ok"):
+                        yield ("card_status_patch", {
+                            "card_id": _source_card_id,
+                            "new_status": "waiting_external_build",
+                            "external_state": "waiting_external_build",
+                            "reason": "handoff_to_" + str(_handoff_payload.get("target_role", "")),
+                        })
+                        yield ("card_patch", {
+                            "action": "handoff_created",
+                            "route_kind": "external",
+                            "derived_card_id": _ho_result.get("derived_card_id"),
+                            "source_card_id": _source_card_id,
+                            "destination": _ho_result.get("destination", ""),
+                            "return_to": _ho_result.get("return_to", "bind_back"),
+                            "handoff_summary": _ho_result.get("handoff_summary", ""),
+                            "acceptance_criteria": _ho_result.get("acceptance_criteria", []),
+                            "explanation": _ho_result.get("explanation", ""),
+                        })
+                    else:
+                        yield ("error", _orchestration_error(
+                            step="handoff",
+                            message=f"外部交接创建失败：{_ho_result.get('error', 'unknown_error')}；当前未自动推进。",
+                            active_card_id=_source_card_id,
+                            payload={**payload, "normalized": _handoff_payload},
+                            retryable=True,
+                        ))
+                except Exception as e_ho:
+                    logger.warning("[studio_agent] external handoff error: %s", e_ho)
+                    yield ("error", _orchestration_error(
+                        step="handoff",
+                        message=f"外部交接创建异常：{type(e_ho).__name__}；当前未自动推进。",
+                        active_card_id=active_card_id,
+                        payload={**payload, "normalized": _handoff_payload},
+                        retryable=True,
+                    ))
+            else:
+                if evt_name == "studio_external_edit_request":
+                    yield ("error", _orchestration_error(
+                        step="handoff",
+                        message=f"外部编辑请求没有解析出 external route（handoff_policy={_ho_policy}），当前未自动推进。",
+                        active_card_id=active_card_id,
+                        payload={**payload, "normalized": _handoff_payload},
+                    ))
+                    continue
+                # 内部路由 → 只 emit card_patch 让前端处理路由
+                yield ("card_patch", {
+                    "action": "internal_route",
+                    "route_kind": "internal",
+                    "source_card_id": active_card_id or "",
+                    "target_role": _handoff_payload.get("target_role", ""),
+                    "target_file": _handoff_payload.get("target_file"),
+                    "handoff_policy": _ho_policy,
+                    "summary": _handoff_payload.get("summary", ""),
+                })
+
+        if evt_name == "studio_bind_back_request" and selected_skill_id:
+            try:
+                from app.services.studio_card_service import bind_back_card as _bind_back
+                _bb_card_id = active_card_id or payload.get("card_id", "")
+                if not _bb_card_id:
+                    yield ("error", _orchestration_error(
+                        step="bind_back",
+                        message="无法回绑外部结果：缺少 active_card_id，当前未自动推进。",
+                        active_card_id=active_card_id,
+                        payload=payload,
+                    ))
+                    continue
+                _bb_result = _bind_back(
+                    db, selected_skill_id, _bb_card_id,
+                    source=payload.get("source", "external_edit_returned"),
+                    summary=payload.get("summary", ""),
+                    required_checks=payload.get("required_checks"),
+                    user_id=user_id,
+                )
+                if _bb_result.get("ok"):
+                    yield ("card_status_patch", {
+                        "card_id": _bb_card_id,
+                        "new_status": _bb_result.get("new_status", "returned_waiting_bindback"),
+                        "external_state": _bb_result.get("new_status", "returned_waiting_bindback"),
+                        "reason": "bind_back_from_" + payload.get("source", "external"),
+                    })
+                    # M4: 通知前端创建了确认卡
+                    if _bb_result.get("confirm_card_id"):
+                        yield ("card_patch", {
+                            "action": "confirm_card_created",
+                            "route_kind": "internal",
+                            "confirm_card_id": _bb_result["confirm_card_id"],
+                            "validate_card_id": _bb_result.get("validate_card_id"),
+                            "next_card_id": _bb_result.get("next_card_id"),
+                            "next_card_kind": _bb_result.get("next_card_kind"),
+                            "return_to": _bb_result.get("return_to"),
+                            "source_card_id": _bb_card_id,
+                            "explanation": _bb_result.get("explanation", ""),
+                        })
+                else:
+                    yield ("error", _orchestration_error(
+                        step="bind_back",
+                        message=f"外部结果回绑失败：{_bb_result.get('error', 'unknown_error')}；当前未自动推进。",
+                        active_card_id=_bb_card_id,
+                        payload=payload,
+                        retryable=True,
+                    ))
+            except Exception as e_bb:
+                logger.warning("[studio_agent] bind_back error: %s", e_bb)
+                yield ("error", _orchestration_error(
+                    step="bind_back",
+                    message=f"外部结果回绑异常：{type(e_bb).__name__}；当前未自动推进。",
+                    active_card_id=active_card_id,
+                    payload=payload,
+                    retryable=True,
+                ))
+
+    # ── M4 B9: 处理 AI 动态卡片提案 ──
+    for evt_name, payload in events:
+        if evt_name == "card_proposals" and selected_skill_id:
+            proposals = payload.get("proposals") if isinstance(payload, dict) else payload
+            if isinstance(proposals, list) and proposals:
+                try:
+                    from app.services.studio_card_service import apply_card_proposals
+                    result = apply_card_proposals(db, selected_skill_id, proposals=proposals, user_id=user_id)
+                    if result.get("applied"):
+                        for applied_item in result["applied"]:
+                            yield ("card_patch", applied_item)
+                except Exception as e_cp:
+                    logger.warning(f"[studio_agent] card_proposals handling error: {e_cp}")
 
     # ── 阶段 4: done ──
     yield ("status", {"stage": "done"})

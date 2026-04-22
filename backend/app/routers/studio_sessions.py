@@ -7,6 +7,8 @@
 - POST /api/skills/{skill_id}/studio/cards/{card_id}/activate — 激活卡片
 - POST /api/skills/{skill_id}/studio/cards/{card_id}/append-context — 追加上下文
 - POST /api/skills/{skill_id}/studio/cards/{card_id}/decision — 用户决策
+- POST /api/skills/{skill_id}/studio/cards/{card_id}/handoff — 卡片交接（M4）
+- POST /api/skills/{skill_id}/studio/cards/{card_id}/bind-back — 外部编辑回绑（M4）
 - POST /api/skills/{skill_id}/studio/global-constraints — 更新全局约束
 
 - POST /api/skills/{skill_id}/studio/test-flow/resolve-entry — test flow 入口解析
@@ -79,6 +81,25 @@ class CreateCardRequest(BaseModel):
     target_file: Optional[str] = None
     origin: str = "user_request"
     activate: bool = False
+
+
+class HandoffRequest(BaseModel):
+    target_role: str  # tool / external_build / etc.
+    target_file: Optional[str] = None
+    handoff_policy: str = "open_development_studio"  # 仅限外部 handoff 策略
+    route_kind: str = "external"
+    destination: Optional[str] = None
+    return_to: str = "bind_back"
+    summary: str = ""
+    handoff_summary: Optional[str] = None
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    activate_target: bool = True
+
+
+class BindBackRequest(BaseModel):
+    source: str = "external_edit_returned"
+    summary: str = ""
+    required_checks: list[str] = Field(default_factory=list)
 
 
 class GlobalConstraintsRequest(BaseModel):
@@ -246,6 +267,76 @@ def card_decision(
     db.commit()
     _emit(db, StudioEventTypes.USER_DECISION_RECORDED, skill_id, user.id, {
         "card_id": card_id, "decision": req.decision,
+    })
+
+    # M5 B12: 传播 confirm 卡产生的 card_status_events
+    for cse in (result.get("card_status_events") or []):
+        _emit(db, StudioEventTypes.CARD_UPDATED, skill_id, user.id, cse)
+
+    return result
+
+
+# ── Handoff / Bind-back ──────────────────────────────────────────────────────
+
+@router.post("/api/skills/{skill_id}/studio/cards/{card_id}/handoff")
+def handoff_card(
+    skill_id: int,
+    card_id: str,
+    req: HandoffRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """从当前卡片派生衍生卡并执行交接。"""
+    try:
+        result = studio_card_service.handoff_card(
+            db, skill_id, card_id,
+            target_role=req.target_role,
+            target_file=req.target_file,
+            handoff_policy=req.handoff_policy,
+            summary=req.summary,
+            handoff_summary=req.handoff_summary,
+            acceptance_criteria=req.acceptance_criteria,
+            activate_target=req.activate_target,
+            user_id=user.id,
+        )
+    except OptimisticLockError:
+        raise HTTPException(status_code=409, detail="并发写入冲突，请重试")
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "操作失败"))
+    db.commit()
+    _emit(db, "handoff_created", skill_id, user.id, {
+        "card_id": card_id,
+        "derived_card_id": result.get("derived_card_id"),
+        "handoff_policy": req.handoff_policy,
+    })
+    return result
+
+
+@router.post("/api/skills/{skill_id}/studio/cards/{card_id}/bind-back")
+def bind_back_card(
+    skill_id: int,
+    card_id: str,
+    req: BindBackRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """外部编辑完成后回绑到卡片。"""
+    try:
+        result = studio_card_service.bind_back_card(
+            db, skill_id, card_id,
+            source=req.source,
+            summary=req.summary,
+            required_checks=req.required_checks,
+            user_id=user.id,
+        )
+    except OptimisticLockError:
+        raise HTTPException(status_code=409, detail="并发写入冲突，请重试")
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "操作失败"))
+    db.commit()
+    _emit(db, "external_edit_returned", skill_id, user.id, {
+        "card_id": card_id,
+        "source": req.source,
     })
     return result
 

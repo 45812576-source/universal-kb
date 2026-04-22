@@ -1144,6 +1144,112 @@ class TestStudioRunsWorkflowBootstrap:
         assert "已生成 1 个 staged edit" in evidence["payload"]["evidence"]
 
     @pytest.mark.asyncio
+    async def test_studio_runs_preserves_full_active_card_payload_in_agent_and_message(self, db, seeded):
+        from app.models.conversation import Conversation, Message, MessageRole
+        from app.services.studio_runs import StudioRun, StudioRunRegistry
+
+        conv = Conversation(user_id=seeded["admin"].id, skill_id=seeded["skill"].id)
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+        db.add_all([
+            Message(conversation_id=conv.id, role=MessageRole.USER, content="第一轮"),
+            Message(conversation_id=conv.id, role=MessageRole.ASSISTANT, content="第一轮回复"),
+            Message(conversation_id=conv.id, role=MessageRole.USER, content="第二轮"),
+        ])
+        db.commit()
+
+        registry = StudioRunRegistry()
+        run = StudioRun(
+            id="run_active_card_meta",
+            conversation_id=conv.id,
+            user_id=seeded["admin"].id,
+            skill_id=seeded["skill"].id,
+            content="继续推进",
+            req_payload={
+                "editor_prompt": "",
+                "editor_is_dirty": False,
+                "selected_source_filename": "example-basic.md",
+                "active_card_id": "card_1",
+                "active_card_title": "主卡",
+                "active_card_mode": None,
+                "active_card_target": "SKILL.md",
+                "active_card_source_card_id": "card_source",
+                "active_card_staged_edit_id": "edit_1",
+                "active_card_validation_source": {"source": "sandbox"},
+                "active_card_file_role": "main_prompt",
+                "active_card_handoff_policy": "open_file_workspace",
+                "active_card_queue_window": {"active_card_id": "card_1"},
+                "active_card_context_summary": "上下文摘要",
+                "active_card_contract_id": "confirm.staged_edit_review",
+                "active_card_phase": "phase_1_why",
+            },
+        )
+
+        seen: dict = {}
+
+        async def _fake_stream(*args, **kwargs):
+            seen.update(kwargs)
+            if False:
+                yield None
+
+        bootstrap_result = SimpleNamespace(
+            workflow_state={},
+            route_status=None,
+            assist_skills_status=None,
+            architect_phase_status=None,
+            audit_summary=None,
+            cards=[],
+            staged_edits=[],
+        )
+
+        with patch("app.services.studio_workflow_orchestrator.bootstrap_workflow", new=AsyncMock(return_value=bootstrap_result)), patch(
+            "app.services.studio_runs.SessionLocal",
+            TestingSessionLocal,
+        ), patch(
+            "app.harness.adapters.build_skill_studio_request",
+            return_value={"conversation_id": conv.id, "skill_id": seeded["skill"].id},
+        ), patch(
+            "app.harness.profiles.skill_studio.skill_studio_profile.run_stream",
+            new=_fake_stream,
+        ), patch(
+            "app.config.settings.STUDIO_STRUCTURED_MODE",
+            "on",
+        ):
+            await registry._execute(run, run.req_payload)
+
+        assert seen["selected_source_filename"] == "example-basic.md"
+        assert seen["active_card_target"] == "SKILL.md"
+        assert seen["active_card_source_card_id"] == "card_source"
+        assert seen["active_card_staged_edit_id"] == "edit_1"
+        assert seen["active_card_phase"] == "phase_1_why"
+        assert seen["active_card_file_role"] == "main_prompt"
+        assert seen["active_card_handoff_policy"] == "open_file_workspace"
+        assert seen["active_card_queue_window"] == {"active_card_id": "card_1"}
+        assert seen["active_card_context_summary"] == "上下文摘要"
+        assert seen["active_card_contract_id"] == "confirm.staged_edit_review"
+
+        assistant_message = db.query(Message).filter(
+            Message.conversation_id == conv.id,
+            Message.role == MessageRole.ASSISTANT,
+        ).order_by(Message.id.desc()).first()
+        assert assistant_message is not None
+        meta = assistant_message.metadata_ or {}
+        assert meta["active_card_target"] == "SKILL.md"
+        assert meta["active_card_source_card_id"] == "card_source"
+        assert meta["active_card_staged_edit_id"] == "edit_1"
+        assert meta["active_card_validation_source"] == {"source": "sandbox"}
+        assert meta["active_card_file_role"] == "main_prompt"
+        assert meta["active_card_handoff_policy"] == "open_file_workspace"
+        assert meta["active_card_queue_window"] == {"active_card_id": "card_1"}
+        assert meta["active_card_context_summary"] == "上下文摘要"
+        assert meta["active_card_contract_id"] == "confirm.staged_edit_review"
+        assert meta["active_card_phase"] == "phase_1_why"
+        assert meta["selected_source_filename"] == "example-basic.md"
+        assert meta["editor_is_dirty"] is False
+        assert meta["editor_target"] is True
+
+    @pytest.mark.asyncio
     async def test_create_supersedes_previous_active_run(self, db, seeded):
         from app.services.studio_runs import StudioRun, StudioRunRegistry
 
@@ -1595,6 +1701,75 @@ class TestSkillStudioRuntimeLatency:
         )
         assert "首轮" in fallback_event.data["text"]
         assert replace_event.data["text"] == "真正结果"
+
+    @pytest.mark.asyncio
+    async def test_profile_run_sync_forwards_active_card_context(self, db, seeded):
+        from app.harness.profiles.skill_studio import SkillStudioAgentProfile
+        from app.models.conversation import Conversation
+
+        conv = Conversation(user_id=seeded["admin"].id)
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+
+        request = self._build_request(
+            user_id=seeded["admin"].id,
+            skill_id=seeded["skill"].id,
+            conversation_id=conv.id,
+        )
+        profile = SkillStudioAgentProfile()
+        seen: dict = {}
+
+        async def fake_stream(**kwargs):
+            seen.update(kwargs)
+            yield ("delta", {"text": "首答"})
+            yield ("status", {"stage": "done"})
+            yield ("__full_content__", {"text": "首答"})
+
+        with (
+            patch.object(SkillStudioAgentProfile, "_build_history", return_value=[]),
+            patch.object(SkillStudioAgentProfile, "_get_available_tools", return_value=[]),
+            patch.object(SkillStudioAgentProfile, "_get_source_files", return_value=([], "", False)),
+            patch.object(SkillStudioAgentProfile, "_get_memo", return_value=""),
+            patch.object(SkillStudioAgentProfile, "_get_skill_metadata", return_value={}),
+            patch("app.services.studio_agent.run_stream", side_effect=fake_stream),
+        ):
+            response = await profile.run_sync(
+                request,
+                db,
+                conv,
+                selected_skill_id=seeded["skill"].id,
+                selected_source_filename="example-basic.md",
+                active_card_id="card_1",
+                active_card_title="主卡",
+                active_card_mode=None,
+                active_card_target="SKILL.md",
+                active_card_source_card_id="card_source",
+                active_card_staged_edit_id="edit_1",
+                active_card_phase="phase_1_why",
+                active_card_validation_source={},
+                active_card_file_role="main_prompt",
+                active_card_handoff_policy="open_file_workspace",
+                active_card_queue_window={},
+                active_card_contract_id="confirm.staged_edit_review",
+                active_card_context_summary="上下文摘要",
+            )
+
+        assert response.content == "首答"
+        assert seen["selected_source_filename"] == "example-basic.md"
+        assert seen["active_card_id"] == "card_1"
+        assert seen["active_card_title"] == "主卡"
+        assert seen["active_card_mode"] is None
+        assert seen["active_card_target"] == "SKILL.md"
+        assert seen["active_card_source_card_id"] == "card_source"
+        assert seen["active_card_staged_edit_id"] == "edit_1"
+        assert seen["active_card_phase"] == "phase_1_why"
+        assert seen["active_card_validation_source"] == {}
+        assert seen["active_card_file_role"] == "main_prompt"
+        assert seen["active_card_handoff_policy"] == "open_file_workspace"
+        assert seen["active_card_queue_window"] == {}
+        assert seen["active_card_contract_id"] == "confirm.staged_edit_review"
+        assert seen["active_card_context_summary"] == "上下文摘要"
 
 
 class TestStudioAdminMetrics:

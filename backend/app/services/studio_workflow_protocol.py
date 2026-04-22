@@ -121,6 +121,13 @@ class WorkflowCardData:
     related_task_ids: list[str] = field(default_factory=list)
     validation_source: dict[str, Any] | None = None
     origin: str | None = None
+    file_role: str | None = None
+    handoff_policy: str | None = None
+    route_kind: str | None = None
+    destination: str | None = None
+    return_to: str | None = None
+    external_state: str | None = None
+    queue_window: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -129,7 +136,19 @@ class WorkflowCardData:
         data["content"] = {"summary": self.summary, **(self.content or {})}
         data["actions"] = [asdict(action) for action in self.actions]
         # 统一架构扩展字段：仅在有值时输出，保持旧 API 响应干净
-        for _k in ("workspace_mode", "target_file", "validation_source", "origin"):
+        for _k in (
+            "workspace_mode",
+            "target_file",
+            "validation_source",
+            "origin",
+            "file_role",
+            "handoff_policy",
+            "route_kind",
+            "destination",
+            "return_to",
+            "external_state",
+            "queue_window",
+        ):
             if data.get(_k) is None:
                 data.pop(_k, None)
         if not data.get("related_task_ids"):
@@ -149,9 +168,14 @@ class WorkflowStagedEditData:
     risk_level: str
     diff_ops: list[dict[str, Any]] = field(default_factory=list)
     status: str = "pending"
+    file_role: str | None = None
+    handoff_policy: str | None = None
+    route_kind: str | None = None
+    destination: str | None = None
+    return_to: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "id": self.id,
             "source": self.source_type,
             "workflow_id": self.workflow_id,
@@ -163,6 +187,10 @@ class WorkflowStagedEditData:
             "diff_ops": self.diff_ops,
             "status": self.status,
         }
+        for _k in ("file_role", "handoff_policy", "route_kind", "destination", "return_to"):
+            if getattr(self, _k) is not None:
+                data[_k] = getattr(self, _k)
+        return data
 
 
 @dataclass
@@ -209,11 +237,12 @@ class WorkflowStateData:
     # ── 统一架构扩展字段 ──
     active_card_id: str | None = None
     workspace_mode: str | None = None
+    queue_window: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         # 统一架构扩展字段：仅在有值时输出
-        for _k in ("active_card_id", "workspace_mode"):
+        for _k in ("active_card_id", "workspace_mode", "queue_window"):
             if data.get(_k) is None:
                 data.pop(_k, None)
         return data
@@ -326,9 +355,20 @@ class StudioSessionData:
     blueprint: dict[str, Any] | None = None
     card_order: list[str] = field(default_factory=list)
     progress_log: list[dict[str, Any]] = field(default_factory=list)
+    workflow_cards: list[dict[str, Any]] = field(default_factory=list)
+    card_queue_window: dict[str, Any] | None = None
+    # ── M3: 卡片编排扩展字段 ──
+    completed_card_ids: list[str] = field(default_factory=list)
+    card_artifacts: dict[str, Any] = field(default_factory=dict)
+    stale_card_ids: list[str] = field(default_factory=list)
+    card_queue_ledger: dict[str, Any] | None = None
+    # ── M4: 外部 handoff 状态汇总 ──
+    external_route_summary: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        if not data.get("workflow_cards"):
+            data["workflow_cards"] = list(data.get("cards") or [])
         # 仅在有值时输出
         if not data.get("context_rollups"):
             data.pop("context_rollups", None)
@@ -336,4 +376,21 @@ class StudioSessionData:
             data.pop("blueprint", None)
         if not data.get("progress_log"):
             data.pop("progress_log", None)
+        if data.get("card_queue_window") is None:
+            data.pop("card_queue_window", None)
+        else:
+            # 兼容：前端读 queue_window，旧代码读 card_queue_window
+            data["queue_window"] = data["card_queue_window"]
+        # M3: 仅在有值时输出
+        if not data.get("completed_card_ids"):
+            data.pop("completed_card_ids", None)
+        if not data.get("card_artifacts"):
+            data.pop("card_artifacts", None)
+        if not data.get("stale_card_ids"):
+            data.pop("stale_card_ids", None)
+        if data.get("card_queue_ledger") is None:
+            data.pop("card_queue_ledger", None)
+        # M4: 仅在有值时输出
+        if data.get("external_route_summary") is None:
+            data.pop("external_route_summary", None)
         return data

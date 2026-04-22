@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy.orm import Session
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 from app.services.studio_workflow_protocol import (
     WorkflowAction,
@@ -13,6 +14,60 @@ from app.services.studio_workflow_protocol import (
     WorkflowEventEnvelope,
     WorkflowStagedEditData,
 )
+
+def _infer_file_role(*, target_file: str | None, target: dict[str, Any] | None, content: dict[str, Any] | None) -> str | None:
+    target_kind = str((content or {}).get("target_kind") or "").strip().lower()
+    target_type = str((target or {}).get("type") or (target or {}).get("target_type") or "").strip().lower()
+    file_path = (target_file or "").strip()
+    file_name = file_path.rsplit("/", 1)[-1] if file_path else ""
+    lower_name = file_name.lower()
+
+    if target_kind == "skill_prompt" or lower_name == "skill.md" or target_type in {"prompt", "system_prompt"}:
+        return "main_prompt"
+    if "example" in lower_name or target_kind == "example":
+        return "example"
+    if "reference" in lower_name or target_kind == "reference":
+        return "reference"
+    if target_kind in {"knowledge_base", "knowledge"}:
+        return "knowledge_base"
+    if target_kind == "template" or "template" in lower_name:
+        return "template"
+    if target_kind == "tool" or target_type == "tool_binding" or "tool" in lower_name:
+        return "tool"
+    if file_path:
+        return "unknown_asset"
+    return None
+
+
+def _infer_handoff_policy(*, file_role: str | None, workspace_mode: str | None, target_file: str | None) -> str | None:
+    if file_role == "tool":
+        return "open_development_studio"
+    if workspace_mode == "report":
+        return "open_governance_panel"
+    if workspace_mode == "analysis":
+        return "stay_in_studio_chat"
+    if target_file:
+        return "open_file_workspace"
+    return None
+
+
+def _route_kind_for_policy(handoff_policy: str | None) -> str | None:
+    if handoff_policy in {"open_development_studio", "open_opencode"}:
+        return "external"
+    if handoff_policy in {"open_file_workspace", "open_governance_panel", "stay_in_studio_chat"}:
+        return "internal"
+    return None
+
+
+def _destination_for_policy(handoff_policy: str | None) -> str | None:
+    destinations = {
+        "open_development_studio": "dev_studio",
+        "open_opencode": "opencode",
+        "open_file_workspace": "file_workspace",
+        "open_governance_panel": "governance_panel",
+        "stay_in_studio_chat": "studio_chat",
+    }
+    return destinations.get(handoff_policy or "")
 
 
 def _recovery_meta(memo: dict[str, Any] | None) -> dict[str, Any]:
@@ -37,9 +92,29 @@ def normalize_workflow_card(
     phase: str = "review",
     workflow_id: str | None = None,
 ) -> dict[str, Any]:
+    content = raw.get("content") if isinstance(raw.get("content"), dict) else {}
+    target = raw.get("target") if isinstance(raw.get("target"), dict) else {}
+    target_file = raw.get("target_file")
+    if target_file is None:
+        target_file = raw.get("target_ref") or content.get("target_ref") or content.get("file_path")
+    target_file_str = str(target_file) if isinstance(target_file, str) and target_file else None
+    workspace_mode = str(raw.get("workspace_mode") or "") or None
+    file_role = str(raw.get("file_role") or content.get("file_role") or "").strip() or None
+    if file_role is None:
+        file_role = _infer_file_role(target_file=target_file_str, target=target, content=content)
+    handoff_policy = str(raw.get("handoff_policy") or content.get("handoff_policy") or "").strip() or None
+    if handoff_policy is None:
+        handoff_policy = _infer_handoff_policy(
+            file_role=file_role,
+            workspace_mode=workspace_mode,
+            target_file=target_file_str,
+        )
+    route_kind = str(raw.get("route_kind") or content.get("route_kind") or "").strip() or _route_kind_for_policy(handoff_policy)
+    destination = str(raw.get("destination") or content.get("destination") or "").strip() or _destination_for_policy(handoff_policy)
+    return_to = str(raw.get("return_to") or content.get("return_to") or "").strip() or ("bind_back" if route_kind == "external" else "none")
     summary = str(
         raw.get("summary")
-        or (raw.get("content") or {}).get("summary")
+        or content.get("summary")
         or raw.get("description")
         or raw.get("reason")
         or ""
@@ -70,9 +145,17 @@ def normalize_workflow_card(
         summary=summary,
         status=str(raw.get("status") or "pending"),
         priority=str(raw.get("priority") or "medium"),
-        target=raw.get("target") if isinstance(raw.get("target"), dict) else {},
+        target=target,
         actions=actions,
-        content=raw.get("content") if isinstance(raw.get("content"), dict) else {},
+        content=content,
+        workspace_mode=workspace_mode,
+        target_file=target_file_str,
+        file_role=file_role,
+        handoff_policy=handoff_policy,
+        route_kind=route_kind,
+        destination=destination,
+        return_to=return_to,
+        external_state=str(raw.get("external_state") or content.get("external_state") or "").strip() or None,
     )
     result = card.to_dict()
     if raw.get("severity") is not None:
@@ -91,17 +174,37 @@ def normalize_workflow_staged_edit(
     workflow_id: str | None = None,
     origin_card_id: str | None = None,
 ) -> dict[str, Any]:
+    target_key = str(raw.get("target_key")) if raw.get("target_key") is not None else None
+    target_type = str(raw.get("target_type") or "system_prompt")
+    file_role = str(raw.get("file_role") or "").strip() or _infer_file_role(
+        target_file=target_key,
+        target={"target_type": target_type},
+        content=None,
+    )
+    handoff_policy = str(raw.get("handoff_policy") or "").strip() or _infer_handoff_policy(
+        file_role=file_role,
+        workspace_mode="file",
+        target_file=target_key,
+    )
+    route_kind = str(raw.get("route_kind") or "").strip() or _route_kind_for_policy(handoff_policy)
+    destination = str(raw.get("destination") or "").strip() or _destination_for_policy(handoff_policy)
+    return_to = str(raw.get("return_to") or "").strip() or ("bind_back" if route_kind == "external" else "none")
     edit = WorkflowStagedEditData(
         id=str(raw.get("id") or ""),
         workflow_id=workflow_id,
         origin_card_id=origin_card_id,
         source_type=source_type,
-        target_type=str(raw.get("target_type") or "system_prompt"),
-        target_key=str(raw.get("target_key")) if raw.get("target_key") is not None else None,
+        target_type=target_type,
+        target_key=target_key,
         summary=str(raw.get("summary") or "治理修改")[:200],
         risk_level=str(raw.get("risk_level") or "medium"),
         diff_ops=list(raw.get("diff_ops") or []),
         status=str(raw.get("status") or "pending"),
+        file_role=file_role,
+        handoff_policy=handoff_policy,
+        route_kind=route_kind,
+        destination=destination,
+        return_to=return_to,
     )
     return edit.to_dict()
 

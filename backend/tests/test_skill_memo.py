@@ -323,6 +323,88 @@ class TestWorkflowRecovery:
         assert fetched["lifecycle_stage"] == "fixing"
         assert fetched["workflow_recovery"]["workflow_state"]["next_action"] == "review_cards"
 
+    def test_sync_workflow_recovery_preserves_v3_recovery_fields(self, db):
+        dept = _make_dept(db, "workflow_v3部门")
+        user = _make_user(db, "workflow_v3_user", dept_id=dept.id)
+        skill = _make_skill(db, user.id, name="恢复保真Skill")
+
+        skill_memo_service.sync_workflow_recovery(
+            db,
+            skill.id,
+            workflow_state={
+                "workflow_id": "run_v3_1",
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "sandbox_remediation",
+                "phase": "remediate",
+                "next_action": "review_cards",
+            },
+            cards=[{
+                "id": "card_1",
+                "title": "修复问题",
+                "type": "staged_edit",
+                "status": "pending",
+                "content": {"summary": "需要修复"},
+            }],
+            staged_edits=[{
+                "id": "edit_1",
+                "target_type": "system_prompt",
+                "summary": "补齐约束",
+                "risk_level": "medium",
+                "diff_ops": [],
+                "status": "pending",
+            }],
+            user_id=user.id,
+            commit=True,
+        )
+
+        row = db.query(skill_memo_service.SkillMemo).filter(skill_memo_service.SkillMemo.skill_id == skill.id).first()
+        assert row is not None
+        payload = row.memo_payload or {}
+        recovery = payload.get("workflow_recovery") or {}
+        recovery["card_order"] = ["card_1"]
+        recovery["queue_window"] = {
+            "active_card_id": "card_1",
+            "visible_card_ids": ["card_1"],
+            "backlog_count": 0,
+            "phase": "remediate",
+            "max_visible": 5,
+            "reveal_policy": "stage_gated",
+        }
+        recovery["card_queue_ledger"] = {"completed": [], "stale": [], "artifacts_by_contract": {}, "exit_log": [], "stats": {"total": 1}}
+        recovery["completed_card_ids"] = ["card_1"]
+        recovery["card_artifacts"] = {"architect.what": {"notes": {"text": "artifact"}}}
+        recovery["stale_card_ids"] = ["card_2"]
+        recovery["card_exit_log"] = [{"card_id": "card_1", "exit_reason": "adopted"}]
+        payload["workflow_recovery"] = recovery
+        skill_memo_service.save_memo_payload_atomic(db, row, json.loads(json.dumps(payload)))
+        db.commit()
+
+        skill_memo_service.sync_workflow_recovery(
+            db,
+            skill.id,
+            workflow_state={
+                "workflow_id": "run_v3_1",
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "sandbox_remediation",
+                "phase": "validate",
+                "next_action": "run_sandbox",
+            },
+            user_id=user.id,
+            commit=True,
+        )
+
+        fetched = skill_memo_service.get_memo(db, skill.id)
+        assert fetched is not None
+        workflow_recovery = fetched["workflow_recovery"]
+        assert workflow_recovery["schema_version"] == 3
+        assert workflow_recovery["card_order"] == ["card_1"]
+        assert workflow_recovery["queue_window"]["active_card_id"] == "card_1"
+        assert workflow_recovery["card_queue_ledger"]["stats"]["total"] == 1
+        assert workflow_recovery["completed_card_ids"] == ["card_1"]
+        assert workflow_recovery["card_artifacts"]["architect.what"]["notes"]["text"] == "artifact"
+        assert workflow_recovery["stale_card_ids"] == ["card_2"]
+        assert workflow_recovery["card_exit_log"][0]["card_id"] == "card_1"
+
     def test_sync_workflow_recovery_creates_import_audit_tasks_for_memo(self, db):
         dept = _make_dept(db, "导入审计联动部门")
         user = _make_user(db, "workflow_import_audit_user", dept_id=dept.id)

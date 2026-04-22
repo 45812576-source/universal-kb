@@ -189,6 +189,8 @@ def _file_card(
     """从文件路径生成一张 governance card。"""
     card_id = _new_id("gcard")
     filename = filepath.rsplit("/", 1)[-1] if "/" in filepath else filepath
+    file_role = _infer_file_role(filepath)
+    handoff_policy = "open_development_studio" if file_role == "tool" else "open_file_workspace"
     return {
         "id": card_id,
         "workflow_id": workflow_state.get("workflow_id"),
@@ -202,9 +204,33 @@ def _file_card(
         "priority": priority,
         "workspace_mode": WorkspaceMode.FILE,
         "target_file": filepath,
+        "file_role": file_role,
+        "handoff_policy": handoff_policy,
         "origin": origin,
         "target": {"target_type": "source_file", "target_key": filepath},
         "actions": [],
-        "content": {"summary": f"处理 {filepath}", "file_path": filepath},
+        "content": {
+            "summary": f"处理 {filepath}",
+            "file_path": filepath,
+            "file_role": file_role,
+            "handoff_policy": handoff_policy,
+        },
         "created_at": _now_iso(),
     }
+
+
+def _infer_file_role(filepath: str) -> str:
+    lower_name = (filepath.rsplit("/", 1)[-1] if "/" in filepath else filepath).lower()
+    if lower_name == "skill.md":
+        return "main_prompt"
+    if "example" in lower_name:
+        return "example"
+    if "reference" in lower_name:
+        return "reference"
+    if "template" in lower_name:
+        return "template"
+    if "tool" in lower_name:
+        return "tool"
+    if "knowledge" in lower_name or lower_name.endswith((".md", ".txt", ".jsonl")):
+        return "knowledge_base"
+    return "unknown_asset"

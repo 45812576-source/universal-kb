@@ -3,7 +3,14 @@ import json
 import os
 import pytest
 
-from app.services.studio_agent import _build_system, _extract_events
+from app.routers.conversations import SendMessage, _active_card_meta, _studio_context_meta
+from app.services.studio_agent import (
+    _build_card_directive,
+    _build_system,
+    _extract_events,
+    _normalize_external_handoff_payload,
+    _orchestration_error,
+)
 from app.services.skill_engine import _read_source_files
 
 
@@ -80,6 +87,168 @@ class TestBuildSystem:
     def test_selected_skill_id_none_shows_unselected(self):
         result = _build_system(None, "hello", False)
         assert "Skill ID：未选择" in result
+
+    def test_main_prompt_file_role_uses_role_directive(self):
+        result = _build_system(
+            1,
+            "## Role\nfoo",
+            False,
+            active_card_mode="file",
+            active_card_title="主 Prompt 改写",
+            active_card_target="SKILL.md",
+            active_card_file_role="main_prompt",
+        )
+        assert "文件角色：main_prompt" in result
+        assert "允许 `studio_draft` 和 `studio_diff`" in result
+        assert "Why / What / How / Governance / Validation" in result
+
+    def test_example_file_role_avoids_main_prompt_rewrite(self):
+        result = _build_system(
+            1,
+            "## Example\nfoo",
+            False,
+            active_card_mode="file",
+            active_card_title="补 example",
+            active_card_target="example-demo.md",
+            active_card_file_role="example",
+        )
+        assert "文件角色：example" in result
+        assert "禁止输出重写主 Prompt 的 `studio_draft`" in result
+        assert "不要继续追问“这个 Skill 要解决什么根因”" in result
+
+    def test_tool_file_role_forbids_diff_and_draft(self):
+        result = _build_system(
+            1,
+            "tool spec",
+            False,
+            active_card_mode="file",
+            active_card_title="实现天气工具",
+            active_card_target="tool-weather.json",
+            active_card_file_role="tool",
+            active_card_handoff_policy="open_opencode",
+            active_card_context_summary="用户希望增加天气查询工具，要求声明权限。",
+        )
+        assert "文件角色：tool" in result
+        assert "严禁输出 `studio_diff`" in result
+        assert "严禁输出 `studio_draft`" in result
+        assert "当前卡片上下文摘要：用户希望增加天气查询工具" in result
+        assert "open_opencode" in result
+
+    def test_unknown_file_role_falls_back_to_unknown_asset(self):
+        result = _build_system(
+            1,
+            "misc",
+            False,
+            active_card_mode="file",
+            active_card_title="未知文件",
+            active_card_target="misc.md",
+        )
+        assert "文件角色：unknown_asset" in result
+        assert "先分类，再说明可执行的最小下一步" in result
+
+    def test_fallback_directive_keeps_contract_and_card_metadata(self):
+        result = _build_card_directive(
+            active_card_mode=None,
+            active_card_title="补充主卡信息",
+            active_card_target="SKILL.md",
+            active_card_id="card_fallback",
+            active_card_source_card_id="card_source",
+            active_card_staged_edit_id="edit_1",
+            active_card_phase="phase_1_why",
+            active_card_validation_source={"kind": "sandbox"},
+            active_card_file_role="main_prompt",
+            active_card_handoff_policy="open_file_workspace",
+            active_card_queue_window={"active_card_id": "card_fallback"},
+            active_card_contract_id="confirm.staged_edit_review",
+            active_card_context_summary="当前卡片虽然没带 mode，但 contract 不能丢。",
+        )
+        assert "卡片 Contract：confirm.staged_edit_review" in result
+        assert "源卡片 ID：card_source" in result
+        assert "关联 staged edit：edit_1" in result
+        assert "卡片阶段：phase_1_why" in result
+        assert "卡片标题：补充主卡信息" in result
+        assert "卡片目标：SKILL.md" in result
+        assert "文件角色：main_prompt" in result
+        assert "交接策略：open_file_workspace" in result
+        assert "当前队列窗口" in result
+        assert "当前卡片上下文摘要：当前卡片虽然没带 mode，但 contract 不能丢。" in result
+        assert "验证来源：" in result
+
+    def test_fallback_directive_keeps_empty_dict_metadata(self):
+        result = _build_card_directive(
+            active_card_mode=None,
+            active_card_title="空字典元数据",
+            active_card_target="SKILL.md",
+            active_card_id="card_empty_dict",
+            active_card_source_card_id=None,
+            active_card_staged_edit_id=None,
+            active_card_phase=None,
+            active_card_validation_source={},
+            active_card_file_role="main_prompt",
+            active_card_handoff_policy="open_file_workspace",
+            active_card_queue_window={},
+            active_card_contract_id="confirm.staged_edit_review",
+            active_card_context_summary="",
+        )
+        assert "当前队列窗口：{}" in result
+        assert "验证来源：{}" in result
+
+
+class TestConversationMeta:
+    def test_active_card_meta_keeps_all_present_fields_without_mode(self):
+        req = SendMessage(
+            content="继续",
+            active_card_id="card_1",
+            active_card_title="卡片标题",
+            active_card_target="SKILL.md",
+            active_card_source_card_id="card_source",
+            active_card_staged_edit_id="edit_1",
+            active_card_validation_source={"source": "sandbox"},
+            active_card_file_role="main_prompt",
+            active_card_handoff_policy="open_file_workspace",
+            active_card_queue_window={"active_card_id": "card_1"},
+            active_card_context_summary="上下文摘要",
+            active_card_contract_id="confirm.staged_edit_review",
+            active_card_phase="phase_1_why",
+        )
+        meta = _active_card_meta(req)
+        assert meta["active_card_id"] == "card_1"
+        assert meta["active_card_title"] == "卡片标题"
+        assert meta["active_card_target"] == "SKILL.md"
+        assert meta["active_card_source_card_id"] == "card_source"
+        assert meta["active_card_staged_edit_id"] == "edit_1"
+        assert meta["active_card_validation_source"] == {"source": "sandbox"}
+        assert meta["active_card_file_role"] == "main_prompt"
+        assert meta["active_card_handoff_policy"] == "open_file_workspace"
+        assert meta["active_card_queue_window"] == {"active_card_id": "card_1"}
+        assert meta["active_card_context_summary"] == "上下文摘要"
+        assert meta["active_card_contract_id"] == "confirm.staged_edit_review"
+        assert meta["active_card_phase"] == "phase_1_why"
+        assert "active_card_mode" not in meta
+
+    def test_active_card_meta_keeps_empty_dict_fields(self):
+        req = SendMessage(
+            content="继续",
+            active_card_validation_source={},
+            active_card_queue_window={},
+        )
+        meta = _active_card_meta(req)
+        assert meta["active_card_validation_source"] == {}
+        assert meta["active_card_queue_window"] == {}
+
+    def test_studio_context_meta_keeps_selected_file_and_editor_state(self):
+        req = SendMessage(
+            content="继续",
+            editor_prompt="",
+            editor_is_dirty=False,
+            selected_source_filename="example-basic.md",
+            active_card_id="card_1",
+        )
+        meta = _studio_context_meta(req)
+        assert meta["active_card_id"] == "card_1"
+        assert meta["selected_source_filename"] == "example-basic.md"
+        assert meta["editor_is_dirty"] is False
+        assert meta["editor_target"] is True
 
 
 # ── _extract_events ──────────────────────────────────────────────────────────
@@ -202,6 +371,98 @@ class TestExtractEvents:
         _, events = _extract_events(text)
         assert len(events) == 1
         assert events[0][0] == "studio_file_split"
+
+    def test_extract_new_file_role_orchestration_blocks(self):
+        blocks = (
+            '```studio_file_role_decision\n'
+            + json.dumps({"file_role": "tool", "confidence": "high"}, ensure_ascii=False)
+            + '\n```\n'
+            + '```studio_card_handoff\n'
+            + json.dumps({"target_role": "main_prompt", "summary": "同步规则"}, ensure_ascii=False)
+            + '\n```\n'
+            + '```studio_queue_update\n'
+            + json.dumps({"intent": "switch_to_existing_card"}, ensure_ascii=False)
+            + '\n```\n'
+            + '```studio_external_edit_request\n'
+            + json.dumps({"target": "open_opencode"}, ensure_ascii=False)
+            + '\n```\n'
+            + '```studio_bind_back_request\n'
+            + json.dumps({"source": "external_edit_returned"}, ensure_ascii=False)
+            + '\n```'
+        )
+        clean, events = _extract_events(blocks)
+        assert clean == ""
+        assert [name for name, _ in events] == [
+            "studio_file_role_decision",
+            "studio_card_handoff",
+            "studio_queue_update",
+            "studio_external_edit_request",
+            "studio_bind_back_request",
+        ]
+
+    def test_extract_m5_orchestration_blocks(self):
+        blocks = (
+            '```studio_governance_complete\n'
+            + json.dumps({"card_id": "gov-1", "result": "pass"}, ensure_ascii=False)
+            + '\n```\n'
+            + '```studio_refine_staged\n'
+            + json.dumps({"origin_card_id": "refine-1"}, ensure_ascii=False)
+            + '\n```\n'
+            + '```studio_audit_scan_complete\n'
+            + json.dumps({"card_id": "audit-1", "issues_count": 0}, ensure_ascii=False)
+            + '\n```\n'
+            + '```studio_fixing_complete\n'
+            + json.dumps({"card_id": "fix-1", "result": "ready_for_validation"}, ensure_ascii=False)
+            + '\n```\n'
+            + '```card_proposals\n'
+            + json.dumps({"proposals": [{"title": "补示例"}]}, ensure_ascii=False)
+            + '\n```'
+        )
+        clean, events = _extract_events(blocks)
+        assert clean == ""
+        assert [name for name, _ in events] == [
+            "studio_governance_complete",
+            "studio_refine_staged",
+            "studio_audit_scan_complete",
+            "studio_fixing_complete",
+            "card_proposals",
+        ]
+
+    def test_external_edit_request_normalizes_to_handoff_contract(self):
+        payload = _normalize_external_handoff_payload(
+            "studio_external_edit_request",
+            {
+                "target": "opencode",
+                "summary": "实现天气工具",
+                "input_schema": {"city": "string"},
+                "acceptance_criteria": ["能返回天气", "失败时有错误提示"],
+            },
+            active_card_target="tools/weather.py",
+            active_card_file_role="tool",
+            active_card_handoff_policy=None,
+        )
+        assert payload == {
+            "target_role": "tool",
+            "target_file": "tools/weather.py",
+            "handoff_policy": "open_opencode",
+            "summary": "实现天气工具",
+            "handoff_summary": "实现天气工具",
+            "acceptance_criteria": ["能返回天气", "失败时有错误提示"],
+            "activate": True,
+        }
+
+    def test_orchestration_error_reports_no_auto_advance(self):
+        error = _orchestration_error(
+            step="handoff",
+            message="外部交接创建失败",
+            active_card_id="card-tool",
+            payload={"target": "opencode"},
+            retryable=True,
+        )
+        assert error["error_type"] == "studio_orchestration_error"
+        assert error["auto_advanced"] is False
+        assert error["retryable"] is True
+        assert error["active_card_id"] == "card-tool"
 
     def test_clean_text_stripped(self):
         """提取后的文本应去除首尾空白。"""
