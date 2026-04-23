@@ -23,7 +23,12 @@ from app.models.sandbox import SandboxTestReport
 from app.models.skill import ModelConfig, Skill, SkillVersion
 from app.models.skill_knowledge_ref import SkillKnowledgeReference
 from app.services.llm_gateway import llm_gateway
-from app.services.preflight_governance import _create_staged_edit, _make_card
+from app.services.preflight_governance import (
+    _create_staged_edit,
+    _extract_description_suggestion,
+    _is_description_remediation_payload,
+    _make_card,
+)
 from app.services.skill_engine import _read_source_files
 
 logger = logging.getLogger(__name__)
@@ -48,6 +53,7 @@ _VALID_TARGET_KINDS = {
     "knowledge_reference",
     "input_slot_definition",
     "permission_config",
+    "skill_metadata",
     "unknown",
 }
 
@@ -65,7 +71,8 @@ _AGENT_SYSTEM_PROMPT = """你是 Skill 质量整改专家。
   - replace: {"op":"replace","old":"精确原文","new":"替换后文本"}
   - insert: {"op":"insert","old":"锚点文本，可为空字符串","new":"插入内容"}
   - delete: {"op":"delete","old":"精确原文"}
-- target_type 只能是 "system_prompt" 或 "source_file"
+- target_type 只能是 "system_prompt"、"source_file" 或 "metadata"
+- 如需修改 Skill 元数据 description，target_type 使用 "metadata"，diff op 使用 {"op":"replace","old":"description","new":"新的描述"}
 - 如果无法给出精确文本修改，就不要编造 diff op；可以保留 task 但省略对应 edit
 - 每个 edit 必须能被现有文本处理器一次性应用，不要输出抽象描述
 """
@@ -97,7 +104,7 @@ _AGENT_USER_PROMPT = """请基于以下上下文生成整改计划。
       "title": "任务标题",
       "priority": "p0|p1|p2",
       "action_type": "fix_prompt_logic|fix_input_slot|fix_tool_usage|fix_knowledge_binding|fix_permission_handling|run_targeted_retest|fix_after_test",
-      "target_kind": "skill_prompt|source_file|tool_binding|knowledge_reference|input_slot_definition|permission_config|unknown",
+      "target_kind": "skill_prompt|source_file|tool_binding|knowledge_reference|input_slot_definition|permission_config|skill_metadata|unknown",
       "target_ref": "SKILL.md 或文件名或配置名",
       "problem_ids": ["issue_xxx"],
       "suggested_changes": "一句话描述要改什么",
@@ -109,7 +116,7 @@ _AGENT_USER_PROMPT = """请基于以下上下文生成整改计划。
   "edits": [
     {{
       "task_id": "task_1",
-      "target_type": "system_prompt|source_file",
+      "target_type": "system_prompt|source_file|metadata",
       "target_key": null,
       "summary": "修改摘要",
       "risk_level": "low|medium|high",
@@ -126,6 +133,7 @@ _AGENT_USER_PROMPT = """请基于以下上下文生成整改计划。
 - edits 只在你能给出“精确 old/new 文本”时才输出
 - 如果需要给附属文件改动，target_type=source_file，target_key=具体文件名
 - 如果要修改 SKILL.md 主 prompt，target_type=system_prompt，target_key=null
+- 如果要修改 Skill 描述，target_type=metadata，target_key=null，old 固定为 "description"
 """
 
 
@@ -260,6 +268,17 @@ def _normalize_diff_op(raw: dict[str, Any]) -> dict[str, str] | None:
     return None
 
 
+def _normalize_metadata_diff_op(raw: dict[str, Any]) -> dict[str, str] | None:
+    op = _coerce_text(raw.get("op")).lower()
+    field_name = _coerce_text(raw.get("old") or raw.get("field") or raw.get("key")).lower()
+    if op != "replace" or field_name != "description":
+        return None
+    new = _coerce_text(raw.get("new") or raw.get("value"))
+    if not new:
+        return None
+    return {"op": "replace", "old": "description", "new": new}
+
+
 def _normalize_edit(
     raw: dict[str, Any],
     task_map: dict[str, dict[str, Any]],
@@ -274,15 +293,19 @@ def _normalize_edit(
         return None
 
     target_type = _coerce_text(raw.get("target_type")).lower()
-    if target_type not in {"system_prompt", "source_file"}:
+    if target_type not in {"system_prompt", "source_file", "metadata"}:
         target_kind = _coerce_text(raw.get("target_kind") or task.get("target_kind"))
         if target_kind == "source_file":
             target_type = "source_file"
+        elif target_kind in {"skill_metadata", "metadata"}:
+            target_type = "metadata"
         else:
             target_type = "system_prompt"
 
     target_key = _coerce_text(raw.get("target_key"))
     if target_type == "system_prompt":
+        target_key = None
+    elif target_type == "metadata":
         target_key = None
     elif not target_key:
         target_ref = _coerce_text(raw.get("target_ref") or task.get("target_ref"))
@@ -291,15 +314,23 @@ def _normalize_edit(
             return None
 
     diff_ops: list[dict[str, str]] = []
-    target_text = target_contents.get((target_type, target_key))
-    if target_text is None:
-        return None
-    for op in raw.get("diff_ops") or []:
-        if not isinstance(op, dict):
-            continue
-        normalized = _normalize_diff_op(op)
-        if normalized and _diff_op_matches_target(normalized, target_text):
-            diff_ops.append(normalized)
+    if target_type == "metadata":
+        for op in raw.get("diff_ops") or []:
+            if not isinstance(op, dict):
+                continue
+            normalized = _normalize_metadata_diff_op(op)
+            if normalized:
+                diff_ops.append(normalized)
+    else:
+        target_text = target_contents.get((target_type, target_key))
+        if target_text is None:
+            return None
+        for op in raw.get("diff_ops") or []:
+            if not isinstance(op, dict):
+                continue
+            normalized = _normalize_diff_op(op)
+            if normalized and _diff_op_matches_target(normalized, target_text):
+                diff_ops.append(normalized)
     if not diff_ops:
         return None
 
@@ -436,6 +467,57 @@ def _build_target_contents(skill_context: dict[str, Any]) -> dict[tuple[str, str
     return target_contents
 
 
+def _has_description_metadata_edit(edits: list[dict[str, Any]]) -> bool:
+    for edit in edits:
+        if edit.get("target_type") != "metadata":
+            continue
+        for op in edit.get("diff_ops") or []:
+            if isinstance(op, dict) and op.get("old") == "description" and op.get("new"):
+                return True
+    return False
+
+
+def _related_issues_for_task(task: dict[str, Any], issue_map: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    related: list[dict[str, Any]] = []
+    for problem_id in task.get("problem_ids") or []:
+        issue = issue_map.get(str(problem_id))
+        if issue:
+            related.append(issue)
+    return related
+
+
+def _append_deterministic_description_edits(
+    edits: list[dict[str, Any]],
+    *,
+    tasks: list[dict[str, Any]],
+    issues: list[dict[str, Any]],
+    skill_context: dict[str, Any],
+) -> None:
+    if _has_description_metadata_edit(edits):
+        return
+
+    issue_map = {str(item.get("issue_id")): item for item in issues if isinstance(item, dict) and item.get("issue_id")}
+    current_description = _coerce_text(skill_context.get("description"))
+    for task in tasks:
+        related_issues = _related_issues_for_task(task, issue_map)
+        payload = {"task": task, "issues": related_issues}
+        if not _is_description_remediation_payload(payload):
+            continue
+        suggestion = _extract_description_suggestion(payload)
+        if not suggestion or suggestion == current_description:
+            continue
+        edits.append({
+            "task_id": task["task_id"],
+            "target_type": "metadata",
+            "target_key": None,
+            "summary": "优化 Skill 描述",
+            "risk_level": "low",
+            "diff_ops": [{"op": "replace", "old": "description", "new": suggestion}],
+            "task": task,
+        })
+        return
+
+
 def _resolve_remediation_model(db: Session) -> dict[str, Any]:
     candidate = (
         db.query(ModelConfig)
@@ -528,6 +610,12 @@ async def generate_remediation_plan(
         normalized = _normalize_edit(raw_edit, task_map, fallback_task, target_contents)
         if normalized:
             normalized_edits.append(normalized)
+    _append_deterministic_description_edits(
+        normalized_edits,
+        tasks=tasks,
+        issues=issues,
+        skill_context=skill_context,
+    )
 
     staged_edits: list[dict] = []
     cards: list[dict] = []

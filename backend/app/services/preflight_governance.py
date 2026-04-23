@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -22,6 +23,49 @@ _QUALITY_SNIPPETS = {
     "constraint": "严格遵守权限、字段边界、输入约束和系统限制；未授权信息一律不输出、不推断。",
     "actionability": "输出必须包含明确结论、判断依据和下一步可执行动作，避免停留在空泛描述。",
 }
+_DESCRIPTION_REMEDIATION_CODES = {
+    "missing_description",
+    "generic_description",
+    "weak_description",
+    "inaccurate_description",
+    "description_too_generic",
+    "description_too_vague",
+    "description_weak",
+    "description_inaccurate",
+    "poor_description",
+}
+_DESCRIPTION_REMEDIATION_HINTS = (
+    "为空",
+    "缺失",
+    "笼统",
+    "过于笼统",
+    "空泛",
+    "泛泛",
+    "不精准",
+    "未精准",
+    "不准确",
+    "核心能力",
+    "检索",
+    "展示",
+    "审核",
+)
+_DESCRIPTION_SUGGESTION_KEYS = (
+    "suggested_description",
+    "replacement_description",
+    "new_description",
+    "expected_description",
+)
+_DESCRIPTION_TEXT_KEYS = (
+    "suggested_changes",
+    "suggestion",
+    "recommendation",
+    "fix",
+    "issue",
+    "reason",
+    "message",
+    "description",
+    "acceptance_rule",
+)
 
 
 def _make_card(
@@ -116,6 +160,113 @@ def _create_staged_edit(
 
 def _clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _iter_text_fragments(value: Any, *, depth: int = 0) -> list[str]:
+    if depth > 4:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        fragments: list[str] = []
+        for item in value.values():
+            fragments.extend(_iter_text_fragments(item, depth=depth + 1))
+        return fragments
+    if isinstance(value, list):
+        fragments: list[str] = []
+        for item in value:
+            fragments.extend(_iter_text_fragments(item, depth=depth + 1))
+        return fragments
+    return []
+
+
+def _strip_description_candidate(text: str) -> str:
+    candidate = re.sub(r"^\s*[-*]\s*", "", text or "")
+    candidate = re.sub(r"^\s*>\s*", "", candidate)
+    candidate = candidate.strip().strip("`\"'“”‘’「」")
+    candidate = re.sub(r"^description\s*(?:字段)?\s*[：:=]\s*", "", candidate, flags=re.IGNORECASE)
+    return _clean_text(candidate).strip()
+
+
+def _valid_description_candidate(text: str) -> bool:
+    candidate = _strip_description_candidate(text)
+    if not 12 <= len(candidate) <= 180:
+        return False
+    blocked_markers = ("修复方案", "修改要点", "验收标准", "失败主因", "```")
+    if any(marker in candidate for marker in blocked_markers):
+        return False
+    lowered = candidate.lower()
+    if lowered.startswith("description") or "替换为" in candidate:
+        return False
+    return True
+
+
+def _extract_description_suggestion(value: Any, *, allow_plain: bool = False) -> str | None:
+    if isinstance(value, dict):
+        for key in _DESCRIPTION_SUGGESTION_KEYS:
+            if key in value:
+                candidate = _extract_description_suggestion(value.get(key), allow_plain=True)
+                if candidate:
+                    return candidate
+        for key in _DESCRIPTION_TEXT_KEYS:
+            if key in value:
+                candidate = _extract_description_suggestion(value.get(key), allow_plain=False)
+                if candidate:
+                    return candidate
+        for item in value.values():
+            candidate = _extract_description_suggestion(item, allow_plain=allow_plain)
+            if candidate:
+                return candidate
+        return None
+
+    if isinstance(value, list):
+        for item in value:
+            candidate = _extract_description_suggestion(item, allow_plain=allow_plain)
+            if candidate:
+                return candidate
+        return None
+
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            candidate = _strip_description_candidate(stripped)
+            if _valid_description_candidate(candidate):
+                return candidate
+
+    patterns = [
+        r"(?:将\s*)?description\s*(?:字段)?\s*(?:替换|改写|更新|优化|改成|改为)\s*为[：:]\s*([^\n\r]+)",
+        r"(?:替换为|改为|更新为|优化为)[：:]\s*([^\n\r]+)",
+        r"description\s*[=:：]\s*([^\n\r]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            candidate = _strip_description_candidate(match.group(1))
+            if _valid_description_candidate(candidate):
+                return candidate
+
+    if allow_plain:
+        candidate = _strip_description_candidate(text)
+        if _valid_description_candidate(candidate):
+            return candidate
+    return None
+
+
+def _is_description_remediation_payload(value: Any) -> bool:
+    text = _clean_text(" ".join(_iter_text_fragments(value))).lower()
+    if not text:
+        return False
+    mentions_description = "description" in text or "skill 描述" in text or "skill描述" in text or "描述" in text
+    has_remediation_hint = any(hint in text for hint in _DESCRIPTION_REMEDIATION_HINTS)
+    return mentions_description and has_remediation_hint
+
+
+def _description_suggestion_for_item(skill: Skill, item: dict) -> str:
+    return _extract_description_suggestion(item) or _default_description(skill)
 
 
 def _latest_prompt(skill: Skill) -> str:
@@ -273,20 +424,24 @@ def build_preflight_governance(
                             "suggested_sections": ["角色定位", "输入要求", "输出要求", "example/reference/template"],
                         },
                     ))
-                elif code == "missing_description":
+                elif code in _DESCRIPTION_REMEDIATION_CODES or _is_description_remediation_payload(item):
+                    is_missing = code == "missing_description"
+                    summary = "补充 Skill 描述" if is_missing else "优化 Skill 描述"
+                    title = summary
+                    description = "一键补齐用于检索和审核展示的 Skill 描述。" if is_missing else "一键替换为更精准概括核心能力的 Skill 描述。"
                     staged = _create_staged_edit(
                         db,
                         skill_id=skill_id,
                         target_type="metadata",
-                        summary="补充 Skill 描述",
-                        diff_ops=[{"op": "replace", "old": "description", "new": _default_description(skill)}],
+                        summary=summary,
+                        diff_ops=[{"op": "replace", "old": "description", "new": _description_suggestion_for_item(skill, item)}],
                         risk_level="low",
                     )
                     staged_edits.append(staged)
                     cards.append(_make_card(
                         f"preflight-structure-description-{skill_id}",
-                        "补充 Skill 描述",
-                        "一键补齐用于检索和审核展示的 Skill 描述。",
+                        title,
+                        description,
                         reason=item.get("issue", "description 为空"),
                         staged_edit_id=int(staged["id"]),
                     ))

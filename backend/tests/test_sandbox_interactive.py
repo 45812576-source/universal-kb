@@ -1564,6 +1564,44 @@ class TestPreflightDescriptionGenerator:
         )
         assert all(edit["target_type"] != "metadata" for edit in result.staged_edits)
 
+    def test_generates_metadata_edit_for_generic_description(self, db):
+        from app.services.preflight_governance import build_preflight_governance
+
+        dept = _make_dept(db)
+        user = _make_user(db, "desc_case_4", Role.SUPER_ADMIN, dept.id)
+        skill, _tool, _version = _setup_skill_with_tool(db, user.id, skill_name="财务核算框架架构师")
+        skill.description = "围绕「财务核算框架架构师」场景提供支持。"
+        db.commit()
+
+        expected_description = "将业务需求转化为 L2 层财务核算框架，输出会计分录模板、税务处理规则与系统字段映射，确保业务设计阶段植入合规核算基因。"
+        result = build_preflight_governance(
+            db,
+            skill_id=skill.id,
+            result={
+                "gates": [{
+                    "gate": "structure",
+                    "status": "failed",
+                    "items": [{
+                        "ok": False,
+                        "code": "generic_description",
+                        "issue": (
+                            "description 过于笼统，未精准概括 Skill 核心能力。\n"
+                            f"将 description 替换为：\n> {expected_description}"
+                        ),
+                    }],
+                }]
+            },
+        )
+
+        assert len(result.staged_edits) == 1
+        assert result.staged_edits[0]["target_type"] == "metadata"
+        assert result.staged_edits[0]["summary"] == "优化 Skill 描述"
+        assert result.staged_edits[0]["diff_ops"] == [{
+            "op": "replace",
+            "old": "description",
+            "new": expected_description,
+        }]
+
 
 class TestSandboxHistory:
     def test_history_lists_latest_sessions_and_report_flags(self, client, db):
