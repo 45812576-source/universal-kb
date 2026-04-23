@@ -1490,6 +1490,44 @@ def _build_memo_context(memo_data: dict | None) -> str:
                     f"- 目标: {current_fix.get('target_ref', '未指定')}\n"
                     f"- 验收: {current_fix.get('acceptance_rule_text', '未指定')}\n"
                 )
+            # 检测 description 元数据修改任务 → 注入 studio_governance_action 指引
+            description_governance_hint = ""
+            if current_fix:
+                target_kind = current_fix.get("target_kind", "")
+                target_ref = current_fix.get("target_ref", "")
+                if target_kind in ("skill_metadata", "metadata") or "description" in target_ref:
+                    suggested = current_fix.get("suggested_changes", "")
+                    # 从 suggested_changes 中提取建议 description（> 引用行或纯文本）
+                    new_desc = ""
+                    for line in (suggested or "").splitlines():
+                        stripped = line.strip()
+                        if stripped.startswith(">"):
+                            new_desc = stripped.lstrip(">").strip().strip("`\"'""''「」")
+                            break
+                    if not new_desc:
+                        # fallback：取 suggested_changes 中冒号后的内容
+                        m = re.search(r"[：:]\s*(.+)", suggested or "")
+                        if m:
+                            new_desc = m.group(1).strip().strip("`\"'""''「」")
+                    if new_desc and 12 <= len(new_desc) <= 180:
+                        escaped = json.dumps(new_desc, ensure_ascii=False)[1:-1]  # strip quotes
+                        description_governance_hint = (
+                            f"\n\n### description 修改指引（必须执行）\n"
+                            f"当前任务是修改 Skill 描述。你必须在回复末尾附加以下结构化块，让用户可以一键采纳：\n"
+                            f"```studio_governance_action\n"
+                            f'{{"card_id": "fix_description_{current_fix.get("id", "1")}", '
+                            f'"title": "优化 Skill 描述", '
+                            f'"summary": "替换为更精准概括核心能力的描述", '
+                            f'"target": "skill_metadata", '
+                            f'"reason": "{current_fix.get("acceptance_rule_text", "description 应精准概括 Skill 核心能力")}", '
+                            f'"risk_level": "low", '
+                            f'"staged_edit": {{"ops": [{{"type": "replace", "old": "description", "new": "{escaped}"}}]}}}}\n'
+                            f"```\n"
+                            f"注意：\n"
+                            f"- 复述问题后直接附加上述块，不要只做文字建议\n"
+                            f"- 用户点击「采纳修改」后 description 会自动更新\n"
+                        )
+
             fix_section += (
                 "\n\n### 你的行为指引\n"
                 "1. 先复述失败主因，让用户确认理解一致\n"
@@ -1499,6 +1537,7 @@ def _build_memo_context(memo_data: dict | None) -> str:
                 "5. 没有精确证据时，只给任务建议，不给 staged diff 或整段替换草稿\n"
                 "6. 修改后推动任务完成，建议进行局部重测\n"
             )
+            fix_section += description_governance_hint
             base += fix_section
 
         elif top_deductions:
