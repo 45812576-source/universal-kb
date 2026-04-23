@@ -1495,6 +1495,8 @@ class TestPreflightGovernanceBoundaries:
         assert len(result.cards) == 1
         assert result.cards[0]["type"] == "followup_prompt"
         assert result.cards[0]["content"]["preflight_action"] == "open_skill_editor"
+        assert result.cards[0]["content"]["immediate_steps"]
+        assert result.cards[0]["content"]["expected_deliverable"]
 
     def test_preflight_quality_patch_is_minimal_guardrail(self, db):
         from app.services.preflight_governance import build_preflight_governance

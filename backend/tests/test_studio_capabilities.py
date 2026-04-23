@@ -531,6 +531,9 @@ class TestGovernance:
         assert len(result.cards) == 1
         assert result.cards[0]["severity"] == "high"
         assert result.cards[0]["suggested_action"] == "manual_review"
+        assert result.cards[0]["content"]["immediate_steps"]
+        assert result.cards[0]["content"]["expected_deliverable"]
+        assert [action["type"] for action in result.cards[0]["actions"]] == ["refine", "reject"]
         assert result.staged_edits == []
 
         # 验证持久化

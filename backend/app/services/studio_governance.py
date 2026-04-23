@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from sqlalchemy.orm import Session
 
 from app.models.skill import Skill, SkillAuditResult, SkillVersion, StagedEdit
+from app.services.governance_action_compiler import build_followup_card
 from app.services.llm_gateway import llm_gateway
 from app.services.studio_workflow_adapter import normalize_workflow_card, normalize_workflow_staged_edit
 
@@ -203,6 +204,25 @@ def _normalize_governance_card(raw: dict, *, has_staged_edits: bool) -> dict:
     }
     if content["target_kind"] == "skill_prompt" and not content["target_ref"]:
         content["target_ref"] = "SKILL.md"
+    if not has_staged_edits:
+        followup_card = build_followup_card(
+            card_id=str(card.get("id") or ""),
+            title=str(card.get("title") or "治理建议"),
+            target_kind=content["target_kind"],
+            target_ref=content["target_ref"],
+            problem_refs=content["problem_refs"],
+            reason=str(card.get("description") or content.get("reason") or ""),
+            acceptance_rule=content["acceptance_rule"],
+            evidence_snippets=list(content.get("evidence_snippets") or []),
+            suggested_changes=str(card.get("description") or card.get("title") or ""),
+            expected_deliverable=str(card.get("description") or card.get("title") or ""),
+            extra_fields={
+                "severity": card.get("severity"),
+                "category": card.get("category"),
+                "suggested_action": card.get("suggested_action"),
+            },
+        )
+        return followup_card
     card["content"] = content
     return card
 

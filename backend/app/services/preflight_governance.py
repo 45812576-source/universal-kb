@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.models.skill import Skill, StagedEdit
+from app.services.governance_action_compiler import build_followup_card
 
 
 @dataclass
@@ -410,11 +411,11 @@ def build_preflight_governance(
                     continue
                 code = item.get("code")
                 if code == "prompt_too_short":
-                    cards.append(_make_card(
-                        f"preflight-structure-prompt-{skill_id}",
-                        "补齐 Prompt 缺失项",
-                        item.get("issue", "System Prompt 过短"),
-                        card_type="followup_prompt",
+                    cards.append(build_followup_card(
+                        card_id=f"preflight-structure-prompt-{skill_id}",
+                        title="补齐 Prompt 缺失项",
+                        target_kind="skill_prompt",
+                        target_ref="SKILL.md",
                         reason="无正式质量检测结论前，只引导补角色、输入、输出与示例，不直接重写主体内容。",
                         preflight_action="open_skill_editor",
                         action_payload={
@@ -423,6 +424,8 @@ def build_preflight_governance(
                             "forbidden_actions": ["rewrite_full_prompt", "replace_main_body"],
                             "suggested_sections": ["角色定位", "输入要求", "输出要求", "example/reference/template"],
                         },
+                        acceptance_rule="补齐角色、输入、输出、示例等关键结构后再重新执行 preflight。",
+                        suggested_changes=item.get("issue", "System Prompt 过短"),
                     ))
                 elif code in _DESCRIPTION_REMEDIATION_CODES or _is_description_remediation_payload(item):
                     is_missing = code == "missing_description"
@@ -470,11 +473,11 @@ def build_preflight_governance(
                     continue
                 code = item.get("code")
                 if code == "knowledge_not_archived":
-                    cards.append(_make_card(
-                        f"preflight-knowledge-archive-{skill_id}-{item.get('check')}",
-                        f"归档知识文件：{item.get('check')}",
-                        "一键按默认路径归档并写入知识库，同时建立向量索引。",
-                        card_type="followup_prompt",
+                    cards.append(build_followup_card(
+                        card_id=f"preflight-knowledge-archive-{skill_id}-{item.get('check')}",
+                        title=f"归档知识文件：{item.get('check')}",
+                        target_kind="knowledge_reference",
+                        target_ref=str(item.get("check") or ""),
                         reason=item.get("issue", "未入库"),
                         preflight_action="confirm_archive",
                         action_payload={
@@ -485,19 +488,23 @@ def build_preflight_governance(
                                 "display_title": item.get("check"),
                             }],
                         },
+                        acceptance_rule="知识文件已入库并建立可用索引。",
+                        suggested_changes="按默认路径归档并写入知识库，同时建立向量索引。",
                     ))
                 elif code == "knowledge_missing_vector_index":
-                    cards.append(_make_card(
-                        f"preflight-knowledge-reindex-{skill_id}-{item.get('knowledge_id')}",
-                        f"重建向量索引：{item.get('check')}",
-                        "一键重建该知识条目的向量索引，然后可重新执行质量检测。",
-                        card_type="followup_prompt",
+                    cards.append(build_followup_card(
+                        card_id=f"preflight-knowledge-reindex-{skill_id}-{item.get('knowledge_id')}",
+                        title=f"重建向量索引：{item.get('check')}",
+                        target_kind="knowledge_reference",
+                        target_ref=str(item.get("check") or ""),
                         reason=item.get("issue", "已入库但无向量索引"),
                         preflight_action="reindex_knowledge",
                         action_payload={
                             "knowledge_ids": [item.get("knowledge_id")],
                             "filenames": [item.get("check")],
                         },
+                        acceptance_rule="对应知识条目存在可用向量索引。",
+                        suggested_changes="重建该知识条目的向量索引，然后重新执行质量检测。",
                     ))
 
         elif gate.get("gate") == "tools":
@@ -508,11 +515,11 @@ def build_preflight_governance(
                 for idx, failure in enumerate(failures):
                     code = failure.get("code")
                     if code in {"tool_inactive", "tool_module_missing"}:
-                        cards.append(_make_card(
-                            f"preflight-tools-tool-{skill_id}-{item.get('tool_id')}-{idx}",
-                            f"处理工具问题：{item.get('check')}",
-                            "一键跳转到 Skills & Tools 页面处理工具状态或实现问题。",
-                            card_type="followup_prompt",
+                        cards.append(build_followup_card(
+                            card_id=f"preflight-tools-tool-{skill_id}-{item.get('tool_id')}-{idx}",
+                            title=f"处理工具问题：{item.get('check')}",
+                            target_kind="tool_binding",
+                            target_ref=str(item.get("check") or ""),
                             reason=item.get("issue", "工具未就绪"),
                             preflight_action="navigate_tools",
                             action_payload={
@@ -520,19 +527,23 @@ def build_preflight_governance(
                                 "tool_id": failure.get("tool_id"),
                                 "tool_name": failure.get("tool_name"),
                             },
+                            acceptance_rule="工具处于可用状态且实现/模块完整。",
+                            suggested_changes="跳转到 Skills & Tools 页面处理工具状态或实现问题。",
                         ))
                     elif code == "registered_table_missing":
-                        cards.append(_make_card(
-                            f"preflight-tools-table-{skill_id}-{failure.get('table_name')}",
-                            f"补齐业务表：{failure.get('table_name')}",
-                            "一键跳转到数据资产页，补充或导入缺失的业务表后再重检。",
-                            card_type="followup_prompt",
+                        cards.append(build_followup_card(
+                            card_id=f"preflight-tools-table-{skill_id}-{failure.get('table_name')}",
+                            title=f"补齐业务表：{failure.get('table_name')}",
+                            target_kind="permission_config",
+                            target_ref=str(failure.get("table_name") or ""),
                             reason=item.get("issue", "registered_table 数据源缺失"),
                             preflight_action="navigate_data_assets",
                             action_payload={
                                 "target_url": "/data",
                                 "table_name": failure.get("table_name"),
                             },
+                            acceptance_rule="缺失业务表已在数据资产中可用并可被 Skill 引用。",
+                            suggested_changes="跳转到数据资产页，补充或导入缺失的业务表后再重检。",
                         ))
 
     quality_detail = result.get("quality_detail", {}) or {}

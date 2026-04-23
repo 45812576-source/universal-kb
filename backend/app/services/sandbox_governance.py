@@ -9,8 +9,13 @@ from sqlalchemy.orm import Session
 
 from app.models.sandbox import SandboxTestReport
 from app.models.sandbox import SandboxTestSession
+from app.services.governance_action_compiler import (
+    TARGET_KIND_LABELS,
+    build_followup_card,
+    normalize_evidence_snippets,
+    string_list,
+)
 from app.services.sandbox_remediation_agent import generate_remediation_plan
-from app.services.preflight_governance import _make_card
 from app.services.skill_memo_service import sync_remediation_tasks
 from app.services.studio_workflow_adapter import normalize_workflow_card, normalize_workflow_staged_edit
 
@@ -21,23 +26,6 @@ logger = logging.getLogger(__name__)
 class SandboxGovernanceResult:
     cards: list[dict] = field(default_factory=list)
     staged_edits: list[dict] = field(default_factory=list)
-
-
-_TARGET_KIND_LABELS = {
-    "skill_prompt": "SKILL.md",
-    "source_file": "附属文件",
-    "tool_binding": "工具绑定",
-    "knowledge_reference": "知识引用",
-    "input_slot_definition": "输入槽位",
-    "permission_config": "权限配置",
-    "skill_metadata": "Skill 元数据",
-    "unknown": "Prompt 逻辑",
-}
-_SUPPORTED_FOLLOWUP_ACTIONS = {
-    "bind_sandbox_tools",
-    "bind_knowledge_references",
-    "bind_permission_tables",
-}
 
 
 def _fallback_fix_items(part3: dict) -> list[dict]:
@@ -65,68 +53,12 @@ def _fallback_fix_items(part3: dict) -> list[dict]:
     return items
 
 
-def _string_list(value: object) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item).strip() for item in value if str(item).strip()]
-
-
 def _issue_evidence(item: dict, issue_map: dict[str, dict]) -> list[str]:
     evidence: list[str] = []
-    for problem_id in _string_list(item.get("problem_ids")):
+    for problem_id in string_list(item.get("problem_ids")):
         issue = issue_map.get(problem_id) or {}
-        for snippet in issue.get("evidence_snippets", []) or []:
-            if isinstance(snippet, str) and snippet.strip():
-                evidence.append(snippet.strip())
+        evidence.extend(normalize_evidence_snippets(issue.get("evidence_snippets", [])))
     return evidence[:5]
-
-
-def _manual_immediate_steps(item: dict) -> list[str]:
-    target_kind = str(item.get("target_kind") or "unknown")
-    target_label = _TARGET_KIND_LABELS.get(target_kind, _TARGET_KIND_LABELS["unknown"])
-    target_ref = str(item.get("target_ref") or target_label)
-    suggested = str(item.get("suggested_changes") or "按整改建议补齐缺失内容").strip()
-    acceptance = str(item.get("acceptance_rule") or "重新运行沙盒测试后对应问题不再出现。").strip()
-
-    if target_kind in {"skill_prompt", "source_file", "input_slot_definition", "skill_metadata", "unknown"}:
-        return [
-            f"打开 {target_ref or target_label}，定位本卡片对应的问题段落。",
-            f"按整改要求落地：{suggested}",
-            f"保存后按验收标准自查：{acceptance}",
-            "仅重跑本卡片 problem_ids 关联的用例，确认问题消失。",
-        ]
-    if target_kind == "knowledge_reference":
-        return [
-            "核对沙盒证据中的知识条目 ID 与当前 Skill 绑定关系。",
-            "将已验证知识写入 Skill 知识引用快照。",
-            f"按验收标准复查：{acceptance}",
-            "重跑关联用例确认回答引用命中已绑定知识。",
-        ]
-    if target_kind == "permission_config":
-        return [
-            "核对沙盒确认通过的数据表与权限快照。",
-            "将数据表写入 Skill 数据查询和运行绑定。",
-            f"按验收标准复查：{acceptance}",
-            "重跑关联用例确认数据来源可用且覆盖必填字段。",
-        ]
-    if target_kind == "tool_binding":
-        return [
-            "核对沙盒确认通过的工具清单。",
-            "将已确认工具绑定回当前 Skill。",
-            f"按验收标准复查：{acceptance}",
-            "重跑关联用例确认工具调用链路可用。",
-        ]
-    return [
-        f"按整改要求落地：{suggested}",
-        f"按验收标准自查：{acceptance}",
-        "重跑关联用例确认问题消失。",
-    ]
-
-
-def _actionable_summary(item: dict) -> str:
-    steps = _manual_immediate_steps(item)
-    deliverable = str(item.get("suggested_changes") or item.get("acceptance_rule") or "完成该整改项并回归验证。").strip()
-    return f"立即执行：{steps[0]} 交付物：{deliverable}"[:300]
 
 
 def _build_action_payload(
@@ -145,8 +77,6 @@ def _build_action_payload(
         "target_ref": item.get("target_ref", ""),
         "acceptance_rule": item.get("acceptance_rule", ""),
         "retest_scope": item.get("retest_scope", []),
-        "immediate_steps": _manual_immediate_steps(item),
-        "expected_deliverable": item.get("suggested_changes") or item.get("acceptance_rule") or "",
         "evidence_snippets": _issue_evidence(item, issue_map),
     }
 
@@ -194,29 +124,21 @@ def _actionable_task_card(
         issue_map=issue_map,
     )
     target_kind = str(item.get("target_kind", "unknown"))
-    actions = (
-        [{"label": "一键处理", "type": "adopt"}, {"label": "忽略", "type": "reject"}]
-        if preflight_action in _SUPPORTED_FOLLOWUP_ACTIONS
-        else [{"label": "打开目标", "type": "view_diff"}, {"label": "继续细化", "type": "refine"}, {"label": "忽略", "type": "reject"}]
-    )
-    card = _make_card(
-        f"sandbox-report-{skill_id}-{item.get('id')}",
-        str(item.get("title", "修复沙盒测试问题"))[:120],
-        _actionable_summary(item),
-        card_type="followup_prompt",
+    card = build_followup_card(
+        card_id=f"sandbox-report-{skill_id}-{item.get('id')}",
+        title=str(item.get("title", "修复沙盒测试问题")),
+        target_kind=target_kind,
+        target_ref=str(item.get("target_ref", "")),
+        problem_refs=string_list(item.get("problem_ids")),
         reason=str(item.get("acceptance_rule") or item.get("estimated_gain") or "按沙盒报告要求修复后再回归测试。")[:300],
+        acceptance_rule=str(item.get("acceptance_rule", "")),
+        evidence_snippets=_issue_evidence(item, issue_map),
+        suggested_changes=str(item.get("suggested_changes") or ""),
+        expected_deliverable=str(item.get("suggested_changes") or item.get("acceptance_rule") or ""),
         preflight_action=preflight_action,
         action_payload=action_payload,
-        actions=actions,
+        extra_content={"retest_scope": item.get("retest_scope", [])},
     )
-    card["content"]["problem_refs"] = item.get("problem_ids", [])
-    card["content"]["target_kind"] = target_kind
-    card["content"]["target_ref"] = item.get("target_ref", "")
-    card["content"]["acceptance_rule"] = item.get("acceptance_rule", "")
-    card["content"]["retest_scope"] = item.get("retest_scope", [])
-    card["content"]["immediate_steps"] = action_payload.get("immediate_steps", [])
-    card["content"]["expected_deliverable"] = action_payload.get("expected_deliverable", "")
-    card["content"]["evidence_snippets"] = action_payload.get("evidence_snippets", [])
     return card
 
 
