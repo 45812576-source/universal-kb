@@ -2104,10 +2104,29 @@ async def run_stream(
                 yield ("content_block_delta", {"index": 0, "delta": {"text": cdata}})
                 yield ("delta", {"text": cdata})
     except Exception as e:
-        # H20: LLM 流式调用异常优雅降级，发送 error event 而非直接崩溃
         logger.error(f"[studio_agent] LLM streaming error: {e}")
-        yield ("error", {"message": f"AI 服务暂时不可用: {type(e).__name__}", "error_type": "server_error", "retryable": True})
-        return
+        if full_content:
+            yield ("error", {"message": f"AI 服务暂时不可用: {type(e).__name__}", "error_type": "server_error", "retryable": True})
+            return
+        try:
+            logger.warning("[studio_agent] stream failed before first token, fallback to non-stream chat")
+            fallback_content, _ = await llm_gateway.chat(
+                model_config=model_config,
+                messages=llm_messages,
+                tools=None,
+            )
+        except Exception as fallback_exc:
+            logger.error(f"[studio_agent] LLM fallback chat error: {fallback_exc}")
+            yield ("error", {"message": f"AI 服务暂时不可用: {type(fallback_exc).__name__}", "error_type": "server_error", "retryable": True})
+            return
+
+        if not fallback_content:
+            yield ("error", {"message": "AI 服务暂时不可用: EmptyResponse", "error_type": "server_error", "retryable": True})
+            return
+
+        full_content = fallback_content
+        yield ("content_block_delta", {"index": 0, "delta": {"text": fallback_content}})
+        yield ("delta", {"text": fallback_content})
 
     # ── 6. Post-process ──
     clean_text, events = _extract_events(full_content)

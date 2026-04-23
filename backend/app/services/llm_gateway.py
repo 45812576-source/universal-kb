@@ -19,6 +19,15 @@ logger = logging.getLogger(__name__)
 # ── 重试配置 ─────────────────────────────────────────────────────────────────
 _RETRYABLE_STATUS_CODES = {429, 502, 503}
 _RETRY_DELAYS = [1.0, 2.0, 4.0]  # 指数退避（最多 3 次重试）
+_RETRYABLE_TRANSPORT_EXCEPTIONS = (
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+    httpx.ProtocolError,
+)
 
 
 # ── Provider 熔断器 ──────────────────────────────────────────────────────────
@@ -345,7 +354,7 @@ class LLMGateway:
                     await asyncio.sleep(delay)
                     continue
                 break
-            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as e:
+            except _RETRYABLE_TRANSPORT_EXCEPTIONS as e:
                 last_exc = e
                 if _attempt < len(_RETRY_DELAYS):
                     delay = _RETRY_DELAYS[_attempt]
@@ -490,7 +499,7 @@ class LLMGateway:
                     cb.record_success()
                     return  # 正常完成，退出重试循环
 
-            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as e:
+            except _RETRYABLE_TRANSPORT_EXCEPTIONS as e:
                 last_exc = e
                 if _attempt < len(_RETRY_DELAYS):
                     delay = _RETRY_DELAYS[_attempt]

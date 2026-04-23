@@ -2,6 +2,7 @@
 import json
 import os
 import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.routers.conversations import SendMessage, _active_card_meta, _studio_context_meta
 from app.services.studio_agent import (
@@ -10,6 +11,7 @@ from app.services.studio_agent import (
     _extract_events,
     _normalize_external_handoff_payload,
     _orchestration_error,
+    run_stream,
 )
 from app.services.skill_engine import _read_source_files
 
@@ -574,3 +576,32 @@ class TestReadSourceFiles:
             files = [{"filename": fname, "category": "reference"}]
             result = _read_source_files(1, files)
             assert f"content-{ext}" in result
+
+
+@pytest.mark.asyncio
+async def test_run_stream_falls_back_to_non_stream_when_stream_fails_before_first_token():
+    db = MagicMock()
+    db.get.return_value = None
+    db.query.return_value.filter.return_value.first.return_value = None
+
+    async def broken_stream(*args, **kwargs):
+        raise RuntimeError("stream transport closed")
+        yield  # pragma: no cover
+
+    with patch("app.services.studio_agent.llm_gateway.chat_stream_typed", new=broken_stream), \
+         patch("app.services.studio_agent.llm_gateway.chat", new=AsyncMock(return_value=("fallback reply", {}))):
+        events = [
+            event async for event in run_stream(
+                db=db,
+                conv_id=1,
+                workspace_system_context="",
+                history_messages=[],
+                user_message="请帮我修复这个问题",
+                model_config={"provider": "ark", "model_id": "test-model"},
+            )
+        ]
+
+    deltas = [event for event in events if isinstance(event, tuple) and event[0] == "delta"]
+    assert deltas
+    assert deltas[-1][1]["text"] == "fallback reply"
+    assert not any(event[0] == "error" for event in events if isinstance(event, tuple))
