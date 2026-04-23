@@ -1351,6 +1351,122 @@ class TestSandboxReportGovernanceActions:
         assert result.staged_edits == []
         assert len(result.cards) == 1
         assert result.cards[0]["type"] == "followup_prompt"
+        assert result.cards[0]["content"].get("preflight_action") != "open_fix_task"
+        assert result.cards[0]["content"]["immediate_steps"]
+
+    @pytest.mark.asyncio
+    async def test_build_governance_compiles_every_task_into_actionable_card(self, db):
+        from app.services.sandbox_governance import build_sandbox_report_governance
+        from app.services.sandbox_remediation_agent import RemediationPlanResult
+
+        dept = _make_dept(db)
+        user = _make_user(db, "sandbox_governance_actionability_user", Role.SUPER_ADMIN, dept.id)
+        _make_model_config(db)
+        skill = _make_skill(db, user.id, name="沙盒可执行化Skill", status=SkillStatus.PUBLISHED)
+
+        session = SandboxTestSession(
+            target_type="skill",
+            target_id=skill.id,
+            target_version=1,
+            target_name=skill.name,
+            tester_id=user.id,
+            status=SessionStatus.COMPLETED,
+            current_step=SessionStep.DONE,
+            detected_slots=[],
+            tool_review=[],
+            permission_snapshot=[{"confirmed": True, "included_in_test": True, "table_name": "finance_orders"}],
+            quality_passed=False,
+            usability_passed=False,
+            anti_hallucination_passed=True,
+            approval_eligible=False,
+        )
+        db.add(session)
+        db.flush()
+
+        fix_plan = [
+            {
+                "id": "fix_prompt",
+                "title": "补齐当前可执行分析框架",
+                "priority": "p1",
+                "problem_ids": ["issue_prompt"],
+                "action_type": "fix_prompt_logic",
+                "target_kind": "skill_prompt",
+                "target_ref": "SKILL.md",
+                "suggested_changes": "在输出要求中加入最小分析框架、操作步骤和验收清单",
+                "acceptance_rule": "无法深度分析时仍必须交付最小框架示例和下一步操作",
+                "retest_scope": ["case_actionability"],
+                "estimated_gain": "避免只承诺未来产物",
+            },
+            {
+                "id": "fix_permission",
+                "title": "挂载沙盒确认数据表",
+                "priority": "p1",
+                "problem_ids": ["issue_permission"],
+                "action_type": "fix_permission_handling",
+                "target_kind": "permission_config",
+                "target_ref": "finance_orders",
+                "suggested_changes": "绑定 finance_orders 作为运行数据源",
+                "acceptance_rule": "输入槽位来源覆盖所有必填字段",
+                "retest_scope": ["case_slots"],
+                "estimated_gain": "补齐数据源",
+            },
+        ]
+        report = SandboxTestReport(
+            session_id=session.id,
+            target_type="skill",
+            target_id=skill.id,
+            target_version=1,
+            target_name=skill.name,
+            tester_id=user.id,
+            part1_evidence_check={},
+            part2_test_matrix={},
+            part3_evaluation={
+                "issues": [
+                    {
+                        "issue_id": "issue_prompt",
+                        "reason": "输出只列未来可能产物，没有交付当下可执行分析框架",
+                        "evidence_snippets": ["仅写了可输出拓扑图、分录模板，未给当前步骤"],
+                    },
+                    {
+                        "issue_id": "issue_permission",
+                        "reason": "输入槽位来源未覆盖数据表",
+                        "evidence_snippets": ["table:finance_orders"],
+                    },
+                ],
+                "fix_plan_structured": fix_plan,
+            },
+            quality_passed=False,
+            usability_passed=False,
+            anti_hallucination_passed=True,
+            approval_eligible=False,
+            report_hash="sandbox-gov-actionability-hash",
+        )
+        db.add(report)
+        db.flush()
+        session.report_id = report.id
+        db.commit()
+
+        with patch(
+            "app.services.sandbox_governance.generate_remediation_plan",
+            new=AsyncMock(return_value=RemediationPlanResult(tasks=fix_plan, staged_edits=[], cards=[])),
+        ):
+            result = await build_sandbox_report_governance(db, skill_id=skill.id, report=report)
+
+        assert result.staged_edits == []
+        assert len(result.cards) == 2
+        for card in result.cards:
+            assert card["content"].get("preflight_action") != "open_fix_task"
+            assert card["content"]["immediate_steps"]
+            assert card["content"]["expected_deliverable"]
+            assert card["content"]["acceptance_rule"]
+
+        prompt_card = next(card for card in result.cards if card["content"]["target_kind"] == "skill_prompt")
+        assert [action["type"] for action in prompt_card["actions"]] == ["view_diff", "refine", "reject"]
+        assert "立即执行" in prompt_card["summary"]
+
+        permission_card = next(card for card in result.cards if card["content"]["target_kind"] == "permission_config")
+        assert permission_card["content"]["preflight_action"] == "bind_permission_tables"
+        assert permission_card["content"]["action_payload"]["table_names"] == ["finance_orders"]
 
 
 class TestPreflightGovernanceBoundaries:
