@@ -1421,6 +1421,46 @@ _EDITOR_CONTEXT_TEMPLATE = """- 当前选中的 Skill ID：{skill_id}
 _EDITOR_NO_CONTEXT = "用户尚未选中任何 Skill，编辑器为空。"
 
 
+def _extract_description_fix_from_memo(memo_data: dict | None) -> dict | None:
+    """从 memo 中提取 description 修改任务的建议内容。
+
+    返回 dict: {task_id, new_desc, acceptance_rule} 或 None。
+    """
+    if not memo_data or memo_data.get("lifecycle_stage") != "fixing":
+        return None
+    payload = memo_data.get("memo", {})
+    tasks = payload.get("tasks", [])
+    fix_tasks = [t for t in tasks if t.get("type", "").startswith("fix_") and t.get("status") in ("todo", "in_progress")]
+    if not fix_tasks:
+        return None
+    current_id = payload.get("current_task_id")
+    current_fix = next((t for t in fix_tasks if t.get("id") == current_id), fix_tasks[0])
+    if not current_fix:
+        return None
+    target_kind = current_fix.get("target_kind", "")
+    target_ref = current_fix.get("target_ref", "")
+    if target_kind not in ("skill_metadata", "metadata") and "description" not in target_ref:
+        return None
+    suggested = current_fix.get("suggested_changes", "")
+    new_desc = ""
+    for line in (suggested or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            new_desc = stripped.lstrip(">").strip().strip("`\"'""''「」")
+            break
+    if not new_desc:
+        m = re.search(r"[：:]\s*(.+)", suggested or "")
+        if m:
+            new_desc = m.group(1).strip().strip("`\"'""''「」")
+    if not new_desc or not (12 <= len(new_desc) <= 180):
+        return None
+    return {
+        "task_id": current_fix.get("id", "1"),
+        "new_desc": new_desc,
+        "acceptance_rule": current_fix.get("acceptance_rule_text", "description 应精准概括 Skill 核心能力"),
+    }
+
+
 def _build_memo_context(memo_data: dict | None) -> str:
     """将 memo 视图数据构建为 prompt 注入文本。"""
     if not memo_data or not memo_data.get("lifecycle_stage"):
@@ -1490,43 +1530,7 @@ def _build_memo_context(memo_data: dict | None) -> str:
                     f"- 目标: {current_fix.get('target_ref', '未指定')}\n"
                     f"- 验收: {current_fix.get('acceptance_rule_text', '未指定')}\n"
                 )
-            # 检测 description 元数据修改任务 → 注入 studio_governance_action 指引
-            description_governance_hint = ""
-            if current_fix:
-                target_kind = current_fix.get("target_kind", "")
-                target_ref = current_fix.get("target_ref", "")
-                if target_kind in ("skill_metadata", "metadata") or "description" in target_ref:
-                    suggested = current_fix.get("suggested_changes", "")
-                    # 从 suggested_changes 中提取建议 description（> 引用行或纯文本）
-                    new_desc = ""
-                    for line in (suggested or "").splitlines():
-                        stripped = line.strip()
-                        if stripped.startswith(">"):
-                            new_desc = stripped.lstrip(">").strip().strip("`\"'""''「」")
-                            break
-                    if not new_desc:
-                        # fallback：取 suggested_changes 中冒号后的内容
-                        m = re.search(r"[：:]\s*(.+)", suggested or "")
-                        if m:
-                            new_desc = m.group(1).strip().strip("`\"'""''「」")
-                    if new_desc and 12 <= len(new_desc) <= 180:
-                        escaped = json.dumps(new_desc, ensure_ascii=False)[1:-1]  # strip quotes
-                        description_governance_hint = (
-                            f"\n\n### description 修改指引（必须执行）\n"
-                            f"当前任务是修改 Skill 描述。你必须在回复末尾附加以下结构化块，让用户可以一键采纳：\n"
-                            f"```studio_governance_action\n"
-                            f'{{"card_id": "fix_description_{current_fix.get("id", "1")}", '
-                            f'"title": "优化 Skill 描述", '
-                            f'"summary": "替换为更精准概括核心能力的描述", '
-                            f'"target": "skill_metadata", '
-                            f'"reason": "{current_fix.get("acceptance_rule_text", "description 应精准概括 Skill 核心能力")}", '
-                            f'"risk_level": "low", '
-                            f'"staged_edit": {{"ops": [{{"type": "replace", "old": "description", "new": "{escaped}"}}]}}}}\n'
-                            f"```\n"
-                            f"注意：\n"
-                            f"- 复述问题后直接附加上述块，不要只做文字建议\n"
-                            f"- 用户点击「采纳修改」后 description 会自动更新\n"
-                        )
+            # 检测 description 元数据修改任务（提示 hint 已弃用，改用 post-process 确定性注入）
 
             fix_section += (
                 "\n\n### 你的行为指引\n"
@@ -1537,7 +1541,6 @@ def _build_memo_context(memo_data: dict | None) -> str:
                 "5. 没有精确证据时，只给任务建议，不给 staged diff 或整段替换草稿\n"
                 "6. 修改后推动任务完成，建议进行局部重测\n"
             )
-            fix_section += description_governance_hint
             base += fix_section
 
         elif top_deductions:
@@ -2691,6 +2694,43 @@ async def run_stream(
                             yield ("card_patch", applied_item)
                 except Exception as e_cp:
                     logger.warning(f"[studio_agent] card_proposals handling error: {e_cp}")
+
+    # ── 6c. 确定性注入 description 修改的 governance action ──
+    # 如果当前是 description 修改任务，且 AI 未输出 studio_governance_action，则自动注入
+    _desc_fix = _extract_description_fix_from_memo(memo_context)
+    if _desc_fix:
+        _already_has_desc_action = any(
+            ename == "studio_governance_action"
+            and isinstance(epayload, dict)
+            and epayload.get("target") in ("skill_metadata", "skill_metadata.description", "description")
+            for ename, epayload in events
+        )
+        if not _already_has_desc_action:
+            _desc_action_payload = {
+                "card_id": f"fix_description_{_desc_fix['task_id']}",
+                "title": "优化 Skill 描述",
+                "summary": "替换为更精准概括核心能力的描述",
+                "target": "skill_metadata",
+                "reason": _desc_fix["acceptance_rule"],
+                "risk_level": "low",
+                "staged_edit": {
+                    "ops": [{"type": "replace", "old": "description", "new": _desc_fix["new_desc"]}],
+                },
+            }
+            yield ("studio_governance_action", _desc_action_payload)
+            # 同步 governance_card 协议
+            yield ("governance_card", {
+                "id": _desc_action_payload["card_id"],
+                "type": "staged_edit",
+                "title": _desc_action_payload["title"],
+                "content": _desc_action_payload,
+                "status": "pending",
+                "actions": [
+                    {"label": "采纳", "type": "adopt"},
+                    {"label": "跳过", "type": "reject"},
+                ],
+            })
+            logger.info("[studio_agent] deterministic description governance action injected: %s", _desc_fix["new_desc"][:60])
 
     # ── 阶段 4: done ──
     yield ("status", {"stage": "done"})
