@@ -289,9 +289,19 @@ class StudioCardOrchestrator:
                 if len(visible_ids) >= 5:
                     break
 
+        total_actionable = sum(
+            1 for c in inp.cards
+            if isinstance(c, dict) and c.get("status") in actionable_statuses
+            and c.get("id") not in completed_set
+        )
+        backlog_count = max(0, total_actionable - len(visible_ids))
+
         return {
             "active_card_id": new_active_id or (visible_ids[0] if visible_ids else None),
             "visible_card_ids": visible_ids,
+            "backlog_count": backlog_count,
+            "max_visible": 5,
+            "reveal_policy": "stage_gated",
             "phase": (inp.workflow_state or {}).get("phase", "discover"),
         }
 
