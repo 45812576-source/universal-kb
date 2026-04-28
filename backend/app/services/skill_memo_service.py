@@ -1759,16 +1759,9 @@ def complete_from_save(
     if not target_task:
         return {"ok": True, "task_completed": False, "reason": "task_not_found"}
 
-    # 检查是否命中目标文件
-    target_files = target_task.get("target_files", [])
-
-    # SKILL.md 特殊处理：prompt 文件保存也算
-    if filename == "SKILL.md" or file_type == "prompt":
-        matched = "SKILL.md" in target_files
-    else:
-        matched = filename in target_files
-
-    if not matched:
+    # 检查是否命中目标。除显式 target_files 外，也兼容结构化整改里的
+    # target_kind/target_ref（例如 skill_metadata.description 不会有实体文件）。
+    if not _saved_file_matches_task(target_task, filename, file_type):
         return {"ok": True, "task_completed": False, "reason": "saved_file_not_in_target_files", "memo": get_memo(db, skill_id)}
 
     # 检查 acceptance_rule
@@ -2211,6 +2204,49 @@ def _remediation_task_target_files(task: dict[str, Any]) -> list[str]:
     if target_kind == "source_file" and target_ref:
         return [target_ref]
     return []
+
+
+def _is_prompt_save(filename: str, file_type: str) -> bool:
+    normalized_file_type = str(file_type or "").strip().lower()
+    return filename == "SKILL.md" or normalized_file_type in {"prompt", "system_prompt"}
+
+
+def _is_metadata_save(file_type: str) -> bool:
+    return str(file_type or "").strip().lower() in {"metadata", "skill_metadata"}
+
+
+def _is_metadata_description_target(target_kind: Any, target_ref: Any) -> bool:
+    normalized_kind = str(target_kind or "").strip().lower()
+    normalized_ref = str(target_ref or "").strip().lower()
+    if normalized_kind not in {"skill_metadata", "metadata"}:
+        return False
+    return (
+        normalized_ref in {"", "description", "metadata.description", "skill_metadata.description"}
+        or "description" in normalized_ref
+    )
+
+
+def _saved_file_matches_task(target_task: dict[str, Any], filename: str, file_type: str) -> bool:
+    target_files = [
+        str(item).strip()
+        for item in (target_task.get("target_files") or [])
+        if str(item).strip()
+    ]
+    if _is_prompt_save(filename, file_type) and "SKILL.md" in target_files:
+        return True
+    if filename in target_files:
+        return True
+
+    target_kind = str(target_task.get("target_kind") or "").strip().lower()
+    target_ref = str(target_task.get("target_ref") or "").strip()
+    if target_kind == "skill_prompt" and _is_prompt_save(filename, file_type):
+        return True
+    if target_kind == "source_file" and target_ref and filename == target_ref:
+        return True
+    if _is_metadata_description_target(target_kind, target_ref):
+        return _is_prompt_save(filename, file_type) or _is_metadata_save(file_type)
+
+    return False
 
 
 def _remediation_priority(priority: str | None) -> str:

@@ -900,6 +900,94 @@ class TestWorkflowRecovery:
         assert workflow_recovery["workflow_state"]["phase"] == "validate"
         assert workflow_recovery["workflow_state"]["next_action"] == "run_sandbox"
 
+    def test_complete_from_save_matches_metadata_description_task(self, db):
+        dept = _make_dept(db, "metadata任务回写部门")
+        user = _make_user(db, "metadata_task_backfill_user", dept_id=dept.id)
+        skill = _make_skill(db, user.id, name="Metadata任务Skill")
+
+        memo = skill_memo_service.init_memo(db, skill.id, "published_iteration", "目标", user.id)
+        payload = dict(memo["memo"])
+        payload["tasks"] = [{
+            "id": "task_metadata_description",
+            "title": "优化 Skill 描述",
+            "type": "fix_prompt_logic",
+            "status": "in_progress",
+            "priority": "medium",
+            "source": "test_failure",
+            "description": "description 过于笼统",
+            "target_files": [],
+            "acceptance_rule": {"mode": "all_target_files_saved_nonempty"},
+            "depends_on": [],
+            "started_at": None,
+            "completed_at": None,
+            "completed_by": None,
+            "result_summary": None,
+            "problem_refs": ["issue_description"],
+            "target_kind": "skill_metadata",
+            "target_ref": "description",
+            "source_report_id": 91,
+        }]
+        payload["current_task_id"] = "task_metadata_description"
+        row = db.query(skill_memo_service.SkillMemo).filter(skill_memo_service.SkillMemo.skill_id == skill.id).first()
+        row.memo_payload = payload
+        db.commit()
+
+        skill_memo_service.sync_workflow_recovery(
+            db,
+            skill.id,
+            workflow_state={
+                "workflow_id": "run_metadata_description",
+                "session_mode": "optimize_existing_skill",
+                "workflow_mode": "sandbox_remediation",
+                "phase": "remediate",
+                "next_action": "review_cards",
+                "route_reason": "sandbox_failed",
+            },
+            cards=[{
+                "id": "card_metadata_description",
+                "title": "优化 Skill 描述",
+                "type": "staged_edit",
+                "status": "pending",
+                "content": {
+                    "summary": "更新 metadata.description",
+                    "staged_edit_id": "edit_metadata_description",
+                    "problem_refs": ["issue_description"],
+                    "target_kind": "skill_metadata",
+                    "target_ref": "description",
+                    "action_payload": {"source_report_id": 91},
+                },
+                "actions": [{"label": "采纳", "type": "adopt"}],
+            }],
+            staged_edits=[{
+                "id": "edit_metadata_description",
+                "target_type": "metadata",
+                "summary": "更新 description",
+                "risk_level": "low",
+                "diff_ops": [{"op": "replace", "old": "description", "new": "新的描述"}],
+                "status": "pending",
+            }],
+            user_id=user.id,
+            commit=True,
+        )
+
+        result = skill_memo_service.complete_from_save(
+            db,
+            skill.id,
+            "task_metadata_description",
+            "SKILL.md",
+            "prompt",
+            128,
+        )
+
+        assert result["task_completed"] is True
+        task = next(task for task in result["memo"]["memo"]["tasks"] if task["id"] == "task_metadata_description")
+        assert task["status"] == "done"
+        workflow_recovery = result["memo"]["workflow_recovery"]
+        assert workflow_recovery["cards"][0]["status"] == "adopted"
+        assert workflow_recovery["staged_edits"][0]["status"] == "adopted"
+        assert workflow_recovery["workflow_state"]["phase"] == "validate"
+        assert workflow_recovery["workflow_state"]["next_action"] == "run_sandbox"
+
     def test_record_test_result_updates_workflow_recovery_after_preflight_pass(self, db):
         dept = _make_dept(db, "workflow测试建议部门")
         user = _make_user(db, "workflow_test_recommend_user", dept_id=dept.id)
