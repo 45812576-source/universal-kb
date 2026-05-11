@@ -44,6 +44,13 @@ VALID_TASK_TYPES = {
 
 VALID_TASK_STATUSES = {"todo", "in_progress", "done", "skipped"}
 
+FIX_TASK_TYPES = {
+    "fix_after_test", "fix_prompt_logic", "fix_input_slot",
+    "fix_tool_usage", "fix_knowledge_binding", "fix_permission_handling",
+}
+
+MAX_ACTIVE_FIX_TASKS = 5
+
 # 关键词用于判断 prompt 是否需要 reference / tool / template
 _REF_KEYWORDS = re.compile(r"(参考|知识|资料|API|文档|数据库|手册)", re.IGNORECASE)
 _TOOL_KEYWORDS = re.compile(r"(调用|获取数据|API|查询|计算|执行|搜索|爬取|请求)", re.IGNORECASE)
@@ -127,6 +134,7 @@ def _empty_payload() -> dict:
         "post_test_diffs": [],
         "adopted_feedback": [],
         "context_rollups": [],
+        "deferred_fix_items": [],
         "workflow_recovery": {
             "workflow_state": None,
             "cards": [],
@@ -826,6 +834,7 @@ def _sync_tasks_from_workflow_action(
     if _resolve_related_notices(payload, matched_task_ids):
         changed = True
     if matched_task_ids:
+        _promote_deferred_fix_items(payload)
         next_task = _pick_next_task(payload)
         payload["current_task_id"] = next_task["id"] if next_task else None
     if changed:
@@ -1823,6 +1832,9 @@ def complete_from_save(
 
     _sync_workflow_recovery_from_completed_tasks(payload, [task_id])
 
+    # 从 deferred 提升任务
+    _promote_deferred_fix_items(payload)
+
     # 选择下一个任务
     next_task = _pick_next_task(payload)
     payload["current_task_id"] = next_task["id"] if next_task else None
@@ -1901,6 +1913,9 @@ def resolve_tool_bound_tasks(db: Session, skill_id: int) -> bool:
         if task.get("status") == "done" and task.get("completed_by") == "system"
     ]
     _sync_workflow_recovery_from_completed_tasks(payload, completed_task_ids)
+
+    # 从 deferred 提升任务
+    _promote_deferred_fix_items(payload)
 
     # 选择下一个任务 + 推进生命周期
     next_task = _pick_next_task(payload)
@@ -2017,10 +2032,14 @@ def record_test_result(
                 ):
                     t["status"] = "superseded"
                     t["result_summary"] = "已被新一轮测试报告替代"
+            payload["deferred_fix_items"] = []  # 清除旧批次
 
         # 优先使用结构化 fix_plan 生成精细任务
         if structured_fix_plan:
-            for fp_item in structured_fix_plan:
+            active_items = structured_fix_plan[:MAX_ACTIVE_FIX_TASKS]
+            deferred_items = structured_fix_plan[MAX_ACTIVE_FIX_TASKS:]
+
+            for fp_item in active_items:
                 task_id = _new_id("task")
                 generated_task_ids.append(task_id)
 
@@ -2052,9 +2071,16 @@ def record_test_result(
                     "source_report_id": source_report_id,
                 })
 
+            # 超出上限的存入 deferred
+            if deferred_items:
+                payload.setdefault("deferred_fix_items", []).extend(deferred_items)
+
         elif suggested_followups:
-            # fallback: 旧逻辑
-            for followup in suggested_followups:
+            # fallback: 旧逻辑，同样加上限
+            active_followups = suggested_followups[:MAX_ACTIVE_FIX_TASKS]
+            deferred_followups = suggested_followups[MAX_ACTIVE_FIX_TASKS:]
+
+            for followup in active_followups:
                 task_id = _new_id("task")
                 generated_task_ids.append(task_id)
                 payload.setdefault("tasks", []).append({
@@ -2073,6 +2099,9 @@ def record_test_result(
                     "completed_by": None,
                     "result_summary": None,
                 })
+
+            if deferred_followups:
+                payload.setdefault("deferred_fix_items", []).extend(deferred_followups)
 
         test_record["followup_task_ids"] = generated_task_ids
         memo.lifecycle_stage = "fixing"
@@ -2315,14 +2344,17 @@ def sync_remediation_tasks(
             task["status"] = "superseded"
             task["result_summary"] = "已由 remediation agent 生成的新整改计划替代"
             superseded_ids.add(str(task.get("id") or ""))
+    payload["deferred_fix_items"] = []  # 清除旧批次
+
+    # 有效 items 过滤
+    valid_items = [item for item in tasks if isinstance(item, dict)]
+    active_items = valid_items[:MAX_ACTIVE_FIX_TASKS]
+    deferred_items = valid_items[MAX_ACTIVE_FIX_TASKS:]
 
     generated_task_ids: list[str] = []
     fix_task_ids: list[str] = []
 
-    for item in tasks:
-        if not isinstance(item, dict):
-            continue
-
+    for item in active_items:
         task_id = _new_id("task")
         action_type = item.get("action_type", "fix_after_test")
         task_type = action_type if action_type in VALID_TASK_TYPES else "fix_after_test"
@@ -2354,6 +2386,10 @@ def sync_remediation_tasks(
         generated_task_ids.append(task_id)
         if task_type != "run_targeted_retest":
             fix_task_ids.append(task_id)
+
+    # 超出上限的存入 deferred
+    if deferred_items:
+        payload.setdefault("deferred_fix_items", []).extend(deferred_items)
 
     for record in payload.get("test_history", []):
         if record.get("source_report_id") == source_report_id:
@@ -2732,6 +2768,7 @@ def ingest_from_paste(
     # ── 5. 推进 current_task 和 lifecycle ──
     if completed_task_ids:
         _sync_workflow_recovery_from_completed_tasks(payload, completed_task_ids)
+        _promote_deferred_fix_items(payload)
         next_task = _pick_next_task(payload)
         payload["current_task_id"] = next_task["id"] if next_task else payload.get("current_task_id")
         _advance_lifecycle(memo, payload)
@@ -2771,12 +2808,70 @@ def _infer_task_category(target_files: list[str]) -> str | None:
 
 # ── 辅助方法 ──────────────────────────────────────────────────────────────────
 
+
+def _promote_deferred_fix_items(payload: dict, source_report_id: int | None = None) -> list[str]:
+    """从 deferred_fix_items 中提升任务，填补活跃 fix task 空缺。
+
+    返回新创建的 task IDs。
+    """
+    deferred = payload.get("deferred_fix_items", [])
+    if not deferred:
+        return []
+
+    tasks = payload.get("tasks", [])
+    active_count = sum(
+        1 for t in tasks
+        if t.get("status") in ("todo", "in_progress")
+        and t.get("source") == "test_failure"
+        and t.get("type") in FIX_TASK_TYPES
+    )
+
+    slots = MAX_ACTIVE_FIX_TASKS - active_count
+    if slots <= 0:
+        return []
+
+    promoted_ids: list[str] = []
+    to_promote = deferred[:slots]
+    payload["deferred_fix_items"] = deferred[slots:]
+
+    for item in to_promote:
+        task_id = _new_id("task")
+        action_type = item.get("action_type", "fix_after_test")
+        task_type = action_type if action_type in VALID_TASK_TYPES else "fix_after_test"
+
+        payload.setdefault("tasks", []).append({
+            "id": task_id,
+            "title": str(item.get("title") or "修复测试问题")[:200],
+            "type": task_type,
+            "status": "todo",
+            "priority": "high" if item.get("priority") == "p0" else "medium" if item.get("priority") == "p1" else "low",
+            "source": "test_failure",
+            "description": item.get("suggested_changes") or item.get("acceptance_rule") or "",
+            "target_files": _remediation_task_target_files(item),
+            "acceptance_rule": {"mode": "custom", "text": item.get("acceptance_rule", "")},
+            "depends_on": [],
+            "started_at": None,
+            "completed_at": None,
+            "completed_by": None,
+            "result_summary": None,
+            "problem_refs": item.get("problem_ids", []),
+            "target_kind": item.get("target_kind", "unknown"),
+            "target_ref": item.get("target_ref", ""),
+            "retest_scope": item.get("retest_scope", []),
+            "acceptance_rule_text": item.get("acceptance_rule", ""),
+            "source_report_id": source_report_id,
+        })
+        promoted_ids.append(task_id)
+
+    return promoted_ids
+
+
 def _deps_done(task: dict, all_tasks: list[dict]) -> bool:
     """检查任务的所有依赖是否已完成。"""
     depends = task.get("depends_on", [])
     if not depends:
         return True
-    done_ids = {t["id"] for t in all_tasks if t["status"] in ("done", "skipped")}
+    done_ids = {t["id"] for t in all_tasks if t["status"] in ("done", "skipped", "superseded")}
     return all(d in done_ids for d in depends)
 
 
@@ -2792,15 +2887,17 @@ def _pick_next_task(payload: dict) -> dict | None:
 def _advance_lifecycle(memo: SkillMemo, payload: dict) -> None:
     """根据状态迁移表自动推进 lifecycle_stage。"""
     tasks = payload.get("tasks", [])
+    _terminal = ("done", "skipped", "superseded")
+    has_deferred = bool(payload.get("deferred_fix_items"))
 
     # 检查是否所有非测试任务完成
     non_test_tasks = [t for t in tasks if t["type"] not in ("run_test",)]
-    all_non_test_done = all(t["status"] in ("done", "skipped") for t in non_test_tasks) if non_test_tasks else True
+    all_non_test_done = all(t["status"] in _terminal for t in non_test_tasks) if non_test_tasks else True
 
-    if memo.lifecycle_stage == "editing" and all_non_test_done:
+    if memo.lifecycle_stage == "editing" and all_non_test_done and not has_deferred:
         memo.lifecycle_stage = _validate_lifecycle("awaiting_test")
     elif memo.lifecycle_stage == "fixing":
-        fix_tasks = [t for t in tasks if t["type"] == "fix_after_test"]
-        all_fixes_done = all(t["status"] in ("done", "skipped") for t in fix_tasks) if fix_tasks else True
-        if all_fixes_done:
+        fix_tasks = [t for t in tasks if t["type"] in FIX_TASK_TYPES]
+        all_fixes_done = all(t["status"] in _terminal for t in fix_tasks) if fix_tasks else True
+        if all_fixes_done and not has_deferred:
             memo.lifecycle_stage = _validate_lifecycle("awaiting_test")

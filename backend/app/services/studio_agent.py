@@ -1352,7 +1352,11 @@ _STUDIO_SYSTEM = """{card_directive}
 ```studio_fixing_complete
 {{"card_id": "当前修复卡ID", "contract_id": "fixing.xxx", "result": "ready_for_validation"}}
 ```
-- 当你建议新增后续卡片时，附加：
+- **卡片提案触发规则（card_proposals）**：
+  - 用户提出新问题、额外修改需求、或超出当前卡片范围的关注点时，必须用 card_proposals 排入队列，不在当前卡片临时处理
+  - 完成当前卡片后发现后续依赖任务时，主动提出 card_proposals
+  - 用户反馈暗示额外工作（如"这个以后再说""还有个问题""顺便把XXX也改了"）时，捕获为新卡片并说明已排入队列
+  - 格式：
 ```card_proposals
 {{"proposals": [{{"title": "补充示例", "summary": "为主 Prompt 增加一个边界样例", "card_type": "governance", "target_file": "example-boundary.md", "file_role": "example"}}]}}
 ```
@@ -1382,6 +1386,8 @@ _MEMO_CONTEXT_TEMPLATE = """当前 Skill 存在 Memo 工作流，你必须围绕
 - 持久提醒：{notices_desc}
 - 最近测试：{latest_test_desc}
 - 最近完成：{recent_progress}
+- 工作摘要：{context_rollups_desc}
+- 卡片决策记录：{decision_history_desc}
 
 **编排行为规则（严格遵守）**：
 1. 有持久提醒且未开始整改时，优先询问是否进入第一个未完成任务
@@ -1480,6 +1486,25 @@ def _build_memo_context(memo_data: dict | None) -> str:
     recent = progress_log[-3:] if progress_log else []
     recent_desc = "、".join(r["summary"] for r in recent) if recent else "无"
 
+    # context_rollups — 工作摘要
+    context_rollups = payload.get("context_rollups", [])
+    recent_rollups = context_rollups[-5:]
+    context_rollups_desc = "、".join(
+        r.get("summary", "") for r in recent_rollups if r.get("summary")
+    ) if recent_rollups else "无"
+
+    # card_exit_log — 卡片决策记录
+    recovery = payload.get("workflow_recovery", {})
+    exit_log = recovery.get("card_exit_log", [])[-8:]
+    decision_parts: list[str] = []
+    for entry in exit_log:
+        event = entry.get("event", entry.get("exit_reason", "unknown"))
+        card_id = entry.get("card_id", "?")
+        summary_text = entry.get("summary") or entry.get("decision") or entry.get("reason", "")
+        if summary_text:
+            decision_parts.append(f"[{event}] card={card_id} {summary_text}")
+    decision_history_desc = " → ".join(decision_parts) if decision_parts else "无"
+
     base = _MEMO_CONTEXT_TEMPLATE.format(
         lifecycle_stage=memo_data.get("lifecycle_stage", "unknown"),
         status_summary=memo_data.get("status_summary", ""),
@@ -1488,6 +1513,8 @@ def _build_memo_context(memo_data: dict | None) -> str:
         notices_desc=notices_desc,
         latest_test_desc=test_desc,
         recent_progress=recent_desc,
+        context_rollups_desc=context_rollups_desc,
+        decision_history_desc=decision_history_desc,
     )
 
     # fixing 阶段 + 最近测试失败 → 追加结构化 fix context
