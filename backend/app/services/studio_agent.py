@@ -2531,6 +2531,38 @@ async def run_stream(
                 "actions": actions,
             })
 
+    # ── FIX-06: fixing.task 产出 studio_diff 但未产出 studio_fixing_complete 时自动补发 ──
+    _has_diff = any(n == "studio_diff" for n, _ in events)
+    _has_fixing_complete = any(n == "studio_fixing_complete" for n, _ in events)
+    if (
+        _has_diff
+        and not _has_fixing_complete
+        and active_card_contract_id in ("fixing.task", "audit.fixing.critical", "audit.fixing.moderate")
+        and selected_skill_id
+    ):
+        _auto_payload = {"card_id": active_card_id, "auto": True, "reason": "diff_emitted"}
+        events.append(("studio_fixing_complete", _auto_payload))
+        # 直接 yield 并走 card complete 逻辑
+        yield ("studio_fixing_complete", _auto_payload)
+        fixing_card_id = active_card_id
+        if fixing_card_id:
+            try:
+                from app.services.studio_card_service import complete_card as _complete_card
+                _complete_card(
+                    db, selected_skill_id,
+                    card_id=fixing_card_id,
+                    contract_id=active_card_contract_id or "",
+                    exit_reason="fixing_complete",
+                    user_id=user_id,
+                )
+                yield ("card_status_patch", {
+                    "card_id": fixing_card_id,
+                    "new_status": "adopted",
+                    "reason": "fixing_complete:auto_from_diff",
+                })
+            except Exception as e_auto_fc:
+                logger.warning(f"[studio_agent] auto fixing_complete error: {e_auto_fc}")
+
     # ── M4: studio_card_handoff / studio_external_edit_request — 区分 internal vs external ──
     for evt_name, payload in events:
         if evt_name in ("studio_card_handoff", "studio_external_edit_request") and selected_skill_id:
