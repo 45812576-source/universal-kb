@@ -2566,11 +2566,8 @@ async def run_stream(
                     exit_reason="fixing_complete",
                     user_id=user_id,
                 )
-                yield ("card_status_patch", {
-                    "card_id": fixing_card_id,
-                    "new_status": "adopted",
-                    "reason": "fixing_complete:auto_from_diff",
-                })
+                # 不发 card_status_patch adopted——让用户 adopt 操作驱动卡片状态变更，
+                # 否则会与 replaceWorkbenchCards 重建的 active 卡片产生竞态
             except Exception as e_auto_fc:
                 db.rollback()
                 logger.warning(f"[studio_agent] auto fixing_complete error: {e_auto_fc}")

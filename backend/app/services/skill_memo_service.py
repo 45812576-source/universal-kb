@@ -532,9 +532,9 @@ def _audit_task_type_from_card(card: dict[str, Any]) -> str:
 
 
 def _audit_task_target_files(card: dict[str, Any]) -> list[str]:
-    target_kind = _workflow_card_target_kind(card)
+    target_kind = _workflow_card_target_kind(card).lower()
     target_ref = _workflow_card_target_ref(card)
-    if target_kind == "skill_prompt":
+    if target_kind in ("skill_prompt", "prompt", "system_prompt"):
         return ["SKILL.md"]
     if target_kind == "source_file" and target_ref:
         return [target_ref]
@@ -2036,7 +2036,7 @@ def record_test_result(
                     "priority": "high" if fp_item.get("priority") == "p0" else "medium" if fp_item.get("priority") == "p1" else "low",
                     "source": "test_failure",
                     "description": fp_item.get("suggested_changes", summary),
-                    "target_files": [],
+                    "target_files": _remediation_task_target_files(fp_item),
                     "acceptance_rule": {"mode": "custom", "text": fp_item.get("acceptance_rule", "")},
                     "depends_on": [],
                     "started_at": None,
@@ -2197,9 +2197,9 @@ def record_post_test_diff(
 
 
 def _remediation_task_target_files(task: dict[str, Any]) -> list[str]:
-    target_kind = str(task.get("target_kind") or "").strip()
+    target_kind = str(task.get("target_kind") or "").strip().lower()
     target_ref = str(task.get("target_ref") or "").strip()
-    if target_kind == "skill_prompt":
+    if target_kind in ("skill_prompt", "prompt", "system_prompt"):
         return ["SKILL.md"]
     if target_kind == "source_file" and target_ref:
         return [target_ref]
@@ -2239,7 +2239,7 @@ def _saved_file_matches_task(target_task: dict[str, Any], filename: str, file_ty
 
     target_kind = str(target_task.get("target_kind") or "").strip().lower()
     target_ref = str(target_task.get("target_ref") or "").strip()
-    if target_kind == "skill_prompt" and _is_prompt_save(filename, file_type):
+    if target_kind in ("skill_prompt", "prompt", "system_prompt") and _is_prompt_save(filename, file_type):
         return True
     if target_kind == "source_file" and target_ref and filename == target_ref:
         return True
