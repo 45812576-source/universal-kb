@@ -2539,6 +2539,7 @@ async def run_stream(
         and not _has_fixing_complete
         and active_card_contract_id in ("fixing.task", "audit.fixing.critical", "audit.fixing.moderate")
         and selected_skill_id
+        and active_card_id
     ):
         _auto_payload = {"card_id": active_card_id, "auto": True, "reason": "diff_emitted"}
         events.append(("studio_fixing_complete", _auto_payload))
