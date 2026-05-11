@@ -480,8 +480,16 @@ class StudioRunRegistry:
                         staged_edit_count += 1
                         await self._append(run, "staged_edit_notice", staged_edit)
                 except Exception as bootstrap_err:
+                    db.rollback()
                     logger.warning("[studio_run] workflow bootstrap failed: %s", bootstrap_err)
                     await self._append(run, "fallback_text", {"text": f"工作流初始化失败: {bootstrap_err}"})
+                else:
+                    # bootstrap 成功后立即 commit，释放 skill_memos 行锁，
+                    # 避免 LLM 流传输期间阻塞前端 complete-from-save 等并发写入
+                    try:
+                        db.commit()
+                    except Exception:
+                        db.rollback()
 
             # Phase 8: 灰度分支 — gateway 主链 vs legacy 直调
             from app.harness.gateway import is_gateway_main_chain

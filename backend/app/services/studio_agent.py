@@ -2245,6 +2245,7 @@ async def run_stream(
                         "data": payload,
                     })
                 except Exception as e:
+                    db.rollback()
                     logger.warning(f"[studio_agent] save artifact error: {e}")
 
             if ready and completed_phase and arch_state:
@@ -2268,6 +2269,7 @@ async def run_stream(
                             "transition": f"{completed_phase} → {next_phase}",
                         })
                 except Exception as e:
+                    db.rollback()
                     logger.warning(f"[studio_agent] phase progression error: {e}")
 
         # ── architect_ooda_decision → 处理收敛或回调 ──
@@ -2308,6 +2310,7 @@ async def run_stream(
                                         _mark_stale(db, selected_skill_id, card_ids=_stale_ids, reason=f"ooda_callback_to_{callback_phase}", user_id=user_id)
                                         yield ("stale_patch", {"card_ids": _stale_ids, "reason": f"ooda_callback_to_{callback_phase}"})
                             except Exception as e_stale:
+                                db.rollback()
                                 logger.warning(f"[studio_agent] stale marking on OODA callback error: {e_stale}")
                     db.commit()
                     yield ("architect_phase_status", {
@@ -2317,6 +2320,7 @@ async def run_stream(
                         "ooda_decision": decision,
                     })
                 except Exception as e:
+                    db.rollback()
                     logger.warning(f"[studio_agent] OODA update error: {e}")
 
         # ── architect_ready_for_draft → 标记就绪 + card_status_patch ──
@@ -2346,6 +2350,7 @@ async def run_stream(
                         "reason": "architect_ready_for_draft",
                     })
                 except Exception as e:
+                    db.rollback()
                     logger.warning(f"[studio_agent] complete_card on ready_for_draft error: {e}")
 
         # ── studio_phase_progress → 标记该 phase 所有卡 adopted + 激活下一 phase 首卡 ──
@@ -2398,6 +2403,7 @@ async def run_stream(
                         "reason": f"phase_completed:{completed_phase_label}",
                     })
             except Exception as e:
+                db.rollback()
                 logger.warning(f"[studio_agent] studio_phase_progress card handling error: {e}")
 
         # ── M5 B11a: studio_governance_complete → 治理审查完成（optimize/audit） ──
@@ -2420,6 +2426,7 @@ async def run_stream(
                         "reason": f"governance_complete:{governance_result}",
                     })
                 except Exception as e_gc:
+                    db.rollback()
                     logger.warning(f"[studio_agent] studio_governance_complete error: {e_gc}")
 
         # ── M5 B11b: studio_refine_staged → optimize refine 产出 staged_edit ──
@@ -2466,6 +2473,7 @@ async def run_stream(
                         "reason": f"audit_scan_complete:severity={severity}",
                     })
                 except Exception as e_asc:
+                    db.rollback()
                     logger.warning(f"[studio_agent] studio_audit_scan_complete error: {e_asc}")
 
         # ── M5 B11d: studio_fixing_complete → 整改完成（audit fixing） ──
@@ -2487,6 +2495,7 @@ async def run_stream(
                         "reason": "fixing_complete",
                     })
                 except Exception as e_fc:
+                    db.rollback()
                     logger.warning(f"[studio_agent] studio_fixing_complete error: {e_fc}")
 
         # ── M4 B8 + M5 B11f: 卡片状态变更后推送 queue_window_patch ──
@@ -2512,6 +2521,7 @@ async def run_stream(
                     if _qwindow:
                         yield ("queue_window_patch", _qwindow)
             except Exception as e_qw:
+                db.rollback()
                 logger.warning(f"[studio_agent] queue_window_patch error: {e_qw}")
 
         # ── studio_governance_action → 也发 governance_card 对齐 ──
@@ -2562,6 +2572,7 @@ async def run_stream(
                     "reason": "fixing_complete:auto_from_diff",
                 })
             except Exception as e_auto_fc:
+                db.rollback()
                 logger.warning(f"[studio_agent] auto fixing_complete error: {e_auto_fc}")
 
     # ── M4: studio_card_handoff / studio_external_edit_request — 区分 internal vs external ──
@@ -2629,6 +2640,7 @@ async def run_stream(
                             retryable=True,
                         ))
                 except Exception as e_ho:
+                    db.rollback()
                     logger.warning("[studio_agent] external handoff error: %s", e_ho)
                     yield ("error", _orchestration_error(
                         step="handoff",
@@ -2705,6 +2717,7 @@ async def run_stream(
                         retryable=True,
                     ))
             except Exception as e_bb:
+                db.rollback()
                 logger.warning("[studio_agent] bind_back error: %s", e_bb)
                 yield ("error", _orchestration_error(
                     step="bind_back",
@@ -2726,6 +2739,7 @@ async def run_stream(
                         for applied_item in result["applied"]:
                             yield ("card_patch", applied_item)
                 except Exception as e_cp:
+                    db.rollback()
                     logger.warning(f"[studio_agent] card_proposals handling error: {e_cp}")
 
     # ── 6c. 确定性注入 description 修改的 governance action ──
