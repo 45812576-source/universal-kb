@@ -15,6 +15,52 @@ from app.services.studio_workflow_protocol import (
     WorkflowStagedEditData,
 )
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _resolve_staged_edit_id(
+    db: "Session",
+    skill_id: int,
+    card_id: str | None,
+    staged_edit_id: int | None,
+) -> int | None:
+    """当 staged_edit_id 缺失时，尝试从 workflow_recovery.staged_edits 按 card_id 自动解析。"""
+    if staged_edit_id is not None:
+        return staged_edit_id
+    if not card_id:
+        return None
+    try:
+        from app.services.skill_memo_service import get_memo
+        memo = get_memo(db, skill_id)
+        if not isinstance(memo, dict):
+            return None
+        recovery = memo.get("workflow_recovery")
+        if not isinstance(recovery, dict):
+            return None
+        staged_edits = recovery.get("staged_edits", [])
+        for edit in staged_edits:
+            if not isinstance(edit, dict):
+                continue
+            if edit.get("origin_card_id") != card_id:
+                continue
+            if edit.get("status") not in ("pending", "reviewing"):
+                continue
+            # 提取 DB id
+            eid = edit.get("id")
+            if isinstance(eid, int):
+                return eid
+            s = str(eid).strip() if eid is not None else ""
+            if s.isdigit():
+                return int(s)
+            if s.startswith("db_") and s[3:].isdigit():
+                return int(s[3:])
+    except Exception:
+        logger.debug("_resolve_staged_edit_id failed for skill=%s card=%s", skill_id, card_id, exc_info=True)
+    return None
+
+
 def _infer_file_role(*, target_file: str | None, target: dict[str, Any] | None, content: dict[str, Any] | None) -> str | None:
     target_kind = str((content or {}).get("target_kind") or "").strip().lower()
     target_type = str((target or {}).get("type") or (target or {}).get("target_type") or "").strip().lower()
@@ -277,6 +323,7 @@ def dispatch_workflow_action(
         from app.services.studio_governance import adopt_staged_edit
         from app.services.skill_memo_service import patch_workflow_recovery_action
 
+        staged_edit_id = _resolve_staged_edit_id(db, skill_id, card_id, staged_edit_id)
         if not staged_edit_id:
             return WorkflowActionResult(
                 action_id="",
@@ -325,6 +372,7 @@ def dispatch_workflow_action(
         from app.services.studio_governance import reject_staged_edit
         from app.services.skill_memo_service import patch_workflow_recovery_action
 
+        staged_edit_id = _resolve_staged_edit_id(db, skill_id, card_id, staged_edit_id)
         if not staged_edit_id:
             return WorkflowActionResult(
                 action_id="",
